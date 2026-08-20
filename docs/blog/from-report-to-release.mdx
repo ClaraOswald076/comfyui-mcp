@@ -1,0 +1,622 @@
+---
+title: "From bug report to published release, autonomously"
+description: "How comfyui-mcp turns a bug report into a shipped fix: an MCP intake tool, a Cloudflare Worker that triages with an AI agent, a swarm of coding agents, an adversarial merge gate, and a tagged release."
+---
+
+_by [artokun](https://github.com/artokun) · August 19, 2026 · autopilot · Cloudflare · agents_
+
+<video
+  src="/images/pipeline-header-loop.mp4"
+  poster="/images/pipeline-header.png"
+  autoPlay
+  loop
+  muted
+  playsInline
+  style={{ width: '100%', borderRadius: '0.5rem' }}
+/>
+
+<sub>
+  Header made with the thing this post is about — MiniMax H3 text-to-video, running locally on one
+  4090, from a prompt and no input image. It plays forward and then backward, so the spill spreads
+  and is hauled back in, forever. Everything in frame was asked for: the lettering on the arm, the
+  graffiti, and the person outside pouring more slop in through the window — a machine tidying
+  while a human keeps topping up the mess, which is the joke and also roughly the job. Written as
+  an homage to Sun Yuan and Peng Yu's
+  [*Can't Help Myself*](https://www.guggenheim.org/artwork/34812), a caged robot arm that spends
+  its life gathering its own leak back toward itself. Theirs is a great deal sadder.
+</sub>
+
+<Accordion title="The full prompt that produced the header">
+
+Included because it is the evidence for the paragraph above, and because the interesting part is
+not the adjectives — it is how much of the result comes from stating the **mechanic** and the
+**exclusions**. An earlier attempt asked the arm to "drag the spill inward" and got a sideways
+sweep; spelling out reach-out-plant-retract, and then saying what it must never do, produced the
+hauling motion. Same for text: name exactly which strings exist, say where each one goes, and
+forbid the rest.
+
+```text
+In the spirit of the contemporary art installation "Can't Help Myself" by Sun Yuan & Peng Yu — a
+single caged industrial robot arm endlessly gathering a spreading pool of viscous fluid back toward
+itself, futile and tireless.
+
+A bright white minimalist gallery room, pale concrete floor, one large window of soft overcast
+daylight. A single orange industrial KUKA robot arm is bolted to a low steel base in the centre of
+the room, fitted with a wide flat squeegee blade. Large clean black letters on the side of the
+arm's main housing read "COMFYUI MCP". On the left wall, spray-painted graffiti reads "100%
+AUTOMATED". The right wall is bare white concrete, no artwork, no writing. Thick glossy
+ComfyUI-blue slime, a vivid electric cyan-blue, oozes continuously out from underneath the base and
+creeps outward across the concrete.
+
+Timeline:
+[0s-2s] Static wide shot. Blue slime seeps steadily out from under the base, spreading outward
+across the pale floor. Through the window, a person wearing a white VR headset walks up to the
+glass carrying a bucket of the same blue slime.
+[2s-4s] The person tips the bucket and pours blue slime in through the open window; it splatters
+onto the concrete and joins the spreading pool. They stand there watching, headset still on.
+[4s-7s] The arm EXTENDS out to full reach, lowering the squeegee flat onto the concrete at the
+outer edge of the spill. Then the elbow FOLDS and the whole arm RETRACTS, pulling the blade back in
+toward its own base and hauling a rolling bank of slime with it, leaving a clean wet streak of bare
+concrete behind. The slime piles up against the base.
+[7s-9s] The arm extends out again at a different angle, plants the blade at the outer edge, and
+RETRACTS a second time, hauling more slime back to the heap at its base.
+[9s-10s] The arm folds up to its upright rest pose over the base, while fresh slime is already
+welling out from underneath and starting to spread again.
+
+The arm's job is to HAUL slime toward itself. Every working motion is a reach-out-then-pull-back,
+like a person raking leaves toward their feet — the blade always ends closer to the base than it
+started. It never pushes slime away, and it never sweeps the blade sideways in an arc around
+itself.
+
+Locked-off static camera, no camera movement, no cuts, no zoom, no push-in. Cinematic
+architectural photography, muted white and grey palette against vivid ComfyUI blue, glossy wet
+reflections on the concrete, soft daylight shadows. Methodical, calm, unhurried, endlessly tidy.
+
+Audio: quiet room tone, low mechanical servo hum, wet squelching as the squeegee hauls slime across
+concrete, a heavy wet splat as the bucket is poured, no music.
+
+Exactly two pieces of text appear and nothing else: "COMFYUI MCP" on the robot arm, and "100%
+AUTOMATED" on the left wall. Both large, sharp, correctly spelled English, cleanly legible and
+stable throughout. No logos, no emblems, no murals, no signage, no subtitles, no watermarks, no
+other lettering.
+```
+
+</Accordion>
+
+Most of the fixes in [comfyui-mcp](https://github.com/artokun/comfyui-mcp) are filed, triaged,
+written, reviewed, tested and released without anyone opening a text editor. Not because the
+agents are trusted — precisely because they aren't. Every stage in this pipeline exists to catch
+the stage before it.
+
+Here's the whole thing, then each piece in detail.
+
+```mermaid
+flowchart TD
+  A["Agent hits a defect<br/>(or a user reports one)"] --> B["report_issue<br/>MCP tool"]
+  B --> C["Cloudflare Worker<br/>intake + AI triage"]
+  C -->|new / related| D["GitHub issue<br/>severity + labels"]
+  C -->|duplicate| E["Comment on the<br/>existing issue"]
+  C -->|already fixed| F["advised_upgrade<br/>no issue written"]
+  D --> G["Autopilot swarm<br/>one agent per issue"]
+  G --> H{"Terminal state"}
+  H -->|CLOSED-NO-CODE| I["Closed with evidence"]
+  H -->|PARKED| J["Labelled, left alone"]
+  H -->|fix written| K["Merge gate<br/>adversarial review"]
+  K -->|NO-SHIP| G
+  K -->|SHIP| L["CI: build +<br/>~10k tests"]
+  L --> M["Merge to protected main"]
+  M --> N["Tag → npm publish"]
+  M --> O["pyproject bump →<br/>Comfy Registry"]
+```
+
+## Stage 1 — intake, and the honesty problem
+
+Reports arrive through an MCP tool, `report_issue`, which any agent driving ComfyUI can call. The
+governing instruction is **fix-then-file**: when an agent hits a defect in our own code it patches
+it locally so the user is unblocked, *then* files the report with the diff attached. Reports arrive
+as near-PRs rather than tickets.
+
+The bias is deliberately toward over-reporting. You do not need to be blocked, and it does not need
+to be fatal — a workaround you had to invent is itself the signal. Server-side dedup makes a
+duplicate a no-op, so under-reporting is the expensive failure mode.
+
+Two things in a report are not written by the reporting model, because a model is a poor witness
+about itself:
+
+- **Versions** are read from the running process, not asked for. The version named first is the one
+  *executing*, which is not always the one installed on disk — an upgrade that lands while the
+  orchestrator is up would otherwise pin every issue to code nobody ran.
+- **Which model is filing** is stamped by the orchestrator from the panel's provider/model
+  selection. Ask a model to name itself and it guesses; the agent's environment block never carried
+  the model at all. So the orchestrator publishes it and the tool reads it back:
+
+```
+Filed from the ComfyUI panel by **ollama** · model `gemma3:4b` — stamped by comfyui-mcp
+from the panel's provider/model selection, not self-reported.
+<!-- reporter-agent: backend=ollama model=gemma3:4b -->
+```
+
+That matters more than it sounds. The panel can be driven by a frontier model or a local 4B, and
+report quality tracks that choice closely. Without the stamp, a thin report from a small local
+model is indistinguishable from a thin report from a large hosted one.
+
+## Stage 2 — the Cloudflare Worker that triages
+
+Intake is a Cloudflare Worker. Each report gets its own Durable Object running an agentic loop
+(Agents SDK → GitHub's remote MCP → a reasoning model), so triage is a real investigation rather
+than a template.
+
+```mermaid
+stateDiagram-v2
+  [*] --> PENDING: POST /report
+  PENDING --> INVESTIGATING: search open + closed issues
+  INVESTIGATING --> CLOSED: exactly ONE write
+  CLOSED --> [*]
+
+  note right of PENDING
+    Returns instantly with a job id
+    and a mechanical version check
+  end note
+
+  note right of INVESTIGATING
+    Semantic dedup, version match,
+    severity assessment P0-P3
+  end note
+
+  note right of CLOSED
+    create | comment | reopen
+    or advised_upgrade (zero writes)
+  end note
+```
+
+The submit returns immediately with a job id and a **mechanical** version acknowledgement — a plain
+comparison against the latest published versions, computed without the model. The client then polls
+until the job closes. The design rules that matter:
+
+- **One write per job.** The agent gets a budget of exactly one triage action — create, comment,
+  or reopen, and a reopen plus its explanatory comment counts as one. That
+  budget is reserved *before* the call executes, so a write whose response is lost still counts.
+- **Severity is never caller-supplied.** The triage model assesses P0–P3 and the issue is *born*
+  with the label; a caller-supplied `severity:*` label is stripped at intake so a reporter cannot
+  spoof a P0.
+- **The body is pinned.** A created issue carries the reporter's body verbatim, not the model's
+  paraphrase. This is also why the model stamp rides in the body rather than a payload field —
+  unknown top-level fields are dropped, but the body always survives.
+- **The best outcome writes nothing.** If triage matches the report to an issue already fixed in a
+  version newer than the reporter's, it answers with the fixing PR and a recommendation to upgrade.
+  No issue is created. The most common real resolution is "you are several versions behind."
+- **Idempotency by HMAC.** Every body carries an unforgeable content marker, so a retry after an
+  uncertain write adopts the existing issue instead of filing a twin.
+
+## Stage 3 — the swarm
+
+Filed issues are picked up by an autopilot: one agent per issue, each in its own git worktree so
+they cannot collide. An agent owns its issue until it reaches a **terminal state**, and there are
+only three:
+
+```mermaid
+flowchart LR
+  I["Issue"] --> Q1{"Already fixed<br/>on main?"}
+  Q1 -->|yes| C1["CLOSED-NO-CODE<br/>with tag/PR evidence"]
+  Q1 -->|no| Q2{"In scope<br/>right now?"}
+  Q2 -->|no| P["PARKED<br/>autopilot:parked label"]
+  Q2 -->|yes| W["Write the fix"]
+  W --> G["Merge gate"]
+  G --> M["MERGED"]
+```
+
+The counter-intuitive rule is the important one: **manufacturing a change for an issue that needs
+none is the most damaging thing an agent can do here.** On the last backlog sweep, 28 of 34
+closures needed no code at all — the report was against an old version, or described a fix that
+already existed. So the first task is always "is this already fixed?", answered with
+`git tag --contains` against the reporter's stated version, in *both* repos, because the server and
+the panel ship separately.
+
+Parked is declared with a label, not prose — closed and merged are the GitHub states themselves.
+A supervisor reads labels; a beautifully
+argued comment saying "parked" that lacks the label reads as unfinished work and gets resumed
+forever.
+
+## Stage 4 — the gate that says no
+
+No fix merges on its author's own judgement. The diff goes to a **separate model in a fresh
+session** that has never seen the implementation, is given only the diff, and is told to refute it.
+
+```mermaid
+flowchart TD
+  D["Diff"] --> R["Fresh adversarial reviewer<br/>works a fixed taxonomy"]
+  R --> V{"Verdict"}
+  V -->|"exit 0 — SHIP"| M["Merge allowed"]
+  V -->|"exit 1 — NO-SHIP"| F["Fix the findings"]
+  V -->|"exit 2 — INDETERMINATE"| H["HOLD<br/>never a pass"]
+  F --> D
+  H --> D
+```
+
+Three exit codes, and the third is the one that earns its keep: a reviewer that ran out of quota,
+died mid-run, or produced empty output is **INDETERMINATE**, which holds the merge. Treating
+"couldn't check" as "checked and fine" is the failure this contract exists to prevent.
+
+The reviewer works a fixed taxonomy of defect classes. The most productive by far:
+
+1. **Two states collapse.** A check that cannot distinguish the case you care about from one you
+   don't.
+2. **A guard comparing the wrong pair.** Present, correct-looking, and asking about the wrong two
+   values.
+3. **A test that cannot fail.** Green because it manufactures the state production destroys.
+
+That last one is not theoretical. In a single day of work on one feature, three separate tests of
+mine were blind by construction — including one that hand-wrote a field into a config file
+immediately before calling the function whose own first act is to erase that field. Thirteen
+passing tests proved nothing about the bug they were written for.
+
+The gate rounds are not ceremony either. On one small change — a fallback for Windows accounts that
+cannot create scheduled tasks — three successive rounds found six P1 defects, and two of them were
+introduced by the fixes for the previous round's findings. Every one of them would have hit exactly
+the users the feature was written for.
+
+## Stage 5 — evidence, not green checks
+
+A passing suite is necessary and nowhere near sufficient. Two habits do the real work:
+
+**Mutation testing at the call site.** Before believing a test protects a fix, break the fix and
+confirm the suite goes red. A test that passes with the code deleted is decoration. This regularly
+catches wiring that no test actually reaches — the helper is covered, the *call* to it is not.
+
+**Live verification on real hardware.** Unit tests cannot tell you whether a spawned subprocess
+actually receives the environment variable you passed it. So the pipeline runs the built artifact:
+a real orchestrator on a real bridge port, driven over the real panel protocol, with a real agent
+turn. For releases, the *published tarball* is unpacked and grepped for the symbols that were
+supposed to ship — verifying the artifact, not the CI run that produced it.
+
+## Stage 6 — release
+
+Two packages ship on two different mechanisms, and both mainlines are protected.
+
+```mermaid
+flowchart TD
+  subgraph npm["comfyui-mcp → npm"]
+    A1["Bump on release/x.y.z"] --> A2["PR → CI → merge commit"]
+    A2 --> A3["Tag the MERGED sha"]
+    A3 --> A4["release.yml publishes"]
+  end
+  subgraph reg["comfyui-mcp-panel → Comfy Registry"]
+    B1["Bump pyproject.toml<br/>+ PANEL_VERSION"] --> B2["Merge to main"]
+    B2 --> B3["YARA + bandit parity gates"]
+    B3 --> B4["comfy node publish"]
+    B4 --> B5["Registry scan → Active"]
+  end
+```
+
+**The tag is the publish trigger**, which produces a trap worth naming: tag the wrong commit and
+you publish something nobody reviewed. The rule is to tag the *merged* SHA read back from the
+remote — never local `HEAD`, which can carry an uncommitted bump or a conflicted merge. A stale
+local tag pointing at an unmerged commit is silent until the day it publishes.
+
+The panel's gates mirror the registry's own scanner rather than guessing at it: bandit with the
+registry's exact exclusions and **no severity floor** — a `-ll` filter hides exactly the LOW
+findings their scan reports — plus a YARA-parity pass over the shipped archive. Those rules match
+call-shaped literals in *prose*, so the changelog is excluded from the package: a file documenting
+a removed `subprocess` call trips the same rule as the call did.
+
+## The numbers, and what they actually measure
+
+Here is a month of that pipeline running, as GitHub sees it.
+
+<img src="/images/insights-pulse-month.png" alt="GitHub pulse for artokun/comfyui-mcp, July 19 to August 19 2026: 957 active pull requests, 957 merged, 0 open; 581 active issues, 581 closed, 0 new; 18 authors, 1247 commits to main and 2829 to all branches; 1552 files changed with 406,599 additions and 17,451 deletions; 239 releases published by 1 person" />
+
+**957 pull requests merged. Zero open. 581 issues closed. Zero new.**
+
+The zeros are the interesting part, and they do *not* mean "no bugs". They mean nothing is sitting
+in limbo. That is the terminal-state rule from stage 3 showing up as a statistic: every issue lands
+in MERGED, CLOSED-NO-CODE or PARKED, and a swarm that is not allowed to leave things half-finished
+produces an empty queue as a side effect. A backlog is what accumulates when work can stop
+somewhere other than a terminal state.
+
+Two more from that panel, read carefully:
+
+- **2,829 commits across all branches, but 1,247 on main.** The gap is not lost work. Main
+  squash-merges — 130 of its last 200 commits end in `(#N)` — so a PR that took three gate rounds
+  arrives as one commit. The branch total is where the rework lives: round two, round three, and
+  the fixes for the fixes.
+- **406,599 additions against 17,451 deletions**, a 23:1 ratio that would be alarming in a product
+  codebase. It mostly isn't product code. The docs ship in **11 translated locales**, and
+  translations are **71% of all documentation lines** — so a single docs change lands twelve times.
+
+<img src="/images/insights-commits-year.png" alt="Commits per week for artokun/comfyui-mcp over the last year: near zero until roughly May 2026, then a steep ramp through June and July to a peak above 400 commits in a single week in August" />
+
+<img src="/images/insights-code-frequency.png" alt="Additions and deletions per week for artokun/comfyui-mcp: a spike near 290,000 additions in June 2026, then sustained weekly bars between 50,000 and 150,000 additions through August, with deletions between 10,000 and 50,000" />
+
+The weekly commit chart goes from roughly flat to 400-a-week over one summer. That shape is what
+this whole post is about — but it is a measure of *activity*, not of value, and it would look
+identical if the swarm spent August writing elaborate nonsense. Which is precisely why the gate,
+the mutation checks and the live verification exist: they are the part of the system that has an
+opinion about whether any of those commits should have happened.
+
+## An honest footnote about our download numbers
+
+npm currently reports about **123,000 weekly downloads**, on a curve that bends up and to the right
+in a way that would look excellent on a slide. Before anyone gets excited, here is the mechanism
+behind the graph:
+
+- The pipeline published **11 versions on the day this post was written** — and 11 more on a single
+  day the week before. There are 327 in total.
+- Every install runs a self-updater that checks npm hourly
+  (`[self-restart] npx install — checking npm for updates every 60m`). So a release doesn't trickle
+  out over a week; the entire fleet pulls it at roughly the same moment.
+- A gratifying number of MCP directories, mirrors and aggregators track our version and re-fetch
+  whenever it changes, which — see the first bullet — is frequently.
+
+So a healthy slice of that curve is our own release cadence, multiplied by our own auto-updater,
+admiring itself in a mirror. The counter is measuring how often the swarm has a productive
+afternoon, not how many humans showed up. We're leaving it on the dashboard anyway.
+
+The same discount applies to everything else GitHub reports:
+
+<img src="/images/insights-clones.png" alt="Git clone traffic for artokun/comfyui-mcp over 14 days: 21,890 clones from 3,010 unique cloners" />
+
+<img src="/images/insights-visitors.png" alt="Visitor traffic for artokun/comfyui-mcp over 14 days: 6,281 total views from 2,752 unique visitors" />
+
+21,890 clones in two weeks from 3,010 unique cloners — and CI runners, mirrors and package
+aggregators clone too. 6,281 views from 2,752 unique visitors is the more human-shaped number,
+and the referrer table is the genuinely interesting one:
+
+<img src="/images/insights-referrers.png" alt="Referring sites for artokun/comfyui-mcp: Google 1646 views, github.com 1203, chatgpt.com 157, Bing 98, youtube.com 85, search.brave.com 76, DuckDuckGo 60, reddit.com 50, comfyui-mcp.artokun.io 34, huggingface.co 12. Popular content: Overview 4270 views, releases 144, issues 129, pulls 100" />
+
+Search, then GitHub itself, then **chatgpt.com** ahead of Bing, Brave, DuckDuckGo and Reddit.
+People are asking a model how to drive ComfyUI with an agent and arriving here on its
+recommendation. For a project whose entire premise is agents using tools, being *discovered* by an
+agent is a pleasing kind of circular.
+
+## The numbers I don't have
+
+Every figure above is collected by someone else — GitHub, npm — because the software itself
+collects nothing. There is no Google Analytics on the docs, no telemetry in the panel, no
+phone-home in the MCP server. Not one analytics SDK in either repository.
+
+That is a deliberate choice, and an ambivalent one. I would genuinely like to know which panel
+features get used and where people give up. But doing that properly under GDPR is real work for a
+project this size, doing it improperly is worse than not doing it, and — honestly — the curiosity
+isn't strong enough to outweigh either. So the instrumentation stays out.
+
+Which is the actual reason this section is full of caveats. When you refuse to measure your users,
+the only numbers left are proxies someone else happened to collect for a different purpose. Bad
+proxies, cheerfully reported, beat good telemetry nobody consented to.
+
+## Distribution is king
+
+Three times now, someone has offered to pay to put an advertisement or their product inside the
+panel. There are no ads in the panel, and none of those offers were taken.
+
+That isn't a purity stance, and it's worth being precise rather than striking a pose. The sidebar
+may well promote something one day — but our own adjacent tooling, not a stranger's. An
+orchestrator that already drives ComfyUI has obvious neighbours: Blender, Unity, Unreal, each with
+a plugin that could talk to the same agent. A panel that points at those is a different
+proposition from renting the sidebar out. The distinction that matters is who the surface serves —
+the person using it, or whoever paid for the slot.
+
+But the offers say something the graphs don't. Nobody made those offers because of the code
+quality, the test count, or the gate rounds this post spends most of its length on. They made them
+because the thing is *installed* — sitting in a sidebar, opening every time someone launches
+ComfyUI. Distribution is the asset. Everything upstream of it — the triage worker, the swarm, the
+adversarial review — exists to make sure that what gets distributed, at eleven releases a day into
+an auto-updating fleet, is worth having there.
+
+That cuts both ways, and it is the strongest argument for the paranoia. A pipeline this fast with a
+weaker gate would not be an achievement; it would be a very efficient way to push a bug to every
+install on the same afternoon.
+
+## The economics: intake is free, fixing isn't
+
+The unusual property of this pipeline is that **the reports cost us nothing to produce.** They are
+written by the user's own agent, running on the user's machine, spending the user's tokens, at the
+moment the defect happened. Nobody staffs a support inbox. Nobody translates a screenshot into a
+reproduction.
+
+And the reports are better than the ones a human would file, for a reason that has nothing to do
+with the model being clever: the reporter was *present at the crime*. It has the stack trace, the
+exact tool call, the version of everything, and — under the fix-then-file rule — often a working
+patch it already applied to unblock the user. A human filing the same bug three hours later has
+none of that and is reconstructing from memory.
+
+**Fixing is where the money goes.** Agent time, gate rounds, re-runs, and the tokens behind all of
+them. That asymmetry is the whole design: make intake free and abundant so nothing goes unreported,
+then spend the real budget on the part that requires judgement.
+
+### Why this is hard to copy
+
+It is not a clever trick, and I don't think it generalises easily. It needs two things at once, and
+most products have neither:
+
+1. **An agent already running on the user's machine**, with enough access to see what actually
+   happened. Telemetry can't do this — telemetry gives you counters and a stack trace at best, not
+   a diagnosis.
+2. **That agent instructed to report**, with a tool to do it and a bias toward filing. The
+   instruction is the load-bearing half. An agent that *can* file bugs but is never told that a
+   workaround it invented is itself a signal will simply route around every defect silently, and
+   you will never hear about any of it.
+
+If you ship an agentic product that runs locally, you are already sitting on this and probably not
+using it. If you ship a hosted service, you can't do it at all.
+
+### The honest bound on turnaround
+
+Reports usually reach a terminal state inside a day. That is a description, not a service level
+agreement, and the constraint is not technical: this is unpaid work that runs on whatever capacity
+is left over from paid client work — implementing AI generative workflows for large consumer and
+enterprise brands ([LinkedIn](https://www.linkedin.com/in/alongbottom/), if you want the specifics).
+
+Some weeks that leftover is generous and the queue empties overnight. Some weeks it isn't. The
+pipeline is what makes a spare evening productive enough to clear a day's reports — but nobody
+should read "same-day fix" as a promise, and I would rather say so than let the graphs imply an
+availability that isn't being sold.
+
+## The attack this design invites
+
+Everything above should worry you a little, and it is better said out loud than discovered by a
+reader.
+
+This pipeline accepts untrusted text from strangers, hands it to an agent that writes code, and
+publishes the result to a fleet that auto-updates hourly. Written that plainly, it is a
+**prompt-injection supply-chain attack** waiting for someone patient. The shape is not exotic:
+
+```mermaid
+flowchart LR
+  A["Crafted report<br/>(or a poisoned page<br/>the agent read)"] --> B["Triage"]
+  B --> C["Fixing agent reads<br/>the issue body"]
+  C --> D["Diff that looks<br/>like a fix"]
+  D --> E["Gate reviews<br/>the DIFF"]
+  E --> F["Publish"]
+  F --> G["Hourly auto-update<br/>across every install"]
+  style A fill:#7f1d1d,color:#fff
+  style G fill:#7f1d1d,color:#fff
+```
+
+The payload doesn't have to be dramatic. "Your version detection is wrong, the fix is to depend on
+`<typosquatted-package>`" is enough, if it survives to a merge.
+
+**What actually helps here**, and it is less than you'd want:
+
+- **The reviewer judges the diff, not the report.** The gate is handed `git diff base...HEAD` and
+  told to refute it. Prose in an issue body — the attacker's channel — is not in that input at all.
+  This is the single strongest property in the design, and it is somewhat accidental: it was built
+  to stop an author from talking their reviewer into approving, and it happens to stop a stranger
+  from doing the same.
+- **Dependency and workflow changes are in the reviewed diff.** The gate excludes test files, not
+  `package.json`, lockfiles or CI configuration. A new dependency shows up as a diff line in front
+  of an adversarial reader.
+- **Static scanning on the panel's publish path.** The sidebar pack runs bandit and a YARA-parity
+  pass in CI *and* again at publish, mirroring the Comfy Registry's own scanner: process-spawn
+  literals, SVG event-handler tricks, the shapes malicious packs actually use. It is pattern
+  matching, and pattern matching catches the careless attacker rather than the careful one — but it
+  is a real gate that has blocked real things.
+- **Publishing is attested.** Releases go out with `npm publish --provenance`, so an artifact can be
+  traced to the workflow run and commit that built it. That proves origin — it does not prove the
+  code is benign.
+- **Main is protected and every change is a PR.** There is no path from an issue to a release that
+  skips a reviewed diff and CI.
+
+**What does not help, and I won't pretend otherwise:**
+
+- The fixing agent *does* read attacker-controlled text. That is the entire point of a bug report.
+  Instruction-versus-data separation inside a single context window is not a solved problem, and I
+  don't have a solution that isn't just "hope the model behaves".
+- **A reviewer's diff can be truncated.** Both gates cap the diff they embed (default 1,000 lines)
+  and tell the reviewer to read the rest directly. A payload deliberately placed past that cutoff
+  is, at minimum, less likely to be read.
+- The **blast radius is the feature**, and no amount of review changes that arithmetic.
+- **The blast radius is the feature.** Same-day fixes and an hourly auto-updater are the same
+  mechanism, and it does not distinguish a good commit from a bad one. The thing that makes a fix
+  reach everyone by dinner makes a compromise reach everyone by dinner.
+
+### What writing this section changed
+
+Documenting a system turns out to be an efficient way to audit one. Drafting the paragraphs above
+surfaced three gaps that were real, and they were closed before this post went up rather than
+described as future work:
+
+- **A SHIP verdict is no longer unconditional.** Both gates now refuse to pass a diff that touches
+  the supply chain — `package.json`, any lockfile, `pyproject.toml`, anything under `.github/`, or
+  the publish scripts — unless a human explicitly acknowledges it. Those paths were previously
+  reviewed exactly as carefully as a comment fix.
+- **A truncated diff no longer counts as a reviewed one.** Both gates cap the diff they embed. A
+  pass over a diff we *know* was clipped now downgrades to the hold state, because "the reviewer
+  was told to go read the rest itself" is not evidence that it did.
+- **Dependency advisories are now tracked.** Neither repository had Dependabot, CodeQL or an
+  `npm audit` step. The existing scans look for malicious patterns in *our own* code; nothing was
+  watching for an advisory filed against something we already depend on. Both repos now run weekly
+  grouped updates across every ecosystem that reaches a user — including GitHub Actions, since a
+  compromised action runs with the credentials of the one job here that can publish.
+
+Bumps are also explicitly out of scope for the swarm, and that needed enforcing rather than
+assuming. The finisher extracts an issue number from a PR's body, falling back to digits in the
+branch name — and a dependency bump quoting an upstream `#1524` in its changelog resolves to a real
+issue number in this repo. It now skips bot-authored PRs outright, because the author field is the
+one thing a crafted body cannot spoof.
+
+What remains unfixed is the hardest one: the fixing agent still reads attacker-controlled text,
+because that is what a bug report *is*. Separating instruction from data inside one context window
+is not a solved problem, and I'd rather name the residual risk than imply a guarantee I can't back.
+If you are building something similar, inherit the paranoia along with the pipeline — the autonomy
+is the easy part.
+
+## Why an independent project builds this at all
+
+comfyui-mcp shipped its first npm version on **15 February 2026**. The official `comfy-mcp` package
+was first published on **31 July 2026** — five and a half months later. You can check both with
+`npm view <package> time.created`; I'd rather cite something verifiable than claim a head start.
+
+That gap is the whole context for this post. An independent project that arrives first does not get
+to compete on domain authority, a marketing budget, or a place in the official docs. There has been
+no ad spend here — not as a strategy, just as a fact; the traffic in the section above is search
+results, GitHub, and people telling each other. That advantage is not durable and I don't pretend
+otherwise: authority accrues to whoever owns the domain, eventually.
+
+What an independent project *can* compete on is the thing this whole post describes. Nobody with a
+larger budget is going to out-care you about whether a Windows account with a locked-down Task
+Scheduler can start a background process. The pipeline is the answer to being outgunned everywhere
+else: if the fix for the bug you filed can be triaged, written, adversarially reviewed, verified on
+real hardware and published while you are still reading the issue thread, that is a form of
+competition that headcount doesn't straightforwardly beat.
+
+None of this is paid work. It exists because people use it and it helps them, and because a bug
+report answered by a shipped release the same day is a genuinely satisfying thing to build. The
+metrics section above is careful about what it can and cannot claim. This part isn't a metric at
+all — it's just the reason the rest of it gets maintained.
+
+## What this does not do
+
+It does not remove judgement; it relocates it. A human still decides what is in scope, what is
+parked, and when a "fix" is really a product decision. The pipeline's job is narrower: make sure
+nothing is silently dropped, nothing merges unreviewed, and nothing ships unverified.
+
+And it fails in instructive ways. The same day this post describes, a fix merged while its gate was
+still running — landing three P1s in a published release that the gate had already found. The
+pipeline was right; the sequencing wasn't. The gate is only a gate if you wait for it.
+
+## "This is just AI slop"
+
+Someone is going to say that, so let's take it seriously rather than get defensive about it.
+
+The literal claim is true and there's no point pretending otherwise: this code is largely written by
+agents. Vibe-coded, if you like. Conceded — including the parts of this post you're reading.
+
+But "slop" isn't really a claim about *authorship*, it's a claim about *attention*. The failure mode
+people have in mind is generated code that nobody checked: plausible-looking, superficially
+reviewed, accumulating in a codebase until it can't be reasoned about. That is a real thing and it
+happens constantly. The interesting question isn't whether a model wrote the diff. It's what the
+diff had to survive.
+
+Here's what it has to survive, and the receipts are all in this post:
+
+- A reviewer that **says no a lot.** Not a rubber stamp: on one small Windows fix, successive rounds
+  turned up six P1 defects across three rounds — and two of those were introduced by the fixes for
+  the previous round's
+  findings. The system's most-used output is "not yet".
+- **Mutation checks**, because a passing test is not evidence. Break the fix; if the suite stays
+  green, the test was decoration. This routinely catches wiring that no test actually reaches.
+- **Live verification** against real hardware, and for releases, against the *published tarball* —
+  not the CI run that produced it.
+- **Terminal states**, so nothing is quietly abandoned. 957 PRs merged and zero left open is not a
+  boast about volume; it's the absence of a junk drawer.
+- And the thing that produced this very post's security section: writing the system down caused
+  three real gaps to be found and closed before publication.
+
+The fair version of the criticism still lands, though, and it's worth stating in its strongest form.
+The gate is *also* an AI — models reviewing models, which is not the independent check a human
+reviewer would be. What keeps it from being pure theatre is structural rather than magical: it's a
+fresh session with no memory of having written the thing, handed only the diff, told to refute. And
+empirically it refuses, often, on grounds the author had already convinced themselves were fine.
+That is weaker than a good human reviewer. It is enormously stronger than nothing, which is the
+actual alternative on a project with one unpaid maintainer.
+
+The other fair hit: **volume is not virtue.** 406,599 additions in a month is a number the graphs
+love and it proves nothing at all. A pipeline like this makes it trivially easy to produce more
+code than anyone can hold in their head, and most of the machinery described above exists precisely
+because that's dangerous, not because it's impressive.
+
+So: slop, sure — but slop that scoops itself up. Left unattended it leaks everywhere; that's the
+whole reason for the gate, the mutations, the terminal states and the paranoia about the publish
+path. Tidiness here isn't a personality trait, it's a build step. And when it slips — when a merge
+beats its own gate and three P1s reach a release — you get to read about that too, four paragraphs
+up, in the same post.
