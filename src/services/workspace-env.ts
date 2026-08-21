@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve as pathResolve, sep } from "node:path";
@@ -271,6 +271,144 @@ export async function resolveEffectiveComfyUIBaseLive(): Promise<string | undefi
     return undefined;
   }
   return configured;
+}
+
+// ---------------------------------------------------------------------------
+// #1765 (recurrence on 0.52.35) — a local WRITE aimed at an install the session
+// is not connected to.
+// ---------------------------------------------------------------------------
+
+/**
+ * How the base a local write is about to land in was chosen — but ONLY for the
+ * two answers that are a guess about THE MACHINE rather than a statement about
+ * THIS SESSION's target. An explicit `COMFYUI_PATH` is neither, and is never
+ * described here (see `detectLocalWriteTargetMismatch`).
+ */
+export type GuessedBaseSource = "saved-default-workspace" | "auto-detected";
+
+export interface LocalWriteTargetMismatch {
+  /** The root the write was about to land in. */
+  base: string;
+  /** Which machine-wide guess produced `base`. */
+  baseSource: GuessedBaseSource;
+  /** The root the CONNECTED server actually scans `custom_nodes/` from. */
+  liveRoot: string;
+  /** What established `liveRoot` — all three are observations of the running server. */
+  liveSource: "base-directory" | "argv" | "observed-process";
+}
+
+/** Canonical spelling for comparing two install roots. realpath resolves the
+ *  symlink/`/private/var` spellings of one tree; a failure keeps the lexical
+ *  form (a path that cannot be canonicalized is compared as written). Case is
+ *  folded only where the platform's filesystem is case-insensitive by default —
+ *  folding can only ever make two roots look EQUAL, i.e. suppress a refusal,
+ *  which is the safe direction for a check that fails open. */
+function canonicalRoot(p: string): string {
+  let out = pathResolve(p);
+  try {
+    out = realpathSync(out);
+  } catch {
+    /* unresolvable — compare the lexical form */
+  }
+  return platform() === "win32" || platform() === "darwin" ? out.toLowerCase() : out;
+}
+
+/** Do these two paths name the SAME install? */
+export function sameInstallRoot(a: string, b: string): boolean {
+  return canonicalRoot(a) === canonicalRoot(b);
+}
+
+/**
+ * Was `COMFYUI_PATH` set explicitly for this process?
+ *
+ * `config.comfyuiPath` conflates two very different things: the user NAMING an
+ * install for this session, and `detectComfyUIPaths()` picking the first of
+ * however many installs happen to sit on the machine. Only the env var is the
+ * former, so only the env var may outrank the running server's self-report.
+ */
+function comfyuiPathWasNamedExplicitly(): boolean {
+  return Boolean(normalizeInstallPathEnv(process.env.COMFYUI_PATH).path);
+}
+
+/**
+ * Is `base` — the root a LOCAL filesystem write is about to land in — a
+ * different install from the one this session is connected to?
+ *
+ * #1765 recurrence. On a machine with six ComfyUI installs, `install_custom_node`
+ * (`source:"git"`) cloned an unregistered pack into the SAVED DEFAULT WORKSPACE
+ * while the session was connected to `http://127.0.0.1:8189`. The call reported
+ * `git-clone` success; only the returned `nodeDir` named the wrong tree, and the
+ * connected server never received the pack. The cause is that the write resolved
+ * its target through `resolveEffectiveComfyUIBase()` — which answers from
+ * CONFIGURATION alone (`COMFYUI_PATH` env, then auto-detection, then the saved
+ * default workspace) — and never asked `resolveLiveServerRoot`, the resolver this
+ * file documents as "the single notion every write-side caller must resolve
+ * through, so they can never disagree about which install is the live one".
+ *
+ * This does NOT pick a winner. It answers only "are these provably two different
+ * installs?", so the caller can REFUSE and name both, instead of silently writing
+ * into whichever one configuration happened to name. Preferring the live root
+ * silently would be a different bug: on a `--base-directory` split install an
+ * explicit `COMFYUI_PATH` IS the pack root (#1715/#1770), and #1766 shipped that
+ * design for this very issue.
+ *
+ * Hence the scope, stated precisely because an overclaiming comment is how the
+ * original survived: a mismatch is reported ONLY when
+ *
+ *   1. the session is LOCAL (a remote target has no local write to misdirect —
+ *      the callers refuse that separately, and earlier);
+ *   2. `base` came from a machine-wide GUESS. An explicit `COMFYUI_PATH` is the
+ *      user naming this install, and keeps winning exactly as documented;
+ *   3. the connected server PROVES a pack root — its resolved `--base-directory`,
+ *      else its own `main.py` root — and that root exists on disk and looks like
+ *      an install;
+ *   4. the two are not the same tree after canonicalization.
+ *
+ * FAILS OPEN everywhere else, deliberately: an unreachable server, a Desktop
+ * launch whose relative `main.py` cannot be anchored, or a `--base-directory` we
+ * cannot resolve all mean we do not KNOW the write is misdirected — and a refusal
+ * on a root we merely failed to prove would break every install that works today.
+ * Never throws.
+ */
+export async function detectLocalWriteTargetMismatch(
+  base: string | undefined,
+): Promise<LocalWriteTargetMismatch | undefined> {
+  if (!base || isRemoteMode()) return undefined;
+  if (comfyuiPathWasNamedExplicitly()) return undefined;
+
+  const baseSource: GuessedBaseSource =
+    getSavedDefaultWorkspaceSync() && sameInstallRoot(getSavedDefaultWorkspaceSync()!, base)
+      ? "saved-default-workspace"
+      : "auto-detected";
+
+  const snapshot = await getLiveServerSnapshot();
+  if (!snapshot.reachable) return undefined;
+
+  // 1. The runtime's OWN base directory. When it is set, ComfyUI scans
+  //    custom_nodes/ from there and nowhere else (#1715).
+  const baseDir = parseBaseDirFromArgv(snapshot.argv, snapshot.cwd);
+  if (baseDir) {
+    if (!safeExists(baseDir)) return undefined;
+    return sameInstallRoot(baseDir, base)
+      ? undefined
+      : { base, baseSource, liveRoot: baseDir, liveSource: "base-directory" };
+  }
+  // A --base-directory that cannot be resolved makes EVERY root we could derive
+  // name a different tree than the one being served — including the main.py root
+  // below. Nothing is provable here.
+  if (hasUnresolvableRelativeBaseDirFlag(snapshot.argv, snapshot.cwd)) return undefined;
+
+  // 2. The server's own install root. Without --base-directory this is where it
+  //    scans custom_nodes/ from.
+  const live = resolveLiveServerRoot(snapshot.argv, snapshot.cwd, { remote: false });
+  if (!live.root || live.source === "unresolved") return undefined;
+  if (!safeExists(live.root)) return undefined;
+  if (!safeExists(join(live.root, "models")) && !safeExists(join(live.root, "custom_nodes"))) {
+    return undefined;
+  }
+  return sameInstallRoot(live.root, base)
+    ? undefined
+    : { base, baseSource, liveRoot: live.root, liveSource: live.source };
 }
 
 /**
