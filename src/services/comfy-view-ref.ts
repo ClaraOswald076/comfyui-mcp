@@ -816,3 +816,60 @@ export function unverifiedViewRefNote(
     `which is verified and inlined as bytes.`
   );
 }
+
+/**
+ * The refusal for an AUDIO item aimed at a HEADLESS (mobile/remote) client
+ * (#1572, second round — raised as a P1 by review).
+ *
+ * WHY REFUSE RATHER THAN SEND. The headless client is not a browser panel and
+ * does not run the panel's `composeShowMediaReply`. Read from the mobile
+ * client's own source (comfyui-mcp-mobile @ c7b0dbc):
+ *
+ *   - `MediaItem.isVideo` decides by mime (`video/` → true, `image/` → false)
+ *     and otherwise by extension from {mp4, mov, webm, m4v, avi, mkv}. An
+ *     `audio/wav` payload matches no mime prefix and `.wav` is not in that set,
+ *     so it is false.
+ *   - `MediaCard.build` is `if (item.isVideo) _video else _still` — TWO
+ *     branches. There is no audio branch anywhere in that client.
+ *   - `_still` builds a `MemoryImage` from the inline bytes, or a `NetworkImage`
+ *     on the `/view` URL, and `Image(errorBuilder:)` falls back to a caption row
+ *     with an IMAGE icon when the decode fails — which it always will for audio.
+ *   - `BridgeClient` replies `{'shown': true}` to ANY `show_media`, without
+ *     looking at the items at all.
+ *
+ * So sending audio there produces `shown: true` over a card the user cannot
+ * play — the agent is told the take was delivered and goes on to talk about a
+ * sound nobody heard. That is the unearned claim this whole tool exists to
+ * remove, and it is why INLINING the bytes was rejected as the fix: inline
+ * audio reaches the same `MemoryImage`, fails the same decode, and lands in the
+ * same caption fallback, having shipped up to 20 MB of base64 to a phone to
+ * arrive at the identical non-result. There is no audio path on that client to
+ * route to; widening the orchestrator cannot invent one.
+ *
+ * The refusal names the limitation, keeps the file's good name (nothing is
+ * wrong with it), and gives the two moves that actually work.
+ */
+export function headlessAudioRefusal(opts: {
+  /** The path the caller passed, or the /view filename. */
+  what: string;
+  via: "path" | "ref";
+}): string {
+  const { what, via } = opts;
+  const where =
+    via === "path"
+      ? `the file itself is fine and still sits at ${what}`
+      : `the ComfyUI reference "${what}" is fine and still resolves`;
+  return (
+    `this conversation is on a HEADLESS client (a paired phone or remote viewer), which has no audio player: ${what}\n` +
+    `That client renders images and video only — it has no audio card at all, so an audio item sent to it would be ` +
+    `shown as a caption row with an image icon and reported back as delivered. You would then have been told the take ` +
+    `was played to the user when nobody heard it, which is worse than this refusal. Inlining the bytes does not help: ` +
+    `they reach the same image decoder and fail the same way.\n` +
+    `Nothing is wrong with the audio — ${where}.\n` +
+    `What you can do:\n` +
+    `  1. Ask the USER to open it on the desktop ComfyUI panel, which does have a player, or to play the file locally. ` +
+    `Tell them where it is; do not describe how it sounds, because you have not heard it either.\n` +
+    `  2. Show something this client CAN present instead — a still or a video — and say plainly that the audio is not ` +
+    `playable here.`
+  );
+}

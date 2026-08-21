@@ -41,6 +41,7 @@ import {
   stageFileIntoServedDir,
   stagedForDisplayNote,
   unverifiedViewRefNote,
+  headlessAudioRefusal,
   type ForwardedByReference,
   type StagedForDisplay,
   type UnverifiedViewRef,
@@ -18047,6 +18048,24 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         };
         const MAX_BYTES = 20 * 1024 * 1024; // 20 MB
 
+        // #1572 (round 2) — WHERE IS THIS GOING? Opening the audio gate is only
+        // half an answer: the browser panel has an `<audio>` card, and the
+        // HEADLESS (mobile/remote) client does not — it renders images and video
+        // only, and replies `{shown:true}` to any show_media without reading the
+        // items. Audio sent there is a caption row with an image icon reported
+        // back as delivered. So the target is resolved ONCE, here, and both
+        // item-source branches below consult it; see headlessAudioRefusal for
+        // the client-source evidence and why inlining the bytes is not the fix.
+        //
+        // Sticky `isHeadless` deliberately, matching the inline branch below
+        // rather than `isCurrentHeadless`: this is a RENDERING decision about
+        // the client that will receive the card, including a phone that is
+        // offline right now and will get it on the mailbox flush. The
+        // typeof-guard is the same one every other isHeadless call site in this
+        // file uses — a lightweight bridge need not implement it.
+        const targetIsHeadless =
+          typeof ctx.bridge?.isHeadless === "function" && ctx.bridge.isHeadless(ctx.tabId);
+
         const resolved: Array<Record<string, unknown>> = [];
         /** Oversized items that took the /view reference route instead (#648). */
         const forwarded: ForwardedByReference[] = [];
@@ -18104,6 +18123,14 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
               mime = VIDEO_MIME[ext];
               kind = "video";
             } else if (AUDIO_EXTS.has(ext)) {
+              // CALL SITE 1 of 2 for the headless-audio gate (the other is in
+              // the /view-ref branch below). Kept as two explicit call sites
+              // rather than one pre-pass so each is greppable and asserted by
+              // name, and so this branch keeps its existing error ORDER —
+              // absolute-path, then stat, then type, then this.
+              if (targetIsHeadless) {
+                return fail(headlessAudioRefusal({ what: p, via: "path" }));
+              }
               mime = AUDIO_MIME[ext];
               kind = "audio";
             } else {
@@ -18209,11 +18236,31 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
             const filename = p.replace(/.*[\/]/, "");
             resolved.push({ kind, dataUrl, filename, caption: item.caption });
           } else {
+            // CALL SITE 2 of 2 for the headless-audio gate. A /view ref is
+            // forwarded UNCLASSIFIED — the orchestrator never reads the bytes —
+            // so the extension on the ref's own filename is the only signal
+            // here, exactly as the panel uses it. Same question as call site 1,
+            // same answer, and it must be asked here too: this branch is how
+            // `SaveAudio` output reaches a client, and it is the branch review
+            // flagged.
+            const refExt = extname(src.filename).toLowerCase();
+            if (targetIsHeadless && AUDIO_EXTS.has(refExt)) {
+              return fail(headlessAudioRefusal({ what: src.filename, via: "ref" }));
+            }
             // ComfyUI /view ref. A browser panel fetches it same-origin — but a
             // HEADLESS (mobile/remote) client can't reach ComfyUI, so resolve the
             // bytes HERE and inline them as a data URL. Best-effort: any failure
             // (fetch error, non-media, too big) falls back to forwarding the ref,
             // which the client renders as a caption card.
+            //
+            // The image/video-only test below is CORRECT and stays as it is.
+            // Review read it as the defect ("audio refs are never inlined"), and
+            // the symptom was real — but inlining is not the remedy: the mobile
+            // client has no audio branch at all, so inline audio bytes reach its
+            // `MemoryImage`, fail to decode, and land in the same caption
+            // fallback a bytes-less ref does, after shipping up to 20 MB of
+            // base64 to a phone. Audio is refused above instead, so this
+            // condition is now unreachable for audio rather than merely narrow.
             let inlined = false;
             if (ctx.bridge.isHeadless(ctx.tabId)) {
               try {
