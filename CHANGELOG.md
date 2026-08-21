@@ -27,6 +27,13 @@ All notable changes to this project are documented here. This project adheres to
   became a caption row with an image icon while the agent was told the take had
   been played. Inlining the bytes is not the remedy; they reach the same image
   decoder and fail the same way.
+  That refusal fires only for a phone that is CONNECTED — an offline one is
+  about to be rebound onto the desktop tab, where audio plays fine. The #941
+  /view probe now compares the served content-type against the family the
+  FILENAME promises, rather than asking only whether the body is media at all:
+  a `plate.png` that serves `audio/wav` paints an `<img>` at audio bytes and
+  breaks, and a `take.wav` serving `image/png` was accepted just as wrongly
+  before any of this.
 
 - **Ollama refuses audio unless the model is a verified listener (#1972).** Native
   `/api/chat` carries audio in `message.images[]`. Most models HTTP 400 (fail
