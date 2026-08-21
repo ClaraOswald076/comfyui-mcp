@@ -1370,6 +1370,38 @@ function sessionRouteIsLive(ctx: PanelToolCtx): boolean {
   }
 }
 
+type MutationRefusalCause =
+  | "unroutable"
+  | "disconnected"
+  | "no_identity"
+  | "capability"
+  | "target_disagreement";
+
+/**
+ * Snapshot of whether this tab can fence a graph WRITE right now.
+ *
+ * `known:false` (resolver threw, ctx threw) is `undefined`, not `false`: the
+ * boolean probe fails closed, and rendering that as "your panel lacks the write
+ * fence" is a claim built from our own failure to look.
+ */
+function readTabMutationCapability(ctx: PanelToolCtx): {
+  canMutateNow: boolean | undefined;
+  refusalCause: MutationRefusalCause | undefined;
+} {
+  try {
+    if (ctx.tabGraphMutationCapability) {
+      const cap = ctx.tabGraphMutationCapability();
+      return {
+        canMutateNow: cap.known ? cap.canMutate : undefined,
+        refusalCause: cap.known && !cap.canMutate ? cap.because : undefined,
+      };
+    }
+    return { canMutateNow: ctx.tabCanMutateGraph?.(), refusalCause: undefined };
+  } catch {
+    return { canMutateNow: undefined, refusalCause: undefined };
+  }
+}
+
 /**
  * #1331 — the bridge refused a mutation because the active workflow has no identity to
  * fence against (ui-bridge's `no trusted identity` branch).
@@ -15070,23 +15102,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // unreadable capability would be RENDERED as "your panel lacks the write
         // fence" — a claim about the panel built from our own failure to look
         // (codex gate). Only an OBSERVED negative may say that.
-        let canMutateNow: boolean | undefined;
-        let refusalCause: "unroutable" | "disconnected" | "no_identity" | "capability" | "target_disagreement" | undefined;
-        try {
-          if (ctx.tabGraphMutationCapability) {
-            const cap = ctx.tabGraphMutationCapability();
-            canMutateNow = cap.known ? cap.canMutate : undefined;
-            if (cap.known && !cap.canMutate) refusalCause = cap.because;
-          } else {
-            // The legacy boolean probe cannot say WHY, and guessing would put us
-            // back where the tri-state started. Leave the cause undefined so the
-            // narration falls back to the generic wording rather than inventing one.
-            canMutateNow = ctx.tabCanMutateGraph?.();
-          }
-        } catch {
-          canMutateNow = undefined; // a guard that can throw is not a guard
-          refusalCause = undefined;
-        }
+        //
+        // This snapshot is taken BEFORE the settling read. After a restart the
+        // tab can still be reconnecting, so the honest answer here is often
+        // unknown (`undefined`) even though a moment later `graph_query` will
+        // round-trip. #1696 re-reads after that probe, on the tab that answered.
+        let { canMutateNow, refusalCause } = readTabMutationCapability(ctx);
         // #1043 (codex review) — NO version note on THIS path, deliberately.
         //
         // The note claims that on 0.11.45+ "the command that re-pointed the canvas
@@ -15201,6 +15222,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           }
           if (probeOk) {
             probePassed = true;
+            // #1696 — the snapshot above is taken BEFORE this read, while the tab
+            // may still be reconnecting. `canMutateNow` is then undefined (the
+            // probe could not inspect the tab) even though this command just
+            // proved the socket and fence are live. Re-read on the tab that
+            // answered; a still-unknown or still-refused write capability keeps
+            // the failure below. Treating unknown as true is not this fix.
+            ({ canMutateNow, refusalCause } = readTabMutationCapability(ctx));
             settledNote =
               // ONE OBSERVATION, STATED AS ONE (codex r2). A passing graph_query proves that
               // read passed this fence just now — not that every command will, and not that
