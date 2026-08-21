@@ -759,6 +759,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.37] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- the QUEUE BUSY refusal names TOOLS, not bridge commands (#1934)
+- first Windows code-mode call survives a sharing-violation host spawn (#1932)
+
+
 ## [0.52.36] - 2026-08-20
 
 ### MCP
