@@ -116,7 +116,12 @@ export async function startQuickTunnel(
   // particular, `localhost` can resolve to IPv6 while a 0.0.0.0 server is
   // listening only on IPv4, so always route wildcard binds through IPv4
   // loopback.
-  const originHost = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
+  const originHost =
+    host === "0.0.0.0" || host === "::"
+      ? "127.0.0.1"
+      : host.includes(":") && !host.startsWith("[")
+        ? `[${host}]`
+        : host;
   const t = Tunnel.quick(`http://${originHost}:${port}`, {
     "--config": getCloudflaredConfigArg(),
     "--edge-ip-version": "4",
