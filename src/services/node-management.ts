@@ -21,6 +21,8 @@ import {
 } from "./manager-api-cache.js";
 export type { ManagerApi } from "./manager-api-cache.js";
 import {
+  type LocalWriteTargetMismatch,
+  detectLocalWriteTargetMismatch,
   resolveEffectiveComfyUIBase,
   resolveEffectiveComfyUICodeBase,
   resolveInstallInterpreter,
@@ -2488,6 +2490,60 @@ function managerEnqueueRefusal(err: unknown): number | undefined {
   return status === 403 || status === 404 ? status : undefined;
 }
 
+/**
+ * #1765 (recurrence on 0.52.35) — the write was aimed at the wrong ComfyUI.
+ *
+ * The reporter ran six installs on one machine, pointed the MCP at
+ * `http://127.0.0.1:8189`, and got a `git-clone` SUCCESS whose `nodeDir` named a
+ * different install entirely; the connected server never received the pack. The
+ * refusal below is what replaces that success. It names both roots, says which
+ * selector produced each, and gives the one-step remedy — because the failure
+ * this class produces is not an error the user can see, it is a report of work
+ * that was done somewhere else.
+ *
+ * Deliberately a REFUSAL and not a retarget: on a `--base-directory` split
+ * install the configured root IS the pack root (#1715/#1770/#1766), so silently
+ * preferring the live `main.py` root would trade this bug for that one. A
+ * `--base-directory` the server actually reports is honored FIRST, so that
+ * deployment never reaches this refusal in the first place.
+ *
+ * A `COMFYUI_PATH` that disagrees with the running server IS refused, and that
+ * is deliberate — see `detectLocalWriteTargetMismatch` for why the env var
+ * cannot be read as the user naming this install (the panel orchestrator
+ * forwards an auto-detected path under exactly that name).
+ */
+function wrongInstallRefusal(
+  m: LocalWriteTargetMismatch,
+  what: string,
+  /** The target CAPTURED for this operation — not `getComfyUIBaseUrl()` read at
+   *  throw time, which a panel retarget mid-call would have already moved. */
+  target: string,
+): string {
+  const chosenBy =
+    m.baseSource === "comfyui-path"
+      ? "COMFYUI_PATH"
+      : m.baseSource === "saved-default-workspace"
+        ? 'the SAVED DEFAULT WORKSPACE (workspace action:"set_default")'
+        : "AUTO-DETECTION of ComfyUI installs on this machine";
+  const provenBy =
+    m.liveSource === "base-directory"
+      ? "its own --base-directory"
+      : m.liveSource === "argv"
+        ? "its own /system_stats launch argv"
+        : "the OS process listening on that port, anchored on the interpreter it runs";
+  return (
+    `${what} would write into ${m.base}, but this session is connected to ` +
+    `${target}, which runs from ${m.liveRoot} (established from ${provenBy}). ` +
+    `Those are two DIFFERENT ComfyUI installs, so NOTHING was written: the pack would have ` +
+    `landed in a custom_nodes/ the connected server never scans, and this call would have ` +
+    `reported success. ${m.base} was chosen by ${chosenBy} — configuration, which describes ` +
+    `this MACHINE; the root above is what the running server says about ITSELF. To install ` +
+    `into the connected server, set COMFYUI_PATH=${m.liveRoot} and retry. If ${m.base} really ` +
+    `is where you want packs for this server, launch it with --base-directory ${m.base} — ` +
+    `that is the flag that makes a data root authoritative, and it is honored here.`
+  );
+}
+
 async function cloneCustomNodeFallback(
   gitId: string,
   repoName: string,
@@ -2866,6 +2922,22 @@ async function installCustomNodeImpl(
   const managerBase = managerBaseUrl();
   const cliWorkspace = opts.comfyuiPath ?? resolveEffectiveComfyUIBase();
   const presenceCtx = capturePackPresenceContext(cliWorkspace);
+  // #1765 — and is that root the install this session is actually CONNECTED to?
+  // Pinned to the very cliWorkspace the write will use, so a panel retarget
+  // mid-call cannot judge one install's root against another's server.
+  //
+  // AFTER presenceCtx, deliberately: this is the first await in the function, and
+  // capturePackPresenceContext must be taken at operation ENTRY from the mode and
+  // config as they are NOW (codex gate round 11 — computing it after an await lets
+  // a mid-op retarget pair Manager A's answer with disk B).
+  //
+  // Taken only when a LOCAL write is reachable for this call: a registry install
+  // goes through ComfyUI-Manager, which targets the connected server by
+  // construction and has no local destination to misdirect.
+  const localWriteMismatch =
+    source === "git" || opts.useCmCli === true
+      ? await detectLocalWriteTargetMismatch(cliWorkspace)
+      : undefined;
   // THE PRE-STATE, OBSERVED BEFORE THE OPERATION (codex gate P0). The "already
   // installed" verdict below used to be inferred from POST-op disk state alone:
   // a pack that was absent before the call and installed as a registry ZIP —
@@ -2887,6 +2959,13 @@ async function installCustomNodeImpl(
   if (opts.useCmCli) {
     const cliProblem = comfyCliUnavailableReason(cliWorkspace);
     if (cliProblem === undefined) {
+      // #1765 — comfy-cli writes into `--workspace`, so the wrong-install hazard
+      // is identical here to the direct clone below.
+      if (localWriteMismatch) {
+        throw new ProcessControlError(
+          wrongInstallRefusal(localWriteMismatch, 'install_custom_node (action:"install", comfy-cli)', managerBase),
+        );
+      }
       // cm-cli install accepts registry ids and git urls alike.
       const installId = source === "git" ? gitId : id;
       const out = runCmCli(["install", installId, "--mode", mode, "--channel", channel], cliWorkspace);
@@ -2978,6 +3057,13 @@ async function installCustomNodeImpl(
       // LOCAL tree that is not the server we are connected to, so "the Manager
       // refused" is the honest and complete answer there.
       if (refusedBy === undefined || isRemoteMode()) throw err;
+      // BEFORE the log line, which says "cloning directly" and would otherwise be
+      // recording an action that then does not happen.
+      if (localWriteMismatch) {
+        throw new ProcessControlError(
+          wrongInstallRefusal(localWriteMismatch, 'install_custom_node (action:"install", git clone)', managerBase),
+        );
+      }
       logger.info("Manager refused the git install enqueue — cloning directly", {
         status: refusedBy,
         gitId,
@@ -3005,6 +3091,11 @@ async function installCustomNodeImpl(
         message: `Installed "${repoName}" via ComfyUI-Manager. Restart may be required to load new nodes.`,
         details: status,
       });
+    }
+    if (localWriteMismatch) {
+      throw new ProcessControlError(
+        wrongInstallRefusal(localWriteMismatch, 'install_custom_node (action:"install", git clone)', managerBase),
+      );
     }
     return withCliNote(
       await cloneCustomNodeFallback(gitId, repoName, gitRef, status, cliWorkspace, { refFromVersion }),
