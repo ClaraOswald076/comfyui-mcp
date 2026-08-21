@@ -161,19 +161,28 @@ vi.mock("node:child_process", async () => {
   };
 });
 
-// The OS process-table probe. `resolveLiveServerRoot`'s `observed-process` tier
-// anchors on where the interpreter BINARY lives, which workspace-env.ts itself
-// documents as "KNOWN GAP … not proof of where the SCRIPT was resolved from".
-// A resolution with a documented soundness gap may FIND a root; it may not be
-// what REFUSES a user's write, so this must never be consulted here.
-const probe = vi.hoisted(() => ({ calls: 0 }));
+// The OS process-table probe — `resolveLiveServerRoot`'s `observed-process` tier.
+//
+// MEASURED against the ComfyUI running on the development machine (0.33.2,
+// ComfyUI Desktop): argv[0] is the RELATIVE "ComfyUI\main.py" and the
+// /system_stats payload carries no `cwd` field at all. `liveRootFromArgv`
+// resolves a relative script only against an absolute server cwd, so on that
+// layout — and on the Windows portable bundle, and on `comfy launch`, which runs
+// `python main.py` from the workspace — the argv tier answers NOTHING. An
+// argv-only guard is green in every test here and INERT on the machines where
+// several installs coexist. Hence this tier, and hence these tests.
+const probe = vi.hoisted(() => ({
+  calls: 0,
+  /** What the OS says is running on the port; undefined = nothing observable. */
+  result: undefined as { python: string; pid: number } | undefined,
+}));
 vi.mock("../../services/live-interpreter.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../services/live-interpreter.js")>();
   return {
     ...actual,
-    observeLiveServerProcess: (...args: unknown[]) => {
+    observeLiveServerProcess: () => {
       probe.calls += 1;
-      return (actual.observeLiveServerProcess as (...a: unknown[]) => unknown)(...args);
+      return probe.result;
     },
   };
 });
@@ -211,6 +220,7 @@ let priorEnvPath: string | undefined;
 beforeEach(() => {
   git.calls = [];
   probe.calls = 0;
+  probe.result = undefined;
   http.mode = "refuse-enqueue";
   live.reachable = true;
   live.statsCalls = 0;
@@ -364,19 +374,49 @@ describe("#1765 — install_custom_node must not write into an install this sess
     expect(clonedInto()).toBe(join(SAVED_DEFAULT, PACK_DIR));
   });
 
-  it("fails OPEN on the Desktop/portable shape, without probing the process table", async () => {
-    // ComfyUI Desktop and the Windows portable bundle both report a RELATIVE
-    // main.py and no cwd. The server's SELF-REPORT cannot resolve a root there,
-    // and the interpreter-anchored tier that can is not sound enough to refuse
-    // on — so nothing is refused, and the OS probe is never even taken.
+  it("REFUSES the relative-main.py shape too, via the OS process observation", async () => {
+    // The shape the live rig actually reports, and the one `comfy launch`
+    // produces: a relative launch script and no server cwd. Nothing in argv
+    // names a root; the interpreter the OS says is on the port does.
+    live.argv = ["main.py", "--port", "8189"];
+    probe.result = { python: join(CONNECTED, ".venv", "Scripts", "python.exe"), pid: 4242 };
+
+    const { ok, error } = await install({ id: REPO, source: "git" });
+
+    expect(ok).toBeUndefined();
+    expect(clonedInto()).toBeUndefined();
+    expect(existsSync(join(SAVED_DEFAULT, PACK_DIR))).toBe(false);
+    expect(error).toContain(CONNECTED);
+    expect(error).toContain("OS process listening on that port");
+    expect(probe.calls).toBeGreaterThan(0);
+  });
+
+  it("fails OPEN when the relative main.py can be anchored on NOTHING", async () => {
+    // Relative script, and the OS observation yields no interpreter (a remote
+    // proxy, a permissions failure, an unreadable process table). Unprovable is
+    // not the same as wrong, so nothing is refused.
     live.argv = ["ComfyUI/main.py", "--port", "8189"];
+    probe.result = undefined;
 
     const { ok, error } = await install({ id: REPO, source: "git" });
 
     expect(error).toBeUndefined();
     expect(ok).toMatchObject({ mechanism: "git-clone" });
     expect(clonedInto()).toBe(join(SAVED_DEFAULT, PACK_DIR));
-    expect(probe.calls).toBe(0);
+  });
+
+  it("fails OPEN when the observed interpreter belongs to no install we can anchor", async () => {
+    // A SYSTEM python: walking up from it reaches directories that are not the
+    // install at all, which is the unsoundness `interpreterBelongsToInstall`
+    // exists to reject. It must not produce a root, and so must not refuse.
+    live.argv = ["ComfyUI/main.py", "--port", "8189"];
+    probe.result = { python: join(SANDBOX, "python", "python.exe"), pid: 4243 };
+
+    const { ok, error } = await install({ id: REPO, source: "git" });
+
+    expect(error).toBeUndefined();
+    expect(ok).toMatchObject({ mechanism: "git-clone" });
+    expect(clonedInto()).toBe(join(SAVED_DEFAULT, PACK_DIR));
   });
 
   it("refuses the comfy-cli branch too — --workspace has the identical hazard", async () => {

@@ -2523,7 +2523,9 @@ function wrongInstallRefusal(
   const provenBy =
     m.liveSource === "base-directory"
       ? "its own --base-directory"
-      : "its own /system_stats launch argv";
+      : m.liveSource === "argv"
+        ? "its own /system_stats launch argv"
+        : "the OS process listening on that port, anchored on the interpreter it runs";
   return (
     `${what} would write into ${m.base}, but this session is connected to ` +
     `${target}, which runs from ${m.liveRoot} (established from ${provenBy}). ` +

@@ -295,8 +295,8 @@ export interface LocalWriteTargetMismatch {
   baseSource: ConfiguredBaseSource;
   /** The root the CONNECTED server actually scans `custom_nodes/` from. */
   liveRoot: string;
-  /** What established `liveRoot`. Both are the server's OWN self-report. */
-  liveSource: "base-directory" | "argv";
+  /** What established `liveRoot` — see `resolveLiveServerRoot` for the tiers. */
+  liveSource: "base-directory" | "argv" | "observed-process";
 }
 
 /** Canonical spelling for comparing two install roots. realpath resolves the
@@ -352,8 +352,8 @@ export function sameInstallRoot(a: string, b: string): boolean {
  *      an install;
  *   3. the two are not the same tree after canonicalization.
  *
- * FAILS OPEN everywhere else, deliberately: an unreachable server, a Desktop
- * launch whose relative `main.py` cannot be anchored, or a `--base-directory` we
+ * FAILS OPEN everywhere else, deliberately: an unreachable server, a relative
+ * `main.py` that no process observation can anchor, or a `--base-directory` we
  * cannot resolve all mean we do not KNOW the write is misdirected — and a refusal
  * on a root we merely failed to prove would break every install that works today.
  * Never throws.
@@ -406,28 +406,43 @@ export async function detectLocalWriteTargetMismatch(
   // below. Nothing is provable here.
   if (hasUnresolvableRelativeBaseDirFlag(snapshot.argv, snapshot.cwd)) return undefined;
 
-  // 2. The server's own main.py root, from its argv. Without --base-directory
-  //    this is where it scans custom_nodes/ from. Same two observations, same
-  //    on-disk checks, and in the same order as `resolveEffectiveComfyUIBaseLive`
-  //    — so what this reports is precisely "configuration shadowed a live answer
-  //    that disagrees with it".
+  // 2. The server's own install root — WITHOUT --base-directory, the directory
+  //    it scans custom_nodes/ from. `resolveLiveServerRoot` is the module's one
+  //    notion of that, and BOTH its tiers are used here.
   //
-  //    Deliberately `liveRootFromArgv` and NOT `resolveLiveServerRoot`: that
-  //    resolver's `observed-process` tier anchors on where the interpreter
-  //    BINARY lives, which its own docstring documents as not being proof of
-  //    where the SCRIPT was resolved from ("KNOWN GAP, measured and filed").
-  //    That is a fine basis for finding a root when there is otherwise none; it
-  //    is not a fine basis for REFUSING a user's write. It also keeps this off
-  //    the process-table probe entirely, so no install pays for a netstat/WMI
-  //    scan it cannot act on.
-  const liveRoot = liveRootFromArgv(snapshot.argv, snapshot.cwd);
-  if (!liveRoot || !safeExists(liveRoot)) return undefined;
-  if (!safeExists(join(liveRoot, "models")) && !safeExists(join(liveRoot, "custom_nodes"))) {
+  //    An earlier revision used `liveRootFromArgv` alone, on the reasoning that
+  //    the `observed-process` tier anchors on where the interpreter BINARY lives
+  //    and its own docstring calls that a "KNOWN GAP … not proof of where the
+  //    SCRIPT was resolved from" — too weak a basis for refusing a user's write.
+  //    That reasoning was refuted by measurement against the ComfyUI running on
+  //    the development machine (0.33.2, ComfyUI Desktop):
+  //
+  //      argv[0] : "ComfyUI\main.py"      (RELATIVE)
+  //      cwd     : the /system_stats payload has no `cwd` FIELD AT ALL
+  //
+  //    `liveRootFromArgv` resolves a relative script only against an absolute
+  //    server cwd, and ComfyUI does not report one — so the argv tier answers
+  //    only for launches whose argv[0] is absolute. ComfyUI Desktop, the Windows
+  //    portable bundle, and `comfy launch` (which runs `python main.py` from the
+  //    workspace) are all relative. Argv-only made this check permanently INERT
+  //    on the layouts where several installs on one machine is most likely —
+  //    green tests, zero reachability.
+  //
+  //    The `observed-process` tier is also what the DOWNLOAD path already
+  //    resolves its write DESTINATION through (#369/#1374), so trusting it to
+  //    detect a mismatch is strictly weaker than what already ships. Its gap is
+  //    real and bounded: with a stale bundle's python on PATH it can name a
+  //    stale root, which here costs a refusal that writes nothing — never a
+  //    wrong write.
+  const live = resolveLiveServerRoot(snapshot.argv, snapshot.cwd, { remote: false });
+  if (!live.root || live.source === "unresolved") return undefined;
+  if (!safeExists(live.root)) return undefined;
+  if (!safeExists(join(live.root, "models")) && !safeExists(join(live.root, "custom_nodes"))) {
     return undefined;
   }
-  return sameInstallRoot(liveRoot, base)
+  return sameInstallRoot(live.root, base)
     ? undefined
-    : { base, baseSource, liveRoot, liveSource: "argv" };
+    : { base, baseSource, liveRoot: live.root, liveSource: live.source };
 }
 
 /**
