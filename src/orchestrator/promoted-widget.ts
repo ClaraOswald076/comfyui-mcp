@@ -116,3 +116,87 @@ export function isContradictoryPromotedWidgetRefusal(
 ): boolean {
   return parseContradictoryPromotedWidgetRefusal(text, requestedWidget) != null;
 }
+
+/**
+ * panel#1558 — a successful promoted write can still be ephemeral: the inner
+ * widget is governed by control_after_generate='randomize', and that control
+ * is NOT promoted onto the subgraph node the caller addressed. The panel
+ * warns and names an enter → set-inner-fixed → exit sequence the caller
+ * cannot follow without hidden inner ids.
+ *
+ * Only this unpromoted-inner shape is parsed. A DIRECT seed warning (control
+ * already on the addressed node) is left alone — randomize there is often
+ * intentional. A "promoted as" outer-node remedy is also left alone: that
+ * write is already parent-scope.
+ */
+export type UnpromotedControlPersistRemedy = {
+  outerNodeId: string;
+  enterPath: string[];
+  innerNodeId: string;
+  controlWidget: string;
+  exitCount: number;
+  mode: string;
+};
+
+const WILL_NOT_PERSIST_RE = /will NOT persist/i;
+const NOT_PROMOTED_RE = /is NOT promoted onto subgraph node (\S+)/i;
+const ENTER_RE = /panel_enter_subgraph\(node_id=([^)]+)\)/gi;
+const SET_FIXED_RE =
+  /panel_set_widget\(node_id=([^,]+),\s*widget='([^']+)',\s*value='fixed'\)/i;
+const EXIT_TIMES_RE = /panel_exit_subgraph\(\)\s+(\d+)\s+times/i;
+const MODE_RE = /control_after_generate='([^']+)'/i;
+
+function stripNodeId(raw: string): string {
+  return raw.trim().replace(/[,:]$/, "");
+}
+
+function sameNodeId(a: unknown, b: unknown): boolean {
+  return stripNodeId(String(a)) === stripNodeId(String(b));
+}
+
+/** Parse the panel#650 unpromoted-control persist warning. Null unless the
+ *  value will not persist AND the control is only reachable by entering. */
+export function parseUnpromotedControlPersistRemedy(
+  text: string,
+): UnpromotedControlPersistRemedy | null {
+  if (!WILL_NOT_PERSIST_RE.test(text)) return null;
+  const notPromoted = NOT_PROMOTED_RE.exec(text);
+  if (!notPromoted) return null;
+  const outerNodeId = stripNodeId(notPromoted[1]);
+  if (!outerNodeId) return null;
+
+  const enterPath: string[] = [];
+  ENTER_RE.lastIndex = 0;
+  for (let m = ENTER_RE.exec(text); m; m = ENTER_RE.exec(text)) {
+    const id = stripNodeId(m[1]);
+    if (id) enterPath.push(id);
+  }
+  if (enterPath.length === 0) return null;
+
+  const setFixed = SET_FIXED_RE.exec(text);
+  if (!setFixed) return null;
+  const innerNodeId = stripNodeId(setFixed[1]);
+  const controlWidget = setFixed[2];
+  if (!innerNodeId || !controlWidget) return null;
+  if (sameNodeId(innerNodeId, outerNodeId)) return null;
+
+  const times = EXIT_TIMES_RE.exec(text);
+  const parsedTimes = times ? Number(times[1]) : NaN;
+  const exitCount =
+    Number.isFinite(parsedTimes) && parsedTimes > 0 ? parsedTimes : enterPath.length;
+
+  const modeMatch = MODE_RE.exec(text);
+  const mode = modeMatch?.[1] && modeMatch[1] !== "fixed" ? modeMatch[1] : "randomize";
+
+  return { outerNodeId, enterPath, innerNodeId, controlWidget, exitCount, mode };
+}
+
+export function addressedNodeMatchesPersistRemedy(
+  addressedNodeId: unknown,
+  remedy: UnpromotedControlPersistRemedy,
+): boolean {
+  return (
+    sameNodeId(addressedNodeId, remedy.outerNodeId) ||
+    sameNodeId(addressedNodeId, remedy.enterPath[0])
+  );
+}
