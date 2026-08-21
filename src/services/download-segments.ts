@@ -332,6 +332,22 @@ async function openScratch(opts: SegmentedRunOptions): Promise<FileHandle> {
   }
 }
 
+/** Drop the first `n` bytes from a buffer list, so a short `writev` can be
+ *  resumed from exactly where the OS stopped. */
+export function dropWritten(buffers: Buffer[], n: number): Buffer[] {
+  let skip = n;
+  const out: Buffer[] = [];
+  for (const b of buffers) {
+    if (skip >= b.length) {
+      skip -= b.length;
+      continue;
+    }
+    out.push(skip > 0 ? b.subarray(skip) : b);
+    skip = 0;
+  }
+  return out;
+}
+
 /** Drain one 206 body into the scratch file at its absolute offset, advancing
  *  `state.written` as bytes land so a retry resumes mid-segment and a failure
  *  can be truncated to a contiguous prefix. */
@@ -362,16 +378,38 @@ async function drainSegmentBody(
   // this module exists to prevent.
   const flush = async (): Promise<void> => {
     if (pendingBytes === 0) return;
-    const buffers = pending;
-    const count = pendingBytes;
+    let buffers = pending;
+    let remaining = pendingBytes;
     pending = [];
     pendingBytes = 0;
-    await fh.writev(buffers, seg.start + state.written);
-    state.written += count;
+    // LOOP ON SHORT WRITES. `filehandle.writev`/`write` resolve with the number
+    // of bytes the OS actually took and do NOT retry a short write (only
+    // `writeFile` does). Advancing `state.written` by the requested count would
+    // let the counter run ahead of the file, and then every guard in this module
+    // reads the counter: the next write would start past an unwritten gap, a
+    // retry's Range would skip it, `written === length` and the total and
+    // `assertComplete`'s stat() would all pass, and `contiguousPrefix` would
+    // publish a "resumable prefix" with a hole inside it. Advance ONLY by what
+    // landed. (The single-connection path never had this: `createWriteStream`
+    // loops internally.)
+    while (remaining > 0) {
+      const { bytesWritten } = await fh.writev(buffers, seg.start + state.written);
+      if (!(bytesWritten > 0)) {
+        throw new ModelError(
+          `Download segment ${index} could not write to the staging file (the filesystem accepted ` +
+            `0 of ${remaining} bytes). Not finalizing.`,
+          { url: opts.logUrl, retryable: true },
+        );
+      }
+      state.written += bytesWritten;
+      remaining -= bytesWritten;
+      if (remaining > 0) buffers = dropWritten(buffers, bytesWritten);
+    }
   };
+  let nodeBody: Readable | undefined;
   try {
-    const body = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream);
-    for await (const chunk of body) {
+    nodeBody = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream);
+    for await (const chunk of nodeBody) {
       if (opts.signal?.aborted) throw abortError();
       const buf = chunk as Buffer;
       // Refuse to write past this segment's own range. A server that streams
@@ -393,6 +431,11 @@ async function drainSegmentBody(
     }
     await flush();
   } finally {
+    // Release this response on EVERY exit, not just a fully-drained one. A
+    // retryable failure part-way through leaves the body unread, and attempt 2
+    // opens a new socket while this one stays pinned until GC — the same leak
+    // fixed on the probe-setup path.
+    nodeBody?.destroy();
     await fh.close().catch(() => {});
   }
   if (state.written !== length) {
@@ -505,7 +548,13 @@ export async function runSegmentedDownload(
     // a large existing `.partial` would hold the old bytes AND the growing `.seg`
     // at once — up to double the peak disk the volume-space check upstream
     // reserved.
-    await truncate(opts.targetPath, 0).catch(() => {});
+    // ENOENT only: a fresh download has no target yet, and that is the one
+    // failure this may ignore. Swallowing anything else (a target that exists and
+    // cannot be truncated) would silently re-introduce the double-disk case the
+    // truncate exists to prevent.
+    await truncate(opts.targetPath, 0).catch((err: unknown) => {
+      if ((err as { code?: string })?.code !== "ENOENT") throw err;
+    });
   } catch (err) {
     // Nothing has read the probe's 206 yet, and nobody downstream will — release
     // its socket rather than leaving it pinned until GC.
