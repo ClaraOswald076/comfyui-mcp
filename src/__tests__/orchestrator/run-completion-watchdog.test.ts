@@ -22,9 +22,12 @@ import {
   createRunCompletionWatchdog,
   synthesizeCompletionPayload,
   resolveHistoryCompletionImages,
+  resolveHistoryCompletionStatus,
+  completionStatusFromHistoryEntry,
   historyOutputRefsFromEntry,
   DEFAULT_SYNTHESIS_GRACE_MS,
 } from "../../orchestrator/run-completion-watchdog.js";
+import type { CompletionStatus } from "../../services/queue-monitor.js";
 import { RunCompletions, type CompletionPayload, type RunTicket } from "../../orchestrator/run-completion-journal.js";
 
 const TAB = "tab-1789";
@@ -39,6 +42,7 @@ function makeWatchdog(
   clock: { t: number },
   extras: {
     resolveOutputs?: (promptId: string) => Promise<CompletionPayload["images"]>;
+    lookupStatus?: (promptId: string) => Promise<CompletionStatus | null>;
   } = {},
 ) {
   const delivered: Array<{ payload: CompletionPayload; ticket: RunTicket }> = [];
@@ -52,6 +56,7 @@ function makeWatchdog(
     },
     now: () => clock.t,
     ...(extras.resolveOutputs ? { resolveOutputs: extras.resolveOutputs } : {}),
+    ...(extras.lookupStatus ? { lookupStatus: extras.lookupStatus } : {}),
   });
   return { wd, delivered };
 }
@@ -220,11 +225,21 @@ describe("#1789: a completion the panel never reported is filled in from ComfyUI
 });
 
 describe("#1789: awaitingCompletion answers 'is this run still owed its notification?'", () => {
+  it("#1556: the grace no longer waits for a panel sweep that may never come", () => {
+    // The panel's own recovery sweep is 20 s. Waiting past it is what left the
+    // reporter's successful SaveImage silent for 45 s. 5 s is past the normal
+    // 1–2 s frame; reconnect skips even that.
+    expect(DEFAULT_SYNTHESIS_GRACE_MS).toBeLessThan(20_000);
+    expect(DEFAULT_SYNTHESIS_GRACE_MS).toBeGreaterThan(1_000);
+  });
+
   it("true for a fresh ticket, false once ANY completion for it is journaled", () => {
     RunCompletions.openRun(PID, { tabId: TAB, conversation: CONV });
     expect(RunCompletions.awaitingCompletion(PID)?.promptId).toBe(PID);
+    expect(RunCompletions.owedCompletions().map((t) => t.promptId)).toEqual([PID]);
     RunCompletions.record(TAB, { kind: "executed", prompt_id: PID }, { conversation: CONV });
     expect(RunCompletions.awaitingCompletion(PID)).toBeUndefined();
+    expect(RunCompletions.owedCompletions()).toEqual([]);
   });
 
   it("false while the completion is merely HANDED OFF (the journal owns the replay from there)", () => {
@@ -444,5 +459,212 @@ describe("#1853: a dropped panel frame still yields the completed prompt's histo
     const refs = historyOutputRefsFromEntry(PID, entry);
     expect(refs.some((img) => img.filename === "still.png")).toBe(true);
     expect(refs.some((img) => img.filename === VIDEO_FILENAME && img.subfolder === VIDEO_SUBFOLDER)).toBe(true);
+  });
+});
+
+describe("#1556: reconnect reconciles owed panel_run ids against ComfyUI history immediately", () => {
+  it("an already-armed observation is delivered without waiting the grace", async () => {
+    const clock = { t: 20_000_000 };
+    const { wd, delivered } = makeWatchdog(clock);
+    RunCompletions.openRun(PID, { tabId: TAB, conversation: CONV });
+    wd.observe([{ promptId: PID, status: "success" }]);
+    expect(wd.armedCount()).toBe(1);
+
+    await wd.reconcile([]);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0].payload.prompt_id).toBe(PID);
+    expect(wd.armedCount()).toBe(0);
+    expect(RunCompletions.awaitingCompletion(PID)).toBeUndefined();
+  });
+
+  it("an unarmed owed ticket is synthesised from /history on reconcile, not after the grace", async () => {
+    const clock = { t: 21_000_000 };
+    const lookedUp: string[] = [];
+    const { wd, delivered } = makeWatchdog(clock, {
+      lookupStatus: async (id) => {
+        lookedUp.push(id);
+        return resolveHistoryCompletionStatus(id, async (promptId) => ({
+          [promptId]: {
+            prompt: {},
+            outputs: {
+              "9": { images: [{ filename: "ComfyUI_00001_.png", type: "output" }] },
+            },
+            status: { status_str: "success", completed: true, messages: [] },
+          },
+        }));
+      },
+      resolveOutputs: (id) =>
+        resolveHistoryCompletionImages(id, async (promptId) => ({
+          [promptId]: {
+            prompt: {},
+            outputs: {
+              "9": { images: [{ filename: "ComfyUI_00001_.png", type: "output" }] },
+            },
+            status: { status_str: "success", completed: true, messages: [] },
+          },
+        })),
+    });
+    expect(RunCompletions.openRun(PID, { tabId: TAB, conversation: CONV })).toBe(true);
+    expect(wd.armedCount()).toBe(0);
+
+    await wd.reconcile(RunCompletions.owedCompletions().map((t) => t.promptId));
+
+    expect(lookedUp).toEqual([PID]);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0].payload.prompt_id).toBe(PID);
+    expect(delivered[0].payload.completion_source).toBe("orchestrator-history-watchdog");
+    expect(delivered[0].payload.images).toEqual([{ filename: "ComfyUI_00001_.png", type: "output" }]);
+    expect(RunCompletions.outstanding(TAB)[0].correlation).toEqual({ status: "matched", promptId: PID });
+  });
+
+  it("a still-running history record is NOT synthesised", async () => {
+    const clock = { t: 22_000_000 };
+    const { wd, delivered } = makeWatchdog(clock, {
+      lookupStatus: (id) =>
+        resolveHistoryCompletionStatus(id, async (promptId) => ({
+          [promptId]: {
+            prompt: {},
+            outputs: {},
+            status: { status_str: "running", completed: false, messages: [] },
+          },
+        })),
+    });
+    RunCompletions.openRun(PID, { tabId: TAB, conversation: CONV });
+    await wd.reconcile([PID]);
+    expect(delivered).toHaveLength(0);
+    expect(RunCompletions.awaitingCompletion(PID)?.promptId).toBe(PID);
+  });
+
+  it("a missing history record is NOT synthesised", async () => {
+    const clock = { t: 23_000_000 };
+    const { wd, delivered } = makeWatchdog(clock, {
+      lookupStatus: (id) => resolveHistoryCompletionStatus(id, async () => ({})),
+    });
+    RunCompletions.openRun(PID, { tabId: TAB, conversation: CONV });
+    await wd.reconcile([PID]);
+    expect(delivered).toHaveLength(0);
+  });
+
+  it("a ticket the panel already journaled is skipped — exactly one completion", async () => {
+    const clock = { t: 24_000_000 };
+    let lookups = 0;
+    const { wd, delivered } = makeWatchdog(clock, {
+      lookupStatus: async () => {
+        lookups += 1;
+        return "success";
+      },
+    });
+    RunCompletions.openRun(PID, { tabId: TAB, conversation: CONV });
+    RunCompletions.record(
+      TAB,
+      { kind: "executed", prompt_id: PID, images: [{ filename: "panel.png" }] },
+      { conversation: CONV },
+    );
+
+    await wd.reconcile([PID]);
+    expect(lookups).toBe(0);
+    expect(delivered).toHaveLength(0);
+    expect(RunCompletions.outstanding(TAB)).toHaveLength(1);
+    expect(RunCompletions.outstanding(TAB)[0].payload.images).toEqual([{ filename: "panel.png" }]);
+  });
+
+  it("reconcile is idempotent — a second call does not produce a second delivery", async () => {
+    const clock = { t: 25_000_000 };
+    const { wd, delivered } = makeWatchdog(clock, {
+      lookupStatus: async () => "success",
+    });
+    RunCompletions.openRun(PID, { tabId: TAB, conversation: CONV });
+    await wd.reconcile([PID]);
+    await wd.reconcile([PID]);
+    expect(delivered).toHaveLength(1);
+  });
+
+  it("a foreign prompt this session never queued is not looked up", async () => {
+    const clock = { t: 26_000_000 };
+    const lookedUp: string[] = [];
+    const { wd, delivered } = makeWatchdog(clock, {
+      lookupStatus: async (id) => {
+        lookedUp.push(id);
+        return "success";
+      },
+    });
+    await wd.reconcile(["p-foreign"]);
+    expect(lookedUp).toEqual([]);
+    expect(delivered).toHaveLength(0);
+  });
+
+  it("a panel frame that lands during the history-status lookup still wins", async () => {
+    const clock = { t: 27_000_000 };
+    let release!: (status: CompletionStatus | null) => void;
+    const { wd, delivered } = makeWatchdog(clock, {
+      lookupStatus: () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    });
+    RunCompletions.openRun(PID, { tabId: TAB, conversation: CONV });
+    const pending = wd.reconcile([PID]);
+    RunCompletions.record(
+      TAB,
+      { kind: "executed", prompt_id: PID, images: [{ filename: "storyboard.png" }] },
+      { conversation: CONV },
+    );
+    release("success");
+    await pending;
+    expect(delivered).toHaveLength(0);
+    expect(RunCompletions.outstanding(TAB)[0].payload.images).toEqual([{ filename: "storyboard.png" }]);
+  });
+});
+
+describe("#1556: completionStatusFromHistoryEntry is fail-closed", () => {
+  it("success / interrupted / error from the shipped history shape", () => {
+    expect(
+      completionStatusFromHistoryEntry({
+        status: { status_str: "success", completed: true, messages: [] },
+      }),
+    ).toBe("success");
+    expect(
+      completionStatusFromHistoryEntry({
+        status: {
+          status_str: "error",
+          completed: false,
+          messages: [["execution_interrupted", { prompt_id: PID }]],
+        },
+      }),
+    ).toBe("interrupted");
+    expect(
+      completionStatusFromHistoryEntry({
+        status: {
+          status_str: "error",
+          completed: true,
+          messages: [["execution_error", { prompt_id: PID }]],
+        },
+      }),
+    ).toBe("error");
+  });
+
+  it("missing, unreadable, or still-running records are null — never a fabricated finish", () => {
+    expect(completionStatusFromHistoryEntry(undefined)).toBeNull();
+    expect(completionStatusFromHistoryEntry(null)).toBeNull();
+    expect(completionStatusFromHistoryEntry({})).toBeNull();
+    expect(
+      completionStatusFromHistoryEntry({
+        status: { status_str: "running", completed: false, messages: [] },
+      }),
+    ).toBeNull();
+  });
+
+  it("resolveHistoryCompletionStatus drives getHistory and returns null on an empty map", async () => {
+    expect(await resolveHistoryCompletionStatus(PID, async () => ({}))).toBeNull();
+    expect(await resolveHistoryCompletionStatus("", async () => ({}))).toBeNull();
+    expect(
+      await resolveHistoryCompletionStatus(PID, async (id) => ({
+        [id]: {
+          prompt: {},
+          outputs: {},
+          status: { status_str: "success", completed: true, messages: [] },
+        },
+      })),
+    ).toBe("success");
   });
 });

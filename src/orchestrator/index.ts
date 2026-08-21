@@ -217,7 +217,12 @@ import {
   describe as describeCorrelation,
   type CompletionPayload,
 } from "./run-completion-journal.js";
-import { createRunCompletionWatchdog, resolveHistoryCompletionImages } from "./run-completion-watchdog.js";
+import {
+  createRunCompletionWatchdog,
+  resolveHistoryCompletionImages,
+  resolveHistoryCompletionStatus,
+  type RunCompletionWatchdog,
+} from "./run-completion-watchdog.js";
 import { AskAnswers, preview as previewQuestion } from "./ask-answer-journal.js";
 import { initRunpodWatcher, getRunpodWatcher, type RunpodStatusFrame, type RunpodAlertFrame } from "../services/runpod-watch.js";
 import { getPod } from "../services/runpod-client.js";
@@ -3796,6 +3801,11 @@ export async function runPanelOrchestrator(): Promise<void> {
     }
   }
 
+  // Assigned next to the queue-status timer below. Declared here so the hello
+  // path can reconcile owed panel_run tickets the moment the panel reconnects
+  // (#1556) without waiting for that timer to construct it.
+  let runCompletionWatchdog: RunCompletionWatchdog | undefined;
+
   bridge.onPanelMessage = (event) => {
     // Connect ack: the instant a panel tab connects, the orchestrator announces
     // itself so "connected" means "a real agent is attending" — not merely "a
@@ -4283,6 +4293,12 @@ export async function runPanelOrchestrator(): Promise<void> {
       // are change-only, so a tab connecting MID-render would otherwise wait for
       // the next state transition to learn a job is already running.
       bridge.push(buildQueueStatusFrame(QueueMonitor.snapshot()), panelTab);
+      // #1556 — a hello is a reconnect (or the first chance after a missed
+      // ComfyUI WS frame). Look up every still-owed panel_run in /history NOW
+      // and journal a completion if ComfyUI already finished it, instead of
+      // waiting the synthesis grace. Exactly-once: the journal skips a run it
+      // already holds.
+      void runCompletionWatchdog?.reconcile(RunCompletions.owedCompletions().map((t) => t.promptId));
       // Seed the RunPod control panel too — a tab that just connected gets the
       // current pod-status frame (or a cleared one when nothing is watched).
       const rpFrame = getRunpodWatcher()?.current();
@@ -6376,9 +6392,10 @@ export async function runPanelOrchestrator(): Promise<void> {
   // after the grace is synthesised into the SAME journal the real frame uses.
   // See run-completion-watchdog.ts for why it waits, and why the panel's frame
   // still wins whenever it is coming.
-  const runCompletionWatchdog = createRunCompletionWatchdog({
+  const wd = createRunCompletionWatchdog({
     awaiting: (promptId) => RunCompletions.awaitingCompletion(promptId),
     resolveOutputs: (promptId) => resolveHistoryCompletionImages(promptId),
+    lookupStatus: (promptId) => resolveHistoryCompletionStatus(promptId),
     deliver: (payload, ticket) => {
       // The SAME arrival path the panel's frame takes: correlated once, here,
       // against the ticket that is still open — so the agent is told this is the
@@ -6393,6 +6410,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       flushRunCompletions(ticket.tabId);
     },
   });
+  runCompletionWatchdog = wd;
   const queueStatusBroadcaster = createQueueStatusBroadcaster(
     () => QueueMonitor.snapshot(),
     (frame) => void bridge.push(frame),
@@ -6401,7 +6419,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     // again — a second call would race and each consumer would see only half.
     () => {
       const completions = QueueMonitor.drainCompletions();
-      runCompletionWatchdog.observe(completions);
+      wd.observe(completions);
       return completions;
     },
   );
@@ -6416,7 +6434,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       // …and only THEN expire the watchdog's arms: the broadcaster tick is what
       // feeds it (the drain tee above), so ticking it first would let an
       // observation sit a whole extra second before it is even armed. #1789.
-      runCompletionWatchdog.tick();
+      wd.tick();
     });
   }, 1000);
   queueStatusTimer.unref?.();
