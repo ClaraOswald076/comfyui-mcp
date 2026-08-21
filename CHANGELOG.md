@@ -759,6 +759,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.39] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- Save-As 409 names the rename path instead of a third filename (#1942)
+
+
 ## [0.52.38] - 2026-08-20
 
 ### MCP
