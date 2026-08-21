@@ -18231,6 +18231,51 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
               mime = VIDEO_MIME[ext];
               kind = "video";
             } else if (AUDIO_EXTS.has(ext)) {
+              // REGRESSION GUARD, and deliberately nothing more (#2010).
+              //
+              // Opening this allowlist changes what a HEADLESS client (paired
+              // phone / remote viewer) receives, and that client cannot play
+              // audio: `MediaCard.build` in comfyui-mcp-mobile is
+              // `if (item.isVideo) _video else _still` — two branches, no audio
+              // path — so the bytes reach an image decoder, fail, and fall back
+              // to a caption row with an image icon, while `BridgeClient` replies
+              // `{shown:true}` to any show_media without reading the items.
+              //
+              // Before this change that client got an honest "unsupported file
+              // type" refusal. Without this guard it would instead get a false
+              // SUCCESS — the agent told the take played when nobody heard it.
+              // Turning an honest refusal into a false success is a regression
+              // THIS change would introduce, so it is fixed here rather than
+              // deferred.
+              //
+              // WHY THIS PREDICATE IS ENOUGH DESPITE BEING IMPRECISE. Sticky
+              // `isHeadless` misses a scope address, and over-refuses a phone
+              // that is offline and about to be rebound onto a canvas tab. Both
+              // are acceptable HERE because the guard's worst case is exactly
+              // main's current behaviour: main refuses ALL audio on this branch,
+              // so this can only ever refuse something main also refused, and it
+              // can never introduce a success main did not have. Getting the
+              // destination right in general needs the routing resolver, the
+              // mailbox rule, and an audio card on the mobile side — that is
+              // #2010/#2012/#2013, not something to smuggle in behind a bug fix.
+              if (
+                typeof ctx.bridge?.isHeadless === "function" &&
+                ctx.bridge.isHeadless(ctx.tabId)
+              ) {
+                return fail(
+                  "this conversation is on a headless client (a paired phone or remote viewer), which has no " +
+                    "audio player, so this file was not sent: " +
+                    p +
+                    "\nThat client renders images and video only. Sending it audio would show a caption row with " +
+                    "an image icon and report back as delivered, so you would be told the take played when nobody " +
+                    "heard it. Nothing is wrong with the file.\n" +
+                    "What you can do:\n" +
+                    "  1. Ask the USER to open it on the desktop ComfyUI panel, which has a real player, or to " +
+                    "play it locally. Tell them where it is; do not describe how it sounds, because you have not " +
+                    "heard it either.\n" +
+                    "  2. Show a still or a video instead, and say plainly that the audio is not playable here.",
+                );
+              }
               mime = AUDIO_MIME[ext];
               kind = "audio";
             } else {

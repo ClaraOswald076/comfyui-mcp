@@ -184,3 +184,106 @@ describe("#1572 .webm stays a VIDEO", () => {
     expect(items[0].dataUrl!.startsWith("data:video/webm;base64,")).toBe(true);
   });
 });
+
+// The REGRESSION this change would otherwise introduce, and the narrow guard
+// that prevents it (#2010 tracks the real fix).
+//
+// Opening the allowlist changes what a HEADLESS client receives. Measured on
+// both sides, same call, same fixture:
+//
+//   origin/main   isError: true   — "unsupported file type \".wav\"", nothing dispatched
+//   without guard isError: false  — dispatched as kind:"audio" with a data: URL
+//
+// The mobile client has no audio branch at all (`MediaCard.build` is
+// `if (item.isVideo) _video else _still`) and `BridgeClient` replies
+// `{'shown': true}` to any show_media without reading the items — so that second
+// row is an honest refusal turned into a false success, which is strictly worse
+// than the refusal it replaced.
+//
+// The predicate is imprecise on purpose. Sticky `isHeadless` misses a scope
+// address and over-refuses an offline phone that is about to be rebound. Neither
+// can make things worse than main, which refuses ALL audio on this branch: the
+// guard can only ever refuse what main also refused, and can never invent a
+// success main did not have. Precision needs the routing resolver and the
+// mailbox rule, which are #2012/#2013.
+describe("#1572 audio is not newly promised to a client that cannot play it", () => {
+  const headlessCtx = (): { ctx: PanelToolCtx; calls: Forwarded[] } => {
+    const calls: Forwarded[] = [];
+    const ctx = {
+      call: async (cmd: Forwarded) => {
+        calls.push(cmd);
+        return { content: [{ type: "text", text: JSON.stringify(cmd) }] } as ToolResult;
+      },
+      confirm: async () => "yes" as const,
+      bridge: { isHeadless: () => true } as unknown as PanelToolCtx["bridge"],
+      tabId: "phone-tab",
+    } as PanelToolCtx;
+    return { ctx, calls };
+  };
+
+  const run = async (ctx: PanelToolCtx, path: string) => {
+    const def = buildPanelToolDefs().find((d) => d.name === "panel_show_media")!;
+    return (await def.handler({ items: [{ source: { path } }] }, ctx)) as ToolResult;
+  };
+
+  it.each(AUDIO_CASES.map(([ext]) => ext))("%s is refused for a headless target", async (ext) => {
+    const { ctx, calls } = headlessCtx();
+    const res = await run(ctx, paths[ext]);
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/headless client/i);
+    // Refused BEFORE dispatch — a refusal that still sent the frame would leave
+    // the false `{shown:true}` in place, which is the whole point.
+    expect(calls.find((c) => c.cmd === "show_media")).toBeFalsy();
+  });
+
+  it("the refusal does not blame the file, and gives the caller a real move", async () => {
+    const { ctx } = headlessCtx();
+    const text = textOf(await run(ctx, paths[".wav"]));
+    expect(text).toMatch(/Nothing is wrong with the file/);
+    expect(text).toContain(paths[".wav"]);
+    expect(text).toMatch(/desktop ComfyUI panel/);
+    expect(text).toMatch(/do not describe how it sounds/i);
+    // It must NOT read as a format problem — that sends the caller off to
+    // re-encode a file that is already perfectly good.
+    expect(text).not.toMatch(/unsupported file type/);
+  });
+
+  it("the guard is narrow — a headless client still gets images and video", async () => {
+    for (const ext of [".png", ".jpg", ".mp4", ".webm"]) {
+      const p = join(root, `other${ext}`);
+      writeFileSync(p, Buffer.alloc(64));
+      const { ctx, calls } = headlessCtx();
+      const res = await run(ctx, p);
+      expect(res.isError, `${ext} should still be sent`).toBeFalsy();
+      expect(calls.find((c) => c.cmd === "show_media")).toBeTruthy();
+    }
+  });
+
+  it("a BROWSER panel is unaffected — the reported case still works", async () => {
+    const { res, calls } = await showMedia([{ source: { path: paths[".wav"] } }]);
+    expect(res.isError).toBeFalsy();
+    const items = calls.find((c) => c.cmd === "show_media")!.items as Array<{ kind?: string }>;
+    expect(items[0].kind).toBe("audio");
+  });
+
+  it("a bridge with no isHeadless does not throw, and audio still flows", async () => {
+    const def = buildPanelToolDefs().find((d) => d.name === "panel_show_media")!;
+    const calls: Forwarded[] = [];
+    const ctx = {
+      call: async (cmd: Forwarded) => {
+        calls.push(cmd);
+        return { content: [{ type: "text", text: "ok" }] } as ToolResult;
+      },
+      confirm: async () => "yes" as const,
+      bridge: {} as unknown as PanelToolCtx["bridge"],
+      tabId: "t",
+    } as PanelToolCtx;
+    const res = (await def.handler(
+      { items: [{ source: { path: paths[".wav"] } }] },
+      ctx,
+    )) as ToolResult;
+    expect(res.isError).toBeFalsy();
+    const items = calls.find((c) => c.cmd === "show_media")!.items as Array<{ kind?: string }>;
+    expect(items[0].kind).toBe("audio");
+  });
+});
