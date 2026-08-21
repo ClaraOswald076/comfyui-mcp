@@ -38,6 +38,10 @@ vi.mock("../../services/runpod-client.js", () => ({
     (pod.runtime?.ports ?? []).some((p) => p.privatePort === 3000 && p.type === "http"),
   runpodProxyUrl: (id: string, port = 3000) => `https://${id}-${port}.proxy.runpod.net`,
   runpodDeployLink: () => "https://console.runpod.io/deploy?template=bnqtkvcer3&ref=dkx71w9b",
+  // Sentinel, not the real text: this pins that the tool RENDERS whatever the
+  // client says the console deploy requires. What that text actually names is
+  // asserted against the real function in runpod-client.test.ts.
+  runpodDeployRequirements: () => "CONSOLE-DEPLOY-REQUIREMENTS-SENTINEL",
   GPU_CLI_CREDIT: "Pod control inspired by gpu-cli.sh (https://gpu-cli.sh) — a cloud-GPU CLI worth checking out.",
 }));
 
@@ -438,6 +442,15 @@ describe("runpod actions call the same services with the same arguments", () => 
   it('action:"deploy_link" returns the referral deploy link', async () => {
     const t = text(await runpod()({ action: "deploy_link" }));
     expect(t).toContain("console.runpod.io/deploy?template=bnqtkvcer3&ref=dkx71w9b");
+  });
+
+  it('action:"deploy_link" also states what the CONSOLE deploy must set by hand (#2014/#2016)', async () => {
+    // createPod sends the disk + CUDA floors on the API path, but the console
+    // path never reaches createPod — the user fills RunPod's form, seeded by a
+    // template that is still registered at 20 GB with no CUDA constraint. The
+    // link alone therefore reproduces both defects on a pod the user pays for.
+    const t = text(await runpod()({ action: "deploy_link" }));
+    expect(t).toContain("CONSOLE-DEPLOY-REQUIREMENTS-SENTINEL");
   });
 });
 

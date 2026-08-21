@@ -1,9 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import {
   createPod,
   resumePod,
   RUNPOD_STOCK_CONTAINER_DISK_GB,
+  RUNPOD_STOCK_ALLOWED_CUDA_VERSIONS,
+  runpodDeployRequirements,
   getPod,
   isProvablyNotCreatedError,
   runpodDeployLink,
@@ -560,5 +562,43 @@ describe("#2014/#2016 wiring — EVERY deploy attempt adopts the floors, not jus
     const src = await readFile(new URL("../../services/runpod-client.ts", import.meta.url), "utf8");
     const deployMutations = src.match(/podFindAndDeployOnDemand\s*\(/g) ?? [];
     expect(deployMutations).toHaveLength(1);
+  });
+});
+
+describe("#2014/#2016 — the CONSOLE deploy path states the floors it cannot enforce", () => {
+  it("names BOTH floors, derived from the same constants the API path sends", () => {
+    const req = runpodDeployRequirements();
+    // Disk: the README floor, and the 20 GB the template still defaults to, so
+    // a user who reads only this knows what to change and from what.
+    expect(req).toContain("30 GB");
+    expect(req).toContain("20 GB");
+    // CUDA: the image's floor, and the console control that applies it.
+    expect(req).toContain("12.8");
+    expect(req).toMatch(/CUDA/i);
+    // It must read as REQUIRED, not as a tip — the pod is billed either way.
+    expect(req).toMatch(/not optional|at least/i);
+  });
+
+  it("stays in step with the API path — the advice cannot drift from the behaviour", () => {
+    const req = runpodDeployRequirements();
+    expect(req).toContain(`${RUNPOD_STOCK_CONTAINER_DISK_GB} GB`);
+    expect(req).toContain(RUNPOD_STOCK_ALLOWED_CUDA_VERSIONS[0]);
+  });
+
+  it("every site that hands out the deploy LINK also hands out the REQUIREMENTS", async () => {
+    // Count the adopting call sites rather than spot-checking deploy_link: a
+    // second place that surfaces the link (an empty-account hint, an error
+    // path) would otherwise send a user to the console with no floors named.
+    const dir = new URL("../../tools/", import.meta.url);
+    const files = (await readdir(dir)).filter((f) => f.endsWith(".ts"));
+    let links = 0;
+    let requirements = 0;
+    for (const f of files) {
+      const src = await readFile(new URL(f, dir), "utf8");
+      links += (src.match(/runpodDeployLink\(\)/g) ?? []).length;
+      requirements += (src.match(/runpodDeployRequirements\(\)/g) ?? []).length;
+    }
+    expect(links).toBeGreaterThan(0);
+    expect(requirements).toBe(links);
   });
 });

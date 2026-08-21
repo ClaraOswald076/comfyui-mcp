@@ -12,6 +12,7 @@ import {
   comfyuiPortExposed,
   runpodProxyUrl,
   runpodDeployLink,
+  runpodDeployRequirements,
   RUNPOD_COMFYUI_PORT,
   RUNPOD_DEFAULT_GPU_TYPES,
   GPU_CLI_CREDIT,
@@ -507,7 +508,7 @@ export function registerRunpodTools(server: McpServer): void {
               content: [
                 {
                   type: "text",
-                  text: `Deploy a new comfyui-mcp pod here (pre-loaded with our template; the link carries our referral so your usage supports the project):\n\n${runpodDeployLink()}\n\nAfter it deploys, grab the pod ID from the RunPod console and use runpod action:"connect" to point this session at it.\n\n${GPU_CLI_CREDIT}`,
+                  text: `Deploy a new comfyui-mcp pod here (pre-loaded with our template; the link carries our referral so your usage supports the project):\n\n${runpodDeployLink()}\n\n${runpodDeployRequirements()}\n\nAfter it deploys, grab the pod ID from the RunPod console and use runpod action:"connect" to point this session at it.\n\n${GPU_CLI_CREDIT}`,
                 },
               ],
             };

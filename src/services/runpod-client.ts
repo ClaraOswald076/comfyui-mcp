@@ -421,6 +421,29 @@ export const RUNPOD_STOCK_ALLOWED_CUDA_VERSIONS: string[] = cudaVersionsAtLeast(
   STOCK_MIN_CUDA_MINOR,
 );
 
+/** What a CONSOLE deploy must set BY HAND, for anywhere we hand out
+ *  runpodDeployLink() (codex gate, #2014/#2016).
+ *
+ *  createPod sends both floors on the API path, but the console path does not
+ *  go through createPod: the user fills RunPod's own deploy form, seeded by the
+ *  template — and the template itself is still registered at containerDiskInGb
+ *  20 with no CUDA constraint, so following the link with its defaults
+ *  reproduces BOTH defects on a pod the user pays for. RunPod documents no
+ *  query parameters that would let the link carry overrides, and the template
+ *  lives on the RunPod account rather than in this repo, so the only thing that
+ *  closes the gap from here is saying so. Built from the SAME constants the API
+ *  path sends, so the advice can never drift from the behaviour. */
+export function runpodDeployRequirements(): string {
+  return (
+    `Two settings on that page are NOT optional for this image — the template's own defaults ` +
+    `are below both, and a pod that misses either boots into an unusable state you still pay for:\n` +
+    `  • Container disk: at least ${RUNPOD_STOCK_CONTAINER_DISK_GB} GB (the template still defaults to ` +
+    `${RUNPOD_DEFAULT_CONTAINER_DISK_GB} GB).\n` +
+    `  • CUDA version: ${RUNPOD_STOCK_ALLOWED_CUDA_VERSIONS[0]} or newer — filter by "CUDA Version" on the ` +
+    `deploy screen. The image is a cu128 build and refuses to start on an older host.`
+  );
+}
+
 /** Escape hatch for a fleet whose CUDA strings we guessed wrong, and the only
  *  way to widen/narrow the filter without a code change. Comma-separated
  *  ("12.8,12.9"); set it EMPTY to send no filter at all. Unset = use the
