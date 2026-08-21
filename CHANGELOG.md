@@ -759,6 +759,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.36] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- a localhost COMFYUI_URL is loopback, and now says so (#1931)
+- the restart refusal names WHICH identity proof was missing (#1927)
+
+#### Changed
+- AI SDK 6 -> 7 (ai + all three providers, together) (#1928)
+
+
 ## [0.52.35] - 2026-08-20
 
 ### MCP
