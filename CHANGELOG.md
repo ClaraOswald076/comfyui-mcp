@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.44] - 2026-08-21
+
 ### Added
 
 - **Transport-aware auto-update (#1963).** At the desk (LAN / no pairing tunnel)
@@ -19,6 +21,16 @@ All notable changes to this project are documented here. This project adheres to
   cannot open the gate. Pair time carries a toggle defaulted ON ("Don't update
   while my phone is paired") and an `apply_updates_now` affordance for when the
   user is back at the desk. Relay and LAN remain safe to apply.
+
+### MCP
+
+#### Added
+- check+apply auto-update at the desk, check-only on a mobile tunnel (#1971)
+
+#### Fixed
+- promoted subgraph widget values persist when control_after_generate is randomize (#1966)
+- a restart confirmation the user gave late is claimed by the next attempt, not discarded (#1957)
+
 
 ## 0.51.35
 
