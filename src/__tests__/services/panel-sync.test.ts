@@ -782,6 +782,35 @@ describe("performPanelSync", () => {
     expect(h.updates).toBe(1);
     expect(existsSync(lockPath)).toBe(false);
   });
+
+  it("reclaims a FRESH lock whose owner is already dead and proceeds (#1953)", async () => {
+    // Self-restart leaves a seconds-old lock owned by the now-dead pre-restart
+    // pid. The 10-minute grace used to protect it; hello auto-sync then timed
+    // out every turn. performPanelSync is that unattended path.
+    const lockPath = process.env.COMFYUI_MCP_PANEL_LOCK!;
+    const deadPid = 0x7ffffffe;
+    writeFileSync(
+      lockPath,
+      JSON.stringify({
+        pid: deadPid,
+        startedAt: new Date().toISOString(),
+        token: "fresh-dead-self-restart",
+      }),
+    );
+    expect(existsSync(lockPath)).toBe(true);
+
+    const h = makeDeps({
+      installedVersion: "0.11.3",
+      onUpdate: (files) => {
+        files[join(PANEL_DIR, "pyproject.toml")] = pyproject(REQUIRED);
+      },
+    });
+    const r = await performPanelSync({ deps: h.deps, ...RUN });
+
+    expect(r.synced).toBe(true);
+    expect(h.updates).toBe(1);
+    expect(existsSync(lockPath)).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------

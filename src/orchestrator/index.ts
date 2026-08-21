@@ -49,6 +49,7 @@ import { resolveBlindTabGate } from "./blind-tab-gate.js";
 import { clearPanelDiskObservation } from "../services/panel-workspace.js";
 import { panelRecoveryContext } from "../services/panel-recovery.js";
 import { isPanelAutoInstallDisabled } from "../services/panel-installer.js";
+import { releaseOwnedPanelLock } from "../services/panel-pin-guard.js";
 import { SelfRestarter, canSelfRestart } from "../services/self-restart.js";
 import { pairUrlDurability } from "./pair-durability.js";
 import { loadOrCreatePairToken } from "./pair-token-store.js";
@@ -6731,6 +6732,14 @@ export async function runPanelOrchestrator(): Promise<void> {
       if (cur?.pid === process.pid) unlinkSync(lockPath);
     } catch {
       // No lockfile / unreadable — nothing to clean up.
+    }
+    // Same for panel-op.lock: a clean exit (SIGINT or self-restart) must not
+    // leave a lock whose owner is about to die (#1953). Idempotent if the
+    // restarter already released it; a lock naming any other pid is left.
+    try {
+      releaseOwnedPanelLock();
+    } catch {
+      /* best-effort — unlock/reclaim remains the recovery if this fails */
     }
   };
   /** The single in-flight teardown, so repeated signals queue behind it. */

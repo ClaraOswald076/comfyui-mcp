@@ -3,7 +3,11 @@
 // timers, registry, or process spawns).
 
 import { describe, expect, it } from "vitest";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { SelfRestarter, type SelfRestartDeps } from "../../services/self-restart.js";
+import { releaseOwnedPanelLock } from "../../services/panel-pin-guard.js";
 import type { InstallInfo, SelfUpdateResult } from "../../services/self-update.js";
 
 interface Harness {
@@ -24,6 +28,7 @@ function makeHarness(opts: {
   uptimeMs?: number;
   spawnOk?: boolean;
   mtime?: number;
+  releasePanelLock?: () => void;
 }): Harness {
   const calls: string[] = [];
   const spawns: Array<{ npxVersion?: string }> = [];
@@ -57,6 +62,10 @@ function makeHarness(opts: {
       spawns.push(o);
       return opts.spawnOk ?? true;
     },
+    releasePanelLock: () => {
+      calls.push("releasePanelLock");
+      opts.releasePanelLock?.();
+    },
     exit: () => {
       calls.push("exit");
     },
@@ -88,7 +97,7 @@ describe("SelfRestarter — dev rebuild watch", () => {
     expect(h.calls).toEqual([]);
     h.restarter.devTick(); // stable → arm + fire (idle)
     await Promise.resolve();
-    expect(h.calls).toEqual(["spawn", "teardown", "exit"]);
+    expect(h.calls).toEqual(["spawn", "releasePanelLock", "teardown", "exit"]);
     expect(h.spawns[0]?.npxVersion).toBeUndefined(); // same argv respawn
   });
 
@@ -116,7 +125,7 @@ describe("SelfRestarter — dev rebuild watch", () => {
     h.setIdle(true);
     h.restarter.tryRestart();
     await Promise.resolve();
-    expect(h.calls).toEqual(["spawn", "teardown", "exit"]);
+    expect(h.calls).toEqual(["spawn", "releasePanelLock", "teardown", "exit"]);
   });
 
   it("respects the minimum-uptime guard", () => {
@@ -136,7 +145,7 @@ describe("SelfRestarter — dev rebuild watch", () => {
     h.restarter.devTick();
     h.restarter.devTick();
     await Promise.resolve();
-    expect(h.calls).toEqual(["spawn"]); // no teardown, no exit
+    expect(h.calls).toEqual(["spawn"]); // no release, no teardown, no exit
     expect(h.announces.some((a) => a.includes("Restart failed"))).toBe(true);
   });
 });
@@ -150,7 +159,7 @@ describe("SelfRestarter — published installs", () => {
     h.restarter.start();
     await h.restarter.updateTick();
     await Promise.resolve();
-    expect(h.calls).toEqual(["check", "spawn", "teardown", "exit"]);
+    expect(h.calls).toEqual(["check", "spawn", "releasePanelLock", "teardown", "exit"]);
     expect(h.spawns[0]?.npxVersion).toBeUndefined(); // disk already updated — same argv
   });
 
@@ -166,7 +175,7 @@ describe("SelfRestarter — published installs", () => {
     h.restarter.start();
     await h.restarter.updateTick();
     await Promise.resolve();
-    expect(h.calls).toEqual(["spawn", "teardown", "exit"]);
+    expect(h.calls).toEqual(["spawn", "releasePanelLock", "teardown", "exit"]);
     expect(h.spawns[0]?.npxVersion).toBe("1.2.0");
   });
 
@@ -208,5 +217,76 @@ describe("SelfRestarter — opt-outs", () => {
     expect(h.calls).toEqual([]); // never spawned/tore down/exited
     const nags = h.announces.filter((a) => a.includes("auto-restart is off"));
     expect(nags).toHaveLength(1);
+  });
+});
+
+describe("SelfRestarter — releases panel-op.lock this process owns (#1953)", () => {
+  it("a successful restart drops the lock so the successor can acquire it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cmcp-self-restart-lock-"));
+    const prev = process.env.COMFYUI_MCP_PANEL_LOCK;
+    const lock = join(dir, "panel-op.lock");
+    process.env.COMFYUI_MCP_PANEL_LOCK = lock;
+    writeFileSync(
+      lock,
+      JSON.stringify({
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+        token: "pre-restart",
+      }),
+    );
+    try {
+      const h = makeHarness({
+        mode: "linked",
+        mtime: 1000,
+        releasePanelLock: () => {
+          releaseOwnedPanelLock();
+        },
+      });
+      h.restarter.start();
+      h.setMtime(2000);
+      h.restarter.devTick();
+      h.restarter.devTick();
+      await Promise.resolve();
+      expect(h.calls).toEqual(["spawn", "releasePanelLock", "teardown", "exit"]);
+      expect(existsSync(lock)).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.COMFYUI_MCP_PANEL_LOCK;
+      else process.env.COMFYUI_MCP_PANEL_LOCK = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a failed spawn leaves the lock in place — we are staying alive", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cmcp-self-restart-lock-fail-"));
+    const prev = process.env.COMFYUI_MCP_PANEL_LOCK;
+    const lock = join(dir, "panel-op.lock");
+    process.env.COMFYUI_MCP_PANEL_LOCK = lock;
+    const payload = JSON.stringify({
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      token: "still-held",
+    });
+    writeFileSync(lock, payload);
+    try {
+      const h = makeHarness({
+        mode: "linked",
+        mtime: 1000,
+        spawnOk: false,
+        releasePanelLock: () => {
+          releaseOwnedPanelLock();
+        },
+      });
+      h.restarter.start();
+      h.setMtime(2000);
+      h.restarter.devTick();
+      h.restarter.devTick();
+      await Promise.resolve();
+      expect(h.calls).toEqual(["spawn"]);
+      expect(existsSync(lock)).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.COMFYUI_MCP_PANEL_LOCK;
+      else process.env.COMFYUI_MCP_PANEL_LOCK = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

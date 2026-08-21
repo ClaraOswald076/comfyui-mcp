@@ -24,6 +24,7 @@
 // depends only on the pin store (and panel-recovery, which is itself a leaf over
 // config + panel-workspace and reaches back into neither).
 
+import { execFileSync } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import {
@@ -328,10 +329,11 @@ function sleep(ms: number): Promise<void> {
  *   - `"unsure"` — a process exists, but the lock is old enough that the number
  *                 may since have been reused. Liveness is UNDETERMINED.
  *
- * The `startedAt` on the record is the LOCK's creation time, not the process's,
- * so it cannot establish identity either; closing that properly needs a
- * per-process start time this module does not have. What it CAN do is stop
- * asserting the strong claim.
+ * The `startedAt` on the record is the LOCK's creation time. Identity of the
+ * owner is `ownerStartedMs` (the process start time recorded at lock take).
+ * This probe stays a cheap existence check for the acquire poll; reclaim
+ * consults `ownerStartedMs` and the OS process table to resolve reuse / the
+ * Windows kill(0) false-positive (#1953).
  */
 function pidLiveness(pid: unknown, ageMs: number): boolean | "unsure" {
   if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
@@ -361,13 +363,66 @@ function pidLiveness(pid: unknown, ageMs: number): boolean | "unsure" {
 }
 
 /**
- * A lock is PROVABLY abandoned only when it is BOTH older than this AND owned
- * by a dead process. Panel operations are ComfyUI-Manager queue cycles
- * measured in seconds to minutes; ten minutes is far beyond a legitimate one,
- * so a lock older than that with a dead owner cannot be a live op — while a
- * younger lock, even with a dead-looking owner, stays untouched.
+ * Age beyond which a live-looking pid is equally well explained by reuse.
+ * The grace window applies ONLY when the recorded owner is NOT proven dead
+ * (#1953): a self-restart leaves a fresh lock whose owner is already gone,
+ * and protecting that for ten minutes is how panel sync wedged indefinitely.
  */
 const STALE_LOCK_MS = 10 * 60_000;
+
+/** Clock skew / tick rounding when comparing recorded vs live process start. */
+const OWNER_START_TOLERANCE_MS = 2_000;
+
+/** This process's start time (uptime-derived). */
+function processStartMs(): number {
+  return Date.now() - process.uptime() * 1000;
+}
+
+/**
+ * Does the OS process table list this pid? Independent of `process.kill(pid, 0)`,
+ * which on Windows has claimed a pid Get-Process could not find (#1953).
+ *
+ * `true` / `false` are answers; `undefined` means the probe could not tell
+ * (missing tool, permission, timeout) and must not be spent as either.
+ */
+function processTableHasPid(pid: number): boolean | undefined {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (process.platform === "linux") {
+    try {
+      return existsSync(`/proc/${pid}`);
+    } catch {
+      return undefined;
+    }
+  }
+  if (process.platform === "win32") {
+    try {
+      const out = execFileSync("tasklist.exe", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
+        encoding: "utf8",
+        timeout: 3000,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      // CSV row is `"image","pid","session",...`. The "no match" INFO line does
+      // not quote the pid as a field.
+      return out.includes(`","${pid}",`);
+    } catch {
+      return undefined;
+    }
+  }
+  try {
+    const out = execFileSync("ps", ["-p", String(pid), "-o", "pid="], {
+      encoding: "utf8",
+      timeout: 2000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return new RegExp(`(?:^|\\s)${pid}(?:\\s|$)`).test(out);
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException & { status?: number };
+    if (e.code === "ENOENT") return undefined;
+    if (e.status === 1) return false;
+    return undefined;
+  }
+}
 
 /** What observing the lock file could establish about its holder. */
 interface PanelLockObservation {
@@ -379,11 +434,66 @@ interface PanelLockObservation {
   pid?: number;
   /** When the lock was taken (the record's startedAt), for messages. */
   startedAt?: string;
+  /** Process start time recorded at lock take — identity, not lock age. */
+  ownerStartedMs?: number;
   /** Pid liveness — only set when a valid pid was recorded. */
   /** Tri-state: see `pidLiveness`. "unsure" must NOT be read as either boolean. */
   alive?: boolean | "unsure";
   /** Why the content proved nothing about the owner (unreadable/corrupt/pid). */
   contentProblem?: string;
+}
+
+function startTimesMatch(obs: PanelLockObservation): boolean {
+  if (obs.ownerStartedMs === undefined) return false;
+  return Math.abs(obs.ownerStartedMs - processStartMs()) <= OWNER_START_TOLERANCE_MS;
+}
+
+/**
+ * Is the recorded owner gone, without pid-reuse ambiguity?
+ *
+ *   - kill(0) says no such process.
+ *   - kill(0) says yes, but the OS process table does not list it (Windows
+ *     kill(0) false-positive, #1953).
+ *   - the pid is ours, but the recorded process start predates this life
+ *     (the number was recycled onto us) AND the lock is past the stale window.
+ */
+function ownerProvablyDead(obs: PanelLockObservation): boolean {
+  if (obs.pid === undefined) return false;
+  if (obs.pid === process.pid) {
+    if (obs.ownerStartedMs !== undefined) {
+      // The age floor is load-bearing, not belt-and-braces (review of #1955).
+      // `processStartMs()` is `Date.now() - uptime*1000`: the recorded value is
+      // written once at lock take, the live one is recomputed here, and only
+      // Date.now() absorbs a wall-clock step. A forward step of more than the
+      // tolerance (a resume from sleep, an NTP correction) therefore makes THIS
+      // process read its OWN live lock as a recycled pid and delete the lock
+      // guarding its own in-flight op — the concurrent-mutation case this
+      // module exists to prevent, reachable because hello auto-sync calls
+      // reclaim outside `lockHolderContext`.
+      //
+      // Requiring the stale window puts the floor exactly where the identity
+      // signal is weakest. It costs nothing real: for this to matter our pid
+      // must have been recycled onto us AND the dead predecessor's lock be
+      // under ten minutes old. Past that window the branch still fires, which
+      // is the wedge it was added for.
+      if (
+        obs.ageMs > STALE_LOCK_MS &&
+        obs.ownerStartedMs < processStartMs() - OWNER_START_TOLERANCE_MS
+      ) {
+        return true;
+      }
+      if (startTimesMatch(obs)) return false;
+    }
+    // The number is ours. Without a recorded start we cannot tell this life
+    // from a previous one, and we already know we exist — do not spawn a
+    // process-table probe to re-learn that.
+    return false;
+  }
+  if (obs.alive === false) return true;
+  if (obs.alive === true || obs.alive === "unsure") {
+    return processTableHasPid(obs.pid) === false;
+  }
+  return false;
 }
 
 /**
@@ -431,18 +541,26 @@ function observePanelLock(path: string): PanelLockObservation | undefined {
     if (before.mtimeMs !== after.mtimeMs || before.size !== after.size) {
       return { ageMs, contentProblem: "changed while being read" };
     }
-    let record: { pid?: unknown; startedAt?: unknown };
+    let record: { pid?: unknown; startedAt?: unknown; ownerStartedMs?: unknown };
     try {
-      record = JSON.parse(raw) as { pid?: unknown; startedAt?: unknown };
+      record = JSON.parse(raw) as {
+        pid?: unknown;
+        startedAt?: unknown;
+        ownerStartedMs?: unknown;
+      };
     } catch {
       return { ageMs, raw, contentProblem: "is not valid JSON" };
     }
     const startedAt = typeof record?.startedAt === "string" ? record.startedAt : undefined;
+    const ownerStartedMs =
+      typeof record?.ownerStartedMs === "number" && Number.isFinite(record.ownerStartedMs)
+        ? record.ownerStartedMs
+        : undefined;
     const pid = record?.pid;
     if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
       return { ageMs, raw, startedAt, contentProblem: "records no valid owner pid" };
     }
-    return { ageMs, raw, pid, startedAt, alive: pidLiveness(pid, ageMs) };
+    return { ageMs, raw, pid, startedAt, ownerStartedMs, alive: pidLiveness(pid, ageMs) };
   } catch (err) {
     // A mid-read failure (e.g. the fd turned out to be a directory). The age
     // here is display-only — the contentProblem is what the decision reads.
@@ -502,10 +620,11 @@ export interface PanelLockReclaimResult {
 }
 
 /**
- * Reclaim the panel operation lock — ONLY when it is provably abandoned
- * (#760): older than STALE_LOCK_MS AND owned by a recorded pid that is dead.
- * Every other state refuses, because deleting a lock whose holder might be
- * alive is how two panel mutations run at once.
+ * Reclaim the panel operation lock — ONLY when its recorded owner is
+ * provably dead (#760, #1953). Age alone is not abandonment, and a live
+ * (or reuse-ambiguous) pid is never deleted. A FRESH lock whose owner is
+ * already gone is abandoned: the 10-minute window protects a slow
+ * ComfyUI-Manager op, not a process that has already exited.
  *
  * This is the explicit, operator/agent-invoked recovery that the acquire
  * path's timeout message names. The acquire loop itself NEVER reclaims
@@ -549,34 +668,40 @@ export function reclaimAbandonedPanelLock(): PanelLockReclaimResult {
         `so there is no owner whose death could prove it abandoned.`,
     );
   }
-  if (obs.ageMs <= STALE_LOCK_MS) {
+  // Owner-aware: a dead owner is abandoned even inside the grace window. A
+  // self-restart (#1953) leaves a lock seconds old whose holder is already gone.
+  if (!ownerProvablyDead(obs)) {
+    if (obs.pid === process.pid && startTimesMatch(obs)) {
+      return refuse(
+        `it is held by this process (pid ${obs.pid}), which is still running, ` +
+          `so it cannot be called abandoned.`,
+      );
+    }
+    if (obs.ageMs <= STALE_LOCK_MS) {
+      return refuse(
+        `it was taken only ${describeLockAge(obs.ageMs)} ago — inside the ` +
+          `${STALE_LOCK_MS / 60_000}-minute window in which a slow ComfyUI-Manager ` +
+          `operation is still legitimate, so it cannot be called abandoned.`,
+      );
+    }
+    if (obs.alive === "unsure" || obs.alive === true) {
+      // NOT "STILL RUNNING" unless identity matched above. A recycled PID used
+      // to refuse this reclaim indefinitely — #760's wedge surviving its own
+      // fix. Still refusing is right when identity cannot be proven, but the
+      // reason has to be true.
+      return refuse(
+        `it is ${describeLockAge(obs.ageMs)} old and a process with pid ${obs.pid} exists, ` +
+          `but at that age the pid may have been REUSED by an unrelated program — so whether ` +
+          `the original owner is still running cannot be determined, and abandonment cannot ` +
+          `be proven. Nothing was deleted. If you are certain no panel operation is running ` +
+          `(check that pid: if it is not a comfyui-mcp orchestrator, it is not the owner), ` +
+          `delete ${path} by hand.`,
+      );
+    }
     return refuse(
-      `it was taken only ${describeLockAge(obs.ageMs)} ago — inside the ` +
-        `${STALE_LOCK_MS / 60_000}-minute window in which a slow ComfyUI-Manager ` +
-        `operation is still legitimate, so it cannot be called abandoned.`,
+      `its owner could not be proven dead (${describeObservedLock(path, obs)}).`,
     );
   }
-  if (obs.alive === "unsure") {
-    // NOT "STILL RUNNING" (codex gate P1). The old code asserted that from a bare
-    // existence check, so a recycled PID refused this reclaim indefinitely — #760's
-    // wedge surviving its own fix. Still refusing is right (deleting a live lock is
-    // worse than leaving a stuck one), but the reason has to be true, and the user
-    // needs the manual path that the false certainty used to hide.
-    return refuse(
-      `it is ${describeLockAge(obs.ageMs)} old and a process with pid ${obs.pid} exists, ` +
-        `but at that age the pid may have been REUSED by an unrelated program — so whether ` +
-        `the original owner is still running cannot be determined, and abandonment cannot ` +
-        `be proven. Nothing was deleted. If you are certain no panel operation is running ` +
-        `(check that pid: if it is not a comfyui-mcp orchestrator, it is not the owner), ` +
-        `delete ${path} by hand.`,
-    );
-  }
-  // NOTE: there is deliberately no `obs.alive === true` branch here. With the
-  // reuse doubt bounded by STALE_LOCK_MS — the same line the age check above
-  // draws — any lock that reaches this point is already past it, so liveness is
-  // "unsure" or a proven dead pid. A `STILL RUNNING` branch would be unreachable
-  // code that reads like a live guarantee. `describeLock` still reports a running
-  // owner for YOUNGER locks, where an existing pid really is evidence.
 
   // Provably abandoned. Rename aside, verify the moved file is the EXACT bytes
   // that were judged abandoned, and only then delete.
@@ -679,6 +804,103 @@ export function reclaimAbandonedPanelLock(): PanelLockReclaimResult {
   }
 }
 
+export interface PanelLockReleaseResult {
+  outcome: "no-lock" | "released" | "not-ours";
+  detail: string;
+}
+
+/**
+ * Drop a panel-op.lock THIS process owns. The self-restart path (and any other
+ * clean exit) knows it is about to die; leaving the file behind is how a
+ * successor then waits forever behind a pid that is gone (#1953).
+ *
+ * Same rename-aside + byte check as reclaim: we only delete the instance we
+ * observed as ours. A lock naming any other pid is left untouched so a
+ * replacement that already took the path is not stolen.
+ */
+export function releaseOwnedPanelLock(): PanelLockReleaseResult {
+  const path = panelLockPath();
+  assertNotWritingRealHomeInTests(path, "the panel operation lock");
+  const obs = observePanelLock(path);
+  if (!obs) {
+    return {
+      outcome: "no-lock",
+      detail: `No panel operation lock is present at ${path}.`,
+    };
+  }
+  if (obs.pid !== process.pid) {
+    return {
+      outcome: "not-ours",
+      detail:
+        obs.pid === undefined
+          ? `The lock at ${path} records no valid owner pid; not deleting it on the way out.`
+          : `The lock at ${path} is owned by pid ${obs.pid}, not this process (${process.pid}); left in place.`,
+    };
+  }
+  const claim = `${path}.release-${randomUUID()}`;
+  try {
+    renameSync(path, claim);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return {
+        outcome: "no-lock",
+        detail: `The lock at ${path} disappeared before it could be released.`,
+      };
+    }
+    logger.warn(
+      `[panel] could not take the panel op lock at ${path} aside to release it (${
+        err instanceof Error ? err.message : String(err)
+      }); it may still be held.`,
+    );
+    return {
+      outcome: "not-ours",
+      detail: `Could not move the lock aside to release it; left in place.`,
+    };
+  }
+  let moved: string | undefined;
+  try {
+    moved = readFileSync(claim, "utf-8");
+  } catch {
+    moved = undefined;
+  }
+  let movedPid: unknown;
+  if (moved !== undefined) {
+    try {
+      movedPid = (JSON.parse(moved) as { pid?: unknown }).pid;
+    } catch {
+      movedPid = undefined;
+    }
+  }
+  if (movedPid === process.pid) {
+    try {
+      rmSync(claim, { force: true });
+    } catch (err) {
+      logger.warn(
+        `[panel] released the panel op lock but could not delete ${claim}: ${
+          err instanceof Error ? err.message : String(err)
+        }. It is no longer at ${path}, so it blocks nothing.`,
+      );
+    }
+    return {
+      outcome: "released",
+      detail: `Released the panel operation lock at ${path} (owned by this process, pid ${process.pid}).`,
+    };
+  }
+  try {
+    linkSync(claim, path);
+    rmSync(claim, { force: true });
+  } catch {
+    logger.warn(
+      `[panel] the panel op lock at ${path} was no longer this process's at release; ` +
+        `the file taken aside is preserved at ${claim}.`,
+    );
+  }
+  return {
+    outcome: "not-ours",
+    detail: `The lock at ${path} was no longer this process's when released; it was restored rather than deleted.`,
+  };
+}
+
 /** The `token` from a lock record, or undefined when it cannot be read. Used to
  *  identify a lock across observations (#1489); pid+startedAt alone cannot. */
 function lockRecordToken(obs: { raw?: string }): string | undefined {
@@ -721,16 +943,18 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
         // record would be truncated (an unreadable owner pid that reclaim can
         // never prove abandoned — the #760 wedge again), so fail the init and
         // let the cleanup below remove the husk (codex gate). The payload is
-        // ASCII (pid + ISO timestamp), so string offsets track byte offsets.
-        // `token` is what makes this lock IDENTIFIABLE, not merely attributable
-        // (codex gate P0). pid+startedAt cannot distinguish two locks taken by the
-        // same process, and more importantly they cannot tell the release closure
-        // whether the file still at the path is the one it created — which is the
-        // question that matters once a lock can be RECLAIMED out from under a
-        // holder.
+        // ASCII (pid + ISO timestamp + ownerStartedMs + uuid), so string offsets
+        // track byte offsets. `token` is what makes this lock IDENTIFIABLE, not
+        // merely attributable (codex gate P0). pid+startedAt cannot distinguish
+        // two locks taken by the same process, and more importantly they cannot
+        // tell the release closure whether the file still at the path is the one
+        // it created — which is the question that matters once a lock can be
+        // RECLAIMED out from under a holder. `ownerStartedMs` is the PROCESS
+        // start time, so reclaim can tell our life from a recycled pid (#1953).
         const payload = JSON.stringify({
           pid: process.pid,
           startedAt: new Date().toISOString(),
+          ownerStartedMs: Math.round(processStartMs()),
           token,
         });
         let written = 0;
@@ -899,7 +1123,7 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
             `concurrent pre-upgrade orchestrator could replace an observed stale path ` +
             `with a fresh lock. To recover a proven abandoned lock, run ` +
             `install_comfyui(action:'panel', panel_action:'unlock') — it re-verifies that the recorded owner is ` +
-            `dead and the lock is old before deleting anything, and refuses otherwise. ` +
+            `dead before deleting anything, and refuses otherwise. ` +
             `Or do it by hand: stop or restart every comfyui-mcp orchestrator, verify ` +
             `none remain, delete this exact lock file, then retry.`,
         );
@@ -920,14 +1144,12 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
       // maybe and MUST keep waiting — treating it as dead is the exact
       // existence-for-identity fold `pidLiveness` was written to stop. `true`
       // means a real operation may still be running.
-      // AGE GATES BEFORE LIVENESS, matching `reclaimAbandonedPanelLock`, which
-      // refuses on age before it ever consults a pid. A FRESH lock is protected
-      // even when its recorded owner is dead — that is a deliberate rule with
-      // its own test ("does NOT reclaim a fresh lock even when its recorded pid
-      // is dead"), and an early report that ignored it would be this module
-      // holding two different opinions about what freshness means. Short-cutting
-      // only the STALE case still covers the report, whose lock had been
-      // blocking long enough to need a manual unlock.
+      // Acquire still age-gates the fast-fail: this loop must NOT delete, and a
+      // young lock whose owner is dead is now reclaimable via unlock / hello
+      // auto-sync (`reclaimAbandonedPanelLock` is owner-aware as of #1953).
+      // Short-cutting only the STALE case keeps the acquire path from holding
+      // a second opinion about freshness while still covering a lock that has
+      // been blocking long enough to need a manual unlock.
       if (Date.now() >= nextLivenessProbe) {
         nextLivenessProbe = Date.now() + LIVENESS_PROBE_MS;
         const early = observePanelLock(path);
@@ -974,7 +1196,7 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
               `timeout, and not deleting it either: a concurrent orchestrator could have ` +
               `replaced it since it was observed. To clear a proven abandoned lock, run ` +
               `install_comfyui(action:'panel', panel_action:'unlock') — it re-verifies that the recorded ` +
-              `owner is dead and the lock is old before deleting anything, and refuses ` +
+              `owner is dead before deleting anything, and refuses ` +
               `otherwise. Or do it by hand: stop or restart every comfyui-mcp orchestrator, ` +
               `verify none remain, delete this exact lock file, then retry.`,
           );

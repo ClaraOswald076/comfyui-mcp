@@ -239,10 +239,11 @@ export async function panelAction(
     // Recovery for the wedge from #760: a crashed/killed orchestrator
     // leaves panel-op.lock behind and the acquire path deliberately never
     // auto-reclaims it (#779). This is the explicit recovery the timeout
-    // message names — it re-verifies the lock is provably abandoned (old
-    // AND its recorded owner is dead) before deleting anything, and says
-    // exactly what it observed when it refuses. It does NOT take the lock
-    // itself: a wedged lock is the very case this exists for.
+    // message names — it re-verifies the recorded owner is provably dead
+    // before deleting anything (#1953: a fresh lock whose owner already
+    // exited is abandoned; the 10-minute window does not protect it), and
+    // says exactly what it observed when it refuses. It does NOT take the
+    // lock itself: a wedged lock is the very case this exists for.
     return json({ action: "unlock", ...reclaimAbandonedPanelLock() });
   }
 

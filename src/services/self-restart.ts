@@ -17,10 +17,11 @@
 // Restart discipline: a restart may NEVER eat a reply. We wait until every
 // agent is idle with nothing queued (plus any extra caller gate — held
 // messages, a render in flight), announce to the panel, spawn a DETACHED
-// replacement with the same command line, then run the caller's clean teardown
-// and exit. The replacement rides the bridge's existing bind-retry while our
-// port frees; agent sessions resume from the durable session store; the panel
-// reconnects on its own.
+// replacement with the same command line, drop any panel-op.lock we still
+// hold (#1953 — the successor otherwise waits forever behind a dead pid),
+// then run the caller's clean teardown and exit. The replacement rides the
+// bridge's existing bind-retry while our port frees; agent sessions resume
+// from the durable session store; the panel reconnects on its own.
 //
 // Loop safety: restarts are strictly CHANGE-driven (a version newer than the
 // one running, or an entry mtime newer than the one we booted with), so a
@@ -45,6 +46,7 @@ import {
   isNewer,
   type InstallInfo,
 } from "./self-update.js";
+import { releaseOwnedPanelLock } from "./panel-pin-guard.js";
 import { logger } from "../utils/logger.js";
 
 /** Registry re-check period. An hour keeps update latency low at ~24 tiny
@@ -77,6 +79,12 @@ export interface SelfRestartDeps {
   teardown: () => Promise<void>;
   /** Spawn the detached replacement process. Returns false on failure. */
   spawnReplacement: (opts: { npxVersion?: string }) => boolean;
+  /**
+   * Drop a panel-op.lock this process owns. Called after a successful spawn
+   * and before teardown so the successor is not blocked by a lock whose
+   * owner is about to exit (#1953).
+   */
+  releasePanelLock: () => void;
   exit: (code: number) => void;
   uptimeMs: () => number;
 }
@@ -134,6 +142,9 @@ export const defaultSelfRestartDeps: SelfRestartDeps = {
   announce: () => {},
   teardown: async () => {},
   spawnReplacement: defaultSpawnReplacement,
+  releasePanelLock: () => {
+    releaseOwnedPanelLock();
+  },
   exit: (code) => process.exit(code),
   uptimeMs: () => process.uptime() * 1000,
 };
@@ -301,6 +312,17 @@ export class SelfRestarter {
       this.deps.announce("⚠️ Restart failed to launch a replacement — still running the current version.");
       this.restarting = false;
       return;
+    }
+    // The successor is already running. Drop any panel-op.lock we still hold
+    // so it is not stuck behind a pid that is about to exit (#1953). Spawn
+    // failure must NOT release: we are staying alive and may still own a
+    // legitimate in-flight op.
+    try {
+      this.deps.releasePanelLock();
+    } catch (err) {
+      logger.debug(
+        `[self-restart] release panel lock: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
     this.stop();
     try {
