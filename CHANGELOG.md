@@ -759,6 +759,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.43] - 2026-08-20
+
 ### MCP
 
 #### Fixed
@@ -777,6 +779,15 @@ All notable changes to this project are documented here. This project adheres to
   reconnects. A dead or ambiguous pin plus exactly one live canvas is adopted
   even when that hello joined the default backend — idle (no pin) unique-foreign
   still refuses, so another conversation's tab is not stolen.
+
+### MCP
+
+#### Fixed
+- current-workflow rebind restores the live canvas after reconnect (#1964)
+- panel_open_workflow no longer false-mismatches the already-open canvas after restart (#1962)
+- a successful panel_run completion is no longer left silent for 45s (#1960)
+- panel_strip_workflow strips a pack against the connected panel, not localhost (#1959)
+
 
 ## [0.52.42] - 2026-08-20
 
