@@ -219,6 +219,14 @@ interface Conn {
    *  updated — a wall of text traded for nothing at all, which is the worse failure. When
    *  this is false the caller falls back to a visible `say`. */
   acceptsAgentNotes: boolean;
+  /**
+   * Painter kinds THIS hello advertised the panel can render (`show_media_kinds`
+   * array). Re-read per hello, never inherited — a reconnect may be a different
+   * build. Undefined when the hello omitted the field (every panel today) or
+   * sent a malformed value; callers then fall back to the version floor in
+   * {@link SHOW_MEDIA_KIND_MIN_PANEL_VERSION} (#2017).
+   */
+  showMediaKinds?: readonly string[];
   /** Commands THIS connection has already proven it doesn't support, via a real
    *  "Unknown command" reply earlier in the session (#236). Once a cmd lands
    *  here, every later call is gated proactively — rejected before it ever
@@ -344,6 +352,28 @@ export const BRIDGE_CAPABILITY_MIN_PANEL_VERSION: Readonly<Record<string, string
   enforces_workflow_stamp_at_write: "0.11.35",
 };
 
+/**
+ * The panel version each `show_media` *painter kind* was actually introduced in.
+ *
+ * Separate from {@link BRIDGE_CAPABILITY_MIN_PANEL_VERSION} on purpose: that
+ * table feeds the aggregate sync floor, and a media-kind floor must not move
+ * "is the install current?" just because we learned a new painter. `show_media`
+ * itself predates every entry here — old panels accept the command; they just
+ * paint an unknown kind as `<img>` and report success (#2017 / panel #710).
+ *
+ * Fallback only. A hello that carries `show_media_kinds` is the authority and
+ * does not consult this table (a capability list does not need a version
+ * lookup). Image and video have no entry: every panel that answers show_media
+ * has always painted those.
+ */
+export const SHOW_MEDIA_KIND_MIN_PANEL_VERSION: Readonly<Record<string, string>> = {
+  // panel #710 — `paintAudio` + `unrenderable` accounting. Merged AFTER the
+  // 0.11.42 release commit (panel `b81b10dd`) and first shipped in 0.11.43
+  // (panel `a1ac583f`). A 0.11.42 floor would allow the published 0.11.42
+  // build, which does not have the painter.
+  audio: "0.11.43",
+};
+
 /** The minimum panel version that supports `cmd`. For a command WITH an
  *  authoritative BRIDGE_CMD_MIN_PANEL_VERSION entry this is its true introduction
  *  version; for anything else it is the 0.11.4 full-set baseline FLOOR — a lower
@@ -456,6 +486,189 @@ export function connPanelVersionReading(conn: {
   if (conn.panelVersionAdvertised) return readPanelVersion(conn.panelVersion);
   const carried = typeof conn.panelVersion === "string" ? conn.panelVersion.trim() : "";
   return carried ? { inherited: carried } : {};
+}
+
+/**
+ * Screen a hello `show_media_kinds` value into a list of painter kinds.
+ *
+ * Absent, non-array, empty, or any non-string/blank element → `undefined`
+ * (treat as omitted). A garbage field must not look like a claim that the
+ * panel can paint nothing, which would refuse image/video on a typo.
+ */
+export function readHelloShowMediaKinds(raw: unknown): readonly string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const kinds: string[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (typeof item !== "string") return undefined;
+    const kind = item.trim();
+    if (!kind) return undefined;
+    if (!seen.has(kind)) {
+      seen.add(kind);
+      kinds.push(kind);
+    }
+  }
+  return kinds.length > 0 ? kinds : undefined;
+}
+
+/** Why a panel cannot paint a `show_media` kind, when we can prove it. */
+export type ShowMediaKindUnsupportedReason = "too_old" | "not_in_hello";
+
+export type ShowMediaKindSupport =
+  | { supported: true }
+  | {
+      supported: false;
+      kind: string;
+      reason: ShowMediaKindUnsupportedReason;
+      version?: string;
+      needed?: string;
+    };
+
+/**
+ * The kind the panel will pick a painter for — the field `classifyShowMediaItem`
+ * on the panel (panel #710) consults, in the same order:
+ *
+ *   1. an explicit orchestrator `kind` of image/video/audio
+ *   2. a /view ref's filename extension (the path audio takes on origin/main)
+ *   3. a data URL's declared MIME
+ *
+ * Image and video are universal (every show_media panel paints them). Audio is
+ * the kind a pre-#710 panel paints as `<img>` and counts as success (#2017).
+ * Anything else is returned as-is so a future kind can grow a floor without
+ * this function having to learn it.
+ */
+export function paintedShowMediaKind(item: Record<string, unknown>): string {
+  const kind = typeof item.kind === "string" ? item.kind : "";
+  if (kind === "image" || kind === "video" || kind === "audio") return kind;
+
+  let name = "";
+  if (kind === "viewRef" && item.viewRef && typeof item.viewRef === "object") {
+    const filename = (item.viewRef as { filename?: unknown }).filename;
+    if (typeof filename === "string") name = filename;
+  }
+  if (!name && typeof item.filename === "string") name = item.filename;
+  const ext = showMediaFilenameExt(name);
+  if (SHOW_MEDIA_AUDIO_PAINT_EXTS.has(ext)) return "audio";
+  if (SHOW_MEDIA_VIDEO_PAINT_EXTS.has(ext)) return "video";
+  if (SHOW_MEDIA_IMAGE_PAINT_EXTS.has(ext)) return "image";
+
+  if (typeof item.dataUrl === "string") {
+    const m = /^data:(image|video|audio)\//i.exec(item.dataUrl);
+    if (m) return m[1]!.toLowerCase();
+  }
+  return kind || "unknown";
+}
+
+/** Panel `AUDIO_EXTENSIONS` (`web/js/lib/media-preview.js`) — what `<audio>` paints. */
+const SHOW_MEDIA_AUDIO_PAINT_EXTS = new Set([
+  ".wav",
+  ".mp3",
+  ".flac",
+  ".ogg",
+  ".oga",
+  ".opus",
+  ".m4a",
+  ".aac",
+]);
+const SHOW_MEDIA_VIDEO_PAINT_EXTS = new Set([".mp4", ".webm", ".mov", ".mkv", ".m4v", ".avi"]);
+const SHOW_MEDIA_IMAGE_PAINT_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
+
+function showMediaFilenameExt(filename: string): string {
+  const stem = filename.split("#")[0]!.split("?")[0]!;
+  const m = /\.([A-Za-z0-9]+)$/.exec(stem);
+  return m ? `.${m[1]!.toLowerCase()}` : "";
+}
+
+function showMediaItemFilename(item: Record<string, unknown>): string {
+  if (typeof item.filename === "string" && item.filename.trim()) return item.filename;
+  if (item.viewRef && typeof item.viewRef === "object") {
+    const filename = (item.viewRef as { filename?: unknown }).filename;
+    if (typeof filename === "string" && filename.trim()) return filename;
+  }
+  return "(unnamed)";
+}
+
+/**
+ * Can this panel paint `kind`?
+ *
+ * Fail-OPEN when we cannot prove it cannot: missing/unparseable/inherited
+ * version, and no hello list, are not evidence of an old panel — telling
+ * someone to update a current one is the wrong remedy (same tri-state as
+ * {@link panelVersionProvesUnsupported}).
+ *
+ * Image and video are always supported. An advertised `show_media_kinds` list
+ * is the authority for every other kind (a capability does not need a version
+ * table). Without a list, only a parseable advertised version below a tabled
+ * floor is proof.
+ */
+export function panelSupportsShowMediaKind(
+  kind: string,
+  opts: {
+    reading: PanelVersionReading;
+    advertisedKinds?: readonly string[];
+  },
+): ShowMediaKindSupport {
+  if (kind === "image" || kind === "video") return { supported: true };
+  // A source kind / unclassified item is not a painter the old panel lacks.
+  if (kind === "viewRef" || kind === "unknown" || kind === "") return { supported: true };
+
+  const advertised = opts.advertisedKinds;
+  if (advertised && advertised.length > 0) {
+    if (advertised.includes(kind)) return { supported: true };
+    return {
+      supported: false,
+      kind,
+      reason: "not_in_hello",
+      version: opts.reading.version,
+      needed: SHOW_MEDIA_KIND_MIN_PANEL_VERSION[kind],
+    };
+  }
+
+  const needed = SHOW_MEDIA_KIND_MIN_PANEL_VERSION[kind];
+  if (!needed) return { supported: true };
+  const version = opts.reading.version;
+  if (!version || !SEMVER_RE.test(version.trim())) return { supported: true };
+  if (compareSemver(version, needed) < 0) {
+    return { supported: false, kind, reason: "too_old", version, needed };
+  }
+  return { supported: true };
+}
+
+export type UnsupportedShowMediaItem = {
+  filename: string;
+  kind: string;
+  reason: ShowMediaKindUnsupportedReason;
+  version?: string;
+  needed?: string;
+};
+
+/**
+ * Items of a `show_media` batch this panel is proven unable to paint.
+ *
+ * Empty for the common case (current panel, image/video only, or unproven
+ * version) — the hot path is a kind scan and no version compare.
+ */
+export function showMediaItemsPanelCannotPaint(
+  items: readonly Record<string, unknown>[],
+  opts: {
+    reading: PanelVersionReading;
+    advertisedKinds?: readonly string[];
+  },
+): UnsupportedShowMediaItem[] {
+  const blocked: UnsupportedShowMediaItem[] = [];
+  for (const item of items) {
+    const kind = paintedShowMediaKind(item);
+    const verdict = panelSupportsShowMediaKind(kind, opts);
+    if (verdict.supported) continue;
+    blocked.push({
+      filename: showMediaItemFilename(item),
+      kind: verdict.kind,
+      reason: verdict.reason,
+      version: verdict.version,
+      needed: verdict.needed,
+    });
+  }
+  return blocked;
 }
 
 /**
@@ -2703,6 +2916,12 @@ export class UiBridge {
           // Re-read per hello like the stamps above: a reconnect can be a different build.
           acceptsAgentNotes:
             (msg as { accepts_agent_notes?: unknown }).accepts_agent_notes === true,
+          // #2017 — painter kinds THIS hello claimed. Never inherited: an omitted
+          // list on a reconnect must fall back to the version floor, not to a
+          // previous connection's claim.
+          showMediaKinds: readHelloShowMediaKinds(
+            (msg as { show_media_kinds?: unknown }).show_media_kinds,
+          ),
           // Fresh per hello — see the field's doc comment (#236).
           unsupportedCmds: new Set<string>(),
           // INHERITED across a reconnect (the panel code did not get older) so a command
@@ -3259,6 +3478,19 @@ export class UiBridge {
       return connPanelVersionReading(this.resolveTarget(tabId));
     } catch {
       return {};
+    }
+  }
+
+  /**
+   * Painter kinds THIS connection advertised in its own hello (`show_media_kinds`).
+   * Undefined when the hello omitted the field or the tab cannot be resolved —
+   * callers then fall back to {@link SHOW_MEDIA_KIND_MIN_PANEL_VERSION} (#2017).
+   */
+  tabShowMediaKinds(tabId: string): readonly string[] | undefined {
+    try {
+      return this.resolveTarget(tabId).showMediaKinds;
+    } catch {
+      return undefined;
     }
   }
 
