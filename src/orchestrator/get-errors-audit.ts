@@ -520,6 +520,17 @@ function sameViewingIdentity(
   const a = viewingIdentity(primary);
   const b = viewingIdentity(followUp);
   if (!a || !b) return false;
+  // `scope:"root"` is only a scope, not a workflow identity. A tab can switch
+  // from root workflow A to root workflow B without changing its tab id, and
+  // both replies then look identical unless the panel publishes a workflow
+  // UUID/path. Never retire A's leftovers from that opaque root pair.
+  if (
+    a.scope === "root" &&
+    b.scope === "root" &&
+    !("workflow_uuid" in a || "workflow" in a || "workflow_uuid" in b || "workflow" in b)
+  ) {
+    return false;
+  }
   // A UUID/path identity cannot be downgraded to a coincidentally equal root
   // scope. If either side publishes one, both must publish the same value.
   for (const key of ["workflow_uuid", "workflow"]) {

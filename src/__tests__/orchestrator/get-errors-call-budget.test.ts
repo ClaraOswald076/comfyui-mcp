@@ -283,6 +283,38 @@ describe("panel_get_errors leftover call-budget audit (#1973)", () => {
     expect(payload.unavailable_widget_values).toBeUndefined();
     expect((payload.unchecked_nodes as Array<Record<string, unknown>>).some((e) => String(e.id) === "5")).toBe(true);
   });
+
+  it("does not complete an opaque root scope after a same-tab workflow switch", async () => {
+    const panel = {
+      ...budgetExhaustedReply({ extraUnchecked: 0 }),
+      viewing: { scope: "root" },
+      unchecked_nodes: [{ id: 5, type: "Loader", reason: BUDGET_REASON }],
+    };
+    const { payload } = await runGetErrors((cmd) => {
+      if (cmd.cmd === "graph_get_errors") return panel;
+      if (cmd.cmd === "graph_query") {
+        return {
+          viewing: { scope: "root" },
+          matched: 1,
+          shown: 1,
+          text: JSON.stringify({ id: 5, type: "Loader", widgets: { asset: "present.safetensors" } }),
+        };
+      }
+      if (cmd.cmd === "graph_get_object_info") {
+        return {
+          ok: true,
+          object_info: {
+            Loader: { input: { required: { asset: [["present.safetensors"], {}] } } },
+          },
+        };
+      }
+      return { ok: false };
+    });
+
+    expect(payload.audit_complete).toBe(false);
+    expect(payload.unchecked_count).toBe(1);
+    expect(payload.unavailable_widget_values).toBeUndefined();
+  });
 });
 
 // #1973 follow-up — the first cut of this fix judged completeness from the
@@ -500,7 +532,7 @@ describe("the clean note may survive only where the PANEL would have called it c
   // A payload whose ONLY abstention is retryable, so the completion pass retires it
   // and the audit finishes — the one path where the panel's note can be re-emitted.
   const completable = (extra: Record<string, unknown>) => ({
-    viewing: { kind: "root" },
+    viewing: { kind: "root", workflow: "wan.json" },
     node_count: 12,
     errored_count: 0,
     nodes: [],
