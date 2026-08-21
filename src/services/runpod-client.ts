@@ -236,7 +236,26 @@ export async function listPods(): Promise<RunpodPod[]> {
 }
 
 /** Resume (start) a stopped/exited pod. gpuCount defaults to 1. Returns the pod's
- *  new desiredStatus (RUNNING) — the container still needs time to boot after. */
+ *  new desiredStatus (RUNNING) — the container still needs time to boot after.
+ *
+ *  NO CUDA FILTER HERE, DELIBERATELY (#2016). A resumed pod can be placed on
+ *  different hardware than it was created on, so the CUDA floor createPod
+ *  enforces does NOT carry across a stop/start — but RunPod's API exposes no
+ *  lever to re-assert it: `PodResumeInput` has NO CUDA field under any name.
+ *  Probed against the live api.runpod.io schema on 2026-08-21 by sending each
+ *  candidate with a wrong-typed `podId`, so variable coercion failed and the
+ *  resolver never ran (no pod was resumed):
+ *
+ *    allowedCudaVersions → Field "allowedCudaVersions" is not defined by type "PodResumeInput".
+ *    cudaVersion / cudaVersions / allowedCudaVersion / minCudaVersion → same
+ *    gpuCount → accepted (control: a KNOWN field draws no such error)
+ *
+ *  runpod-python's `generate_pod_resume_mutation` agrees — it sends only podId
+ *  and gpuCount. docs.runpod.io/sdks/graphql/manage-pods shows an example with
+ *  `allowedCudaVersions` on podResume; that example is WRONG, and copying it
+ *  turns every start into a GraphQL validation failure. Adding the field here
+ *  BREAKS `runpod action:"start"` outright — the test
+ *  "sends NO CUDA filter on resume — PodResumeInput has no such field" pins it. */
 export async function resumePod(podId: string, gpuCount = 1): Promise<{ id: string; desiredStatus: string }> {
   const data = await runpodGql<{ podResume: { id: string; desiredStatus: string } }>(
     `mutation Resume($input: PodResumeInput!) { podResume(input: $input) { id desiredStatus } }`,
@@ -345,6 +364,101 @@ export const RUNPOD_DEFAULT_GPU_TYPES: string[] = (
   ]
 );
 
+// ── Stock-image deploy floors (#2014, #2016) ─────────────────────────────────
+// Both of these describe OUR image, so both apply only when the deploy targets
+// the STOCK template — same scoping rule the dead-man switch uses below. A user
+// pointing RUNPOD_TEMPLATE_ID / opts.templateId at their own image may
+// legitimately want a smaller disk or a different CUDA floor, and we cannot
+// verify what their image needs.
+
+/** Container disk (GB) a STOCK-template deploy gets. docker/runpod/README.md's
+ *  "Deploy on RunPod" table requires **>= 30 GB** ("the baked ComfyUI + venv +
+ *  cu128 torch + any runtime-installed nodes/caches, which are ephemeral").
+ *  We used to send 20 — matching the RunPod template's own setting, which is
+ *  ALSO below the documented floor — and the pod was created, billed, and never
+ *  came up: desiredStatus RUNNING, `runtime` null, no ports, unreachable. */
+export const RUNPOD_STOCK_CONTAINER_DISK_GB = 30;
+
+/** Container disk (GB) sent for a NON-stock template. Unchanged from the value
+ *  every deploy used before #2014 — raising it for images we did not build
+ *  would silently bill those users for disk they may not need. */
+export const RUNPOD_DEFAULT_CONTAINER_DISK_GB = 20;
+
+/** The host CUDA floor the STOCK image needs: driver >= 570 == CUDA 12.8. Set
+ *  by docker/runpod/Dockerfile (`MIN_DRIVER_DEFAULT=570`, cu128 torch) and
+ *  enforced pod-side by docker/runpod/post_start.sh's driver preflight, which
+ *  refuses to launch and holds the pod open on an older host. */
+const STOCK_MIN_CUDA_MAJOR = 12;
+const STOCK_MIN_CUDA_MINOR = 8;
+
+/** RunPod matches `allowedCudaVersions` as an ALLOW-LIST of exact "major.minor"
+ *  strings against the host's CUDA version — there is no ">=" form and no way
+ *  to enumerate what the fleet reports (GraphQL introspection is disabled;
+ *  Query/GpuType/PodMachineInfo expose no CUDA field). So the list is GENERATED
+ *  from the floor rather than pinned to the versions that happen to exist today.
+ *
+ *  Why generate past 13.x: an OVER-NARROW list is the dangerous direction. Too
+ *  broad reproduces #2016 (a pod on an incompatible host); too narrow matches
+ *  NO host, every GPU/cloud slot comes back "no capacity", and one-tap deploy
+ *  stops working entirely the day RunPod's fleet moves to a CUDA we did not
+ *  foresee. Version strings that do not exist are inert, not an error — probed
+ *  against the live schema, `allowedCudaVersions` is a free-form [String] that
+ *  accepts "banana" without complaint, and an unmatched entry simply never
+ *  selects a host. Padding forward therefore costs nothing and buys durability. */
+const CUDA_ALLOWLIST_MAX_MAJOR = 14;
+function cudaVersionsAtLeast(minMajor: number, minMinor: number): string[] {
+  const out: string[] = [];
+  for (let major = minMajor; major <= CUDA_ALLOWLIST_MAX_MAJOR; major++) {
+    // CUDA has never shipped a minor above 9 (12.0-12.9, then 13.0).
+    for (let minor = major === minMajor ? minMinor : 0; minor <= 9; minor++) out.push(`${major}.${minor}`);
+  }
+  return out;
+}
+
+/** Host CUDA versions a STOCK-template deploy will accept (>= 12.8). */
+export const RUNPOD_STOCK_ALLOWED_CUDA_VERSIONS: string[] = cudaVersionsAtLeast(
+  STOCK_MIN_CUDA_MAJOR,
+  STOCK_MIN_CUDA_MINOR,
+);
+
+/** What a CONSOLE deploy must set BY HAND, for anywhere we hand out
+ *  runpodDeployLink() (codex gate, #2014/#2016).
+ *
+ *  createPod sends both floors on the API path, but the console path does not
+ *  go through createPod: the user fills RunPod's own deploy form, seeded by the
+ *  template — and the template itself is still registered at containerDiskInGb
+ *  20 with no CUDA constraint, so following the link with its defaults
+ *  reproduces BOTH defects on a pod the user pays for. RunPod documents no
+ *  query parameters that would let the link carry overrides, and the template
+ *  lives on the RunPod account rather than in this repo, so the only thing that
+ *  closes the gap from here is saying so. Built from the SAME constants the API
+ *  path sends, so the advice can never drift from the behaviour. */
+export function runpodDeployRequirements(): string {
+  // Scoped to the stock template exactly like the API-path defaults are: the
+  // link carries RUNPOD_TEMPLATE_ID, and if that points at someone else's
+  // image these are not our floors to state. Empty string = nothing to add;
+  // callers must not render a stray blank block for it.
+  if (RUNPOD_TEMPLATE_ID !== DEFAULT_TEMPLATE_ID) return "";
+  return (
+    `Two settings on that page are NOT optional for this image — the template's own defaults ` +
+    `are below both, and a pod that misses either boots into an unusable state you still pay for:\n` +
+    `  • Container disk: at least ${RUNPOD_STOCK_CONTAINER_DISK_GB} GB (the template still defaults to ` +
+    `${RUNPOD_DEFAULT_CONTAINER_DISK_GB} GB).\n` +
+    `  • CUDA version: ${RUNPOD_STOCK_ALLOWED_CUDA_VERSIONS[0]} or newer — filter by "CUDA Version" on the ` +
+    `deploy screen. The image is a cu128 build and refuses to start on an older host.`
+  );
+}
+
+/** Escape hatch for a fleet whose CUDA strings we guessed wrong, and the only
+ *  way to widen/narrow the filter without a code change. Comma-separated
+ *  ("12.8,12.9"); set it EMPTY to send no filter at all. Unset = use the
+ *  stock default above (and no filter for a custom template). An explicit
+ *  value applies to custom templates too — the user is asserting it. */
+export const RUNPOD_ALLOWED_CUDA_VERSIONS: string[] | undefined =
+  process.env.RUNPOD_ALLOWED_CUDA_VERSIONS === undefined
+    ? undefined
+    : process.env.RUNPOD_ALLOWED_CUDA_VERSIONS.split(",").map((s) => s.trim()).filter(Boolean);
+
 export interface RunpodCreateOptions {
   /** GPU types to try in order (default RUNPOD_DEFAULT_GPU_TYPES). */
   gpuTypeIds?: string[];
@@ -353,8 +467,15 @@ export interface RunpodCreateOptions {
   cloudType?: "COMMUNITY" | "SECURE";
   name?: string; // default "comfyui-mcp"
   templateId?: string; // default RUNPOD_TEMPLATE_ID (our image)
-  containerDiskInGb?: number; // default 20 (matches our template)
-  volumeInGb?: number; // default 60 (matches our template; /workspace)
+  /** default RUNPOD_STOCK_CONTAINER_DISK_GB (30) on the stock template — the
+   *  floor docker/runpod/README.md documents — and 20 on a custom template. */
+  containerDiskInGb?: number;
+  volumeInGb?: number; // default 60 (/workspace; README states no minimum — "size for your models")
+  /** Host CUDA versions RunPod may schedule this pod onto. Defaults to
+   *  RUNPOD_STOCK_ALLOWED_CUDA_VERSIONS on the stock template (whose image
+   *  needs CUDA >= 12.8) and to NO filter on a custom template. Pass `[]` to
+   *  send no filter. Create-only: RunPod's podResume takes no CUDA field. */
+  allowedCudaVersions?: string[];
   /** SSH public key injected as PUBLIC_KEY (trainer drives the pod over ssh). */
   publicKey?: string;
   /** Arm the pod-side dead-man watchdog (default RUNPOD_DEADMAN_DEFAULT): adds
@@ -363,6 +484,29 @@ export interface RunpodCreateOptions {
    *  it. The stop is authorized by RunPod's auto-injected POD-SCOPED key — the
    *  owner's account key is never added to the pod env. */
   deadman?: boolean;
+}
+
+/** Which template a deploy targets — the stock-only defaults key off this. */
+function targetTemplateId(opts: RunpodCreateOptions): string {
+  return opts.templateId ?? RUNPOD_TEMPLATE_ID;
+}
+
+/** Container disk (GB) this deploy will request (#2014). ONE source of truth:
+ *  deployOnce sends it and the tests assert against it. */
+function effectiveContainerDiskGb(opts: RunpodCreateOptions): number {
+  if (opts.containerDiskInGb !== undefined) return opts.containerDiskInGb;
+  return targetTemplateId(opts) === DEFAULT_TEMPLATE_ID
+    ? RUNPOD_STOCK_CONTAINER_DISK_GB
+    : RUNPOD_DEFAULT_CONTAINER_DISK_GB;
+}
+
+/** The CUDA allow-list this deploy will send, or undefined/[] for no filter
+ *  (#2016). ONE source of truth: deployOnce sends it AND createPod's
+ *  everything-failed error explains it, so the two can never disagree. */
+function effectiveAllowedCudaVersions(opts: RunpodCreateOptions): string[] | undefined {
+  if (opts.allowedCudaVersions !== undefined) return opts.allowedCudaVersions;
+  if (RUNPOD_ALLOWED_CUDA_VERSIONS !== undefined) return RUNPOD_ALLOWED_CUDA_VERSIONS;
+  return targetTemplateId(opts) === DEFAULT_TEMPLATE_ID ? RUNPOD_STOCK_ALLOWED_CUDA_VERSIONS : undefined;
 }
 
 async function deployOnce(
@@ -378,6 +522,8 @@ async function deployOnce(
   // Overrides need an explicit deadman:true — the caller is asserting their
   // image ships the watchdog.
   const deadman = opts.deadman ?? (templateId === DEFAULT_TEMPLATE_ID && RUNPOD_DEADMAN_DEFAULT);
+  const containerDiskInGb = effectiveContainerDiskGb(opts);
+  const allowedCudaVersions = effectiveAllowedCudaVersions(opts);
   const data = await runpodGql<{ podFindAndDeployOnDemand: RunpodPod | null }>(
     `mutation Deploy($input: PodFindAndDeployOnDemandInput!) {
        podFindAndDeployOnDemand(input: $input) {
@@ -391,9 +537,13 @@ async function deployOnce(
         gpuTypeId,
         templateId,
         name: podName,
-        containerDiskInGb: opts.containerDiskInGb ?? 20,
+        containerDiskInGb,
         volumeInGb: opts.volumeInGb ?? 60,
         volumeMountPath: "/workspace",
+        // Keep RunPod off hosts the image cannot run on (#2016). Omitted
+        // entirely when empty — sending `allowedCudaVersions: []` would match
+        // no host and make the pod unschedulable.
+        ...(allowedCudaVersions?.length ? { allowedCudaVersions } : {}),
         // Guarantee ComfyUI is reachable through RunPod's HTTP proxy even if
         // the template's port config drifts — AND expose ssh (22/tcp) so the
         // pod-native trainer can drive ai-toolkit over it (codex finding:
@@ -594,10 +744,20 @@ export async function createPod(opts: RunpodCreateOptions = {}): Promise<RunpodP
       }
     }
   }
+  // Name the CUDA filter when one was applied (#2016). It restricts which hosts
+  // can match, so "no capacity everywhere" has a second possible cause now — and
+  // an unschedulable pod would otherwise look exactly like a capacity crunch.
+  const cuda = effectiveAllowedCudaVersions(opts);
+  const cudaNote = cuda?.length
+    ? `\nThis deploy also required host CUDA ${cuda[0]}+ (allowedCudaVersions), which our image needs — ` +
+      `if RunPod reports a CUDA version outside [${cuda.join(", ")}], set RUNPOD_ALLOWED_CUDA_VERSIONS ` +
+      `to the versions your fleet offers (empty to send no filter).`
+    : "";
   throw new Error(
     `Could not deploy a pod on any of [${gpuTypeIds.join(", ")}] in ${cloudTypes.join("/")}. RunPod reported:\n` +
       attempts.map((a) => `  • ${a}`).join("\n") +
       `\nTry again shortly (capacity fluctuates), set RUNPOD_GPU_TYPES to other GPUs, ` +
-      `or deploy from the console with runpod action:"deploy_link".`,
+      `or deploy from the console with runpod action:"deploy_link".` +
+      cudaNote,
   );
 }

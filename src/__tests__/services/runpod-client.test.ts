@@ -1,6 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { readFile, readdir } from "node:fs/promises";
 import {
   createPod,
+  resumePod,
+  RUNPOD_STOCK_CONTAINER_DISK_GB,
+  RUNPOD_STOCK_ALLOWED_CUDA_VERSIONS,
+  runpodDeployRequirements,
   getPod,
   isProvablyNotCreatedError,
   runpodDeployLink,
@@ -411,5 +416,206 @@ describe("deadman switch (#269)", () => {
     }) as unknown as typeof fetch;
     await expect(beatDeadman({ id: "abc123", name: "dm-pod" })).resolves.toBe(false);
     await expect(beatDeadman({ id: "abc123", name: null })).resolves.toBe(false);
+  });
+});
+
+// ── #2014 / #2016 — the stock image's deploy floors ──────────────────────────
+// Both defects shipped a pod that RunPod created and BILLED and that never
+// became usable (desiredStatus RUNNING, `runtime` null, no ports). They are
+// independent — an undersized container disk and an unconstrained CUDA host —
+// so they keep independent tests.
+const deployInputs = (fetchMock: ReturnType<typeof vi.fn>) =>
+  fetchMock.mock.calls
+    .map((c) => JSON.parse((c[1] as { body: string }).body))
+    .filter((b) => b.query.includes("podFindAndDeployOnDemand"))
+    .map((b) => b.variables.input as Record<string, unknown>);
+const firstDeployInput = (fetchMock: ReturnType<typeof vi.fn>) => deployInputs(fetchMock)[0];
+
+describe("#2014 — stock deploys get the container disk the image documents", () => {
+  it("sends 30 GB on the stock template (docker/runpod/README.md requires >= 30 GB)", async () => {
+    const { fetchMock } = mockGql((b) => (b.query.includes("myself") ? emptyList : deployed("pod1")));
+    await createPod({ gpuTypeIds: ["GPU-A"], name: "disk-stock" });
+    // The literal floor, NOT a value recomputed from the code under test — an
+    // assertion derived from the constant would move with a mutation of it.
+    expect(firstDeployInput(fetchMock).containerDiskInGb).toBe(30);
+    expect(RUNPOD_STOCK_CONTAINER_DISK_GB).toBe(30);
+  });
+
+  it("leaves a CUSTOM template on the pre-#2014 default — we cannot size an image we did not build", async () => {
+    const { fetchMock } = mockGql((b) => (b.query.includes("myself") ? emptyList : deployed("pod1")));
+    await createPod({ gpuTypeIds: ["GPU-A"], name: "disk-custom", templateId: "some-other-template" });
+    expect(firstDeployInput(fetchMock).containerDiskInGb).toBe(20);
+  });
+
+  it("an explicit containerDiskInGb still wins on the stock template", async () => {
+    const { fetchMock } = mockGql((b) => (b.query.includes("myself") ? emptyList : deployed("pod1")));
+    await createPod({ gpuTypeIds: ["GPU-A"], name: "disk-explicit", containerDiskInGb: 50 });
+    expect(firstDeployInput(fetchMock).containerDiskInGb).toBe(50);
+  });
+});
+
+describe("#2016 — stock deploys pin the host CUDA version", () => {
+  it("sends allowedCudaVersions covering 12.8+ and NOTHING below the image's floor", async () => {
+    const { fetchMock } = mockGql((b) => (b.query.includes("myself") ? emptyList : deployed("pod1")));
+    await createPod({ gpuTypeIds: ["GPU-A"], name: "cuda-stock" });
+    const sent = firstDeployInput(fetchMock).allowedCudaVersions as string[];
+    expect(sent).toContain("12.8"); // driver >= 570 == CUDA 12.8 (Dockerfile MIN_DRIVER_DEFAULT)
+    // The incident host was CUDA 12.6; every version below the floor must be absent.
+    for (const bad of ["11.8", "12.0", "12.4", "12.6", "12.7"]) expect(sent).not.toContain(bad);
+    // Over-narrow is the dangerous direction: a list matching no host makes the
+    // pod unschedulable. Newer CUDA than we knew about at build time must pass.
+    for (const good of ["12.9", "13.0", "13.5", "14.0"]) expect(sent).toContain(good);
+  });
+
+  it("sends NO CUDA filter for a CUSTOM template — its image may need a different one", async () => {
+    const { fetchMock } = mockGql((b) => (b.query.includes("myself") ? emptyList : deployed("pod1")));
+    await createPod({ gpuTypeIds: ["GPU-A"], name: "cuda-custom", templateId: "some-other-template" });
+    expect(firstDeployInput(fetchMock)).not.toHaveProperty("allowedCudaVersions");
+  });
+
+  it("an explicit list wins, and [] OMITS the field entirely (never sends an empty allow-list)", async () => {
+    const { fetchMock } = mockGql((b) => (b.query.includes("myself") ? emptyList : deployed("pod1")));
+    await createPod({ gpuTypeIds: ["GPU-A"], name: "cuda-explicit", allowedCudaVersions: ["12.8", "12.9"] });
+    expect(firstDeployInput(fetchMock).allowedCudaVersions).toEqual(["12.8", "12.9"]);
+
+    const { fetchMock: fm2 } = mockGql((b) => (b.query.includes("myself") ? emptyList : deployed("pod2")));
+    await createPod({ gpuTypeIds: ["GPU-A"], name: "cuda-none", allowedCudaVersions: [] });
+    // `allowedCudaVersions: []` would match NO host — worse than no filter.
+    expect(firstDeployInput(fm2)).not.toHaveProperty("allowedCudaVersions");
+  });
+
+  it("RUNPOD_ALLOWED_CUDA_VERSIONS overrides the built-in list (escape hatch for a fleet we guessed wrong)", async () => {
+    vi.resetModules();
+    process.env.RUNPOD_ALLOWED_CUDA_VERSIONS = "12.8, 12.9";
+    try {
+      const mod = await import("../../services/runpod-client.js");
+      const { fetchMock } = mockGql((b) => (b.query.includes("myself") ? emptyList : deployed("pod1")));
+      await mod.createPod({ gpuTypeIds: ["GPU-A"], name: "cuda-env" });
+      expect(firstDeployInput(fetchMock).allowedCudaVersions).toEqual(["12.8", "12.9"]);
+    } finally {
+      delete process.env.RUNPOD_ALLOWED_CUDA_VERSIONS;
+      vi.resetModules();
+    }
+  });
+
+  it("an EMPTY RUNPOD_ALLOWED_CUDA_VERSIONS disables the filter (opt out without editing code)", async () => {
+    vi.resetModules();
+    process.env.RUNPOD_ALLOWED_CUDA_VERSIONS = "";
+    try {
+      const mod = await import("../../services/runpod-client.js");
+      const { fetchMock } = mockGql((b) => (b.query.includes("myself") ? emptyList : deployed("pod1")));
+      await mod.createPod({ gpuTypeIds: ["GPU-A"], name: "cuda-env-off" });
+      expect(firstDeployInput(fetchMock)).not.toHaveProperty("allowedCudaVersions");
+    } finally {
+      delete process.env.RUNPOD_ALLOWED_CUDA_VERSIONS;
+      vi.resetModules();
+    }
+  });
+
+  it("names the CUDA filter when every slot came back empty (unschedulable is not a capacity crunch)", async () => {
+    mockGql((b) => (b.query.includes("myself") ? emptyList : { errors: [{ message: "no capacity" }] }));
+    await expect(createPod({ gpuTypeIds: ["GPU-A"], name: "cuda-starved" })).rejects.toThrow(
+      /RUNPOD_ALLOWED_CUDA_VERSIONS/,
+    );
+  });
+
+  it("sends NO CUDA filter on resume — PodResumeInput has no such field (#2016)", async () => {
+    // Probed against the live api.runpod.io schema on 2026-08-21 (wrong-typed
+    // podId, so coercion failed and the resolver never ran): every candidate
+    // name — allowedCudaVersions, cudaVersion, cudaVersions, allowedCudaVersion,
+    // minCudaVersion — came back `is not defined by type "PodResumeInput"`,
+    // while the known field gpuCount drew no such error. runpod-python agrees.
+    // docs.runpod.io shows a podResume example WITH allowedCudaVersions; that
+    // example is wrong, and adopting it turns every runpod action:"start" into
+    // a GraphQL validation failure. This test is the guard against that.
+    const { fetchMock } = mockGql(() => ({ data: { podResume: { id: "pod1", desiredStatus: "RUNNING" } } }));
+    await resumePod("pod1", 1);
+    const input = JSON.parse((fetchMock.mock.calls[0][1] as { body: string }).body).variables.input;
+    expect(input).toEqual({ podId: "pod1", gpuCount: 1 });
+    for (const k of Object.keys(input)) expect(k.toLowerCase()).not.toContain("cuda");
+  });
+});
+
+describe("#2014/#2016 wiring — EVERY deploy attempt adopts the floors, not just the first", () => {
+  it("applies both floors on every GPU x cloud slot the fallback loop tries", async () => {
+    // The fallback loop calls deployOnce once per (cloudType x gpuType). A fix
+    // applied at one call site only would pass a spot-check of attempt #1 and
+    // still ship an undersized/unconstrained pod on the slot that wins.
+    const gpuTypeIds = ["GPU-A", "GPU-B", "GPU-C"];
+    const { fetchMock } = mockGql((b) =>
+      b.query.includes("myself") ? emptyList : { errors: [{ message: "no capacity" }] },
+    );
+    await expect(createPod({ gpuTypeIds, name: "wiring" })).rejects.toThrow();
+    const inputs = deployInputs(fetchMock);
+    // 3 GPU types x 2 cloud types — count the ADOPTING sites, never spot-check one.
+    expect(inputs).toHaveLength(gpuTypeIds.length * 2);
+    const adoptingDisk = inputs.filter((i) => i.containerDiskInGb === 30);
+    const adoptingCuda = inputs.filter((i) => (i.allowedCudaVersions as string[] | undefined)?.includes("12.8"));
+    expect(adoptingDisk).toHaveLength(inputs.length);
+    expect(adoptingCuda).toHaveLength(inputs.length);
+  });
+
+  it("only ONE code path issues podFindAndDeployOnDemand — a second must be wired too", async () => {
+    // Behavioural coverage above rides on createPod being the sole deploy path.
+    // If someone adds another, this fails and forces them to extend that test
+    // rather than silently shipping a deploy that skips both floors.
+    const src = await readFile(new URL("../../services/runpod-client.ts", import.meta.url), "utf8");
+    const deployMutations = src.match(/podFindAndDeployOnDemand\s*\(/g) ?? [];
+    expect(deployMutations).toHaveLength(1);
+  });
+});
+
+describe("#2014/#2016 — the CONSOLE deploy path states the floors it cannot enforce", () => {
+  it("names BOTH floors, derived from the same constants the API path sends", () => {
+    const req = runpodDeployRequirements();
+    // Disk: the README floor, and the 20 GB the template still defaults to, so
+    // a user who reads only this knows what to change and from what.
+    expect(req).toContain("30 GB");
+    expect(req).toContain("20 GB");
+    // CUDA: the image's floor, and the console control that applies it.
+    expect(req).toContain("12.8");
+    expect(req).toMatch(/CUDA/i);
+    // It must read as REQUIRED, not as a tip — the pod is billed either way.
+    expect(req).toMatch(/not optional|at least/i);
+  });
+
+  it("stays in step with the API path — the advice cannot drift from the behaviour", () => {
+    const req = runpodDeployRequirements();
+    expect(req).toContain(`${RUNPOD_STOCK_CONTAINER_DISK_GB} GB`);
+    expect(req).toContain(RUNPOD_STOCK_ALLOWED_CUDA_VERSIONS[0]);
+  });
+
+  it("says NOTHING when the link points at a CUSTOM template — not our floors to state", async () => {
+    // runpodDeployLink() carries RUNPOD_TEMPLATE_ID. If the user repointed it,
+    // the console form is seeded by THEIR image and our 30 GB / CUDA 12.8 would
+    // be wrong advice — the same scoping the API-path defaults use.
+    vi.resetModules();
+    const saved = process.env.RUNPOD_TEMPLATE_ID;
+    process.env.RUNPOD_TEMPLATE_ID = "someone-elses-template";
+    try {
+      const mod = await import("../../services/runpod-client.js");
+      expect(mod.runpodDeployRequirements()).toBe("");
+    } finally {
+      if (saved === undefined) delete process.env.RUNPOD_TEMPLATE_ID;
+      else process.env.RUNPOD_TEMPLATE_ID = saved;
+      vi.resetModules();
+    }
+  });
+
+  it("every site that hands out the deploy LINK also hands out the REQUIREMENTS", async () => {
+    // Count the adopting call sites rather than spot-checking deploy_link: a
+    // second place that surfaces the link (an empty-account hint, an error
+    // path) would otherwise send a user to the console with no floors named.
+    const dir = new URL("../../tools/", import.meta.url);
+    const files = (await readdir(dir)).filter((f) => f.endsWith(".ts"));
+    let links = 0;
+    let requirements = 0;
+    for (const f of files) {
+      const src = await readFile(new URL(f, dir), "utf8");
+      links += (src.match(/runpodDeployLink\(\)/g) ?? []).length;
+      requirements += (src.match(/runpodDeployRequirements\(\)/g) ?? []).length;
+    }
+    expect(links).toBeGreaterThan(0);
+    expect(requirements).toBe(links);
   });
 });
