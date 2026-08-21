@@ -3200,6 +3200,12 @@ export async function runPanelOrchestrator(): Promise<void> {
       backendForTab,
       backendOfKey: backendOf,
       info: (msg) => logger.info(msg),
+      // panel#1557 — a unique-canvas reconnect that hello'd without `backend`
+      // joined the default conversation; claiming puts it on this one so the
+      // pin we just wrote is not immediately invalidated at resolution.
+      claimTab: (tab, backend) => {
+        tabBackends.set(tab, backend);
+      },
     }),
   );
   // #884 P1 (confirming gate 2) — a hello whose `backend` is absent or unknown

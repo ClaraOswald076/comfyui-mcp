@@ -9244,6 +9244,14 @@ export interface PanelToolCtx {
     scopeRecoveryConsent?: boolean;
   }) => { previous: string; current: string; rebound: boolean; repinRefusal?: string };
   /**
+   * panel#1557 — set by `panel_set_workflow_target({mode:"current"})` when a
+   * SCOPE-bound recovery DEFERS because nothing is connected yet. The next
+   * graph call's `ensureReachable` consumes this as the same explicit consent,
+   * so a tab that reconnects a moment later is bound instead of staying fenced
+   * to the previous (dead) workflow instance.
+   */
+  pendingScopeRecoveryConsent?: boolean;
+  /**
    * Best-effort in-place self-heal for the handful of tools that call the bridge
    * DIRECTLY (not via `ctx.call`) — e.g. panel_request_adult_consent's ask_user
    * (#372) and the live-canvas graph_serialize. Silently rebinds an orphaned,
@@ -9367,7 +9375,23 @@ export function makePanelToolCtx(
     // pinned tab is gone the resolution THROWS loudly by design. Silently
     // picking another tab here would be exactly the mid-turn re-target the pin
     // forbids — and it would PERMANENTLY unbind this shared ctx.
-    if (isScopeAddress(ctx.tabId)) return;
+    //
+    // panel#1557 — the one exception is a STILL-VALID explicit mode:"current"
+    // consent that DEFERRED because nothing was connected yet. Consuming it
+    // here is the same recovery, just delayed until a canvas tab exists; it is
+    // not a silent re-target.
+    if (isScopeAddress(ctx.tabId)) {
+      if (ctx.pendingScopeRecoveryConsent) {
+        try {
+          const out = rebindToActiveTab({ scopeRecoveryConsent: true });
+          if (out.rebound) ctx.pendingScopeRecoveryConsent = false;
+          else if ((interactiveTabIds() ?? []).length > 0) ctx.pendingScopeRecoveryConsent = false;
+        } catch {
+          // still nothing bindable — keep the consent for the next attempt
+        }
+      }
+      return;
+    }
     if (typeof bridge.canReach !== "function") return; // lightweight test ctx
     if (bridge.canReach(ctx.tabId)) return; // healthy binding — leave untouched
     if (workflowTargets?.get(ctx.tabId)?.mode === "pinned") return; // stay strict
@@ -10566,6 +10590,17 @@ export function makePanelToolCtx(
       const repinned = typeof outcome === "string" ? outcome : undefined;
       const repinRefusal =
         outcome && typeof outcome === "object" ? outcome.reason : undefined;
+      // panel#1557 — a scope ctx used to RETURN the zero-tab refusal, so the
+      // #474 catch never fired and mode:"current" failed as a backend-mismatch
+      // instead of deferring. Throw the same "nothing connected" error the
+      // real-tab path throws so the documented recovery can DEFER and bind
+      // onto the first canvas that reconnects.
+      if (!repinned) {
+        const eligible = interactiveTabIds();
+        if (eligible && eligible.length === 0) {
+          throw new Error("Panel not reachable: no panel connected");
+        }
+      }
       return {
         previous,
         current: previous,
@@ -14936,11 +14971,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               // — the only caller that may escape a DEAD scope pin (a healthy pin
               // still stays put; see rebindToActiveTab's double gate).
               const rebind = ctx.rebindToActiveTab!({ scopeRecoveryConsent: true });
-              // #1077 Finding 2 — a scope repin that declined now says WHY.
-              if (rebind?.repinRefusal && !/pin was NOT moved/.test(rebindNote)) {
+              if (rebind?.rebound) {
+                currentModeTurnRepinned = true;
+              } else if (rebind?.repinRefusal && !/pin was NOT moved/.test(rebindNote)) {
+                // #1077 Finding 2 — a scope repin that declined now says WHY.
                 rebindNote += ` The session pin was NOT moved: ${rebind.repinRefusal}.`;
               }
-              if (rebind?.rebound) currentModeTurnRepinned = true;
             } catch (err) {
               // #474: with 2+ live tabs the rebind is AMBIGUOUS — fail so the user picks.
               // But with ZERO tabs connected (the "Connected: none" window right after a
@@ -15003,6 +15039,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           } finally {
             if (recoveringScope) ctx.bridge.endScopeRecovery?.(before);
           }
+          // panel#1557 — the consent survives a zero-tab DEFER so a graph call
+          // after the canvas reconnects can finish the recovery.
+          if (deferredBind && recoveringScope) ctx.pendingScopeRecoveryConsent = true;
           // Detect the rebind regardless of whether awaitReachable or rebindToActiveTab
           // performed it (either mutates ctx.tabId), so the note is never swallowed.
           if (!deferredBind && ctx.tabId !== before) {

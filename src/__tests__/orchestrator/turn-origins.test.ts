@@ -859,8 +859,11 @@ describe("makeScopeRepinHandler — explicit recovery gates (gate 3, P0)", () =>
       backendForTab: (tab) => tabBackends.get(tab) ?? "claude",
       backendOfKey: (key) => key.slice(key.lastIndexOf("::") + 2),
       info,
+      claimTab: (tab, backend) => {
+        tabBackends.set(tab, backend);
+      },
     });
-    return { tracker, bridge, repin, info };
+    return { tracker, tabBackends, bridge, repin, info };
   }
 
   it("REFUSES to displace a HEALTHY pin — even when another tab is last-active", async () => {
@@ -909,6 +912,18 @@ describe("makeScopeRepinHandler — explicit recovery gates (gate 3, P0)", () =>
     });
     expectDeclined(repin("orchestrator"));
     expect(tracker.pinOf(KEY)).toBeUndefined();
+  });
+
+  it("a DEAD pin adopts the unique live canvas even when hello attributed it to another backend (panel#1557)", () => {
+    const { tracker, tabBackends, repin } = makeRepinHarness({
+      tabs: [{ id: "live-tab", backend: "codex" }],
+      active: "live-tab",
+      reachable: (tab) => tab !== "tab-gone",
+    });
+    tracker.repinTo(KEY, "tab-gone");
+    expect(repin("orchestrator")).toBe("live-tab");
+    expect(tracker.pinOf(KEY)).toBe("live-tab");
+    expect(tabBackends.get("live-tab")).toBe("claude");
   });
 
   it("falls back to the backend's SOLE interactive tab when the active tab is foreign or headless", () => {
