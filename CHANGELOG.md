@@ -37,6 +37,10 @@ All notable changes to this project are documented here. This project adheres to
   The headless verdict asks about the tab the frame RESOLVES to rather than
   the address it names, so a scope-bound session (`orchestrator::<backend>`)
   sitting on a connected phone can no longer walk past it.
+  And audio is never QUEUED for an unproven client: show_media is the only
+  mailboxable command, so an unroutable frame is buffered and replayed on the
+  next hello rather than refused — which for a scope address means whichever
+  client connects first, phone included.
 
 - **Ollama refuses audio unless the model is a verified listener (#1972).** Native
   `/api/chat` carries audio in `message.images[]`. Most models HTTP 400 (fail
