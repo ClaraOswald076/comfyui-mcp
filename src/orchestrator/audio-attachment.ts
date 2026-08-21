@@ -173,6 +173,7 @@ export const MAX_AUDIO_BYTES = 24 * 1024 * 1024;
 export type AudioRefusalReason =
   | "backend-has-no-audio-part"
   | "model-lacks-audio-capability"
+  | "model-not-verified-audio"
   | "unsupported-format"
   | "empty-file"
   | "too-large"
@@ -279,8 +280,35 @@ export function audioUserNotice(
 /** Audio-capable local models we have a concrete, checkable pull command for.
  *  Ollama's own release integration tests pin these as the audio-tested set
  *  (integration/reg_release_test.go: releaseAudioModels), which is why they are
- *  named here rather than a general "try a multimodal model" hand-wave. */
+ *  named here rather than a general "try a multimodal model" hand-wave.
+ *
+ *  This is also the native-Ollama SEND allowlist (#1972). `/api/show` reporting
+ *  `audio` is an architecture flag, not a guarantee these weights can hear: a
+ *  namespaced Gemma 4 fork accepts a WAV in `message.images[]` and returns a
+ *  fluent fabricated transcript. Only these tags may ride that carrier. */
 export const AUDIO_CAPABLE_OLLAMA_MODELS = ["gemma4:e2b", "gemma4:e4b", "nemotron3:33b"] as const;
+
+function normalizeOllamaAudioModelId(model: string): string {
+  let s = model.trim().toLowerCase();
+  if (s.startsWith("library/")) s = s.slice("library/".length);
+  return s;
+}
+
+/**
+ * True when `model` is one of the Ollama tags we have actually verified can
+ * hear — not merely a tag whose architecture reports an `audio` capability.
+ *
+ * Native Ollama has no separate audio field; bytes ride `message.images[]`.
+ * "The endpoint took it" is therefore not "the model heard it" (#1972).
+ * A user/org namespace is a different weight set even when `/api/show`
+ * inherits the flag, so `library/` is the only prefix that still matches.
+ */
+export function isKnownAudioCapableOllamaModel(model: string): boolean {
+  const normalized = normalizeOllamaAudioModelId(model);
+  return (AUDIO_CAPABLE_OLLAMA_MODELS as readonly string[]).some(
+    (known) => normalizeOllamaAudioModelId(known) === normalized,
+  );
+}
 
 /** Refusal text: this backend has no audio content part at all. Names the
  *  providers that DO, so the remedy is reachable from where the user is. */
@@ -306,6 +334,23 @@ export function modelLacksAudioText(model: string, capabilities: string[], filen
     `I can't send ${filename} to ${model}: the server reports its capabilities as [${caps}] — no audio. ` +
     `Pull a model that can hear and select it, e.g. \`ollama pull ${AUDIO_CAPABLE_OLLAMA_MODELS[0]}\` ` +
     `(others: ${AUDIO_CAPABLE_OLLAMA_MODELS.slice(1).join(", ")}). Until then I have not heard this file ` +
+    `and won't pretend otherwise.`
+  );
+}
+
+/** Refusal text: native Ollama would put audio in the image slot, and this
+ *  model is not one we have verified can hear.
+ *
+ *  Distinct from `modelLacksAudioText`: the server may well list an `audio`
+ *  capability (architecture flag) even when the weights invent a transcript.
+ *  Quoting that flag as "no audio" would be a lie; this names the actual
+ *  reason we are not sending. */
+export function modelNotVerifiedAudioText(model: string, filename: string): string {
+  return (
+    `I can't send ${filename} to ${model}: native Ollama carries audio in the image slot, and a model ` +
+    `that merely ACCEPTS that payload can still invent a transcript. ${model} is not in the verified-audio ` +
+    `set, so I am not sending the bytes. Pull a model that can hear, e.g. \`ollama pull ${AUDIO_CAPABLE_OLLAMA_MODELS[0]}\` ` +
+    `(others: ${AUDIO_CAPABLE_OLLAMA_MODELS.slice(1).join(", ")}), and re-send. Until then I have not heard this file ` +
     `and won't pretend otherwise.`
   );
 }

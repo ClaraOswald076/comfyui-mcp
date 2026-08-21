@@ -50,6 +50,12 @@ Connect. `:e4b` is the built-in default — zero further config once pulled.
   agent generates and edits workflows fine but can't visually critique its
   own outputs. Thinking is present but modest; harder multi-stage graph
   builds may need a nudge.
+- **Audio:** these fine-tunes cannot hear. Native Ollama puts audio in the
+  image slot; a namespaced Gemma 4 fork (e.g. `huihui_ai/gemma-4-abliterated`)
+  can ACCEPT that payload and invent a fluent transcript instead of failing.
+  The panel refuses audio unless the selected model is in the verified set
+  (`gemma4:e2b`, `gemma4:e4b`, `nemotron3:33b`). Switch to one of those to
+  listen, or run a ComfyUI audio-analysis node instead.
 - First request after connect is slow (cold model load, 30s+). That's normal.
 - For non-panel MCP harnesses (Hermes, OpenClaw, any Ollama-speaking client),
   pair these models with **compact tool mode** (`--compact`) — full docs:
@@ -59,3 +65,4 @@ Connect. `:e4b` is the built-in default — zero further config once pulled.
 
 - **Official:** https://ollama.com/download and https://comfyui-mcp.artokun.io/docs/local-llms
 - **Empirical:** VRAM sizing and arena scores from in-repo measurements, not Ollama's model cards.
+  Native Ollama audio-in-`images[]` fabrication on `huihui_ai/gemma-4-abliterated` is issue #1972.

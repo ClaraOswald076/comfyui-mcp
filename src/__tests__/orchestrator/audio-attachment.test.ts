@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  AUDIO_CAPABLE_OLLAMA_MODELS,
   AUDIO_MIME_BY_EXT,
   MAX_AUDIO_BYTES,
   audioMimeForFilename,
@@ -7,8 +8,10 @@ import {
   audioUserNotice,
   fetchAudioAttachment,
   isDeliverableAudioMime,
+  isKnownAudioCapableOllamaModel,
   looksLikeAudioFilename,
   modelLacksAudioText,
+  modelNotVerifiedAudioText,
   noAudioPartText,
   openAiAudioFormat,
   dedupeAudioRefs,
@@ -54,6 +57,24 @@ describe("audio mime classification", () => {
     expect(openAiAudioFormat("audio/mpeg")).toBe("mp3");
     expect(openAiAudioFormat("audio/flac")).toBe("flac");
     expect(openAiAudioFormat("audio/mp4")).toBe("m4a");
+  });
+});
+
+describe("isKnownAudioCapableOllamaModel — native images[] allowlist", () => {
+  it("accepts every tag in the verified set, and the official library/ prefix", () => {
+    for (const model of AUDIO_CAPABLE_OLLAMA_MODELS) {
+      expect(isKnownAudioCapableOllamaModel(model)).toBe(true);
+      expect(isKnownAudioCapableOllamaModel(`library/${model}`)).toBe(true);
+      expect(isKnownAudioCapableOllamaModel(model.toUpperCase())).toBe(true);
+    }
+  });
+
+  it("rejects the #1972 fabrication model even though it is a Gemma 4 fork", () => {
+    expect(isKnownAudioCapableOllamaModel("huihui_ai/gemma-4-abliterated:E4b-qat")).toBe(false);
+  });
+
+  it("rejects the default fine-tune — that tag HTTP 400s on audio in images[]", () => {
+    expect(isKnownAudioCapableOllamaModel("artokun/gemma4-comfyui-mcp:e4b")).toBe(false);
   });
 });
 
@@ -134,6 +155,19 @@ describe("refusal texts name a remedy", () => {
     expect(t).toContain("qwen3:4b");
     expect(t).toContain("completion, tools");
     expect(t).toContain("ollama pull");
+  });
+
+  it("an unverified native model names the image-slot risk AND a pull command, without claiming the server said no audio", () => {
+    // #1972: /api/show may list `audio` (architecture) while the weights invent
+    // a transcript. The refusal must not quote a "no audio" verdict we did not
+    // get; it must name the verified set the user can switch to.
+    const t = modelNotVerifiedAudioText("huihui_ai/gemma-4-abliterated:E4b-qat", "song.wav");
+    expect(t).toContain("huihui_ai/gemma-4-abliterated:E4b-qat");
+    expect(t).toContain("song.wav");
+    expect(t).toContain("invent a transcript");
+    expect(t).toContain("ollama pull");
+    expect(t).not.toContain("no audio");
+    for (const known of AUDIO_CAPABLE_OLLAMA_MODELS) expect(t).toContain(known);
   });
 
   it("an unsupported format lists the formats that would work", () => {

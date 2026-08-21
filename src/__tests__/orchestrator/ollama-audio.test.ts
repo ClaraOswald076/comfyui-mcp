@@ -263,6 +263,95 @@ describe("#790 — a MODEL that cannot take audio", () => {
   });
 });
 
+describe("#1972 — a model that ACCEPTS audio in images[] is not a model that can hear", () => {
+  function viewFetches(): number {
+    return fetchMock.mock.calls.filter((c) => String(c[0]).includes("/view?")).length;
+  }
+
+  it("REFUSES gemma-4-abliterated even when /api/show lists audio, and never puts bytes on images[]", async () => {
+    // Live: this tag returns HTTP 200 plus a fluent fabricated transcript that
+    // changes every run. The architecture flag is not a hearing guarantee, so
+    // native Ollama must fail closed rather than ship a WAV in the image slot.
+    showCapabilities = ["completion", "vision", "audio", "tools", "thinking"];
+    const model = "huihui_ai/gemma-4-abliterated:E4b-qat";
+    const events = await collect(nativeBackend(model), turnsOf(AUDIO_TURN));
+    const said = assistantText(events);
+    expect(said).toContain(model);
+    expect(said).toContain("invent a transcript");
+    expect(said).toContain("ollama pull");
+    expect(said).not.toContain("cannot confirm");
+    const user = (chatRequests[0].messages as Array<Record<string, unknown>>).find((m) => m.role === "user") as {
+      images?: string[];
+      content: string;
+    };
+    expect(user.images).toBeUndefined();
+    expect(user.content).toContain("did NOT hear");
+    // Refused before fetch — we do not pull ComfyUI bytes we will not send.
+    expect(viewFetches()).toBe(0);
+  });
+
+  it("REFUSES the default fine-tune the same way — that tag HTTP 400s on the image slot", async () => {
+    showCapabilities = ["completion", "vision", "audio", "tools", "thinking"];
+    const events = await collect(nativeBackend("artokun/gemma4-comfyui-mcp:e4b"), turnsOf(AUDIO_TURN));
+    const user = (chatRequests[0].messages as Array<Record<string, unknown>>).find((m) => m.role === "user") as {
+      images?: string[];
+    };
+    expect(user.images).toBeUndefined();
+    expect(assistantText(events)).toContain("artokun/gemma4-comfyui-mcp:e4b");
+    expect(viewFetches()).toBe(0);
+  });
+
+  it("does NOT apply the allowlist on the OpenAI dialect — that path uses input_audio, not images[]", async () => {
+    const backend = new OllamaBackend({
+      api: "openai",
+      host: "http://127.0.0.1:9999/v1",
+      apiKey: "sk-test",
+      model: "huihui_ai/gemma-4-abliterated:E4b-qat",
+      comfyuiUrl: "http://127.0.0.1:8188",
+      connectToolClients: async () => ({ comfyui: fakeMcpClient() }),
+    });
+    await collect(backend, turnsOf(AUDIO_TURN));
+    const user = (openaiChatRequests[0].messages as Array<Record<string, unknown>>).find(
+      (m) => m.role === "user",
+    ) as { content: Array<{ type: string; input_audio?: { data: string; format: string } }> };
+    const audioPart = user.content.find((p) => p.type === "input_audio");
+    expect(audioPart?.input_audio).toEqual({ data: RIFF_B64, format: "wav" });
+  });
+
+  it("a live model SWITCH does not replay delivered audio into the new model's images[]", async () => {
+    // The attach-time gate only sees the turn the audio arrives on. Ollama is
+    // stateless per request, so history is re-serialized every turn and
+    // toOllamaMessages merges `audios` into `images[]` — measured: turn 2 to
+    // huihui_ai/gemma-4-abliterated:E4b-qat carried ["UklGRg=="] plus the
+    // earlier "you can hear them" note, with no new attachment anywhere in it.
+    // Reachable from panel-agent.ts setModel, which switches live and keeps
+    // history.
+    const backend = nativeBackend("gemma4:e2b"); // allowlisted: turn 1 delivers
+    await collect(backend, turnsOf(AUDIO_TURN));
+    const t1 = (chatRequests[0].messages as Array<Record<string, unknown>>).find((m) => m.role === "user") as {
+      images?: string[];
+    };
+    expect(t1.images).toEqual([RIFF_B64]); // baseline — the gate let this through
+
+    await backend.setModel("huihui_ai/gemma-4-abliterated:E4b-qat");
+    await collect(backend, turnsOf({ text: "and now?" })); // TEXT only — no new audio
+
+    const t2 = chatRequests[1];
+    expect(t2.model).toBe("huihui_ai/gemma-4-abliterated:E4b-qat");
+    const replayed = (t2.messages as Array<Record<string, unknown>>).filter((m) =>
+      Array.isArray((m as { images?: string[] }).images),
+    );
+    for (const m of replayed) expect((m as { images: string[] }).images).not.toContain(RIFF_B64);
+    // The stale "you can hear them" note is still in that message, so silence is
+    // not enough — the new model must be told the audio is NOT in its context.
+    const stale = (t2.messages as Array<Record<string, unknown>>).find((m) =>
+      String((m as { content: string }).content).includes("what do you hear?"),
+    ) as { content: string };
+    expect(stale.content).toContain("You did NOT hear this audio");
+    expect(stale.content).toContain("no longer applies");
+  });
+});
+
 describe("#790 — an UNSUPPORTED attachment type", () => {
   it("REFUSES a non-audio file and lists the formats that would work", async () => {
     const events = await collect(
@@ -515,7 +604,7 @@ describe("#790 — a later error must not fabricate a delivery failure", () => {
     // reported rather than swallowed by what the previous model accepted.
     const backend = nativeBackend();
     await collect(backend, turnsOf(AUDIO_TURN)); // gemma4:e2b accepts it
-    await backend.setModel("qwen3:4b");
+    await backend.setModel("gemma4:e4b");
     showCapabilities = "http-error"; // unverified, so delivery is attempted
     rejectNextChatWith = "unsupported media type";
     const said = assistantText(await collect(backend, turnsOf(AUDIO_TURN)));

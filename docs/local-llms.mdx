@@ -122,6 +122,15 @@ for a model that can hear — rather than being dropped into the request where
 the model would answer from your text alone. The same applies to a file that
 isn't an audio format, or that is present but zero bytes.
 
+That `/api/show` flag is not enough on its own. Native Ollama carries audio in
+`message.images[]` (the picture slot), and a model that merely **accepts** that
+payload can still invent a transcript — measured on
+`huihui_ai/gemma-4-abliterated:E4b-qat`, which returned a fluent, different
+fabrication on every run instead of HTTP 400. Audio is therefore sent only to
+the Ollama-tested tags (`gemma4:e2b`, `gemma4:e4b`, `nemotron3:33b`). A
+namespaced fork, including `artokun/gemma4-comfyui-mcp`, is refused by name
+with a pull command for a model that can hear.
+
 Delivering the bytes is not quite the whole job. Measured live against
 `gemma4:e2b`: with the WAV demonstrably in context (555 prompt tokens,
 `/api/show` reporting `audio`), the model still answered *"I do not have the

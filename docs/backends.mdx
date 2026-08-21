@@ -181,6 +181,13 @@ because a silently dropped attachment is worse than a refused one:
     /api/tags` also returns a `capabilities` array and is **not** the same
     answer — the same model reported no audio there and audio from `/api/show`
     — so only `/api/show` is consulted.
+  - **The `audio` flag is not a hearing guarantee.** It is inherited from the
+    architecture. A namespaced Gemma 4 fork can list `audio`, accept a WAV in
+    `images[]` with HTTP 200, and return a fluent fabricated transcript
+    (`huihui_ai/gemma-4-abliterated:E4b-qat`, #1972). Native Ollama therefore
+    also requires the model tag to be one of the Ollama-tested set above;
+    anything else — including `artokun/gemma4-comfyui-mcp` — is refused before
+    bytes hit the image slot.
   - The capability is re-checked on every turn that carries audio, because an
     Ollama tag is mutable: `ollama pull` can replace the weights under the same
     name, and a cached verdict could outlive the model it described.
