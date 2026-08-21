@@ -2507,7 +2507,13 @@ function managerEnqueueRefusal(err: unknown): number | undefined {
  * `detectLocalWriteTargetMismatch` only ever reports a mismatch for a base
  * nobody named for this session.
  */
-function wrongInstallRefusal(m: LocalWriteTargetMismatch, what: string): string {
+function wrongInstallRefusal(
+  m: LocalWriteTargetMismatch,
+  what: string,
+  /** The target CAPTURED for this operation — not `getComfyUIBaseUrl()` read at
+   *  throw time, which a panel retarget mid-call would have already moved. */
+  target: string,
+): string {
   const chosenBy =
     m.baseSource === "comfyui-path"
       ? "COMFYUI_PATH"
@@ -2520,7 +2526,7 @@ function wrongInstallRefusal(m: LocalWriteTargetMismatch, what: string): string 
       : "its own /system_stats launch argv";
   return (
     `${what} would write into ${m.base}, but this session is connected to ` +
-    `${getComfyUIBaseUrl()}, which runs from ${m.liveRoot} (established from ${provenBy}). ` +
+    `${target}, which runs from ${m.liveRoot} (established from ${provenBy}). ` +
     `Those are two DIFFERENT ComfyUI installs, so NOTHING was written: the pack would have ` +
     `landed in a custom_nodes/ the connected server never scans, and this call would have ` +
     `reported success. ${m.base} was chosen by ${chosenBy} — configuration, which describes ` +
@@ -2908,9 +2914,16 @@ async function installCustomNodeImpl(
   // checkout for want of a path (codex gate rounds 5-6).
   const managerBase = managerBaseUrl();
   const cliWorkspace = opts.comfyuiPath ?? resolveEffectiveComfyUIBase();
+  const presenceCtx = capturePackPresenceContext(cliWorkspace);
   // #1765 — and is that root the install this session is actually CONNECTED to?
-  // Observed HERE, pinned to the very cliWorkspace the write will use, so a panel
-  // retarget mid-call cannot judge one install's root against another's server.
+  // Pinned to the very cliWorkspace the write will use, so a panel retarget
+  // mid-call cannot judge one install's root against another's server.
+  //
+  // AFTER presenceCtx, deliberately: this is the first await in the function, and
+  // capturePackPresenceContext must be taken at operation ENTRY from the mode and
+  // config as they are NOW (codex gate round 11 — computing it after an await lets
+  // a mid-op retarget pair Manager A's answer with disk B).
+  //
   // Taken only when a LOCAL write is reachable for this call: a registry install
   // goes through ComfyUI-Manager, which targets the connected server by
   // construction and has no local destination to misdirect.
@@ -2918,7 +2931,6 @@ async function installCustomNodeImpl(
     source === "git" || opts.useCmCli === true
       ? await detectLocalWriteTargetMismatch(cliWorkspace)
       : undefined;
-  const presenceCtx = capturePackPresenceContext(cliWorkspace);
   // THE PRE-STATE, OBSERVED BEFORE THE OPERATION (codex gate P0). The "already
   // installed" verdict below used to be inferred from POST-op disk state alone:
   // a pack that was absent before the call and installed as a registry ZIP —
@@ -2944,7 +2956,7 @@ async function installCustomNodeImpl(
       // is identical here to the direct clone below.
       if (localWriteMismatch) {
         throw new ProcessControlError(
-          wrongInstallRefusal(localWriteMismatch, 'install_custom_node (action:"install", comfy-cli)'),
+          wrongInstallRefusal(localWriteMismatch, 'install_custom_node (action:"install", comfy-cli)', managerBase),
         );
       }
       // cm-cli install accepts registry ids and git urls alike.
@@ -3044,7 +3056,7 @@ async function installCustomNodeImpl(
       });
       if (localWriteMismatch) {
         throw new ProcessControlError(
-          wrongInstallRefusal(localWriteMismatch, 'install_custom_node (action:"install", git clone)'),
+          wrongInstallRefusal(localWriteMismatch, 'install_custom_node (action:"install", git clone)', managerBase),
         );
       }
       return withCliNote(
@@ -3073,7 +3085,7 @@ async function installCustomNodeImpl(
     }
     if (localWriteMismatch) {
       throw new ProcessControlError(
-        wrongInstallRefusal(localWriteMismatch, 'install_custom_node (action:"install", git clone)'),
+        wrongInstallRefusal(localWriteMismatch, 'install_custom_node (action:"install", git clone)', managerBase),
       );
     }
     return withCliNote(
