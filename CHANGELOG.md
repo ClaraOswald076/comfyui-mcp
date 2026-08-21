@@ -6,6 +6,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### Fixed
+
+- **`panel_show_media`'s `/view` probe now asks whether the served family matches the filename (#2011).**
+  The probe exists to predict a card that will render BROKEN, and the panel
+  picks its painter from the ref's filename, never from the body. Asking only
+  "is this media" flagged `take.wav` serving `audio/wav` (a file the panel
+  paints into an `<audio>` card fine) and silently blessed `take.wav` serving
+  `image/png` (an `<audio>` card pointed at image bytes). Widening the old
+  image-or-video test to accept `audio/*` would have swapped the false alarm
+  for a false clearance of `plate.png` serving `audio/wav`. The probe now
+  compares families.
+
 ## [0.52.54] - 2026-08-22
 
 ### MCP
