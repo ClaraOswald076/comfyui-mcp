@@ -504,11 +504,13 @@ export function registerRunpodTools(server: McpServer): void {
 
           // ── DEPLOY LINK (referral) ─────────────────────────────────────────
           case "deploy_link": {
+            // Empty for a custom RUNPOD_TEMPLATE_ID — render no blank block then.
+            const requirements = runpodDeployRequirements();
             return {
               content: [
                 {
                   type: "text",
-                  text: `Deploy a new comfyui-mcp pod here (pre-loaded with our template; the link carries our referral so your usage supports the project):\n\n${runpodDeployLink()}\n\n${runpodDeployRequirements()}\n\nAfter it deploys, grab the pod ID from the RunPod console and use runpod action:"connect" to point this session at it.\n\n${GPU_CLI_CREDIT}`,
+                  text: `Deploy a new comfyui-mcp pod here (pre-loaded with our template; the link carries our referral so your usage supports the project):\n\n${runpodDeployLink()}\n\n${requirements ? `${requirements}\n\n` : ""}After it deploys, grab the pod ID from the RunPod console and use runpod action:"connect" to point this session at it.\n\n${GPU_CLI_CREDIT}`,
                 },
               ],
             };

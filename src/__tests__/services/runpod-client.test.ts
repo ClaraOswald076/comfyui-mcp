@@ -585,6 +585,23 @@ describe("#2014/#2016 — the CONSOLE deploy path states the floors it cannot en
     expect(req).toContain(RUNPOD_STOCK_ALLOWED_CUDA_VERSIONS[0]);
   });
 
+  it("says NOTHING when the link points at a CUSTOM template — not our floors to state", async () => {
+    // runpodDeployLink() carries RUNPOD_TEMPLATE_ID. If the user repointed it,
+    // the console form is seeded by THEIR image and our 30 GB / CUDA 12.8 would
+    // be wrong advice — the same scoping the API-path defaults use.
+    vi.resetModules();
+    const saved = process.env.RUNPOD_TEMPLATE_ID;
+    process.env.RUNPOD_TEMPLATE_ID = "someone-elses-template";
+    try {
+      const mod = await import("../../services/runpod-client.js");
+      expect(mod.runpodDeployRequirements()).toBe("");
+    } finally {
+      if (saved === undefined) delete process.env.RUNPOD_TEMPLATE_ID;
+      else process.env.RUNPOD_TEMPLATE_ID = saved;
+      vi.resetModules();
+    }
+  });
+
   it("every site that hands out the deploy LINK also hands out the REQUIREMENTS", async () => {
     // Count the adopting call sites rather than spot-checking deploy_link: a
     // second place that surfaces the link (an empty-account hint, an error

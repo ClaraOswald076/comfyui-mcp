@@ -434,6 +434,11 @@ export const RUNPOD_STOCK_ALLOWED_CUDA_VERSIONS: string[] = cudaVersionsAtLeast(
  *  closes the gap from here is saying so. Built from the SAME constants the API
  *  path sends, so the advice can never drift from the behaviour. */
 export function runpodDeployRequirements(): string {
+  // Scoped to the stock template exactly like the API-path defaults are: the
+  // link carries RUNPOD_TEMPLATE_ID, and if that points at someone else's
+  // image these are not our floors to state. Empty string = nothing to add;
+  // callers must not render a stray blank block for it.
+  if (RUNPOD_TEMPLATE_ID !== DEFAULT_TEMPLATE_ID) return "";
   return (
     `Two settings on that page are NOT optional for this image — the template's own defaults ` +
     `are below both, and a pod that misses either boots into an unusable state you still pay for:\n` +
