@@ -116,3 +116,261 @@ export function isContradictoryPromotedWidgetRefusal(
 ): boolean {
   return parseContradictoryPromotedWidgetRefusal(text, requestedWidget) != null;
 }
+
+// ---- #1940: empty combo on a subgraph UUID --------------------------------
+//
+// panel_set_widget on a subgraph instance's promoted COMBO is refused:
+//
+//   panel_set_widget refused "choice" on node 816 (<uuid>) after refreshing
+//   combo options: Combo widget "choice" has an EMPTY option list; the
+//   server's option list may simply be stale — refreshing it before deciding.
+//
+// The subgraph node's type is a UUID, which is never in /object_info. Combo
+// validation keys that UUID and gets []. The legal values live on the INNER
+// node (CustomCombo / UNETLoader / CLIPLoader). Refreshing cannot help.
+// Entering the subgraph and writing the inner widget is NOT equivalent: the
+// inner widget is link-driven from the parent rail, so the parent value still
+// wins at queue time.
+
+export type EmptyPromotedComboRefusal = {
+  nodeId: string;
+  widget: string;
+  type: string;
+};
+
+export type InnerComboOptionSource = "object_info" | "serialized" | "none";
+
+export type InnerComboOptions = {
+  innerNodeId: number | string;
+  widget: string;
+  innerType: string | null;
+  options: unknown[] | null;
+  source: InnerComboOptionSource;
+};
+
+const EMPTY_COMBO_RE =
+  /panel_set_widget refused "([^"]+)" on node (\S+) \(([^)]+)\)(?: after refreshing combo options)?: Combo widget "([^"]+)" has an EMPTY option list/i;
+
+const SUBGRAPH_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function isSubgraphUuidType(type: string): boolean {
+  return SUBGRAPH_UUID_RE.test(type.trim());
+}
+
+/**
+ * Parse the empty-combo refusal that names a subgraph UUID type. Returns null
+ * unless the refused widget matches (when supplied) and the type is a UUID —
+ * a genuine empty list on a backend type (nothing installed) is left alone.
+ */
+export function parseEmptyPromotedComboRefusal(
+  text: string,
+  requestedWidget?: string,
+): EmptyPromotedComboRefusal | null {
+  const m = EMPTY_COMBO_RE.exec(text);
+  if (!m) return null;
+  const widget = m[1];
+  const comboWidget = m[4];
+  if (widget !== comboWidget) return null;
+  if (requestedWidget != null && requestedWidget !== widget && requestedWidget.toLowerCase() !== widget.toLowerCase()) {
+    return null;
+  }
+  const type = m[3].trim();
+  if (!isSubgraphUuidType(type)) return null;
+  return { nodeId: m[2].replace(/[,:]$/, ""), widget, type };
+}
+
+/** Combo option list from an /object_info input spec, or null when it is not a combo. */
+export function comboOptionsFromInputSpec(spec: unknown): unknown[] | null {
+  if (!Array.isArray(spec) || spec.length === 0) return null;
+  const type = spec[0];
+  if (Array.isArray(type)) return type;
+  if (typeof type !== "string") return null;
+  const cfg = spec[1];
+  if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) return null;
+  const opts = (cfg as { options?: unknown }).options;
+  if (!Array.isArray(opts)) return null;
+  return opts.map((o) =>
+    o && typeof o === "object" && !Array.isArray(o) && "key" in (o as Record<string, unknown>)
+      ? (o as { key: unknown }).key
+      : o,
+  );
+}
+
+function inputSpecsOf(def: unknown): Record<string, unknown> | null {
+  if (!def || typeof def !== "object" || Array.isArray(def)) return null;
+  const input = (def as { input?: unknown }).input;
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const rec = input as { required?: unknown; optional?: unknown };
+  const required =
+    rec.required && typeof rec.required === "object" && !Array.isArray(rec.required)
+      ? (rec.required as Record<string, unknown>)
+      : {};
+  const optional =
+    rec.optional && typeof rec.optional === "object" && !Array.isArray(rec.optional)
+      ? (rec.optional as Record<string, unknown>)
+      : {};
+  return { ...required, ...optional };
+}
+
+export function comboOptionsFromObjectInfo(
+  objectInfo: unknown,
+  classType: string,
+  widgetName: string,
+): unknown[] | null {
+  if (!objectInfo || typeof objectInfo !== "object" || Array.isArray(objectInfo)) return null;
+  const def = (objectInfo as Record<string, unknown>)[classType];
+  const specs = inputSpecsOf(def);
+  if (!specs) return null;
+  const matched = matchListedName(widgetName, Object.keys(specs));
+  if (!matched) return null;
+  return comboOptionsFromInputSpec(specs[matched]);
+}
+
+function asOptionList(raw: unknown): unknown[] | null {
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    const values = (raw as { values?: unknown }).values;
+    if (Array.isArray(values)) return values;
+    const options = (raw as { options?: unknown }).options;
+    if (Array.isArray(options)) return options;
+  }
+  return null;
+}
+
+/**
+ * Combo options carried on a serialized inner node. graph_get_subgraph's usual
+ * summary is name→value only; when a payload DOES include an options array
+ * (widget_options, a widget object, or a widgets[] row) that is the fallback
+ * for a frontend-only inner type with no /object_info entry.
+ */
+export function comboOptionsFromSerializedNode(
+  node: Record<string, unknown>,
+  widgetName: string,
+): unknown[] | null {
+  const named = (bag: unknown): unknown[] | null => {
+    if (!bag || typeof bag !== "object" || Array.isArray(bag)) return null;
+    const rec = bag as Record<string, unknown>;
+    const matched = matchListedName(widgetName, Object.keys(rec));
+    return matched ? asOptionList(rec[matched]) : null;
+  };
+
+  const fromNamed = named(node.widget_options) ?? named(node.widgets);
+  if (fromNamed) return fromNamed;
+
+  const widgets = node.widgets;
+  if (Array.isArray(widgets)) {
+    for (const raw of widgets) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+      const row = raw as Record<string, unknown>;
+      if (typeof row.name !== "string" || matchListedName(widgetName, [row.name]) == null) continue;
+      return asOptionList(row.options) ?? asOptionList(row);
+    }
+  }
+  return null;
+}
+
+export function comboValueIsListed(value: unknown, options: readonly unknown[]): boolean {
+  if (options.includes(value as never)) return true;
+  if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
+    return false;
+  }
+  const label = String(value);
+  return options.some(
+    (o) =>
+      (typeof o === "string" || typeof o === "number" || typeof o === "boolean") &&
+      String(o) === label,
+  );
+}
+
+function innerTypeOf(node: Record<string, unknown>): string | null {
+  const t = node.type ?? node.class_type;
+  return typeof t === "string" && t.trim() !== "" ? t : null;
+}
+
+function uniqueInnerNode(
+  subgraph: Record<string, unknown> | null | undefined,
+  displayedWidget: string,
+): { innerNodeId: number | string; widget: string; node: Record<string, unknown> } | null {
+  if (!subgraph || typeof subgraph !== "object") return null;
+  if (subgraph.truncated === true) return null;
+  const nodes = subgraph.nodes;
+  if (!Array.isArray(nodes)) return null;
+
+  const hits: { innerNodeId: number | string; widget: string; node: Record<string, unknown> }[] =
+    [];
+  for (const raw of nodes) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const node = raw as Record<string, unknown>;
+    const id = innerNodeId(node);
+    if (id == null) continue;
+    const names = [
+      ...widgetNamesOnInner(node),
+      ...(node.widget_options && typeof node.widget_options === "object" && !Array.isArray(node.widget_options)
+        ? Object.keys(node.widget_options as Record<string, unknown>).filter((n) => n.length > 0)
+        : []),
+      ...(Array.isArray(node.widgets)
+        ? (node.widgets as unknown[])
+            .map((w) =>
+              w && typeof w === "object" && !Array.isArray(w) && typeof (w as { name?: unknown }).name === "string"
+                ? (w as { name: string }).name
+                : "",
+            )
+            .filter((n) => n.length > 0)
+        : []),
+    ];
+    const matched = matchListedName(displayedWidget, names);
+    if (matched) hits.push({ innerNodeId: id, widget: matched, node });
+  }
+  return hits.length === 1 ? hits[0] : null;
+}
+
+/**
+ * Resolve a promoted combo's option list from the unique inner node.
+ * Prefer /object_info of that inner type; if the type is absent (frontend-only),
+ * fall back to the serialized node's own options array.
+ */
+export function resolveInnerComboOptions(
+  subgraph: Record<string, unknown> | null | undefined,
+  displayedWidget: string,
+  objectInfo: unknown,
+): InnerComboOptions | null {
+  const hit = uniqueInnerNode(subgraph, displayedWidget);
+  if (!hit) return null;
+  const innerType = innerTypeOf(hit.node);
+  const fromInfo =
+    innerType != null ? comboOptionsFromObjectInfo(objectInfo, innerType, hit.widget) : null;
+  // A returned array — including [] — is the server's list for this input. []
+  // means nothing is installed, not "we could not look it up".
+  if (fromInfo != null) {
+    return {
+      innerNodeId: hit.innerNodeId,
+      widget: hit.widget,
+      innerType,
+      options: fromInfo,
+      source: "object_info",
+    };
+  }
+  const serialized = comboOptionsFromSerializedNode(hit.node, hit.widget);
+  if (serialized != null) {
+    return {
+      innerNodeId: hit.innerNodeId,
+      widget: hit.widget,
+      innerType,
+      options: serialized,
+      source: "serialized",
+    };
+  }
+  return {
+    innerNodeId: hit.innerNodeId,
+    widget: hit.widget,
+    innerType,
+    options: null,
+    source: "none",
+  };
+}
+
+export function formatComboOptionsPreview(options: readonly unknown[], limit = 40): string {
+  const preview = options.slice(0, limit).map((o) => JSON.stringify(o)).join(", ");
+  return options.length > limit ? `${preview}, …` : preview;
+}

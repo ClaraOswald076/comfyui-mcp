@@ -82,7 +82,11 @@ import {
   unionErrorFor,
 } from "./node-id.js";
 import {
+  comboValueIsListed,
+  formatComboOptionsPreview,
   parseContradictoryPromotedWidgetRefusal,
+  parseEmptyPromotedComboRefusal,
+  resolveInnerComboOptions,
   resolveInnerPromotedTarget,
 } from "./promoted-widget.js";
 import { includeRequestedCreateGroupMembers } from "./create-group-membership.js";
@@ -4093,6 +4097,124 @@ async function refuseAnimaRegionalPromptWrite(
   const type = parseQueriedNodeType(parseToolResultJson(probe));
   if (!type || !ANIMA_REGIONAL_CANVAS_TYPES.has(type)) return null;
   return animaRegionalPromptRefusal(type, widget);
+}
+
+function objectInfoFromToolResult(res: ToolResult): unknown {
+  const payload = parseToolResultJson(res);
+  if (!payload) return null;
+  return payload.object_info ?? payload;
+}
+
+/**
+ * #1940 — a promoted COMBO on a subgraph UUID is refused with an EMPTY option
+ * list "that may simply be stale". The legal values live on the inner node.
+ * Resolve that list from /object_info (or the serialized inner widget) and
+ * either refuse the VALUE against it, or replace the stale-list wording.
+ * Never enter the subgraph to write the inner widget: it is link-driven from
+ * the parent rail, so an inner write would report success over a value that
+ * does not serialize.
+ */
+async function recoverEmptyPromotedComboWrite(
+  first: ToolResult,
+  args: { node_id: unknown; widget: string; value: unknown },
+  ctx: PanelToolCtx,
+): Promise<ToolResult | null> {
+  const parsed = parseEmptyPromotedComboRefusal(textOfToolResult(first), args.widget);
+  if (!parsed || String(parsed.nodeId) !== String(args.node_id)) return null;
+
+  const sub = await ctx.call({ cmd: "graph_get_subgraph", node_id: args.node_id });
+  if (sub.isError) {
+    return appendToolResultText(
+      first,
+      `\n\n(This node type ${parsed.type} is a subgraph UUID, which is absent from ` +
+        `/object_info by design — the empty combo list is not a stale cache, so ` +
+        `panel_refresh_nodes cannot fill it. Tried to resolve "${parsed.widget}" to the ` +
+        `inner node that owns it and graph_get_subgraph FAILED: ${textOfToolResult(sub)})`,
+    );
+  }
+
+  const infoRes = await ctx.call(
+    { cmd: "graph_get_object_info" },
+    OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+  );
+  const objectInfo = infoRes.isError ? null : objectInfoFromToolResult(infoRes);
+  const inner = resolveInnerComboOptions(
+    parseToolResultJson(sub),
+    parsed.widget,
+    objectInfo,
+  );
+  if (!inner) {
+    return appendToolResultText(
+      first,
+      `\n\n(This node type ${parsed.type} is a subgraph UUID, which is absent from ` +
+        `/object_info by design — the empty combo list is not a stale cache, so ` +
+        `panel_refresh_nodes cannot fill it. graph_get_subgraph did not uniquely ` +
+        `identify an inner node that owns "${parsed.widget}", so the value was not ` +
+        `checked against an inner option list — guessing among several inners, or ` +
+        `acting on a truncated inner list, would target the wrong node.)`,
+    );
+  }
+
+  const innerLabel =
+    inner.innerType != null
+      ? `${inner.innerType} node ${inner.innerNodeId} "${inner.widget}"`
+      : `inner node ${inner.innerNodeId} "${inner.widget}"`;
+  const listSource =
+    inner.source === "object_info"
+      ? "that node's /object_info"
+      : "the serialized inner widget";
+
+  if (Array.isArray(inner.options)) {
+    if (inner.options.length === 0) {
+      return fail(
+        `panel_set_widget refused "${parsed.widget}" on subgraph node ${parsed.nodeId}: ` +
+          `the inner ${innerLabel} has an EMPTY option list (${listSource}) — nothing is ` +
+          `installed for that combo, so ${JSON.stringify(args.value)} is not writable. ` +
+          `The subgraph type ${parsed.type} is absent from /object_info by design; this is ` +
+          `not a stale cache, and panel_refresh_nodes cannot help.`,
+      );
+    }
+    if (!comboValueIsListed(args.value, inner.options)) {
+      return fail(
+        `panel_set_widget refused "${parsed.widget}" on subgraph node ${parsed.nodeId}: ` +
+          `value ${JSON.stringify(args.value)} is not a valid option for the inner ${innerLabel} ` +
+          `(${inner.options.length} option${inner.options.length === 1 ? "" : "s"} from ` +
+          `${listSource}). The subgraph type ${parsed.type} is absent from /object_info by ` +
+          `design — this is not a stale list, and panel_refresh_nodes cannot help. Valid ` +
+          `options: ${formatComboOptionsPreview(inner.options)}.`,
+      );
+    }
+    return fail(
+      `panel_set_widget refused "${parsed.widget}" on subgraph node ${parsed.nodeId} ` +
+        `(${parsed.type}): Combo widget "${parsed.widget}" has an EMPTY option list because ` +
+        `this node's type is a subgraph UUID, which is absent from /object_info — not ` +
+        `because the server's list is stale. panel_refresh_nodes cannot fill it. ` +
+        `${JSON.stringify(args.value)} IS a valid option for the inner ${innerLabel} ` +
+        `(${inner.options.length} option${inner.options.length === 1 ? "" : "s"} from ` +
+        `${inner.source === "object_info" ? "/object_info" : "the serialized inner widget"}). ` +
+        `The write did not land. Do not panel_enter_subgraph to set the inner widget: it is ` +
+        `link-driven from this parent rail, so the parent value still wins at queue time.`,
+    );
+  }
+
+  const whyNone =
+    inner.innerType != null && (infoRes.isError || objectInfo == null)
+      ? `inner type ${inner.innerType} could not be looked up` +
+        (infoRes.isError ? ` (graph_get_object_info FAILED: ${textOfToolResult(infoRes)})` : "")
+      : inner.innerType != null
+        ? `inner type ${inner.innerType} is itself absent from /object_info (a frontend-only node) ` +
+          `and the serialized inner widget carried no options array`
+        : `the inner node has no type string and the serialized widget carried no options array`;
+
+  return fail(
+    `panel_set_widget refused "${parsed.widget}" on subgraph node ${parsed.nodeId} ` +
+      `(${parsed.type}): Combo widget "${parsed.widget}" has an EMPTY option list because ` +
+      `this node's type is a subgraph UUID, which is absent from /object_info — not ` +
+      `because the server's list is stale. panel_refresh_nodes cannot fill it. ` +
+      `Resolved "${parsed.widget}" to ${innerLabel}, but ${whyNone}, so the value ` +
+      `${JSON.stringify(args.value)} could not be checked against an inner option list. ` +
+      `The write did not land.`,
+  );
 }
 
 // ---- #809: turn the panel's silent `truncated: true` booleans into a remedy --------
@@ -12680,7 +12802,16 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           textOfToolResult(first),
           args.widget as string,
         );
-        if (!refusal || String(refusal.nodeId) !== String(args.node_id)) return first;
+        if (!refusal || String(refusal.nodeId) !== String(args.node_id)) {
+          // #1940 — a promoted COMBO on a subgraph UUID is refused with an empty
+          // option list "that may simply be stale". Resolve the inner node's list
+          // instead; do not enter the subgraph (the inner widget is link-driven).
+          return (await recoverEmptyPromotedComboWrite(
+            first,
+            { node_id: args.node_id, widget: args.widget as string, value },
+            ctx,
+          )) ?? first;
+        }
 
         if (refusal.widget !== args.widget) {
           const remapped = await write(args.node_id, refusal.widget);
