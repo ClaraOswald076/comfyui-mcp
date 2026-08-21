@@ -8,6 +8,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **An unroutable `show_media` no longer reads as a delivery (#2013).**
+  `show_media` is the only command the bridge buffers when it cannot route —
+  a finished render survives a phone being away — and that receipt used to be
+  `{ok: true, mailboxed: true}` for both a concrete tab and a scope address.
+  A scope-keyed box then flushed to the first matching hello, which is how
+  "could not route" silently became "queued for whoever connects next". The
+  receipt now names the recipient when it knows one (`queued_for` is the
+  tab id, `recipient_known: true`) and says `recipient_known: false` /
+  `queued_for: null` when the box is scope-keyed. A flush to a client of the
+  wrong kind (a phone collecting a canvas-produced box, or the reverse) is
+  declined and the box stays queued for a matching reconnect. Untagged
+  (never-seen) boxes still flush to the first hello, which is the original
+  mailbox purpose.
 - **`panel_show_media` inlines a `/view` ref for the tab the frame will actually
   reach, not for the address the session holds (#2012).** `ctx.tabId` may be a
   scope (`orchestrator`, `orchestrator::<backend>`), an 8-char prefix, or a

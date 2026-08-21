@@ -166,6 +166,33 @@ describe("#2010 an unaccounted reply no longer answers with the client's claim",
     expect(t).not.toMatch(/The client acknowledged the command/);
   });
 
+  it("a scope-keyed mailbox (no queued_for) says whichever client connects next (#2013)", () => {
+    // Kills: describing every mailbox as waiting for a named tab — a scope
+    // address names nobody.
+    const t = textOf(
+      annotateShowMediaAck(okResult({ ok: true, mailboxed: true, queued_for: null, recipient_known: false }), ITEM),
+    );
+    expect(t).toMatch(/whichever client connects next/);
+    expect(t).not.toMatch(/waiting for tab /);
+    const d = doc(
+      annotateShowMediaAck(okResult({ ok: true, mailboxed: true, queued_for: null, recipient_known: false }), ITEM),
+    );
+    expect(d.recipient_known).toBe(false);
+    expect(d.queued_for).toBeNull();
+  });
+
+  it("a concrete-tab mailbox names the tab it is waiting for (#2013)", () => {
+    // Kills: using the scope wording for a knowable recipient.
+    const receipt = { ok: true, mailboxed: true, queued_for: "phone-stable-1", recipient_known: true };
+    const t = textOf(annotateShowMediaAck(okResult(receipt), ITEM));
+    expect(t).toMatch(/waiting for tab /);
+    expect(t).toMatch(/phone-st/);
+    expect(t).not.toMatch(/whichever client connects next/);
+    const d = doc(annotateShowMediaAck(okResult(receipt), ITEM));
+    expect(d.recipient_known).toBe(true);
+    expect(d.queued_for).toBe("phone-stable-1");
+  });
+
   it("a non-JSON reply is still corrected, and is kept as text", () => {
     const out = annotateShowMediaAck({ content: [{ type: "text", text: "shown" }] }, ITEM);
     expect(doc(out).client_reply).toBe("shown");
