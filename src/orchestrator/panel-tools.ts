@@ -82,8 +82,11 @@ import {
   unionErrorFor,
 } from "./node-id.js";
 import {
+  addressedNodeMatchesPersistRemedy,
   parseContradictoryPromotedWidgetRefusal,
+  parseUnpromotedControlPersistRemedy,
   resolveInnerPromotedTarget,
+  type UnpromotedControlPersistRemedy,
 } from "./promoted-widget.js";
 import { includeRequestedCreateGroupMembers } from "./create-group-membership.js";
 import {
@@ -4222,6 +4225,125 @@ function summarizeSetWidgetEcho(res: ToolResult, full: boolean): ToolResult {
       i === idx && c.type === "text" ? { ...c, text: JSON.stringify(fitted, null, 2) } : c,
     ),
   };
+}
+
+function rewriteToolResultJson(
+  res: ToolResult,
+  payload: Record<string, unknown>,
+): ToolResult {
+  const idx = res.content.findIndex((c) => c.type === "text");
+  if (idx < 0) return res;
+  return {
+    ...res,
+    content: res.content.map((c, i) =>
+      i === idx && c.type === "text" ? { ...c, text: JSON.stringify(payload, null, 2) } : c,
+    ),
+  };
+}
+
+async function exitSubgraphLevels(
+  ctx: PanelToolCtx,
+  count: number,
+): Promise<{ failed: boolean; note: string }> {
+  const failures: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+    if (exited.isError) failures.push(textOfToolResult(exited));
+  }
+  if (failures.length === 0) return { failed: false, note: "" };
+  return {
+    failed: true,
+    note:
+      `panel_exit_subgraph then FAILED — the canvas may still be inside the subgraph. ` +
+      `Call panel_exit_subgraph. (${failures.join("; ")})`,
+  };
+}
+
+function pinnedControlPayload(
+  payload: Record<string, unknown>,
+  remedy: UnpromotedControlPersistRemedy,
+  extraWarning?: string,
+): Record<string, unknown> {
+  const next: Record<string, unknown> = { ...payload };
+  delete next.warning;
+  next.control_after_generate_pinned = {
+    node_id: remedy.innerNodeId,
+    widget: remedy.controlWidget,
+    value: "fixed",
+    from: remedy.mode,
+  };
+  if (extraWarning) next.warning = extraWarning;
+  return next;
+}
+
+/**
+ * panel#1558 — a successful promoted write whose inner control_after_generate
+ * is randomize (and NOT promoted) will not hold across runs. Follow the
+ * panel's own enter → set-fixed → exit remedy so the value the caller just
+ * set persists, without asking them to address hidden inner node ids.
+ *
+ * Failures here never turn the already-verified write into an error: the
+ * original success + warning stays, plus a disclosure of the pin attempt.
+ */
+async function persistUnpromotedControlAfterGenerate(
+  res: ToolResult,
+  ctx: PanelToolCtx,
+  addressedNodeId: unknown,
+): Promise<ToolResult> {
+  if (res.isError) return res;
+  const payload = parseToolResultJson(res);
+  if (!payload || typeof payload.warning !== "string") return res;
+  const remedy = parseUnpromotedControlPersistRemedy(payload.warning);
+  if (!remedy || !addressedNodeMatchesPersistRemedy(addressedNodeId, remedy)) {
+    return res;
+  }
+  const set = payload.set;
+  if (set && typeof set === "object" && !Array.isArray(set)) {
+    const writtenWidget = (set as Record<string, unknown>).widget;
+    if (
+      typeof writtenWidget === "string" &&
+      writtenWidget.toLowerCase() === remedy.controlWidget.toLowerCase()
+    ) {
+      return res;
+    }
+  }
+
+  const entered: string[] = [];
+  for (const id of remedy.enterPath) {
+    const step = await ctx.call({ cmd: "graph_enter_subgraph", node_id: id }, 15000);
+    if (step.isError) {
+      const exits = await exitSubgraphLevels(ctx, entered.length);
+      const pinFail =
+        `\n\n(Tried to pin inner "${remedy.controlWidget}" to 'fixed' so this value would persist, ` +
+        `but panel_enter_subgraph(node_id=${id}) FAILED: ${textOfToolResult(step)}` +
+        `${exits.failed ? ` ${exits.note}` : ""})`;
+      return appendToolResultText(res, pinFail);
+    }
+    entered.push(id);
+  }
+
+  const pinned = await ctx.call(
+    {
+      cmd: "graph_set_widget",
+      node_id: remedy.innerNodeId,
+      widget: remedy.controlWidget,
+      value: "fixed",
+    },
+    OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+  );
+  const exits = await exitSubgraphLevels(ctx, entered.length);
+  if (pinned.isError) {
+    return appendToolResultText(
+      res,
+      `\n\n(Tried to pin inner node ${remedy.innerNodeId} "${remedy.controlWidget}" to 'fixed' ` +
+        `so this value would persist, but that write FAILED: ${textOfToolResult(pinned)}` +
+        `${exits.failed ? ` ${exits.note}` : ""})`,
+    );
+  }
+  return rewriteToolResultJson(
+    res,
+    pinnedControlPayload(payload, remedy, exits.failed ? exits.note : undefined),
+  );
 }
 
 // ---- #1658: Anima/Krea2 regional canvas prompt textareas --------------------------
@@ -13304,7 +13426,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             echoFull,
           );
         const first = await write(args.node_id, args.widget as string);
-        if (!first.isError) return first;
+        if (!first.isError) {
+          return persistUnpromotedControlAfterGenerate(first, ctx, args.node_id);
+        }
 
         // #1655 — the panel listed this widget as promoted while refusing it as
         // not promoted. The listing is node.widgets; the write looks up host
@@ -13319,7 +13443,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
 
         if (refusal.widget !== args.widget) {
           const remapped = await write(args.node_id, refusal.widget);
-          if (!remapped.isError) return remapped;
+          if (!remapped.isError) {
+            return persistUnpromotedControlAfterGenerate(remapped, ctx, args.node_id);
+          }
           if (
             !parseContradictoryPromotedWidgetRefusal(
               textOfToolResult(remapped),
