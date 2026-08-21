@@ -309,8 +309,13 @@ describe("segmented download through downloadWithCache (#1697)", () => {
     expect(ranged.length).toBeGreaterThanOrEqual(4);
     expect(rig.maxConcurrent).toBeGreaterThan(1);
 
-    // The scratch file is gone — it only ever reaches the target by rename.
-    await expect(stat(segmentScratchPath(dest))).rejects.toThrow();
+    // The scratch file is gone — it only ever reaches the staged file by rename.
+    // Assert on the path the writer actually uses (beside the CACHE `.partial`);
+    // `dest + ".seg"` is a path that never exists either way, so checking it
+    // would pass whether or not the scratch was cleaned up.
+    const stagedPartial = `${__downloadCacheTestHooks.cachePathForUrl(rig.url, {})}.partial`;
+    await expect(stat(segmentScratchPath(stagedPartial))).rejects.toThrow();
+    await expect(stat(stagedPartial)).rejects.toThrow();
   });
 
   it("is byte-identical to the same file fetched over ONE connection", async () => {
@@ -357,7 +362,10 @@ describe("segmented download through downloadWithCache (#1697)", () => {
     // It advertised ranges, so a probe WAS issued; the 200 answer sent us back to
     // the single-connection path rather than failing the download.
     expect(rig.requests.some((r) => r.range)).toBe(true);
-    await expect(stat(segmentScratchPath(dest))).rejects.toThrow();
+    // A declined probe must not have created a scratch at all.
+    await expect(
+      stat(segmentScratchPath(`${__downloadCacheTestHooks.cachePathForUrl(rig.url, {})}.partial`)),
+    ).rejects.toThrow();
   });
 
   it("falls back when the 206's Content-Range does not describe what was asked for", async () => {
