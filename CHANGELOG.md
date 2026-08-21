@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.46] - 2026-08-21
+
 ### Fixed
 
 - **`panel_show_media` no longer repeats a claim its client did not support (#2010).**
@@ -45,6 +47,21 @@ All notable changes to this project are documented here. This project adheres to
   the newly-selected model's image slot along with the earlier "you can hear them"
   note. That audio is now dropped, with a note telling the incoming model plainly
   that it did not hear it.
+
+### MCP
+
+#### Fixed
+- a frontend-only type refused for an unavailable object_info says so (#2019)
+- a rejected tool call names the argument it meant, without guessing at intent (#1986)
+- the synthesis grace is read off the panel's own send bounds, and the notice stops claiming the panel never sent one (#2020)
+- a stock RunPod pod gets the container disk and CUDA host its image actually needs (#2022)
+- a show_media reply establishes only what it accounts for (#2018)
+- a drained ComfyUI-Manager queue is not a completed one — report what the task actually did (#2005)
+- a boot slower than the readiness budget no longer forfeits the post-restart reconnect wait (#1997)
+- install_comfyui(action:"panel") reports whether a NEWER panel is published, not only whether it clears the floor (#1995)
+- Ollama refuses audio unless the model is a verified listener (#1980)
+- retire the restart confirmation wherever the CARD LEAVES THE SCREEN (review fix for #1957) (#1982)
+
 
 ## [0.52.45] - 2026-08-21
 
