@@ -93,6 +93,7 @@ import {
   type UnpromotedControlPersistRemedy,
 } from "./promoted-widget.js";
 import { includeRequestedCreateGroupMembers } from "./create-group-membership.js";
+import { sizeForUncollapse } from "./edit-node-uncollapse.js";
 import {
   fastGroupsFilterPropertyNote,
   isFastGroupsFilterProperty,
@@ -4233,6 +4234,85 @@ function isObjectInfoUnavailableRefusal(res: ToolResult): boolean {
   return /object_info is unavailable|cannot verify (?:the )?node type/i.test(
     textOfToolResult(res),
   );
+}
+
+/**
+ * #2004 — panel_set_widget refused an installed backend node because both
+ * whole-schema routes exhausted their budget. Matched on the panel's own
+ * wording (assertTypeAgainstFreshBackend / objectInfoOracleFailureNote) so a
+ * miss costs a missing hint and a false positive costs an extra paragraph.
+ * Used ONLY to APPEND advice to a refusal the panel already made — never to
+ * authorize a write, and never to consult COMFYUI_URL (#1359).
+ */
+function isObjectInfoStarvationRefusal(res: ToolResult): boolean {
+  if (!res.isError) return false;
+  const text = textOfToolResult(res);
+  return (
+    /no usable \/object_info schema was obtained/i.test(text) ||
+    (/api\.getNodeDefs\(\) did not answer/i.test(text) &&
+      /GET \/object_info did not answer/i.test(text))
+  );
+}
+
+function objectInfoStarvationNote(): string {
+  return (
+    `\n\nThis is a live /object_info refresh TIMEOUT, not a missing node. ` +
+    `The write was refused before it mutated anything because the schema routes ` +
+    `exhausted their budget. The node is already on the canvas, so this type is in use. ` +
+    `Do NOT reinstall a pack. Retry panel_set_widget in a moment; if it keeps happening, ` +
+    `the tab's whole-schema snapshot was never populated — wait for a successful ` +
+    `panel_refresh_nodes, or reload the ComfyUI tab.`
+  );
+}
+
+/** #2004 — the panel's 13s save budget fired while the userdata write was still in flight. */
+function isWorkflowSaveBudgetTimeout(res: ToolResult): boolean {
+  if (!res.isError) return false;
+  return /workflow_save did not finish within \d+s/i.test(textOfToolResult(res));
+}
+
+/**
+ * modified:false AND persisted:true is the only follow-up observation that
+ * proves the in-flight save marked the canvas clean. persisted:true alone is
+ * the reporter's timeout snapshot (a previously-saved dirty workflow) and
+ * must not be read as "the write landed".
+ */
+function saveLandedAfterTimeout(list: Record<string, unknown> | null): boolean {
+  const active = list?.active;
+  if (!active || typeof active !== "object" || Array.isArray(active)) return false;
+  const rec = active as Record<string, unknown>;
+  return rec.modified === false && rec.persisted === true;
+}
+
+const SAVE_TIMEOUT_OUTCOME_UNKNOWN =
+  `\n\nOUTCOME UNKNOWN: the save was already in flight when this budget fired. ` +
+  `Confirm by reading the saved file (or panel_list_workflows) before retrying — a re-issue may write twice.`;
+
+/**
+ * #2004 — the panel's 13s budget fired while userdata PUT was still running.
+ * A follow-up list that now shows modified:false persisted:true is the save
+ * completing; anything else stays outcome-unknown. persisted:true alone is
+ * the timeout-time snapshot of a previously-saved dirty tab, not proof.
+ */
+async function settleWorkflowSaveTimeout(
+  res: ToolResult,
+  ctx: PanelToolCtx,
+): Promise<ToolResult> {
+  if (!isWorkflowSaveBudgetTimeout(res)) return res;
+  try {
+    const listRes = await ctx.call({ cmd: "workflow_list" }, 6000);
+    const list = parseToolResultJson(listRes);
+    if (saveLandedAfterTimeout(list)) {
+      return ok({
+        saved: true,
+        acknowledged_after_timeout: true,
+        active: list?.active,
+      });
+    }
+  } catch {
+    /* keep the timeout refusal; the note below is the honest remainder */
+  }
+  return appendToolResultText(res, SAVE_TIMEOUT_OUTCOME_UNKNOWN);
 }
 
 function tabAdvertisedPanelVersion(ctx: PanelToolCtx): string | undefined {
@@ -13646,6 +13726,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         if (!first.isError) {
           return persistUnpromotedControlAfterGenerate(first, ctx, args.node_id);
         }
+        // #2004 — both whole-schema routes timed out. The panel refused BEFORE
+        // mutating, so this is not outcome-unknown. Name the timeout rather than
+        // leaving "cannot verify the node type" as "the type is missing".
+        if (isObjectInfoStarvationRefusal(first)) {
+          return appendToolResultText(first, objectInfoStarvationNote());
+        }
 
         // #1655 — the panel listed this widget as promoted while refusing it as
         // not promoted. The listing is node.widgets; the write looks up host
@@ -13845,12 +13931,17 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       async (args: A, ctx) => {
         const error = validatePanelEditNodeArgs(args);
         if (error) return fail(error);
+        // #2004 — uncollapse of a title-chip (stored size[1]===0) is refused by
+        // the panel's sizeSane unless a positive size rides along. Restore from
+        // the live query; an unreadable probe leaves the command as the caller
+        // wrote it.
+        const restoredSize = await sizeForUncollapse(args, ctx.call);
         return ctx.call({
           cmd: "graph_edit_node",
           node_id: args.node_id,
           node_ids: args.node_ids,
           pos: args.pos,
-          size: args.size,
+          size: restoredSize ?? args.size,
           title: args.title,
           preset: args.preset,
           color: args.color,
@@ -15405,6 +15496,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             }
           }
         }
+        if (res.isError && !args.name) res = await settleWorkflowSaveTimeout(res, ctx);
         if (res.isError) {
           // #1873 — named Save-As 409s by contract; the panel's "choose a different
           // name" is what forced a third file. Keep the 409 and name the rename path.
