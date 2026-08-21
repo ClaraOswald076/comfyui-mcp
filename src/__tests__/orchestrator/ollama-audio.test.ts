@@ -317,6 +317,39 @@ describe("#1972 — a model that ACCEPTS audio in images[] is not a model that c
     const audioPart = user.content.find((p) => p.type === "input_audio");
     expect(audioPart?.input_audio).toEqual({ data: RIFF_B64, format: "wav" });
   });
+
+  it("a live model SWITCH does not replay delivered audio into the new model's images[]", async () => {
+    // The attach-time gate only sees the turn the audio arrives on. Ollama is
+    // stateless per request, so history is re-serialized every turn and
+    // toOllamaMessages merges `audios` into `images[]` — measured: turn 2 to
+    // huihui_ai/gemma-4-abliterated:E4b-qat carried ["UklGRg=="] plus the
+    // earlier "you can hear them" note, with no new attachment anywhere in it.
+    // Reachable from panel-agent.ts setModel, which switches live and keeps
+    // history.
+    const backend = nativeBackend("gemma4:e2b"); // allowlisted: turn 1 delivers
+    await collect(backend, turnsOf(AUDIO_TURN));
+    const t1 = (chatRequests[0].messages as Array<Record<string, unknown>>).find((m) => m.role === "user") as {
+      images?: string[];
+    };
+    expect(t1.images).toEqual([RIFF_B64]); // baseline — the gate let this through
+
+    await backend.setModel("huihui_ai/gemma-4-abliterated:E4b-qat");
+    await collect(backend, turnsOf({ text: "and now?" })); // TEXT only — no new audio
+
+    const t2 = chatRequests[1];
+    expect(t2.model).toBe("huihui_ai/gemma-4-abliterated:E4b-qat");
+    const replayed = (t2.messages as Array<Record<string, unknown>>).filter((m) =>
+      Array.isArray((m as { images?: string[] }).images),
+    );
+    for (const m of replayed) expect((m as { images: string[] }).images).not.toContain(RIFF_B64);
+    // The stale "you can hear them" note is still in that message, so silence is
+    // not enough — the new model must be told the audio is NOT in its context.
+    const stale = (t2.messages as Array<Record<string, unknown>>).find((m) =>
+      String((m as { content: string }).content).includes("what do you hear?"),
+    ) as { content: string };
+    expect(stale.content).toContain("You did NOT hear this audio");
+    expect(stale.content).toContain("no longer applies");
+  });
 });
 
 describe("#790 — an UNSUPPORTED attachment type", () => {

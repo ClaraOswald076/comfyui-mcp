@@ -16,7 +16,11 @@ All notable changes to this project are documented here. This project adheres to
   The panel now also requires the tag to be one of the Ollama-tested set
   (`gemma4:e2b`, `gemma4:e4b`, `nemotron3:33b`) before putting bytes on that
   carrier, and refuses namespaced forks (including the default fine-tune) out
-  loud with a pull command.
+  loud with a pull command. The gate also covers the HISTORY: Ollama is stateless
+  per request, so a live model switch used to replay already-delivered audio into
+  the newly-selected model's image slot along with the earlier "you can hear them"
+  note. That audio is now dropped, with a note telling the incoming model plainly
+  that it did not hear it.
 
 ## [0.52.44] - 2026-08-21
 

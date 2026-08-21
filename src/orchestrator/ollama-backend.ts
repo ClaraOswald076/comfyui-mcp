@@ -1249,6 +1249,38 @@ export class OllamaBackend implements AgentBackend {
   }
 
   /**
+   * Drop audio the ACTIVE model must not be handed (#1972).
+   *
+   * The attach-time allowlist only governs the turn the audio arrives on. Ollama
+   * is stateless per request, so the whole history is re-serialized every turn
+   * and `toOllamaMessages` merges `audios` into `images[]` unconditionally —
+   * audio delivered under a verified tag is therefore re-sent to whatever model
+   * is selected NOW. A live switch hands the fabricating tag from #1972 both the
+   * bytes and the earlier "you can hear them" note, which by then names a model
+   * that is no longer selected and forbids the very "I cannot hear" reply that
+   * would be truthful.
+   *
+   * Run at the top of every turn rather than from `setModel`, because
+   * `this.model` has a second mutation site (the `opts.model` adoption in
+   * `start`) that never passes through `setModel`: a guard installed on one of
+   * them is not installed on the other.
+   */
+  private stripUnverifiedAudioFromHistory(): void {
+    if (this.api !== "ollama" || isKnownAudioCapableOllamaModel(this.model)) return;
+    for (const m of this.history) {
+      if (!m.audios?.length) continue;
+      delete m.audios;
+      delete m.audioMimes;
+      m.content +=
+        `\n[note: the audio attached to this message was removed. The active model (${this.model}) is not a ` +
+        `verified listener, and native Ollama carries audio in the IMAGE slot, where a model can accept the ` +
+        `bytes and invent a transcript. You did NOT hear this audio: do not describe, transcribe or guess at ` +
+        `its contents. An earlier note in this message may claim the audio is in your context and that you can ` +
+        `hear it — that note described a different model and no longer applies.]`;
+    }
+  }
+
+  /**
    * Capabilities the SERVER reports for the active model (#790), or null when we
    * could not establish them.
    *
@@ -1391,6 +1423,9 @@ export class OllamaBackend implements AgentBackend {
     // should get. Reconcile BEFORE buildModelTools reads the catalog, and here
     // rather than in setModel because nothing is in flight at this point.
     await this.reconcileToolModeForModel();
+    // #1972 — same reason, for audio the history is still carrying: the model
+    // selected NOW may not be the one that was verified when it was attached.
+    this.stripUnverifiedAudioFromHistory();
     const tools = this.buildModelTools();
     // Vision is a per-MODEL property (gemma4 sees images, qwen3 doesn't;
     // DeepSeek's API rejects image parts outright), so ALWAYS attempt delivery:
