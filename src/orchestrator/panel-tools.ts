@@ -1951,14 +1951,7 @@ export function classifyRestartFallbackTarget({
   observedOrigin?: string | null;
 }): { kind: "same" } | { kind: "different"; proven: string } | { kind: "unproven" } {
   if (panelBase != null && sameHttpBase(headlessBase, panelBase)) return { kind: "same" };
-  const dnsAmbiguous = (u: string | null) => {
-    if (!u) return false;
-    try {
-      return new URL(u).hostname.toLowerCase().replace(/^\[|\]$/g, "") === "localhost";
-    } catch {
-      return false;
-    }
-  };
+  const dnsAmbiguous = isDnsAmbiguousLoopback;
   const originMismatch =
     observedOrigin != null &&
     !dnsAmbiguous(observedOrigin) &&
@@ -2126,7 +2119,14 @@ function restartRefusedPreservingBinding(ctx: PanelToolCtx, note: string): ToolR
   });
 }
 
-function unboundLocalRestartRefusalNote(ctx: PanelToolCtx, panelBase: string | null): string {
+function unboundLocalRestartRefusalNote(
+  ctx: PanelToolCtx,
+  panelBase: string | null,
+  // panel#1546 — the blocker from the SAME capture that produced `panelBase`.
+  // Passed in rather than re-derived: a second call to the classifier could read
+  // a binding that changed in between and explain a refusal that did not happen.
+  blocker: RestartIdentityBlocker | null = null,
+): string {
   return (
     "Refusing to restart ComfyUI: I could not confirm that this panel's ComfyUI is " +
     "the local instance I can account for, so I cannot tell which server the restart " +
@@ -2153,6 +2153,10 @@ function unboundLocalRestartRefusalNote(ctx: PanelToolCtx, panelBase: string | n
       panelBase,
       observedOrigin: ctx.bridge?.tabServerOrigin?.(ctx.tabId) ?? null,
     }) +
+    // panel#1546 — and say WHICH proof was missing. Without this, a `localhost`
+    // origin (curable in one step), an absent Origin (cured by updating the
+    // panel) and a relayed tab (not curable here at all) were the same sentence.
+    restartIdentityBlockerNote(blocker) +
     // artokun/comfyui-mcp-panel#769 — a REMOTE ComfyUI reached over a
     // tunnel or port-forward has a LOOPBACK host, and remoteUrlActive is
     // derived from exactly that (`forceRemote || !isLoopbackHost(host)`).
@@ -2398,13 +2402,61 @@ function objectInfoHostMismatchMessage(err: unknown): string {
 
 Node definitions are read from COMFYUI_URL (${configured}) for a pack/path/inline source. That host did not answer /object_info.`;
 }
-function captureRebootHealthBase(ctx: PanelToolCtx): string | null {
-  if (isCloudMode() || isRemoteMode()) return null;
+/**
+ * panel#1546 — WHY the binding proof failed, when it failed.
+ *
+ * `captureRebootHealthBase` answers null for SEVEN structurally different
+ * reasons and the refusal built on it said only "I could not confirm". Three of
+ * them were verified to produce a BYTE-IDENTICAL note (a `localhost` origin, an
+ * absent Origin, a tab that is not server-trusted-local), so the reader could
+ * not tell which proof was missing — and they do not have the same answer:
+ * `origin-dns-ambiguous` is cured by opening the panel at the concrete literal,
+ * while `tab-not-local` cannot be cured from this machine at all.
+ *
+ * This is a DISCLOSURE, not a loosened gate. Every branch below still returns
+ * null from the capture; the blocker only names what was already decided.
+ */
+export type RestartIdentityBlocker =
+  /** Remote/cloud target: there is no local process to account for by design. */
+  | { kind: "not-local-mode" }
+  /** No boot-time local ComfyUI URL was resolvable at all. */
+  | { kind: "no-boot-base" }
+  /** The configured ComfyUI is off-box, so this host cannot account for it. */
+  | { kind: "boot-base-not-loopback"; bootBase: string }
+  /** The tab's socket did not arrive on the token-less loopback listener. */
+  | { kind: "tab-not-local" }
+  /** The WS handshake carried no usable Origin (an older panel / non-browser client). */
+  | { kind: "origin-absent"; bootBase: string }
+  /** `localhost` on ONE side: no concrete loopback family, so no match is possible.
+   *  `concrete` is the OTHER side's literal — the address that resolves the ambiguity,
+   *  and which side it belongs to decides which remedy is the right one to name. */
+  | {
+      kind: "origin-dns-ambiguous";
+      bootBase: string;
+      origin: string;
+      concrete: string;
+      ambiguousSide: "panel" | "boot";
+    }
+  /** The boot base is mounted under a basePath the pathless Origin cannot prove. */
+  | { kind: "origin-path-ambiguous"; bootBase: string; origin: string }
+  /** Proven a different scheme/host/port — the #851 wrong-server case. */
+  | { kind: "origin-different"; bootBase: string; origin: string };
+
+/** The SINGLE decision. `captureRebootHealthBase` returns `.base`; the refusal
+ *  note reads `.blocker`. Two readers of one evidence set that cannot disagree —
+ *  the same reason `classifyRestartFallbackTarget` was extracted for #1593. */
+function resolveRebootHealthBinding(ctx: PanelToolCtx): {
+  base: string | null;
+  blocker: RestartIdentityBlocker | null;
+} {
+  const no = (blocker: RestartIdentityBlocker) => ({ base: null, blocker });
+  if (isCloudMode() || isRemoteMode()) return no({ kind: "not-local-mode" });
   const bootBase = getBootLocalComfyUIBaseUrl(); // server-authorized, hello-immutable
-  if (!bootBase || !isLoopbackOrigin(bootBase)) return null;
+  if (!bootBase) return no({ kind: "no-boot-base" });
+  if (!isLoopbackOrigin(bootBase)) return no({ kind: "boot-base-not-loopback", bootBase });
   const base = bootBase.replace(/\/+$/, "");
   // Server-trusted provenance: the tab arrived on the token-less loopback listener.
-  if (ctx.bridge?.tabIsLocal?.(ctx.tabId) !== true) return null;
+  if (ctx.bridge?.tabIsLocal?.(ctx.tabId) !== true) return no({ kind: "tab-not-local" });
   // And the rebooted tab must provably front THAT SAME boot instance. Use the SERVER-
   // OBSERVED handshake Origin (tabServerOrigin) — the browser sets it on the WS upgrade
   // and blocks page JS from forging it — NOT the spoofable client hello.comfyui_url
@@ -2421,12 +2473,165 @@ function captureRebootHealthBase(ctx: PanelToolCtx): string | null {
   // (loopbackFamily → null), so it never matches a concrete literal and this returns null
   // (coordinator P0). A different instance / family / path / absent Origin → null too.
   const origin = ctx.bridge?.tabServerOrigin?.(ctx.tabId);
-  if (!sameHttpBase(origin, base)) return null;
+  if (!sameHttpBase(origin, base)) {
+    // SAME verdict as before — only the reason is now carried out. Ordered so each
+    // kind names the FIRST thing that made a match impossible, because that is the
+    // one the reader can act on.
+    if (!origin) return no({ kind: "origin-absent", bootBase: base });
+    return no(classifyOriginBlocker(origin, base));
+  }
   // Return a CONNECTABLE probe URL bound to the SAME concrete family identity matched
   // above: a wildcard-bound (0.0.0.0/::) local ComfyUI is reachable on loopback, so probe
   // the family literal at that port (127.0.0.1 / [::1]). The probe (and the auth headers
   // it carries) can therefore never cross to a different-family instance.
-  return loopbackProbeUrl(base);
+  return { base: loopbackProbeUrl(base), blocker: null };
+}
+
+function captureRebootHealthBase(ctx: PanelToolCtx): string | null {
+  return resolveRebootHealthBinding(ctx).base;
+}
+
+/**
+ * panel#1546 — WHY a present Origin failed to match the boot base.
+ *
+ * Ordered so each verdict names the FIRST thing that made a match impossible, and
+ * NEVER blames the DNS ambiguity for something the ambiguity did not cause. A
+ * `localhost` origin on a DIFFERENT PORT is a different server and is reported as
+ * one; a `localhost` origin against a basePath mount is unprovable even with the
+ * host resolved, so it stays the path verdict. Only the case where resolving
+ * `localhost` would ACTUALLY settle it — same port, no mount, exactly one
+ * ambiguous side — gets the DNS answer and its one-step remedy.
+ *
+ * Exported for test: the boot base is fixed at process start, so the
+ * boot-side-ambiguous direction has no handler-driven fixture.
+ */
+export function classifyOriginBlocker(
+  origin: string,
+  bootBase: string,
+): Extract<
+  RestartIdentityBlocker,
+  { kind: "origin-dns-ambiguous" | "origin-path-ambiguous" | "origin-different" }
+> {
+  const originAmbiguous = isDnsAmbiguousLoopback(origin);
+  const bootAmbiguous = isDnsAmbiguousLoopback(bootBase);
+  if (originAmbiguous !== bootAmbiguous) {
+    let sameSpot = false;
+    try {
+      const o = new URL(origin);
+      const b = new URL(bootBase);
+      // A handshake Origin is pathless BY CONSTRUCTION — normalizeHandshakeOrigin
+      // rebuilds it from protocol/hostname/port and relayIdentityOrigin uses
+      // URL.origin — so only the BOOT base can carry a mount, and the DNS answer
+      // can never settle one. Ports must already agree; resolving a hostname never
+      // reconciles :8188 with :8189. Compare EFFECTIVE ports: the same normalizer
+      // fills in 80/443 explicitly, so a default-port boot base ("") would
+      // otherwise read as a port mismatch against an origin that says "80".
+      const port = (u: URL) => u.port || (u.protocol === "https:" ? "443" : "80");
+      sameSpot =
+        o.protocol === b.protocol &&
+        port(o) === port(b) &&
+        b.pathname.replace(/\/+$/, "") === "";
+    } catch {
+      sameSpot = false;
+    }
+    if (sameSpot) {
+      return {
+        kind: "origin-dns-ambiguous",
+        bootBase,
+        origin,
+        concrete: originAmbiguous ? bootBase : origin,
+        ambiguousSide: originAmbiguous ? "panel" : "boot",
+      };
+    }
+  }
+  // The Origin is pathless by construction, so a boot base under a basePath mount
+  // can be same-ORIGIN yet unprovable as the same INSTANCE. Distinguish that from a
+  // genuinely different host:port, which is the #851 wrong-server case.
+  if (sameHttpOrigin(origin, bootBase)) return { kind: "origin-path-ambiguous", bootBase, origin };
+  return { kind: "origin-different", bootBase, origin };
+}
+
+/** True when a URL's host is the DNS-ambiguous `localhost` — it names a loopback
+ *  service without revealing which family the browser actually reached, which is
+ *  exactly why `loopbackFamily` refuses it (coordinator P0, #1233). Shared by the
+ *  blocker classifier and `classifyRestartFallbackTarget` so "ambiguous" means one
+ *  thing in this file. */
+function isDnsAmbiguousLoopback(rawUrl: string | null | undefined): boolean {
+  if (!rawUrl) return false;
+  try {
+    return new URL(rawUrl).hostname.toLowerCase().replace(/^\[|\]$/g, "") === "localhost";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * panel#1546 — the one sentence that turns the refusal from a dead end into a step.
+ *
+ * The reporter's panel was attached, local and graph-tool ready; the refusal named
+ * neither what was missing nor how to supply it, so the filed diagnosis was
+ * "target identity cannot be confirmed" with no next action. Each blocker has a
+ * DIFFERENT next action, and `origin-dns-ambiguous` — a browser at
+ * `localhost:8188` against a `127.0.0.1:8188` boot base, the ordinary local setup
+ * this file's own comments already flag as returning null — has a one-step one.
+ *
+ * Deliberately NOT a fix for the underlying ambiguity. Proving that a `localhost`
+ * tab reached the boot family would mean trusting a resolution this process did
+ * not observe, and #1233 recorded why that is a P0. Naming the cause costs no
+ * soundness; guessing it would.
+ */
+export function restartIdentityBlockerNote(blocker: RestartIdentityBlocker | null): string {
+  if (!blocker) return "";
+  const why = " WHY I could not confirm it: ";
+  switch (blocker.kind) {
+    case "not-local-mode":
+      return `${why}this target is configured as remote/cloud, so there is no local process here to account for.`;
+    case "no-boot-base":
+      return `${why}no local ComfyUI address was resolvable when this server started, so there is no boot instance to compare against.`;
+    case "boot-base-not-loopback":
+      return (
+        `${why}the ComfyUI this server booted against (${blocker.bootBase}) is not a loopback address, ` +
+        "so it is not a process on this machine that I can account for."
+      );
+    case "tab-not-local":
+      return (
+        `${why}this panel tab did not arrive on the local loopback listener — it reached me over a relay, ` +
+        "tunnel, LAN address or pairing link, so I cannot treat the ComfyUI behind it as one of mine. " +
+        "Restart it from the machine it actually runs on."
+      );
+    case "origin-absent":
+      return (
+        `${why}this tab's WebSocket handshake carried no Origin, so there is nothing to check against ` +
+        `the boot instance (${blocker.bootBase}). An older panel build does this; updating the panel restores the proof.`
+      );
+    case "origin-dns-ambiguous": {
+      // Name the remedy for the side that is ACTUALLY ambiguous. Telling a user
+      // whose browser is already on 127.0.0.1 to "open the panel at localhost"
+      // would be advice that re-creates the problem.
+      const ambiguous = blocker.ambiguousSide === "panel" ? blocker.origin : blocker.bootBase;
+      const fix =
+        blocker.ambiguousSide === "panel"
+          ? `FIX: open the panel at ${loopbackProbeUrl(blocker.concrete)} — the same ComfyUI, addressed by its literal.`
+          : `FIX: set COMFYUI_URL to ${loopbackProbeUrl(blocker.concrete)} — the same ComfyUI, addressed by the literal your browser is already on.`;
+      return (
+        `${why}${blocker.ambiguousSide === "panel" ? "this panel is open at" : "this server booted against"} ` +
+        `${ambiguous}, and "localhost" does not say which loopback address was actually reached — it can ` +
+        `be 127.0.0.1 or ::1, and those can be DIFFERENT ComfyUI instances on the same port. The other ` +
+        `side is ${blocker.concrete}, so I cannot show the two are one server. ${fix}`
+      );
+    }
+    case "origin-path-ambiguous":
+      return (
+        `${why}the boot instance is mounted under a path (${blocker.bootBase}) and a handshake Origin ` +
+        `carries no path (${blocker.origin}), so this tab could be fronting a different ComfyUI at the ` +
+        "same host and port. I will not stop a server on that."
+      );
+    case "origin-different":
+      return (
+        `${why}this panel is open at ${blocker.origin}, which is not the ComfyUI this server booted ` +
+        `against (${blocker.bootBase}) — a different server, so stopping mine would not restart yours.`
+      );
+  }
 }
 
 /**
@@ -15583,7 +15788,8 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // of the current binding: a silent rebind here would confirm a restart of
         // a tab the user was not working in. Healing belongs on the refusal path.
         if (!isRemoteMode() && !isCloudMode()) {
-          const identityHealthBase = captureRebootHealthBase(ctx);
+          const identityBinding = resolveRebootHealthBinding(ctx);
+          const identityHealthBase = identityBinding.base;
           const identityBound =
             identityHealthBase != null &&
             sameHttpBase(getComfyUIBaseUrl(), identityHealthBase);
@@ -15595,7 +15801,7 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
             if (tabStillHere) {
               return restartRefusedPreservingBinding(
                 ctx,
-                unboundLocalRestartRefusalNote(ctx, identityHealthBase),
+                unboundLocalRestartRefusalNote(ctx, identityHealthBase, identityBinding.blocker),
               );
             }
             // Tab is gone: confirm will be unreachable and #1671 crash-recovery
@@ -16285,7 +16491,8 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // can be proven. They keep restart_comfyui, and the note says so. Weighed
         // against #814 — where exactly such a user's server was stopped and never came
         // back — declining is the recoverable side.
-        const preflightHealthBase = captureRebootHealthBase(ctx);
+        const preflightBinding = resolveRebootHealthBinding(ctx);
+        const preflightHealthBase = preflightBinding.base;
         const preflightBound =
           preflightHealthBase != null &&
           sameHttpBase(getComfyUIBaseUrl(), preflightHealthBase);
@@ -16315,7 +16522,7 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           // still here must stay usable (#1819).
           return restartRefusedPreservingBinding(
             ctx,
-            unboundLocalRestartRefusalNote(ctx, preflightHealthBase),
+            unboundLocalRestartRefusalNote(ctx, preflightHealthBase, preflightBinding.blocker),
           );
         }
         if (preflightBound) {
