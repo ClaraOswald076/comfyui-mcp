@@ -759,6 +759,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.41] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- panel_set_workflow_target reports bound after a settling read that proves writes (#1951)
+- a timed-out ComfyUI call makes the same connected-panel comparison a refused one does (#1952)
+- correct what a successful revoke actually proves, and pin the requeue window (#1949)
+
+
 ## [0.52.40] - 2026-08-20
 
 ### MCP
