@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### MCP
+
+#### Fixed
+- `panel_show_media` now accepts audio files through the panel's existing audio card (panel #1572).
+
 ## [0.52.68] - 2026-08-23
 
 _No user-facing changes._

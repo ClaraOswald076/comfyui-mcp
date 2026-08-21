@@ -674,3 +674,94 @@ describe("stagedForDisplayNote (#802)", () => {
     expect(note).not.toMatch(/was displayed to the user/i);
   });
 });
+
+// #1572 — panel_show_media gained a third kind. These notes had TWO branches
+// and treated "not a video" as "an image", so an oversized .wav would have been
+// described to the agent as displayed "at full size", with get_image offered as
+// the way to look at it — a claim about a file nobody can look at. The kind
+// union is one shared type (ShownMediaKind) precisely so the compiler names
+// every note when a kind is added; these pin the prose it named.
+describe("#1572 the notes tell an AUDIO caller the truth about audio", () => {
+  const audio = {
+    path: "/refs/take.wav",
+    sizeBytes: 72 * 1024 * 1024,
+    capBytes: 20 * 1024 * 1024,
+    kind: "audio" as const,
+  };
+
+  it("oversizedInlineRefusal does not describe audio as displayed, or offer get_image for it", () => {
+    const msg = oversizedInlineRefusal({
+      ...audio,
+      resolution: { status: "outside", checked: [{ kind: "output", dir: "/c/output" }] },
+    });
+    // The player is what the user actually gets.
+    expect(msg).toMatch(/audio player/i);
+    // The two false claims the image branch would have made.
+    expect(msg).not.toContain("displays it to the USER at full size");
+    expect(msg).not.toContain("returns the image inline");
+    // And it must not borrow the video branch's contact sheet, which audio has no
+    // equivalent of.
+    expect(msg).not.toContain("SAMPLED");
+    // Still actionable — the remedy survives.
+    expect(msg).toMatch(/Copy or move it/);
+  });
+
+  it("oversizedInlineRefusal still says the agent cannot hear it", () => {
+    const msg = oversizedInlineRefusal({
+      ...audio,
+      resolution: { status: "outside", checked: [{ kind: "output", dir: "/c/output" }] },
+    });
+    expect(msg).toMatch(/cannot hear it/i);
+  });
+
+  it("forwardedByReferenceNote gives audio its own caveat instead of leaving it bare", () => {
+    const note = forwardedByReferenceNote(
+      [
+        {
+          path: "/c/output/take.wav",
+          sizeBytes: 3e7,
+          kind: "audio",
+          ref: { filename: "take.wav", type: "output" },
+        },
+      ],
+      20 * 1024 * 1024,
+    );
+    expect(note).toMatch(/AUDIO is never sent to you/);
+    expect(note).toMatch(/no sampled preview/i);
+    expect(note).toMatch(/Do not describe how it sounds/i);
+    // The image branch's advice must not appear for an audio-only batch.
+    expect(note).not.toContain("comes back inline");
+  });
+
+  it("forwardedByReferenceNote keeps every kind's caveat in a mixed batch", () => {
+    const note = forwardedByReferenceNote(
+      [
+        { path: "/c/output/a.png", sizeBytes: 3e7, kind: "image", ref: { filename: "a.png", type: "output" } },
+        { path: "/c/output/a.mp4", sizeBytes: 3e7, kind: "video", ref: { filename: "a.mp4", type: "output" } },
+        { path: "/c/output/a.wav", sizeBytes: 3e7, kind: "audio", ref: { filename: "a.wav", type: "output" } },
+      ],
+      20 * 1024 * 1024,
+    );
+    expect(note).toContain("comes back inline");
+    expect(note).toContain("never sent to you inline");
+    expect(note).toMatch(/AUDIO is never sent to you/);
+  });
+
+  it("stagedForDisplayNote labels a staged audio copy as audio", () => {
+    const note = stagedForDisplayNote(
+      [
+        {
+          path: "/refs/take.wav",
+          stagedPath: "/c/output/_panel_staged/1724000000000-take.wav",
+          sizeBytes: 72 * 1024 * 1024,
+          kind: "audio",
+          ref: { filename: "1724000000000-take.wav", subfolder: "_panel_staged", type: "output" },
+        },
+      ],
+      20 * 1024 * 1024,
+    );
+    expect(note).toContain("audio");
+    expect(note).not.toContain(", video)");
+    expect(note).not.toContain(", image)");
+  });
+});
