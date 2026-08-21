@@ -1,5 +1,5 @@
 // #1524 — a respawned orchestrator was observed alive for HOURS holding no
-// listening ports, while an older instance owned 9180/9181/9183. From the user's
+// listening ports, while an older instance owned the bridge port block. From the user's
 // side the sidebar kept working; the agent session had simply lost the panel.
 //
 // WHY THE EXISTING GUARD DOES NOT COVER IT, which is the whole reason this is a
@@ -17,6 +17,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DEFAULT_PANEL_BRIDGE_PORT } from "../../services/bridge-ports.js";
+import { classifyBridgeHolder } from "../../services/listener-ownership.js";
 
 // Importing the orchestrator drags in `resolveLiveInterpreter`, which shells out
 // to find the python actually serving the port ON THIS MACHINE — so an unstubbed
@@ -33,7 +35,7 @@ vi.mock("../../services/live-interpreter.js", async () => ({
 
 const { armStartupDeadline } = await import("../../orchestrator/index.js");
 
-const PORT = 9180;
+const PORT = DEFAULT_PANEL_BRIDGE_PORT;
 
 let exits: number[];
 let errors: string[];
@@ -62,14 +64,23 @@ const exit = ((code: number) => {
   return undefined as never;
 }) as (code: number) => never;
 
+const oursHolder = classifyBridgeHolder({
+  speaksPanelProtocol: true,
+  lockfileOursOrStale: true,
+});
+const foreignHolder = classifyBridgeHolder({
+  speaksPanelProtocol: false,
+  lockfileOursOrStale: true,
+});
+
 describe("the startup deadline (#1524)", () => {
-  it("exits non-zero when startup never completes", () => {
+  it("exits non-zero when startup never completes", async () => {
     armStartupDeadline(PORT, { exit, incumbent: () => undefined });
 
-    vi.advanceTimersByTime(89_000);
+    await vi.advanceTimersByTimeAsync(89_000);
     expect(exits).toEqual([]); // still within the default window
 
-    vi.advanceTimersByTime(2_000);
+    await vi.advanceTimersByTimeAsync(2_000);
     expect(exits).toEqual([1]);
   });
 
@@ -82,23 +93,51 @@ describe("the startup deadline (#1524)", () => {
     expect(errors.join("")).not.toMatch(/startup did not complete/);
   });
 
-  it("names the incumbent pid when one holds the port", () => {
-    // The actionable case: an older comfyui-mcp still owns 9180. Telling the user
+  it("names the incumbent pid when one holds the port", async () => {
+    // The actionable case: an older comfyui-mcp still owns the bridge. Telling the user
     // WHICH pid is the difference between "something is wrong" and a fix.
-    armStartupDeadline(PORT, { exit, incumbent: () => 3807 });
-    vi.advanceTimersByTime(91_000);
+    // "stop it" is licensed only for a classified `ours`.
+    armStartupDeadline(PORT, {
+      exit,
+      incumbent: () => 3807,
+      assessHolder: () => ({ ownership: oursHolder.ownership, processName: "node.exe" }),
+    });
+    await vi.advanceTimersByTimeAsync(91_000);
 
     const msg = errors.join("");
     expect(msg).toMatch(/pid 3807/);
     expect(msg).toMatch(/stop it/);
   });
 
-  it("says the hang is BEFORE the bind when nothing holds the port", () => {
+  it("a foreign holder is named as not comfyui-mcp and is not a kill instruction (#2030)", async () => {
+    // Drives the DEFAULT holderAdvice (assessHolder → startupDeadlineHolderAdvice
+    // with ownership). Injecting holderAdvice would not go red if production
+    // stopped classifying.
+    armStartupDeadline(PORT, {
+      exit,
+      incumbent: () => 3807,
+      assessHolder: () => ({
+        ownership: foreignHolder.ownership,
+        processName: "lghub_agent.exe",
+      }),
+    });
+    await vi.advanceTimersByTimeAsync(91_000);
+
+    const msg = errors.join("");
+    expect(msg).toMatch(/pid 3807/);
+    expect(msg).toContain("lghub_agent.exe");
+    expect(msg).toMatch(/not comfyui-mcp/);
+    expect(msg).toMatch(/Leave it running/);
+    expect(msg).not.toMatch(/stop it/);
+    expect(msg).not.toMatch(/taskkill/i);
+  });
+
+  it("says the hang is BEFORE the bind when nothing holds the port", async () => {
     // The reporter's actual state: no listener at all, so the process did not even
     // reach the bind. That is a different instruction — and a bug report, not a
     // port conflict.
     armStartupDeadline(PORT, { exit, incumbent: () => undefined });
-    vi.advanceTimersByTime(91_000);
+    await vi.advanceTimersByTimeAsync(91_000);
 
     const msg = errors.join("");
     expect(msg).toMatch(/before the bind/);
@@ -106,19 +145,19 @@ describe("the startup deadline (#1524)", () => {
     expect(msg).not.toMatch(/pid \d/);
   });
 
-  it("honours COMFYUI_MCP_STARTUP_DEADLINE_MS", () => {
+  it("honours COMFYUI_MCP_STARTUP_DEADLINE_MS", async () => {
     // A cold npx start on a slow disk is legitimately slow; the escape hatch has
     // to work or the guard becomes the outage.
     process.env.COMFYUI_MCP_STARTUP_DEADLINE_MS = "5000";
     armStartupDeadline(PORT, { exit, incumbent: () => undefined });
 
-    vi.advanceTimersByTime(4_000);
+    await vi.advanceTimersByTimeAsync(4_000);
     expect(exits).toEqual([]);
-    vi.advanceTimersByTime(2_000);
+    await vi.advanceTimersByTimeAsync(2_000);
     expect(exits).toEqual([1]);
   });
 
-  it("ignores a nonsense override rather than disabling itself", () => {
+  it("ignores a nonsense override rather than disabling itself", async () => {
     // `0`, a negative, or a word must not silently switch the guard off — that
     // would reintroduce exactly the silent-zombie state, via a typo.
     // `0.5` and anything past Node's 32-bit setTimeout ceiling both COERCE TO 1ms
@@ -135,10 +174,10 @@ describe("the startup deadline (#1524)", () => {
       // startup instantly — strictly worse than disabling it — and an
       // exits-are-[1]-after-91s assertion cannot tell that apart from a sane
       // default. A surviving mutation is what exposed the gap.
-      vi.advanceTimersByTime(89_000);
+      await vi.advanceTimersByTimeAsync(89_000);
       expect(exits, `override ${JSON.stringify(bad)} must not fire early`).toEqual([]);
 
-      vi.advanceTimersByTime(2_000);
+      await vi.advanceTimersByTimeAsync(2_000);
       expect(exits, `override ${JSON.stringify(bad)} should fall back to the default`).toEqual([1]);
       disarm();
     }
@@ -172,6 +211,14 @@ describe("the startup deadline (#1524)", () => {
     expect(armAt).toBeLessThan(bridgeAt);
     // Disarmed only after the port is confirmed held.
     expect(disarmAt).toBeGreaterThan(boundAt);
+
+    // Production arms with the port alone — classification is the default
+    // holderAdvice, not a stub. A second arg that skipped assessHolder would
+    // bring back "stop it" for G HUB.
+    const armLine = lines[armAt] ?? "";
+    expect(armLine).toMatch(/armStartupDeadline\(lockPort\)/);
+    expect(src).toMatch(/bindFailureAdvice\(/);
+    expect(src).not.toMatch(/ownership !== ["']not-ours["']/);
   });
 
   it("does not hold the process open by itself", () => {
@@ -200,5 +247,10 @@ describe("the startup deadline (#1524)", () => {
     expect(start, "armStartupDeadline is gone — this test is checking nothing").toBeGreaterThan(-1);
     const body = src.slice(start, src.indexOf("return () => clearTimeout(timer);", start));
     expect(body).toMatch(/timer\.unref\?\.\(\)/);
+    // Default holderAdvice must classify (assessHolder → ownership). A fallback
+    // of `startupDeadlineHolderAdvice({ port, pid })` with no ownership is the
+    // G HUB "stop it" path this pin exists to keep red.
+    expect(body).toMatch(/assessHolder/);
+    expect(body).toMatch(/ownership:\s*a\.ownership/);
   });
 });
