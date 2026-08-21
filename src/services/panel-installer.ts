@@ -2381,6 +2381,16 @@ export function describeManagerTaskVerdict(
   counts: QueueCounts,
   provenLegacyEmptyQueue: boolean,
 ): string {
+  // Manager's `result` is whatever the failing handler produced, and on an
+  // unhandled exception that is a full Python repr — one measured here ran to
+  // several hundred characters of QueueTaskItem(...). Quoting it whole turns a
+  // diagnostic into a wall. Clamp it and SAY it is clamped, with the log named
+  // as the place the rest lives: a silently truncated error message is its own
+  // small dishonesty.
+  const quote = (v: string): string =>
+    v.length <= 400
+      ? v
+      : `${v.slice(0, 400)}… (truncated — the full text is in the ComfyUI server log)`;
   const c =
     `total_count=${counts.total ?? "?"}, done_count=${counts.done ?? "?"}, ` +
     `pending_count=${counts.pending ?? "?"}, in_progress_count=${counts.inProgress ?? "?"}`;
@@ -2388,12 +2398,14 @@ export function describeManagerTaskVerdict(
     case "failed":
       return (
         `ComfyUI-Manager RAN the task and it FAILED — its own per-task record ` +
-        `reports: "${verdict.result}". The queue drained afterwards (${c}), which ` +
+        `reports: "${quote(verdict.result)}". The queue drained afterwards (${c}), ` +
+        `which ` +
         `is why the drain on its own looked like a success`
       );
     case "succeeded":
       return (
-        `ComfyUI-Manager recorded this task as "${verdict.result}", yet nothing ` +
+        `ComfyUI-Manager recorded this task as "${quote(verdict.result)}", yet ` +
+        `nothing ` +
         `moved on disk (${c}) — the task ran, and whether it changed anything ` +
         `could NOT be established`
       );

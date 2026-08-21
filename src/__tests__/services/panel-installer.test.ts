@@ -3186,6 +3186,17 @@ describe("#1999 drained Manager queue: report what was observed", () => {
       );
     });
 
+    it("clamps a runaway Manager result, and SAYS it clamped it", () => {
+      // An unhandled Manager exception puts a full Python repr in `result` — one
+      // measured on the rig ran to several hundred characters of
+      // QueueTaskItem(...). Quoting it whole buries the diagnostic; truncating
+      // it silently is its own small dishonesty.
+      const huge = "E".repeat(900);
+      const text = describeManagerTaskVerdict({ kind: "failed", result: huge }, counts, false);
+      expect(text.length).toBeLessThan(huge.length);
+      expect(text).toMatch(/truncated — the full text is in the ComfyUI server log/);
+    });
+
     it("a failure quotes the Manager's own result and never claims success", () => {
       const text = describeManagerTaskVerdict(
         { kind: "failed", result: "An error occurred while updating 'comfyui-mcp-panel'." },
