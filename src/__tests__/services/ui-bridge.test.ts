@@ -22,6 +22,7 @@ import {
   unclassifiedGraphCommandsSeen,
   __resetUnclassifiedGraphCommands,
 } from "../../services/ui-bridge.js";
+import { tunnelPairingLive } from "../../orchestrator/tunnel-pairing-live.js";
 import { SHARED_SESSION_SCOPE, normalizeHelloBackend } from "../../services/session-scope.js";
 import {
   TurnOriginTracker,
@@ -5208,21 +5209,31 @@ describe("#875: hasLiveHeadlessClient reports the LIVE set, not the sticky one",
     await new Promise((r) => setTimeout(r, 80));
 
     expect(bridge.hasLiveHeadlessClient()).toBe(true);
+    const tunnel = { url: "wss://test.trycloudflare.com", stop: () => {} };
+    expect(tunnelPairingLive(tunnel, bridge)).toBe(true);
 
     sock.close();
     await new Promise((r) => setTimeout(r, 150));
-    // #1176 — 150ms after the socket closed is NOT "the phone is gone". It is
-    // exactly the backgrounded case: the mobile OS suspends the socket within
-    // seconds of the screen going off. This assertion used to demand `false`
-    // here, and that is the bug — a reporter's restart rotated the cloudflared
-    // hostname during a pocket interval and their phone came back to a dead URL.
-    expect(bridge.hasLiveHeadlessClient()).toBe(true);
+    // Live means live: the socket is gone, so the LIVE accessor is false. The
+    // sticky isHeadless() stays true (mailbox / inlining) and that is still
+    // wrong for the restart gate — using it would defer forever.
+    expect(bridge.hasLiveHeadlessClient()).toBe(false);
+    expect(bridge.isHeadless("phone-live")).toBe(true);
+
+    // #1176 / #1961 — 150ms after the socket closed is NOT "the phone is gone".
+    // It is exactly the backgrounded case: the mobile OS suspends the socket
+    // within seconds of the screen going off. The disconnect site must arm the
+    // recency clock HERE (unit tests that set the clock directly cannot see a
+    // dropped call site), and the GATE — not the live accessor — still defers.
+    expect(bridge.headlessSeenWithin(HEADLESS_RECENCY_MS)).toBe(true);
+    expect(tunnelPairingLive(tunnel, bridge)).toBe(true);
 
     // The property that killed the sticky isHeadless() is still intact: a phone
     // that has genuinely been gone longer than the window stops deferring, on
     // its own, with no unpairing step and no user action.
     bridge.markHeadlessDisconnectForTests(performance.now() - HEADLESS_RECENCY_MS - 1);
-    expect(bridge.hasLiveHeadlessClient()).toBe(false);
+    expect(bridge.headlessSeenWithin(HEADLESS_RECENCY_MS)).toBe(false);
+    expect(tunnelPairingLive(tunnel, bridge)).toBe(false);
   });
 
   it("is false for a connected NON-headless (canvas) tab", async () => {

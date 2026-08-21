@@ -1224,25 +1224,28 @@ export const BRIDGE_DEFAULT_TIMEOUT_MS = 20_000;
 
 /**
  * How long after a headless client's socket closes it still counts as present
- * for the #875 restart-deferral gate (#1176).
+ * for the #875 restart-deferral gate (#1176, #1961).
  *
  * Chosen from what the window has to cover and what it costs if it is wrong.
  *
  * It must cover: a phone whose screen went off, which the mobile OS suspends
  * within seconds and which reconnects when the user next picks it up. That is a
- * pocket interval — minutes to hours, unbounded in principle.
+ * pocket interval — minutes to hours, unbounded in principle. A work-day pocket
+ * is the EXPECTED condition for someone who paired the phone to use at work.
  *
  * It costs: a deferred auto-update, for this long, after a phone genuinely
  * leaves. Nothing is lost — the update applies at the next check — so the price
  * of being generous is a delay, while the price of being stingy is the reported
  * bug: a rotated tunnel hostname and a phone that cannot get back in.
  *
- * Asymmetric, so lean generous. Thirty minutes covers a meeting or a commute and
- * still lets an install that has truly lost its phone update within the hour,
- * with no unpairing step and no user action — which is the property that made the
- * sticky `isHeadless()` unacceptable for this gate.
+ * Asymmetric, so lean generous. Thirty minutes (#1176) was shorter than the
+ * hourly auto-update check, so a pocketed phone still had its hostname rotated
+ * (#1961). Eight hours covers a work day and still lets an install that has
+ * truly lost its phone update overnight, with no unpairing step and no user
+ * action — which is the property that made the sticky `isHeadless()`
+ * unacceptable for this gate.
  */
-export const HEADLESS_RECENCY_MS = 30 * 60_000;
+export const HEADLESS_RECENCY_MS = 8 * 60 * 60_000;
 
 /**
  * The first panel version whose save / new-workflow replies carry `workflow_uuid`
@@ -3687,8 +3690,6 @@ export class UiBridge {
     }
   }
 
-  /** True when the tab advertised itself as a canvas-less (mobile/remote) client
-   *  in its `hello`. Unknown tabs → false. */
   /**
    * #875 — is any CURRENTLY-CONNECTED client headless (a paired phone / mirror)?
    *
@@ -3698,37 +3699,25 @@ export class UiBridge {
    * rendering decisions and wrong for a LIVENESS gate — using it would report a
    * phone that paired once and left as still connected, and the self-restarter
    * would defer updates forever.
+   *
+   * Also deliberately NOT the recency window (#1176 / #1961). Folding "seen
+   * recently" into this accessor left the restart gate looking live-only — the
+   * exact reading #1961 verified against 0.52.41. Recency is `headlessSeenWithin`,
+   * composed at `tunnelPairingLive`.
    */
   hasLiveHeadlessClient(): boolean {
     for (const c of this.conns.values()) if (c.headless === true) return true;
-    // #1176 — A BACKGROUNDED PHONE IS NOT A DEPARTED PHONE.
-    //
-    // `conns` holds currently-OPEN sockets. A phone at work with its screen off
-    // has had its WebSocket suspended or closed by the mobile OS, so the loop
-    // above answers false and the restart gate opens — and the restart mints a
-    // NEW cloudflared hostname. A reporter picked their phone up to:
-    //
-    //   Failed host lookup: 'cameron-timing-face-spies.trycloudflare.com'
-    //   (No address associated with hostname, errno = 7)
-    //
-    // Not a timeout and not a refusal: the hostname no longer existed.
-    //
-    // The sticky `isHeadless()` was rejected for this gate, correctly — a phone
-    // that paired once and left would defer updates forever. But "socket open
-    // right now" and "ever paired" are not the only options, and the state
-    // between them is not an edge case: a phone in a pocket is the EXPECTED
-    // condition for someone who paired it to use at work.
-    //
-    // So: a bounded recency window. It keeps the property that killed the sticky
-    // option — a phone that genuinely left stops deferring, on its own, without
-    // anyone unpairing anything — while covering the normal mobile case.
-    return this.recentHeadlessWithin(HEADLESS_RECENCY_MS);
+    return false;
   }
 
-  /** Was a headless client connected within `ms`? (#1176) Reads the disconnect
-   *  clock, so it answers true for a phone whose socket the OS suspended and
-   *  false for one that has genuinely been gone longer than the window. */
-  private recentHeadlessWithin(ms: number): boolean {
+  /** Was a headless client connected within `ms`? (#1176, #1961)
+   *
+   *  Reads the disconnect clock, so it answers true for a phone whose socket the
+   *  OS suspended and false for one that has genuinely been gone longer than the
+   *  window. The restart gate ORs this with `hasLiveHeadlessClient` rather than
+   *  folding it in — a backgrounded phone is not a departed phone, and hiding
+   *  that fact inside the live accessor is how #1961 read as unfixed. */
+  headlessSeenWithin(ms: number): boolean {
     if (this.lastHeadlessDisconnectAt === undefined) return false;
     return performance.now() - this.lastHeadlessDisconnectAt < ms;
   }
