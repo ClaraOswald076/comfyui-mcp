@@ -4133,6 +4133,25 @@ function isUnknownBackendNodeRefusal(res: ToolResult): boolean {
   );
 }
 
+/**
+ * #2000 — the OTHER refusal shape a frontend-only type can come back with, and the
+ * one an old panel emits on a perfectly healthy ComfyUI: the panel's add-node guard
+ * checked /object_info AVAILABILITY before consulting its frontend-only allowlist, so
+ * a /object_info fetch that merely TIMED OUT refused "MarkdownNote" — a type that
+ * fetch could never have spoken to, since the backend never lists it by design.
+ *
+ * Matched on the panel's own wording rather than a structured field because that is
+ * all the panel sends here; it is used ONLY to APPEND advice to a refusal the panel
+ * already made, never to authorize anything, so a miss costs a missing hint and a
+ * false positive costs an extra paragraph on an unrelated error.
+ */
+function isObjectInfoUnavailableRefusal(res: ToolResult): boolean {
+  if (!res.isError) return false;
+  return /object_info is unavailable|cannot verify (?:the )?node type/i.test(
+    textOfToolResult(res),
+  );
+}
+
 function tabAdvertisedPanelVersion(ctx: PanelToolCtx): string | undefined {
   const fn = ctx.bridge.advertisedPanelVersion;
   if (typeof fn !== "function") return undefined;
@@ -4153,14 +4172,57 @@ function tabAdvertisedPanelVersion(ctx: PanelToolCtx): string | undefined {
  * the pack update + hard-refresh; a restart alone leaves cached JS running the
  * old guard.
  */
+/**
+ * #2000 — what to tell the caller when an allowlisted FRONTEND-ONLY type is refused
+ * for an unavailable /object_info.
+ *
+ * The load-bearing sentence is the FACT, not a diagnosis: this type is never in
+ * /object_info, so a fetch that did not answer withheld nothing about it. Both causes
+ * are then named WITHOUT picking one — the panel repo deliberately stopped asserting
+ * definite verdicts from absent evidence (panel#612), and nothing here can tell a stale
+ * guard apart from a baseline that has not loaded yet. The version sentence is added
+ * only when the tab actually ADVERTISED a version below this orchestrator's floor,
+ * which is real evidence; otherwise it is left out entirely.
+ */
+function frontendOnlyUnavailableNote(classType: string, ctx: PanelToolCtx): string {
+  const advertised = tabAdvertisedPanelVersion(ctx);
+  const required = requiredPanelVersion();
+  let skew = "";
+  if (advertised && compareSemver(advertised, required) < 0) {
+    skew =
+      ` This tab announced panel ${advertised}, which is below this orchestrator's ` +
+      `floor of ${required} — ${describeInstallPanelAction(
+        "update",
+        "update the panel pack on the ComfyUI host",
+      )}, restart ComfyUI, then HARD-REFRESH the browser tab (Ctrl+Shift+R, or ` +
+      `Cmd+Shift+R on macOS); a restart alone leaves the tab running cached old JS.`;
+  }
+  return (
+    `
+
+NOTE: "${classType}" is a FRONTEND-ONLY node type. The ComfyUI backend never ` +
+    `lists it in /object_info by design, so an /object_info fetch that failed or timed ` +
+    `out says nothing about whether this type is addable — a healthy ComfyUI produces ` +
+    `exactly this state when /object_info is merely SLOW. Do NOT reinstall a pack and ` +
+    `do NOT treat this as a missing node.${skew} If the panel is already current, the ` +
+    `tab's node-type baseline has not finished loading: wait a moment and retry, and ` +
+    `reload the ComfyUI tab if it persists.`
+  );
+}
+
 function withFrontendOnlyPanelSkewNote(
   res: ToolResult,
   classType: unknown,
   ctx: PanelToolCtx,
 ): ToolResult {
   if (typeof classType !== "string") return res;
-  if (!isUnknownBackendNodeRefusal(res)) return res;
   if (!PANEL_ADD_NODE_FRONTEND_ONLY_TYPES.has(classType)) return res;
+  // #2000 — a DIFFERENT refusal shape with the same cause, handled first because the
+  // two are mutually exclusive and this one carries no version evidence of its own.
+  if (isObjectInfoUnavailableRefusal(res)) {
+    return appendToolResultText(res, frontendOnlyUnavailableNote(classType, ctx));
+  }
+  if (!isUnknownBackendNodeRefusal(res)) return res;
   const advertised = tabAdvertisedPanelVersion(ctx);
   if (!advertised) return res;
   const required = requiredPanelVersion();
