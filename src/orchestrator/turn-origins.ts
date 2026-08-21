@@ -688,6 +688,13 @@ export function makeScopeRepinHandler(opts: {
   backendForTab: (tabId: string) => string;
   backendOfKey: (key: string) => string;
   info: (msg: string) => void;
+  /**
+   * panel#1557 — re-attribute a unique live canvas to this conversation when
+   * recovery adopts it. After a restart the reconnect hello often omits
+   * `backend`, so the tab joins the default conversation; without this, the
+   * pin we just wrote is immediately invalidated by {@link TurnOriginTracker.resolvedPinOf}.
+   */
+  claimTab?: (tabId: string, backend: string) => void;
 }): (scopeId: string, preferredWorkflowPath?: string) => ScopeRepinOutcome {
   return (scopeId, preferredWorkflowPath) => {
     const key = opts.scopeAgentKeyOf(scopeId);
@@ -771,6 +778,25 @@ export function makeScopeRepinHandler(opts: {
     // experienced before refreshing and reopening the tab. Nothing in the old
     // reply hinted at either way out.
     if (!tab) {
+      const interactive = opts.bridge
+        .tabs()
+        .map((t) => t.tab_id)
+        .filter((t) => opts.bridge.isHeadless?.(t) !== true);
+      // panel#1557 — a DEAD or AMBIGUOUS pin plus exactly one live canvas is the
+      // post-restart reconnect of THIS conversation's tab. Hello after a reload
+      // often omits `backend`, so the canvas joins the default conversation and
+      // Codex finds 0 eligible tabs while the user is looking at it. Idle (no
+      // pin) still refuses: that is the P0 "never steal another backend's tab".
+      const recovering = existing === null || typeof existing === "string";
+      if (recovering && eligible.length === 0 && interactive.length === 1) {
+        const only = interactive[0];
+        opts.claimTab?.(only, backend);
+        opts.tracker.repinTo(key, only);
+        opts.info(
+          `[panel-orchestrator] ${key} re-pinned onto ${only.slice(0, 8)} by explicit target request (#884 recovery, panel#1557 unique-canvas reconnect)`,
+        );
+        return only;
+      }
       if (eligible.length === 0) {
         return {
           repinned: false,

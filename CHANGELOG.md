@@ -759,6 +759,25 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### MCP
+
+#### Fixed
+- **`panel_set_workflow_target({mode:"current"})` rebinds a Codex session after reconnect (panel#1557).**
+  After a ComfyUI restart/reload, Codex's live-canvas tools are scope-bound
+  (`orchestrator::codex`). The documented recovery refused with "no connected
+  tab belongs to this conversation's backend (codex)" and "did NOT restore this
+  session's graph binding": a scope ctx returns a refusal instead of throwing,
+  so the zero-tab DEFER path never fired, and a unique canvas that re-hello'd
+  without `backend` joined the default conversation so Codex could not adopt it.
+  The session stayed fenced to the previous workflow instance; retrying
+  `panel_graph_outline` failed identically until a manual browser refresh.
+
+  Zero connected tabs now DEFER the same way a real-tab session already did,
+  and the consent is kept so the next graph call binds the canvas that
+  reconnects. A dead or ambiguous pin plus exactly one live canvas is adopted
+  even when that hello joined the default backend — idle (no pin) unique-foreign
+  still refuses, so another conversation's tab is not stolen.
+
 ## [0.52.42] - 2026-08-20
 
 ### MCP
@@ -768,7 +787,6 @@ All notable changes to this project are documented here. This project adheres to
 
 #### Fixed
 - self-restart no longer leaves an unreclaimable panel-op.lock (#1955)
-
 
 ## [0.52.41] - 2026-08-20
 
