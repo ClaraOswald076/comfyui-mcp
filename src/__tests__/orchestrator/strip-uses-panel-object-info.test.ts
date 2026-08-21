@@ -1,19 +1,14 @@
-// #1359 — `panel_strip_workflow` captured the graph from the connected panel and then
-// fetched node definitions through the global client, which resolves COMFYUI_URL. One
-// machine locally; two whenever the panel is remote. The reporter's canvas was on a
-// runpod proxy URL and the definitions request went to 127.0.0.1:8188, so a remote panel
-// could not strip its own canvas at all.
+// #1359 / #1421 — `panel_strip_workflow` fetched node definitions through the global
+// client, which resolves COMFYUI_URL. One machine locally; two whenever the panel is
+// remote. #1359 wired the live canvas through the panel; pack/path/inline still hit
+// localhost, which is the original #1421 report (`{pack:'krea2-txt2img-manual'}`).
 //
-// A partial fix already shipped (5eeca00): the failure names which host was asked and why.
-// Its own comment says it "does NOT fix the split authority — that needs the panel to
-// serve its own /object_info, a protocol change tracked separately."
-//
-// That panel change had ALREADY SHIPPED, in panel 0.13.0 (#1006). Nothing called it. This
-// is the wiring, and the tests below are mostly about the direction that must NOT happen:
-// falling back to COMFYUI_URL when the panel cannot answer. Both hosts can respond, and if
-// they disagree a fallback returns a confidently wrong workflow — converted against a
-// different ComfyUI's schema, with wrong widget order and input names, silently. That is
-// worse than the ECONNREFUSED this issue was filed about, which at least failed loudly.
+// Every source now asks the panel. The tests below are mostly about the direction that
+// must NOT happen: falling back to COMFYUI_URL when the panel cannot answer. Both hosts
+// can respond, and if they disagree a fallback returns a confidently wrong workflow —
+// converted against a different ComfyUI's schema, with wrong widget order and input names,
+// silently. That is worse than the ECONNREFUSED this issue was filed about, which at least
+// failed loudly.
 
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
@@ -31,18 +26,43 @@ function panelToolsCode(): string {
     .replace(/\/\/.*/g, "");
 }
 
-describe("the live canvas is converted with ITS OWN ComfyUI's definitions (#1359)", () => {
-  it("WIRING: a live-canvas strip asks the PANEL, not the global client", () => {
-    const src = panelToolsCode();
-    const at = src.indexOf("const liveCanvasSource =");
-    expect(at, "the live-canvas discriminator must still exist").toBeGreaterThan(-1);
-    const block = src.slice(at, at + 1200);
-    expect(block).toMatch(/if \(liveCanvasSource\)/);
-    // Passes the graph's node types now, so the reply can be judged against the canvas it
-    // is meant to describe rather than against its own shape (codex round 3).
-    expect(block).toMatch(/panelObjectInfo\(ctx, collectNodeTypes\(ui\)\)/);
-    // …and the global client is still used for the sources that genuinely belong to it.
-    expect(block).toMatch(/getObjectInfo\(\)/);
+/** The `def("panel_strip_workflow", …)` body, comments already stripped. */
+function stripHandlerSource(): string {
+  const src = panelToolsCode();
+  const nameAt = src.indexOf('"panel_strip_workflow",');
+  expect(nameAt, "panel_strip_workflow is not registered by name any more").toBeGreaterThan(0);
+  const start = src.lastIndexOf("def(", nameAt);
+  expect(start, "no def( opens the panel_strip_workflow registration").toBeGreaterThan(0);
+  const open = src.indexOf("(", start + 3);
+  let depth = 0;
+  let end = open;
+  for (let i = open; i < src.length; i++) {
+    const c = src[i];
+    if (c === "(") depth++;
+    else if (c === ")") {
+      depth--;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  const body = src.slice(start, end);
+  expect(body, "the def( walk overran into the next tool").not.toContain('"panel_flatten_workflow",');
+  return body;
+}
+
+describe("every strip source is converted with the PANEL's ComfyUI definitions (#1359/#1421)", () => {
+  it("WIRING: a strip asks the PANEL, not the global client — pack included", () => {
+    const body = stripHandlerSource();
+    expect(body).toMatch(/panelObjectInfo\(ctx, collectNodeTypes\(ui\)\)/);
+    // #1421: pack/path/inline used to branch to getObjectInfo() here. That is the
+    // reporter's localhost /object_info. There is no remaining source that belongs
+    // to COMFYUI_URL on this tool.
+    expect(body.includes("getObjectInfo("), "pack/path/inline must not consult COMFYUI_URL").toBe(
+      false,
+    );
+    expect(body).not.toMatch(/liveCanvasSource/);
   });
 
   it("the panel helper sends the command the panel actually implements", () => {
@@ -58,35 +78,32 @@ describe("the live canvas is converted with ITS OWN ComfyUI's definitions (#1359
 
   it("NO FALLBACK: the BACKFILL is skipped too, or the guarantee leaks one line later", () => {
     // `backfillObjectInfo` fetches each type it lacks from
-    // `${getComfyUIBaseUrl()}/object_info/<Type>` — COMFYUI_URL, the host the live path
+    // `${getComfyUIBaseUrl()}/object_info/<Type>` — COMFYUI_URL, the host this path
     // just refused. Refusing the bulk fetch and then backfilling from that server merges a
     // DIFFERENT ComfyUI's definitions into the panel's map, which is exactly the silent
     // wrong-schema outcome the refusal exists to prevent. It fails soft, so it degrades to
     // "type absent" when that host is unreachable and to a quietly wrong schema when it is
     // not.
-    const src = panelToolsCode();
-    const at = src.indexOf("const objectInfo =");
-    expect(at).toBeGreaterThan(-1);
-    const line = src.slice(at, at + 200);
-    expect(line).toMatch(/liveCanvasSource\s*\?\s*bulk/);
-    expect(line).toMatch(/backfillObjectInfo\(bulk, collectNodeTypes\(ui\)\)/);
+    const body = stripHandlerSource();
+    expect(
+      body.includes("backfillObjectInfo("),
+      "a pack strip must not backfill from COMFYUI_URL after a panel schema",
+    ).toBe(false);
   });
 
-  it("NO FALLBACK: the live-canvas path never reaches getObjectInfo() on a panel failure", () => {
+  it("NO FALLBACK: no strip source reaches getObjectInfo() on a panel failure", () => {
     // THE TEST THIS FILE EXISTS FOR. A fallback is the tempting shape and the dangerous
     // one, and it would pass every other assertion here.
     const src = panelToolsCode();
     const at = src.indexOf("async function panelObjectInfo");
-    const body = src.slice(at, src.indexOf("function objectInfoHostMismatchMessage"));
+    const helper = src.slice(at, src.indexOf("export type RestartIdentityBlocker"));
     expect(
-      body.includes("getObjectInfo("),
+      helper.includes("getObjectInfo("),
       "the panel-sourced path must not call the global client, on any branch",
     ).toBe(false);
 
     // …and the caller returns on a failure rather than continuing.
-    const call = src.indexOf("const liveCanvasSource =");
-    const callBlock = src.slice(call, call + 1200);
-    expect(callBlock).toMatch(/if \(!reply\.ok\) return fail\(reply\.message\)/);
+    expect(stripHandlerSource()).toMatch(/if \(!reply\.ok\) return fail\(reply\.message\)/);
   });
 });
 

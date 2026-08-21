@@ -1,28 +1,25 @@
-// #1359 — the graph and its node definitions come from different authorities, and the
-// failure never said so.
+// #1359 / #1421 — the graph and its node definitions come from different authorities.
 //
-// `panel_strip_workflow` captures the live canvas through the connected panel, then
-// fetches /object_info through the GLOBAL headless client, which resolves COMFYUI_URL.
-// One machine for a local session; two for a connected REMOTE panel. When they differ
-// the reporter got:
+// `panel_strip_workflow` used to fetch /object_info through the GLOBAL headless client,
+// which resolves COMFYUI_URL. One machine for a local session; two for a connected
+// REMOTE panel. When they differ the reporter got:
 //
 //   fetch failed: connect ECONNREFUSED 127.0.0.1:8188 — while requesting
 //   http://127.0.0.1:8188/object_info
 //
-// Nothing there mentions that the workflow itself came from a ComfyUI on a different
-// host. They had to read dist/orchestrator/panel-tools.js to work it out.
+// #1359 routed the LIVE CANVAS through `graph_get_object_info` and left pack/path/inline
+// on COMFYUI_URL. That is the original #1421 case: `panel_strip_workflow({pack:
+// 'krea2-txt2img-manual'})` with a live remote panel still requested localhost. Recurrence
+// on 0.52.41, same session, `panel_run` working.
 //
-// THE SPLIT IS NOW FIXED, so most of this file changed meaning. The live canvas takes its
-// definitions from the panel that supplied the graph (`graph_get_object_info`, panel
-// 0.13.0 / #1006), so the message these tests were written for — "THE GRAPH AND ITS NODE
-// DEFINITIONS CAME FROM DIFFERENT PLACES", with a WORKAROUND to repoint COMFYUI_URL — is
-// unreachable and has been deleted rather than left as a confident explanation of a
-// situation the code can no longer produce.
-//
-// What remains here is the pack/path/inline case, where COMFYUI_URL genuinely IS the right
-// authority, plus a test that the live canvas no longer touches it at all.
+// Every source now takes definitions from the connected panel. The mocked global client
+// throws ECONNREFUSED for every call — if any strip path still consults it, that string
+// appears here.
 
 import { describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { collectNodeTypes } from "../../services/workflow-converter.js";
+import type { UiWorkflow } from "../../comfyui/types.js";
 
 const hoisted = vi.hoisted(() => ({ objectInfoFails: { value: true } }));
 vi.mock("../../comfyui/client.js", () => ({
@@ -62,6 +59,9 @@ let objectInfoReply: unknown = {
   object_info: { KSampler: { input: { required: { seed: ["INT"] } }, output: [], name: "KSampler" } },
 };
 
+/** Commands the fake panel was asked, in order. Reset per `stripResult`. */
+const cmds: string[] = [];
+
 async function stripWithPanelObjectInfo(reply: unknown): Promise<string> {
   const prev = objectInfoReply;
   objectInfoReply = reply;
@@ -76,6 +76,7 @@ async function stripWithPanelObjectInfo(reply: unknown): Promise<string> {
 function bridge(serverOrigin: string | null) {
   return {
     send: async (cmd: Record<string, unknown>) => {
+      cmds.push(String(cmd.cmd));
       if (cmd.cmd === "graph_serialize" || cmd.cmd === "graph_get_state") {
         // A NON-EMPTY graph. It was empty, which made `object_info: {}` look like a
         // perfectly good conversion — the fixture blessed the exact shape the fail-closed
@@ -96,12 +97,27 @@ function bridge(serverOrigin: string | null) {
   } as unknown as PanelToolCtx["bridge"];
 }
 
-async function strip(args: object, serverOrigin: string | null = REMOTE): Promise<string> {
+async function stripResult(args: object, serverOrigin: string | null = REMOTE): Promise<ToolResult> {
+  cmds.length = 0;
   const ctx = makePanelToolCtx(bridge(serverOrigin), TAB, new WorkflowTargetStore());
   const def = buildPanelToolDefs().find((d) => d.name === "panel_strip_workflow");
   if (!def) throw new Error("panel_strip_workflow is not registered");
-  const res: ToolResult = await def.handler(args as never, ctx);
+  return await def.handler(args as never, ctx);
+}
+
+async function strip(args: object, serverOrigin: string | null = REMOTE): Promise<string> {
+  const res = await stripResult(args, serverOrigin);
   return res.content.map((c) => (c as { text?: string }).text ?? "").join(" ");
+}
+
+const REPORTER_PACK = "krea2-txt2img-manual";
+
+function defsCovering(types: readonly string[]): Record<string, unknown> {
+  const object_info: Record<string, unknown> = {};
+  for (const t of types) {
+    object_info[t] = { input: { required: {} }, output: [], name: t };
+  }
+  return object_info;
 }
 
 describe("an /object_info failure names which host it asked (#1359)", () => {
@@ -151,7 +167,7 @@ describe("an /object_info failure names which host it asked (#1359)", () => {
       object_info: { KSampler: { input: { required: { seed: ["INT"] } }, output: [], name: "KSampler" } },
     });
     expect(text).not.toMatch(/EMPTY node-definition map/i);
-    expect(text).not.toMatch(/do not describe this canvas/i);
+    expect(text).not.toMatch(/do not describe this graph/i);
     expect(text).not.toMatch(/nothing was converted/i);
     // ASSERT THE POSITIVE, not just the absence of two error phrases (codex P2). The
     // earlier version passed with the guard removed entirely, because "no error appeared"
@@ -173,7 +189,7 @@ describe("an /object_info failure names which host it asked (#1359)", () => {
         AlsoUnrelated: { input: { required: {} }, output: [], name: "AlsoUnrelated" },
       },
     });
-    expect(text).toMatch(/do not describe this canvas/i);
+    expect(text).toMatch(/do not describe this graph/i);
     expect(text).toMatch(/KSampler/); // names what it was looking for
     expect(text).toMatch(/nothing was converted/i);
   });
@@ -216,14 +232,46 @@ describe("an /object_info failure names which host it asked (#1359)", () => {
   });
 
 
-  it("a PACK/PATH/INLINE source is not told about the panel at all", async () => {
-    // Those sources are deliberately tied to COMFYUI_URL, so the bare failure is
-    // already about the host the caller asked for. Blaming a host mismatch there
-    // would send them to change a setting that is correct.
-    const text = await strip({ graph: { nodes: [], links: [] } });
+  it("PACK: the reporter's pack strip asks the panel, never localhost (#1421)", async () => {
+    // The original report: panel_strip_workflow({pack:'krea2-txt2img-manual'}) with a
+    // live remote panel, COMFYUI_URL still at 127.0.0.1:8188. The live-canvas path
+    // was already panel-sourced; this source was not.
+    const packUi = JSON.parse(
+      readFileSync(new URL("../../../packs/krea2-txt2img-manual/workflow.json", import.meta.url), "utf8"),
+    ) as UiWorkflow;
+    const types = collectNodeTypes(packUi);
+    expect(types.length, "the reporter's pack must still have nodes to convert").toBeGreaterThan(0);
 
-    expect(text).toMatch(/Node definitions are read from COMFYUI_URL/);
-    expect(text).not.toMatch(/DIFFERENT PLACES/);
-    expect(text).not.toContain(REMOTE);
+    const prev = objectInfoReply;
+    objectInfoReply = { ok: true, served_by: REMOTE, object_info: defsCovering(types) };
+    let res: ToolResult;
+    try {
+      res = await stripResult({ pack: REPORTER_PACK });
+    } finally {
+      objectInfoReply = prev;
+    }
+    const text = res.content.map((c) => (c as { text?: string }).text ?? "").join(" ");
+
+    expect(text).not.toMatch(/ECONNREFUSED 127\.0\.0\.1:8188/);
+    expect(text).not.toMatch(/Node definitions are read from COMFYUI_URL/);
+    expect(res.isError).toBeFalsy();
+    expect(text).toMatch(/Stripped to \d+ nodes/);
+    expect(cmds).toContain("graph_get_object_info");
+    // Pack is read from disk; a canvas capture would mean we took the live path.
+    expect(cmds).not.toContain("graph_serialize");
+    expect(cmds).not.toContain("graph_get_state");
+    const structured = res.structuredContent as { node_count?: number } | undefined;
+    expect(structured?.node_count).toBeGreaterThan(0);
+  });
+
+  it("an INLINE graph also asks the panel, never localhost (#1421)", async () => {
+    const text = await strip({
+      graph: { nodes: liveNodes, links: [] },
+    });
+    expect(text).not.toMatch(/ECONNREFUSED 127\.0\.0\.1:8188/);
+    expect(text).not.toMatch(/Node definitions are read from COMFYUI_URL/);
+    expect(text).toMatch(/Stripped to \d+ nodes/);
+    expect(cmds).toContain("graph_get_object_info");
+    expect(cmds).not.toContain("graph_serialize");
   });
 });
