@@ -264,8 +264,6 @@ import {
 } from "./ask-answer-journal.js";
 import {
   getClient,
-  getObjectInfo,
-  backfillObjectInfo,
   getQueueVerified,
   resetClient,
   resetObjectInfoCache,
@@ -2231,13 +2229,13 @@ function unboundLocalRestartRefusalNote(
 }
 
 /**
- * Node definitions from the ComfyUI the PANEL is connected to (#1359 / #1006).
+ * Node definitions from the ComfyUI the PANEL is connected to (#1359 / #1421 / #1006).
  *
- * The panel has served these since 0.13.0 and the orchestrator never asked. Everything
- * that pairs a panel-captured graph with definitions was reading the graph from the tab
- * and the schema from COMFYUI_URL — one machine locally, two for a remote panel, and no
- * way at all to convert a live canvas in a tunnel or loopback-only topology, where the
- * browser is the only thing that can reach that ComfyUI.
+ * The panel has served these since 0.13.0. Everything that converts a graph — the live
+ * canvas AND a pack/path/inline source — used to read the schema from COMFYUI_URL. That
+ * is one machine locally and two whenever the panel is remote, so a pack strip with a
+ * live RunPod tab still requested unreachable 127.0.0.1:8188. In a tunnel or
+ * loopback-only topology the browser is the only thing that can reach that ComfyUI.
  *
  * FAIL CLOSED, DELIBERATELY, AND ALL THE WAY THROUGH. Every failure here returns a
  * message instead of falling back to `getObjectInfo()`. A fallback is the tempting move
@@ -2293,14 +2291,13 @@ async function panelObjectInfo(
         `Could not read node definitions from the panel's own ComfyUI: ${raw}
 
 ` +
-        `The live canvas is converted using definitions from the ComfyUI the PANEL is ` +
+        `panel_strip_workflow converts using definitions from the ComfyUI the PANEL is ` +
         `connected to, not from COMFYUI_URL — those are different machines whenever the ` +
-        `panel is remote, and only the browser can reach a tunnelled or loopback-only host. ` +
-        `Or pass an explicit \`pack\`/\`path\`/\`graph\` source, which is read from ` +
-        `COMFYUI_URL by design.
+        `panel is remote, and only the browser can reach a tunnelled or loopback-only host.
 
-No fallback to COMFYUI_URL is attempted on purpose ` +
-        `(#1359): both hosts can answer, and converting this canvas against a different ` +
+` +
+        `No fallback to COMFYUI_URL is attempted on purpose ` +
+        `(#1359/#1421): both hosts can answer, and converting this graph against a different ` +
         `ComfyUI's schema would return a confidently wrong workflow instead of an error.`,
     };
   }
@@ -2424,7 +2421,7 @@ The conversion is refused rather than retried against ` +
       return {
         ok: false,
         message:
-          `The panel returned node definitions that do not describe this canvas` +
+          `The panel returned node definitions that do not describe this graph` +
           (r.served_by ? ` (served from ${r.served_by})` : "") +
           `: none of its ${neededTypes.length} node type(s) — e.g. ${neededTypes.slice(0, 3).join(", ")} — ` +
           `appear among the ${Object.keys(r.object_info).length} definition(s) returned. ` +
@@ -2436,26 +2433,6 @@ The conversion is refused rather than retried against ` +
   return { ok: true, objectInfo: r.object_info };
 }
 
-/**
- * #1359 — an /object_info failure that names WHICH host it asked.
- *
- * ONLY pack/path/inline sources reach this now. The live-canvas branch it used to carry —
- * "THE GRAPH AND ITS NODE DEFINITIONS CAME FROM DIFFERENT PLACES", with a WORKAROUND
- * telling the user to repoint COMFYUI_URL — described a split that no longer exists: the
- * live canvas takes its definitions from the panel that supplied the graph. That message
- * was the best available answer while the split stood, and keeping it would now be a
- * confident explanation of a situation the code cannot produce.
- *
- * For a pack/path/inline source COMFYUI_URL genuinely IS the right authority, so the bare
- * failure is already about the host the caller asked for. Say only what is true.
- */
-function objectInfoHostMismatchMessage(err: unknown): string {
-  const raw = err instanceof Error ? err.message : String(err);
-  const configured = getComfyUIBaseUrl();
-  return `${raw}
-
-Node definitions are read from COMFYUI_URL (${configured}) for a pack/path/inline source. That host did not answer /object_info.`;
-}
 /**
  * panel#1546 — WHY the binding proof failed, when it failed.
  *
@@ -12439,63 +12416,21 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         const captureNotes: string[] = [];
         const raw = await resolveWorkflowInput(args, ctx, true, captureNotes);
         const ui = raw as unknown as UiWorkflow;
-        // #1359 — the graph came from the PANEL; the node definitions come from
-        // COMFYUI_URL. Those are the same machine for a local session and different
-        // ones for a connected REMOTE panel, and when they differ this fails with a
-        // bare `ECONNREFUSED 127.0.0.1:8188` that never mentions the canvas host. The
-        // reporter had to read dist/ to discover that the two halves have different
-        // authorities.
+        // #1421 / #1359 — EVERY source takes definitions from the connected panel.
         //
-        // Only the live-canvas source is affected: a pack/path/inline graph is
-        // deliberately tied to COMFYUI_URL, so its definitions belong there.
-        const liveCanvasSource = args.pack == null && args.path == null && args.graph == null;
-        let bulk: Awaited<ReturnType<typeof getObjectInfo>>;
-        if (liveCanvasSource) {
-          // THE DEFINITIONS NOW COME FROM THE SAME PLACE AS THE GRAPH (#1359).
-          //
-          // The panel has served its own /object_info since 0.13.0 (#1006) and nothing
-          // here called it. Asking the browser is not a workaround for the remote case —
-          // it is the only correct source for ANY case, because the tab that drew this
-          // canvas is by definition able to reach the ComfyUI that defines its nodes. In a
-          // tunnel or loopback-only topology the browser is the sole thing that can.
-          //
-          // FAIL CLOSED. If the panel cannot serve definitions we surface that; we do NOT
-          // fall back to COMFYUI_URL. A fallback would convert the live canvas against a
-          // DIFFERENT ComfyUI's schema and return a confident, wrong workflow — silently,
-          // since the two hosts can both answer and disagree. That is strictly worse than
-          // the ECONNREFUSED this issue was filed about, which at least failed loudly.
-          const reply = await panelObjectInfo(ctx, collectNodeTypes(ui));
-          if (!reply.ok) return fail(reply.message);
-          bulk = reply.objectInfo;
-        } else {
-          try {
-            bulk = await getObjectInfo();
-          } catch (err) {
-            // Returned as a tool ERROR rather than thrown: a throw here escapes the
-            // handler and reaches the caller as a transport-shaped failure, which is how
-            // the bare ECONNREFUSED got to the reporter in the first place.
-            return fail(objectInfoHostMismatchMessage(err));
-          }
-        }
-        // THE FAIL-CLOSED GUARANTEE LEAKED ONE LINE LATER, so this branches too.
+        // #1359 wired the live canvas through `graph_get_object_info` and left
+        // pack/path/inline on COMFYUI_URL "by design". That is the reporter's
+        // case: `panel_strip_workflow({pack:'krea2-txt2img-manual'})` with a live
+        // remote panel still requested /object_info from unreachable
+        // 127.0.0.1:8188. A pack is converted so it can run on the ComfyUI the
+        // panel is on; that schema is what the browser can reach, not localhost.
         //
-        // `backfillObjectInfo` fetches each type it is missing from
-        // `${getComfyUIBaseUrl()}/object_info/<Type>` — COMFYUI_URL, the exact authority
-        // the live-canvas path just refused to consult. Refusing the bulk fetch and then
-        // backfilling from that host would merge a DIFFERENT ComfyUI's definitions into
-        // the panel's map, silently, which is the outcome the branch above exists to
-        // prevent. It fails soft (each miss is swallowed), so on an unreachable
-        // COMFYUI_URL it degrades to "type absent" — but when that host IS reachable and
-        // is a different server, the schema is quietly wrong.
-        //
-        // For a panel-sourced map a miss is not something to repair from elsewhere: the
-        // panel returned that ComfyUI's WHOLE /object_info, so a type absent from it is
-        // absent from the server that will run the workflow. convertUiToApi already
-        // reports unknown types as warnings, which is the honest outcome.
-        const objectInfo = liveCanvasSource
-          ? bulk
-          : await backfillObjectInfo(bulk, collectNodeTypes(ui));
-        const converted = convertUiToApi(ui, objectInfo);
+        // FAIL CLOSED, same as the live canvas. No getObjectInfo(), no
+        // backfillObjectInfo() — both hit `${COMFYUI_URL}/object_info` and would
+        // convert against a different server's schema when that host answers.
+        const reply = await panelObjectInfo(ctx, collectNodeTypes(ui));
+        if (!reply.ok) return fail(reply.message);
+        const converted = convertUiToApi(ui, reply.objectInfo);
         const workflow = converted.workflow;
         const warnings = [...captureNotes, ...converted.warnings];
 
@@ -12546,7 +12481,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // `structuredContent` deleted from ToolResult, `tsc --noEmit` still exited 0).
         // A typed local restores it, so the field is a contract the compiler enforces
         // rather than a comment.
-        const reply: ToolResult = {
+        const result: ToolResult = {
           content: [
             { type: "text", text: proseSummary },
             { type: "text", text: JSON.stringify(workflow, null, 2) },
@@ -12558,7 +12493,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             warnings,
           },
         };
-        return reply;
+        return result;
       },
     ),
     def(
