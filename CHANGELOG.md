@@ -21,6 +21,10 @@ All notable changes to this project are documented here. This project adheres to
   for each was measured in Chromium rather than copied from a table — `.opus` as
   `audio/opus` and `.flac` as `audio/x-flac` are both refused by the browser
   before any decoder runs.
+  Audio is not offered to a HEADLESS client (a paired phone or remote viewer),
+  which has no audio card and acknowledges any media as shown — that client kept
+  its honest refusal rather than gaining a false success. Making it actually play
+  audio is tracked separately (#2010).
 
 - **Ollama refuses audio unless the model is a verified listener (#1972).** Native
   `/api/chat` carries audio in `message.images[]`. Most models HTTP 400 (fail
