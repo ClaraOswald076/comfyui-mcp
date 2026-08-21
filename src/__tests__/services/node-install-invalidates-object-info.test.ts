@@ -45,6 +45,25 @@ vi.mock("@stable-canvas/comfyui-client", () => ({
   },
 }));
 
+// #1765 — the LAST unstubbed network boundary in this file. installCustomNode now
+// asks the CONNECTED server where it lives before any local write, so on a machine
+// that really is running ComfyUI on 127.0.0.1:8188 this test reached the developer's
+// own install, correctly observed that it is not `/fake/comfy`, and refused. The
+// test is about the object_info cache and says nothing about install targeting, so
+// the honest fixture is a server that is not there: the mismatch check then has no
+// evidence and fails open, exactly as it does offline and on CI.
+vi.mock("../../comfyui/client.js", async () => {
+  const actual = await vi.importActual<typeof import("../../comfyui/client.js")>(
+    "../../comfyui/client.js",
+  );
+  return {
+    ...actual,
+    getSystemStats: async () => {
+      throw new Error("no ComfyUI in this fixture");
+    },
+  };
+});
+
 // Stub the comfy-cli subprocess so the useCmCli install path returns cleanly
 // without spawning anything. The probe exports are stubbed too: installCustomNode
 // checks CLI usability before choosing the subprocess path (#808), and this test

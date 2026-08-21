@@ -2502,10 +2502,15 @@ function managerEnqueueRefusal(err: unknown): number | undefined {
  * that was done somewhere else.
  *
  * Deliberately a REFUSAL and not a retarget: on a `--base-directory` split
- * install an explicit `COMFYUI_PATH` IS the pack root (#1715/#1770/#1766), so
- * silently preferring the live `main.py` root would trade this bug for that one.
- * `detectLocalWriteTargetMismatch` only ever reports a mismatch for a base
- * nobody named for this session.
+ * install the configured root IS the pack root (#1715/#1770/#1766), so silently
+ * preferring the live `main.py` root would trade this bug for that one. A
+ * `--base-directory` the server actually reports is honored FIRST, so that
+ * deployment never reaches this refusal in the first place.
+ *
+ * A `COMFYUI_PATH` that disagrees with the running server IS refused, and that
+ * is deliberate — see `detectLocalWriteTargetMismatch` for why the env var
+ * cannot be read as the user naming this install (the panel orchestrator
+ * forwards an auto-detected path under exactly that name).
  */
 function wrongInstallRefusal(
   m: LocalWriteTargetMismatch,
