@@ -759,6 +759,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.38] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- the instance-mismatch refusal names TOOLS, not bridge commands (#1939)
+- install_custom_node refuses a local write aimed at an install this session is not connected to (#1938)
+
+#### Changed
+- prove the tool/command PAIRING end-to-end across the fenced surface (#1937)
+
+
 ## [0.52.37] - 2026-08-20
 
 ### MCP
