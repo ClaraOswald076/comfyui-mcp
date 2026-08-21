@@ -18248,33 +18248,65 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
               // THIS change would introduce, so it is fixed here rather than
               // deferred.
               //
-              // WHY THIS PREDICATE IS ENOUGH DESPITE BEING IMPRECISE. Sticky
-              // `isHeadless` misses a scope address, and over-refuses a phone
-              // that is offline and about to be rebound onto a canvas tab. Both
-              // are acceptable HERE because the guard's worst case is exactly
-              // main's current behaviour: main refuses ALL audio on this branch,
-              // so this can only ever refuse something main also refused, and it
-              // can never introduce a success main did not have. Getting the
-              // destination right in general needs the routing resolver, the
-              // mailbox rule, and an audio card on the mobile side — that is
-              // #2010/#2012/#2013, not something to smuggle in behind a bug fix.
-              if (
-                typeof ctx.bridge?.isHeadless === "function" &&
-                ctx.bridge.isHeadless(ctx.tabId)
-              ) {
-                return fail(
-                  "this conversation is on a headless client (a paired phone or remote viewer), which has no " +
-                    "audio player, so this file was not sent: " +
-                    p +
-                    "\nThat client renders images and video only. Sending it audio would show a caption row with " +
-                    "an image icon and report back as delivered, so you would be told the take played when nobody " +
-                    "heard it. Nothing is wrong with the file.\n" +
-                    "What you can do:\n" +
-                    "  1. Ask the USER to open it on the desktop ComfyUI panel, which has a real player, or to " +
-                    "play it locally. Tell them where it is; do not describe how it sounds, because you have not " +
-                    "heard it either.\n" +
-                    "  2. Show a still or a video instead, and say plainly that the audio is not playable here.",
-                );
+              // THE RULE IS "ALLOW ONLY A PROVEN NON-HEADLESS DESTINATION", not
+              // "refuse a known phone", and the difference is the whole
+              // correctness argument.
+              //
+              // A first attempt asked `isHeadless(ctx.tabId)` directly and
+              // claimed its worst case was main's behaviour. That claim was
+              // FALSE, and review caught it: `ctx.tabId` may be a SCOPE ADDRESS
+              // (`orchestrator::<backend>`), which is not a tab — `conns` is
+              // keyed by tab id, so the lookup misses and answers `false` — while
+              // `resolveTarget`'s scope branch ends "…else the most recent
+              // headless one". A scope-bound session sitting on a phone sailed
+              // through and got the false success back.
+              //
+              // Phrased as a positive requirement the property actually holds.
+              // `liveTabIdFor` is `resolveTarget` with the throw swallowed, so it
+              // answers for scope addresses, id prefixes and migration aliases
+              // alike, and returns undefined when nothing resolves. Audio goes
+              // out only when that names a tab AND the tab is not headless.
+              // Everything else — a phone, an unroutable session, an unknown
+              // destination — is refused, and every one of those cases is a case
+              // main refused too (main rejects ALL audio on this branch). So the
+              // guard is monotone by construction: it can only ever refuse what
+              // main also refused, and can never invent a success main lacked.
+              //
+              // That is a REGRESSION GUARD, not a destination gate. It says "do
+              // not newly promise audio to a client that cannot play it"; it does
+              // not make audio work on those clients, and it leaves the /view-ref
+              // path (never gated) alone. Doing it properly needs an audio card
+              // on the mobile side, the mailbox recipient rule, and this resolver
+              // applied everywhere — #2010 / #2012 / #2013.
+              const mediaBridge = ctx.bridge as
+                | {
+                    isHeadless?: (id: string) => boolean;
+                    liveTabIdFor?: (id: string) => string | undefined;
+                  }
+                | undefined;
+              if (typeof mediaBridge?.isHeadless === "function") {
+                const routedTab =
+                  typeof mediaBridge.liveTabIdFor === "function"
+                    ? mediaBridge.liveTabIdFor(ctx.tabId)
+                    : ctx.tabId;
+                if (routedTab == null || mediaBridge.isHeadless(routedTab)) {
+                  return fail(
+                    (routedTab == null
+                      ? "no tab can currently be identified for this session, so this audio was not sent: "
+                      : "this conversation is on a headless client (a paired phone or remote viewer), which has " +
+                        "no audio player, so this file was not sent: ") +
+                      p +
+                      "\nA headless client renders images and video only. Sending it audio would show a caption " +
+                      "row with an image icon and report back as delivered, so you would be told the take played " +
+                      "when nobody heard it — and when no tab resolves, whichever client collects this later may " +
+                      "be exactly that. Nothing is wrong with the file.\n" +
+                      "What you can do:\n" +
+                      "  1. Ask the USER to open it on the desktop ComfyUI panel, which has a real player, or to " +
+                      "play it locally. Tell them where it is; do not describe how it sounds, because you have " +
+                      "not heard it either.\n" +
+                      "  2. Show a still or a video instead, and say plainly that the audio is not playable here.",
+                  );
+                }
               }
               mime = AUDIO_MIME[ext];
               kind = "audio";

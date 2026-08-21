@@ -287,3 +287,116 @@ describe("#1572 audio is not newly promised to a client that cannot play it", ()
     expect(items[0].kind).toBe("audio");
   });
 });
+
+// The correction the gate forced on the guard above.
+//
+// Asking `isHeadless(ctx.tabId)` is asking about an ADDRESS. `ctx.tabId` may be
+// a SCOPE ADDRESS (#884: `orchestrator`, `orchestrator::<backend>`), which is
+// not a tab at all — `conns` is keyed by tab id and `headlessSeen` never holds a
+// scope address — so the lookup misses and answers `false`, while
+// `resolveTarget`'s scope branch ends "…else the most recent headless one". A
+// codex- or claude-backend session resting on a phone therefore walked straight
+// past a guard written to stop exactly that.
+//
+// Restated as a positive requirement — allow only a PROVEN non-headless
+// destination — the monotonicity argument actually holds: every refusal here is
+// a case main refused too, because main refuses all audio on this branch.
+describe("#1572 the guard requires a proven destination, not an unexamined address", () => {
+  const ctxFor = (opts: {
+    tabId: string;
+    resolves?: (id: string) => string | undefined;
+    headless: (id: string) => boolean;
+  }): { ctx: PanelToolCtx; calls: Forwarded[] } => {
+    const calls: Forwarded[] = [];
+    const bridge: Record<string, unknown> = { isHeadless: opts.headless };
+    if (opts.resolves) bridge.liveTabIdFor = opts.resolves;
+    const ctx = {
+      call: async (cmd: Forwarded) => {
+        calls.push(cmd);
+        return { content: [{ type: "text", text: "ok" }] } as ToolResult;
+      },
+      confirm: async () => "yes" as const,
+      bridge: bridge as unknown as PanelToolCtx["bridge"],
+      tabId: opts.tabId,
+    } as PanelToolCtx;
+    return { ctx, calls };
+  };
+
+  const run = async (ctx: PanelToolCtx) => {
+    const def = buildPanelToolDefs().find((d) => d.name === "panel_show_media")!;
+    return (await def.handler({ items: [{ source: { path: paths[".wav"] } }] }, ctx)) as ToolResult;
+  };
+
+  it("a SCOPE address resolving onto a phone is refused — the gate's exact case", async () => {
+    const { ctx, calls } = ctxFor({
+      tabId: "orchestrator::claude",
+      // The real isHeadless: a scope address is never a key, so it answers false.
+      headless: (id) => id === "phone-1",
+      resolves: (id) => (id === "orchestrator::claude" ? "phone-1" : id),
+    });
+    const res = await run(ctx);
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/headless client/i);
+    expect(calls.find((c) => c.cmd === "show_media")).toBeFalsy();
+  });
+
+  it("a SCOPE address resolving onto a desktop tab still gets its audio", async () => {
+    const { ctx, calls } = ctxFor({
+      tabId: "orchestrator::claude",
+      headless: (id) => id === "phone-1",
+      resolves: () => "desktop-1",
+    });
+    const res = await run(ctx);
+    expect(res.isError).toBeFalsy();
+    const items = calls.find((c) => c.cmd === "show_media")!.items as Array<{ kind?: string }>;
+    expect(items[0].kind).toBe("audio");
+  });
+
+  it("an address that resolves to NOTHING is refused, and says so in its own words", async () => {
+    // Not "you are on a phone" — nobody knows what it is on. main refused this
+    // too, so refusing keeps the guard monotone; claiming a phone would not.
+    const { ctx, calls } = ctxFor({
+      tabId: "orchestrator::claude",
+      headless: () => false,
+      resolves: () => undefined,
+    });
+    const res = await run(ctx);
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toMatch(/no tab can currently be identified/);
+    expect(text).not.toMatch(/this conversation is on a headless client/);
+    expect(calls.find((c) => c.cmd === "show_media")).toBeFalsy();
+  });
+
+  it("the ADDRESS itself is never what gets asked about", async () => {
+    // A bridge answering true for the address and false for the resolved tab
+    // must still let the audio through. If the guard regresses to reading
+    // ctx.tabId directly, this fails.
+    const { ctx, calls } = ctxFor({
+      tabId: "orchestrator::claude",
+      headless: (id) => id === "orchestrator::claude",
+      resolves: () => "desktop-1",
+    });
+    const res = await run(ctx);
+    expect(res.isError).toBeFalsy();
+    expect(calls.find((c) => c.cmd === "show_media")).toBeTruthy();
+  });
+
+  it("a concrete id is resolved too, so a prefix cannot dodge the guard", async () => {
+    const { ctx, calls } = ctxFor({
+      tabId: "phone-1",
+      headless: (id) => id === "phone-1-full-id",
+      resolves: (id) => (id === "phone-1" ? "phone-1-full-id" : id),
+    });
+    const res = await run(ctx);
+    expect(res.isError).toBe(true);
+    expect(calls.find((c) => c.cmd === "show_media")).toBeFalsy();
+  });
+
+  it("a bridge without liveTabIdFor falls back to the id it was given", async () => {
+    const { ctx, calls } = ctxFor({ tabId: "desktop-1", headless: () => false });
+    const res = await run(ctx);
+    expect(res.isError).toBeFalsy();
+    expect(calls.find((c) => c.cmd === "show_media")).toBeTruthy();
+  });
+});
