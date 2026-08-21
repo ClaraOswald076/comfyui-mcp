@@ -2350,8 +2350,13 @@ async function streamUrlToFile(
   try {
     // #1697 — MULTI-CONNECTION BODY. One TCP flow is bounded by BDP and, on the
     // CDNs that serve model weights, routinely by a per-connection rate cap; N
-    // ranged GETs are what `aria2c -x4`/`hf_transfer` do and are worth 1.5-1.7x
-    // even on a link where one connection already sustains ~80 MB/s.
+    // ranged GETs are what `aria2c -x4`/`hf_transfer` do. Measured through
+    // `downloadWithCache` on a real 2.13 GB Hugging Face file: 1.56-1.84x at four
+    // connections. Under an explicit per-connection cap the gain is linear in the
+    // connection count (3.97x at four, 7.85x at eight) — that is the shape #1697's
+    // field reports describe. On a source fast enough to saturate the local disk
+    // (loopback, ~570 MB/s on one connection) it is 0.83x, which is why
+    // COMFYUI_DOWNLOAD_CONNECTIONS=1 exists.
     //
     // Engaged ONLY on a fresh 200 whose own Content-Length agrees with the size
     // we will verify against, that advertises `Accept-Ranges: bytes`, carries no
