@@ -26,6 +26,7 @@ import { resolveLiveInterpreter } from "./live-interpreter.js";
 import { parsePyproject } from "./node-authoring.js";
 import { compareSemver, detectInstallMode } from "./self-update.js";
 import { logger } from "../utils/logger.js";
+import { parseKitchenLog } from "./kitchen.js";
 
 // The interpreter resolver lives in workspace-env (which owns ComfyUI-base
 // resolution) so the environment read and this panel probe share ONE live-first
@@ -85,6 +86,8 @@ export interface EnvCapabilities {
    */
   mcpVersionInstalled?: string;
   panelVersion?: string; // sidebar panel version from the panel's hello, e.g. "0.11.3" / "nightly"
+  /** Compact kitchen line, omitted when the log/probe did not establish presence. */
+  kitchen?: string;
 }
 
 // Shape of the bits of /system_stats we read (mirrors the environment read).
@@ -330,7 +333,7 @@ async function fetchSystemStatsWithRetry(
 async function detectAttentionFromComfyLog(
   comfyuiUrl: string,
   timeoutMs: number,
-): Promise<{ triton?: TriState; sageattention?: TriState }> {
+): Promise<{ triton?: TriState; sageattention?: TriState; kitchen?: string }> {
   const base = comfyuiUrl.replace(/\/+$/, "");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -349,10 +352,12 @@ async function detectAttentionFromComfyLog(
       : typeof data === "string"
         ? data
         : JSON.stringify(data);
-    const out: { triton?: TriState; sageattention?: TriState } = {};
+    const out: { triton?: TriState; sageattention?: TriState; kitchen?: string } = {};
     if (/Using sage attention/i.test(text)) out.sageattention = "installed";
     if (/Enabling comfy-kitchen triton backend|Found triton \d/i.test(text))
       out.triton = "installed";
+    const kitchenLog = parseKitchenLog(text);
+    if (kitchenLog.version.status === "known") out.kitchen = `Kitchen: ${kitchenLog.version.value}`;
     return out;
   } catch {
     return {};
@@ -989,6 +994,7 @@ export async function gatherEnvCapabilities(opts: GatherOptions): Promise<EnvCap
     );
     if (fromLog?.sageattention) caps.sageattention = fromLog.sageattention;
     if (fromLog?.triton) caps.triton = fromLog.triton;
+    if (fromLog?.kitchen) caps.kitchen = fromLog.kitchen;
   }
 
   return caps;
@@ -1088,6 +1094,7 @@ export function formatEnvBlock(caps: EnvCapabilities): string {
   if (triton) parts.push(`Triton: ${triton}`);
   const sage = triLabel(caps.sageattention);
   if (sage) parts.push(`SageAttention: ${sage}`);
+  if (caps.kitchen) parts.push(caps.kitchen);
 
   if (caps.backend) {
     // With three providers the specific "other" isn't single-valued, so name them

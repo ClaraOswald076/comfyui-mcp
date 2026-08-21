@@ -72,6 +72,12 @@
                   "arena",
                   "troubleshooting"
                 ]
+              },
+              {
+                "group": "Tools",
+                "pages": [
+                  "kitchen"
+                ]
               }
             ]
           },
@@ -108,6 +114,7 @@
                 "group": "Blog",
                 "pages": [
                   "blog/index",
+                  "blog/comfy-kitchen",
                   "blog/from-report-to-release",
                   "blog/micro-apps",
                   "blog/runpod-comfyui",

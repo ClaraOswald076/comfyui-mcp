@@ -4,7 +4,7 @@ description: "Install/update ComfyUI and the sidebar panel, self-update the MCP 
 icon: "wrench"
 ---
 
-<Info>4 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
+<Info>5 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
 <Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
 
@@ -272,5 +272,85 @@ File or triage a GitHub issue for a bug/problem you hit (ComfyUI, a workflow, a 
 **You get back:** A GitHub issue on the project, with your environment details attached automatically, and a link to it.
 
 <Warning>This posts publicly. The environment block it attaches includes paths and versions from your machine — glance at what it drafted before agreeing to send it.</Warning>
+
+---
+
+## kitchen
+
+See what comfy-kitchen can do on this GPU, find where a graph is leaving it on the table, and apply the faster path. Driven by `action`:
+- action:"status" — kitchen version, backends (hip/cuda/triton/eager), INT8 attention, GPU fp8/NVFP4/MXFP8, launch flags (--use-ck-attention, --enable-triton-backend, --fast fp8_matrix_mult). Local gets log + /system_stats + an import probe when COMFYUI_PATH is set; remote gets log + /system_stats only and reports model.quant / the probe as unknown. A failed probe is unknown, never a no.
+- action:"assess" — walk the workflow JSON's UNETLoaders and emit a recommendation only when every fact it needs is known: (1) weight_dtype default on a bf16 UNETLoader + GPU fp8 + kitchen present → fp8_e4m3fn_fast (widget, no restart); (2) no --use-sage-attention, sageattention not installed, kitchen INT8 available → --use-ck-attention (restart, confirm); (3) Blackwell + local NVFP4 sibling → model swap; (4) ROCm + triton ≥ 3.7 + kitchen, triton backend off → --enable-triton-backend. Pass `workflow` (API or UI JSON). For the open canvas use panel_kitchen.
+- action:"apply" — apply one recommendation_id from assess. Widget edits are reversible and do not need confirm. Flags and downloads need `confirm: true`. Flag apply names the launch flag; restart_comfyui replays the previous argv and does not inject a new one. Proof (before/after s/it, peak VRAM, output not black) is the panel_kitchen apply path.
+
+<Tip>**In plain terms:** comfy-kitchen is ComfyUI's kernel library (fp8 / NVFP4 / MXFP8 / INT8 attention). This tool reports what the connected GPU can run, walks a graph for the faster path, and applies a recommendation. A failed probe is unknown, never a no — a recommendation fires only when every fact it needs is known. For the open canvas use panel_kitchen.</Tip>
+
+### Parameters
+
+<ParamField path="action" type="enum" required>
+  Which kitchen operation. "status" takes no other parameters; "assess" takes `workflow`; "apply" takes `recommendation_id` and `confirm` for restarts/downloads.
+  Options: `action:"status"`, `action:"assess"`, `action:"apply"`.
+</ParamField>
+<ParamField path="workflow" type="string | object">
+  action:"assess" / "apply" — workflow JSON (API-format &#123;id:&#123;class_type,inputs&#125;&#125; or UI-format &#123;nodes,links&#125;), as a string or object.
+</ParamField>
+<ParamField path="recommendation_id" type="string">
+  action:"apply" — id from assess (e.g. "fp8_unet_fast:12" or "ck_attention").
+</ParamField>
+<ParamField path="confirm" type="boolean">
+  action:"apply" — required true for anything that restarts or downloads. Widget edits do not need it.
+</ParamField>
+
+### Examples
+
+**You say:** Is kitchen even installed on this GPU, and can it do fp8?
+
+```json
+{
+  "tool": "kitchen",
+  "arguments": {
+    "action": "status"
+  }
+}
+```
+
+**You get back:** Kitchen version (or unknown), which backends loaded, whether INT8 attention is on, GPU fp8/NVFP4/MXFP8, and the launch flags in argv. Remote sessions skip the import probe and model.quant.
+
+**You say:** Where is this workflow leaving kitchen speed on the table?
+
+```json
+{
+  "tool": "kitchen",
+  "arguments": {
+    "action": "assess",
+    "workflow": {
+      "12": {
+        "class_type": "UNETLoader",
+        "inputs": {
+          "unet_name": "flux1-dev.safetensors",
+          "weight_dtype": "default"
+        }
+      }
+    }
+  }
+}
+```
+
+**You get back:** Per-loader facts plus recommendations that fired. A default UNETLoader on a bf16 file, with kitchen present and an fp8 GPU, yields fp8_e4m3fn_fast. Missing facts stay unknown; they do not invent a rec.
+
+**You say:** Apply that fp8 widget change.
+
+```json
+{
+  "tool": "kitchen",
+  "arguments": {
+    "action": "apply",
+    "recommendation_id": "fp8_unet_fast:12"
+  }
+}
+```
+
+**You get back:** The widget edit on the supplied workflow, or a needs_confirm refusal for a flag that would restart. Flag apply names the launch flag; restart_comfyui replays argv and does not inject it.
+
+<Warning>A flag or download recommendation needs confirm:true. Proof of a faster non-black after-run is panel_kitchen apply.</Warning>
 
 ---

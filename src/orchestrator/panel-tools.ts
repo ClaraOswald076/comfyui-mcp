@@ -133,6 +133,14 @@ import {
 } from "./switch-hold.js";
 import { NO_ORIGIN_REMEDY } from "./fence-refusal.js";
 import { completeGetErrorsAudit } from "./get-errors-audit.js";
+import {
+  applyKitchenRecommendation,
+  assessKitchen,
+  assessKitchenGraph,
+  extractLoaders,
+  gatherKitchenStatus,
+  kitchenProactiveHint,
+} from "../services/kitchen.js";
 
 /** #884 — journal TICKETS (run completions #468, ask answers #486) must be
  *  keyed by the REAL tab a run/card was routed to: the panel reports back under
@@ -19392,6 +19400,107 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           });
         }
         return res;
+      },
+    ),
+    def(
+      "panel_kitchen",
+      "See what comfy-kitchen can do on this GPU against the OPEN canvas, find where the live graph leaves it on the table, and apply the faster path. Same actions as the core `kitchen` tool, fenced like every other panel mutation. Driven by `action`:\n" +
+        '- action:"status" — kitchen version, backends (hip/cuda/triton/eager), INT8 attention, GPU fp8/NVFP4/MXFP8, launch flags. Remote sessions report the import probe and model.quant as unknown.\n' +
+        '- action:"assess" — walk the live graph\'s UNETLoaders. A recommendation fires only when every fact it needs is known (fp8_e4m3fn_fast widget; --use-ck-attention flag; NVFP4 swap; ROCm --enable-triton-backend).\n' +
+        '- action:"apply" — apply one recommendation_id. Widget edits go through graph_set_widget (Ctrl+Z). Flags need confirm:true; restart_comfyui / panel_restart_comfyui replay argv and do not inject flags. skip_proof:true skips the follow-up panel_run. A black or slower after-run reverts the widget.',
+      {
+        action: z
+          .enum(["status", "assess", "apply"])
+          .describe('Which kitchen operation against the live graph.'),
+        recommendation_id: z
+          .string()
+          .optional()
+          .describe('action:"apply" — id from assess (e.g. "fp8_unet_fast:12").'),
+        confirm: z
+          .boolean()
+          .optional()
+          .describe("Required true for flag/download recommendations. Widget edits do not need it."),
+        skip_proof: z
+          .boolean()
+          .optional()
+          .describe("If true, apply the widget/flag plan without queueing a proof panel_run."),
+      },
+      async (args: A, ctx) => {
+        const status = await gatherKitchenStatus();
+        if (args.action === "status") {
+          const hint = kitchenProactiveHint(status, assessKitchen(status, {}));
+          return ok(hint ? { status, hint } : { status });
+        }
+        const query = await ctx.call({
+          cmd: "graph_query",
+          types: ["UNETLoader"],
+          fields: "detail",
+          limit: 200,
+        });
+        const graph = parseToolResultJson(query) ?? { nodes: [] };
+        const recs = await assessKitchenGraph(status, graph);
+        if (args.action === "assess") {
+          const hint = kitchenProactiveHint(status, recs);
+          return ok({
+            status,
+            loaders: extractLoaders(graph),
+            recommendations: recs,
+            ...(hint ? { hint } : {}),
+          });
+        }
+        if (args.action !== "apply") {
+          return fail(`Unknown panel_kitchen action "${String(args.action)}". Expected status, assess, or apply.`);
+        }
+        if (!args.recommendation_id) {
+          return fail('panel_kitchen action:"apply" needs recommendation_id from assess.');
+        }
+        const rec = recs.find((r) => r.id === args.recommendation_id);
+        if (!rec) {
+          return fail(
+            `No recommendation "${args.recommendation_id}" on the live graph. Call panel_kitchen action:"assess" first. Known: ${recs.map((r) => r.id).join(", ") || "(none)"}`,
+          );
+        }
+        const result = await applyKitchenRecommendation({
+          rec,
+          confirm: args.confirm === true,
+          applyWidget:
+            rec.change.type === "widget" || rec.change.type === "model_swap"
+              ? async (nodeId, widget, value) => {
+                  const write = await ctx.call(
+                    { cmd: "graph_set_widget", node_id: nodeId, widget, value },
+                    OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+                  );
+                  if (write.isError) {
+                    throw new Error(write.content.map((c) => ("text" in c ? c.text : "")).join("\n"));
+                  }
+                  return parseToolResultJson(write);
+                }
+              : undefined,
+          revertWidget:
+            rec.change.type === "widget" || rec.change.type === "model_swap"
+              ? async (nodeId, widget, value) => {
+                  await ctx.call(
+                    { cmd: "graph_set_widget", node_id: nodeId, widget, value },
+                    OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+                  );
+                }
+              : undefined,
+        });
+        if (result.applied && args.skip_proof !== true && rec.change.type !== "flag") {
+          const run = await ctx.call({ cmd: "graph_run" });
+          return ok({
+            ...result,
+            proof: {
+              ...result.proof,
+              status: "queued",
+              summary:
+                (result.proof.summary ? `${result.proof.summary}; ` : "") +
+                "panel_run queued on the current seed — compare s/it and peak VRAM when it finishes; a black or slower after-run should be reverted with the previous widget value.",
+            },
+            run: parseToolResultJson(run),
+          });
+        }
+        return ok(result);
       },
     ),
     def(

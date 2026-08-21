@@ -171,6 +171,7 @@ const CATEGORIES: Array<{
       "install_comfyui",
       "apply_manifest", "workspace",
       "report_issue",
+      "kitchen",
     ],
   },
   {

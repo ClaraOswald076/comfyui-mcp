@@ -69,6 +69,7 @@ export const TOOL_NAMES = [
   "train_doctor",
   "apps",
   "batch",
+  "kitchen",
 ] as const;
 
 /** A name that is actually registered today. A typo is a compile error. */
@@ -120,7 +121,7 @@ const BASELINE_URL = new URL("../../docs/design/tool-surface.txt", import.meta.u
  * 200-line rename. APPENDING is legitimate — new tools join the baseline when they
  * ship — so the workflow is: append, update this hash, say why in the message.
  */
-export const BASELINE_SHA256 = "984b006e468063be6fb8a5ad5432b21a2246f1510829d30775cfafd06693bc75";
+export const BASELINE_SHA256 = "edde835eb2c3eabea65d7c2f59a316690a7df00cd27bf1344f06c16d5a2d89a5";
 
 /**
  * LAZY on purpose, and this is not a micro-optimisation.
@@ -169,7 +170,7 @@ const PANEL_BASELINE_URL = new URL("../../docs/design/panel-surface.txt", import
  * Sorted rather than in registration order: unlike tools/list, the panel surface has
  * no observable ordering, so sorting keeps the diff readable as names are added.
  */
-export const PANEL_BASELINE_SHA256 = "c6f6a85a439d0d893f4ba502837e41de3f791265f398cf833139fddd513edd0d";
+export const PANEL_BASELINE_SHA256 = "1464d3c0f2323bc102ec6522753119e57c7c2ee59df764c1649b4b688dbe685d";
 
 /** Lazy for the same reason as the core baseline — see readBaseline(). */
 export function panelRetirementBaseline(): readonly string[] {
@@ -194,7 +195,7 @@ export function panelBaselineIntegrity(): { ok: boolean; actual: string } {
  * to the surface. That is the ratchet: not that it cannot rise, but that it cannot
  * rise silently.
  */
-export const MAX_TOOLS = 37;
+export const MAX_TOOLS = 38;
 
 /** Where this is headed, for reference in review. A goal, not enforced. */
 export const TOOL_BUDGET_TARGET = 30;

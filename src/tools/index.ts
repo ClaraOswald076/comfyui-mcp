@@ -32,6 +32,7 @@ import { registerModelExplorerTools } from "./model-explorer.js";
 // untouched and now imported there.
 import { registerSkillsAccessTools } from "./skills-access.js";
 import { registerCalculateTools } from "./calculate.js";
+import { registerKitchenTools } from "./kitchen.js";
 import { registerComfyCliTools } from "./comfy-cli.js";
 import { registerTrainTools } from "./train.js";
 import { registerAppsTools } from "./apps.js";
@@ -97,6 +98,8 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   // Appended (not inserted next to queue-management) because tools/list order
   // is observable and must not shift for existing tools.
   ["workflows", registerBatchTools],
+  // Appended: tools/list order is observable and must not shift existing names.
+  ["diagnostics", registerKitchenTools],
 ];
 
 // ── Blind content mode (panel issue #90) ────────────────────────────────────

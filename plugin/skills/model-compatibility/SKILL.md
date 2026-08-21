@@ -227,6 +227,7 @@ VAELoader (vae_name="ae.safetensors") → VAE
 - **Separate VAE required** — Flux uses its own VAE (`ae.safetensors`), not SD VAEs
 - **FP8 strongly recommended** for 24GB cards — FP16 Flux barely fits in 24GB VRAM
 - T5-XXL encoder can be loaded in FP8 to save additional VRAM
+- **Kitchen quant column (this GPU):** `kitchen` action:"status" reports `gpu.fp8` (SM ≥ 8.9, Ada), `gpu.nvfp4` and `gpu.mxfp8` (SM ≥ 10.0, Blackwell). A UNETLoader on `weight_dtype: default` with an unquantized file and kitchen present is `panel_kitchen` action:"assess" rec `fp8_unet_fast` (set `fp8_e4m3fn_fast`). An NVFP4 sibling on disk is rec `nvfp4_swap`. MXFP8 is reported in status but not recommended until a loader path exposes it.
 
 ### Workflow Pattern
 
@@ -435,5 +436,5 @@ Going below the recommended resolution produces blurry/low-quality results. Goin
 
 ## Sources
 
-- **Official:** none found as a vendor pairing matrix.
+- **Official:** none found as a vendor pairing matrix. Kitchen hardware gates: ComfyUI `comfy/model_management.py` (`supports_fp8_compute`, `supports_nvfp4_compute`, `supports_mxfp8_compute`); UNETLoader `weight_dtype` in `nodes.py`.
 - **Empirical:** base-model / VAE / CLIP pairing rules from observed load failures.
