@@ -27,6 +27,14 @@ import { reportDownloadProgress, type DownloadProgress } from "./download-progre
 import type { ResumeReporter } from "./download-resume-diag.js";
 import { checkCacheVolumeSpace } from "./download-volume.js";
 import {
+  planSegments,
+  probeSegmentedRanges,
+  runSegmentedDownload,
+  segmentedDownloadPolicy,
+  SegmentedRangeUnsupportedError,
+  type SegmentedProbe,
+} from "./download-segments.js";
+import {
   abortableDelay,
   backoffDelayMs,
   classifyDownloadFailure,
@@ -2148,8 +2156,12 @@ async function streamUrlToFile(
     if (refusal) throw new ModelError(refusal, { path: targetPath });
   }
 
-  const nodeStream = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream);
-  const fileStream = createWriteStream(targetPath, { flags });
+  // #1697 — the single-connection body and the write stream are opened LAZILY,
+  // immediately before the pipe, not here. `createWriteStream(targetPath, {flags:"w"})`
+  // truncates and holds an fd the moment it is constructed, and the segmented path
+  // below renames its scratch file OVER `targetPath` — on Windows a rename onto a
+  // path we still hold open is exactly the EPERM this ordering avoids. It also means
+  // a segmented transfer never truncates the staged file it is not going to write.
 
   // Truncation/verification target = the true full-file size. For a validated 206
   // that is the Content-Range total (NOT content-length, which is only the
@@ -2282,21 +2294,6 @@ async function streamUrlToFile(
       },
     });
 
-  // No progress tray AND no stall watchdog (internal/cache caller, not under the
-  // panel) → straight pipe, nothing to count.
-  if (!progress && !onBytes) {
-    await pipeline(nodeStream, fileStream, { signal });
-    await assertComplete();
-    // Baseline the file the INSTANT our write finished — BEFORE the body is
-    // classified. Taking it inside the rejection callback would baseline whatever
-    // is on disk AFTER the classify gap, i.e. adopt a foreign writer's replacement
-    // as our own and then delete it.
-    await assertModelPayload(await currentStagedBaseline());
-    // Complete: the validator sidecar is only needed to guard a resume, so drop it.
-    if (resumable) await safeRm(validatorSidecar);
-    return responseContentType;
-  }
-
   // Tally bytes as they flow: report throughput to the panel tray (when a tray row
   // was requested) and feed the caller's stall watchdog (#470). The counter now runs
   // whenever EITHER sink is present — the watchdog must be able to bound a wedged
@@ -2315,6 +2312,25 @@ async function streamUrlToFile(
         )
       : undefined;
   emit("downloading", true); // show the row immediately, even before the first chunk
+
+  /** The ONE byte sink. Both transfer shapes — the single-connection counter
+   *  Transform and the #1697 segmented writer — report through it, so the tray
+   *  and the #470 stall watchdog behave identically whichever one runs. */
+  const noteBytes = (delta: number): void => {
+    downloaded += delta;
+    // Feed the watchdog FIRST and unconditionally — before the 400 ms throughput
+    // window gate — so a trickle that never fills a window still counts as
+    // liveness. Gating it would let a slow-but-alive transfer be killed as stalled.
+    onBytes?.(delta);
+    const now = Date.now();
+    const dt = now - windowStart;
+    if (dt >= 400) {
+      bytesPerSec = ((downloaded - windowBytes) * 1000) / dt;
+      windowStart = now;
+      windowBytes = downloaded;
+      emit("downloading");
+    }
+  };
   // #1697 — deliberately NO explicit highWaterMark: the counter runs at Node's
   // default, which matches the write stream it feeds (measured in-pipeline on
   // Node v24: both `writableHighWaterMark` are 16384; 64 KiB is createReadStream's
@@ -2327,24 +2343,78 @@ async function streamUrlToFile(
   // regime you care about.
   const counter = new Transform({
     transform(chunk: Buffer, _enc, cb) {
-      downloaded += chunk.length;
-      // Feed the watchdog FIRST and unconditionally — before the 400 ms throughput
-      // window gate — so a trickle that never fills a window still counts as
-      // liveness. Gating it would let a slow-but-alive transfer be killed as stalled.
-      onBytes?.(chunk.length);
-      const now = Date.now();
-      const dt = now - windowStart;
-      if (dt >= 400) {
-        bytesPerSec = ((downloaded - windowBytes) * 1000) / dt;
-        windowStart = now;
-        windowBytes = downloaded;
-        emit("downloading");
-      }
+      noteBytes(chunk.length);
       cb(null, chunk);
     },
   });
   try {
-    await pipeline(nodeStream, counter, fileStream, { signal });
+    // #1697 — MULTI-CONNECTION BODY. One TCP flow is bounded by BDP and, on the
+    // CDNs that serve model weights, routinely by a per-connection rate cap; N
+    // ranged GETs are what `aria2c -x4`/`hf_transfer` do and are worth 1.5-1.7x
+    // even on a link where one connection already sustains ~80 MB/s.
+    //
+    // Engaged ONLY on a fresh 200 whose own Content-Length agrees with the size
+    // we will verify against, that advertises `Accept-Ranges: bytes`, carries no
+    // Content-Encoding and was not itself a Range request (planSegments). It then
+    // PROBES a real range before touching a file, while `res.body` here is still
+    // unread — so a server that refuses, lies about, or mis-answers ranges costs
+    // one request and falls through to the byte-identical single-connection path
+    // below. Bytes land in a `.seg` scratch file and reach `targetPath` only by
+    // rename, so a hole can never exist under `targetPath` (see download-segments.ts).
+    let segmented = false;
+    const segmentPlan = planSegments({
+      status: res.status,
+      appendMode,
+      acceptRanges: res.headers.get("accept-ranges"),
+      contentEncoding: res.headers.get("content-encoding"),
+      contentLength: lengthHeader,
+      expectedTotal,
+      requestHadRange: Boolean(currentHeaders.Range || currentHeaders.range),
+      policy: segmentedDownloadPolicy(),
+    });
+    if (segmentPlan) {
+      const segmentOpts = {
+        url: currentUrl,
+        headers: currentHeaders,
+        targetPath,
+        totalBytes: expectedTotal,
+        segments: segmentPlan,
+        signal,
+        logUrl,
+        onBytes: noteBytes,
+      };
+      let probe: SegmentedProbe | undefined;
+      try {
+        probe = await probeSegmentedRanges(segmentOpts);
+      } catch (err) {
+        if (err instanceof SegmentedRangeUnsupportedError) {
+          // Not a failure. The single-connection response is still unread.
+          logger.debug(
+            `Multi-connection download declined for ${logUrl}: ${err.message}. Using one connection.`,
+          );
+        } else {
+          throw err;
+        }
+      }
+      if (probe) {
+        // Ranges are proven, so this response is redundant — release its socket
+        // before the segments compete with it for bandwidth.
+        await (res.body as { cancel?: () => Promise<void> } | null)?.cancel?.().catch(() => {});
+        await runSegmentedDownload(segmentOpts, probe);
+        segmented = true;
+      }
+    }
+
+    if (!segmented) {
+      // The ordinary single-connection path, unchanged: opened here so a
+      // segmented transfer never truncates the staged file or holds an fd on it.
+      const nodeStream = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream);
+      const fileStream = createWriteStream(targetPath, { flags });
+      // No progress tray AND no stall watchdog (internal/cache caller, not under
+      // the panel) → straight pipe, nothing to count.
+      if (!progress && !onBytes) await pipeline(nodeStream, fileStream, { signal });
+      else await pipeline(nodeStream, counter, fileStream, { signal });
+    }
     await assertComplete();
     // See above: baseline before the classify gap, not inside the callback.
     await assertModelPayload(await currentStagedBaseline());
