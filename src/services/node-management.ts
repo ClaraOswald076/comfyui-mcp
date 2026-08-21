@@ -146,6 +146,16 @@ export interface NodeOpResult {
    * at the SAME server even if the global target was retargeted in between.
    */
   managerBase?: string;
+  /**
+   * #1999 — the `ui_id` the Manager task was ACTUALLY enqueued under, when this
+   * result came from the unified task queue. It is the ONLY key that correlates
+   * a drained queue back to what our specific task did: Manager v4 keeps the
+   * per-task record at `/v2/manager/queue/history?ui_id=…` while the queue-wide
+   * counts say nothing about it (see readQueueCounts / fetchManagerTaskHistoryEntry).
+   * Absent on the cm-cli and git-clone mechanisms, and on paths that never
+   * enqueued a single correlatable task.
+   */
+  taskUiId?: string;
 }
 
 export interface ParsedGitUrl {
@@ -1018,6 +1028,13 @@ export interface ManagerTaskHistoryEntry {
   uiId: string;
   kind?: string;
   result?: string;
+  /**
+   * `status.status_str` — Manager's own STRUCTURED verdict for the task, one of
+   * success/failed/skipped/error/skip (OperationResult in its data models). This
+   * is the field to classify on; `result` is free prose whose only stable values
+   * are the literals "success"/"skip" (measured against Manager 4.2.2).
+   */
+  statusStr?: string;
 }
 
 /**
@@ -1057,10 +1074,17 @@ export async function fetchManagerTaskHistoryEntry(
   // history) must never prove anything about OUR task — least of all clear
   // its marker as already-drained (#689 round 4).
   if (h.ui_id !== uiId) return undefined;
+  const status = h.status;
+  const statusStr =
+    status && typeof status === "object" &&
+    typeof (status as Record<string, unknown>).status_str === "string"
+      ? ((status as Record<string, unknown>).status_str as string)
+      : undefined;
   return {
     uiId: h.ui_id,
     kind: typeof h.kind === "string" ? h.kind : undefined,
     result: typeof h.result === "string" ? h.result : undefined,
+    statusStr,
   };
 }
 
@@ -1147,20 +1171,46 @@ async function queueManagerTask(
   params: ManagerTaskParams,
   base = managerBaseUrl(),
 ): Promise<QueueStatus> {
+  return (await queueManagerTaskTracked(kind, params, base)).status;
+}
+
+/**
+ * #1999 — the same enqueue+drain, but it also HANDS BACK the `ui_id` the task
+ * was enqueued under. A drained queue's counts are queue-wide and, on Manager
+ * v4, identical for a task that succeeded and one that errored (measured: an
+ * idle v4 answers `total_count:0` with a `done_count` that is the CUMULATIVE
+ * session history length). The ui_id is the only handle that can ask Manager
+ * what OUR task actually did — see fetchManagerTaskHistoryEntry.
+ *
+ * Callers that don't correlate keep using queueManagerTask above; nothing about
+ * the enqueue, drain, dialect self-heal or timeout behaviour differs.
+ */
+async function queueManagerTaskTracked(
+  kind: ManagerTaskKind,
+  params: ManagerTaskParams,
+  base = managerBaseUrl(),
+): Promise<{ status: QueueStatus; uiId: string }> {
   // Normalize to a resolver so every attempt builds its body for the dialect it
   // is about to speak — a few operations (git installs) have dialect-specific
   // params, and a self-heal retry must rebuild them, not just re-route them.
   const resolve: ManagerParamsResolver =
     typeof params === "function" ? params : () => params;
+  // The id is minted PER ATTEMPT, exactly as before. A self-heal retry is a
+  // genuinely second enqueue, so it gets its own id; the one recorded here is
+  // therefore the id of the attempt that LANDED (a failed attempt throws, so it
+  // never reaches the drain, and a v2→v2-batch downgrade inside a single attempt
+  // reuses that attempt's id).
+  let uiId = "";
   // This is a mutation transaction, so freeze its target before the first await.
   // A later setComfyuiTarget() selects where NEW calls go; it must not redirect a
   // retry, queue start, or verification of a request the user already made.
-  const used = await enqueueWithDialectSelfHeal(kind, (api, epoch) =>
-    enqueueManagerTask(api, kind, resolve, randomUUID(), base, epoch),
-    base,
-  );
+  const used = await enqueueWithDialectSelfHeal(kind, (api, epoch) => {
+    uiId = randomUUID();
+    return enqueueManagerTask(api, kind, resolve, uiId, base, epoch);
+  }, base);
   // Thread the kind so a model download gets the model budget, not the node one (#817).
-  return runManagerQueue(used, base, kind);
+  const status = await runManagerQueue(used, base, kind);
+  return { status, uiId };
 }
 
 /** Params for a Manager task: a fixed body, or a resolver invoked with the
@@ -3606,6 +3656,12 @@ async function updateCustomNodeImpl(
   if (!all && isManagerSelfTarget(id)) return updateManagerSelf(id);
 
   let status: QueueStatus;
+  /** #1999 — set only on the single-pack branch; see NodeOpResult.taskUiId. The
+   *  update-all branch deliberately leaves it undefined: v4 derives a SEPARATE
+   *  per-pack task id (`${uiId}_${pack}`) there, so the bare enqueue id would
+   *  never resolve in queue history and handing it out would invite a lookup
+   *  that answers "no such task" about a task that really ran. */
+  let taskUiId: string | undefined;
   // Freeze the target BEFORE the first await (queueManagerTask does the same):
   // a mid-op retarget must not split the enqueue and the post-op verification
   // across two servers. The base travels back on the result so callers (the
@@ -3629,7 +3685,13 @@ async function updateCustomNodeImpl(
     // resolves nowhere is refused with NOTHING queued.
     const tracked = await resolveTrackedForOp(id, "update", base, presenceCtx);
     // Single-pack update → unified task; UpdatePackParams uses node_name/node_ver.
-    status = await queueManagerTask("update", { node_name: tracked.module }, base);
+    const queued = await queueManagerTaskTracked(
+      "update",
+      { node_name: tracked.module },
+      base,
+    );
+    status = queued.status;
+    taskUiId = queued.uiId;
     // VERIFY (#730): the drain passes trivially for an id Manager never
     // enqueued (total_count 0 — the "Queued + updated" lie in the issue).
     // Require the pack to resolve SOMEWHERE post-op before claiming success.
@@ -3642,6 +3704,7 @@ async function updateCustomNodeImpl(
       : `Queued + updated "${id}" via ComfyUI-Manager.`,
     details: status,
     managerBase: base,
+    taskUiId,
   };
 }
 

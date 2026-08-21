@@ -43,6 +43,8 @@ import {
   looksLikePanelBackupName,
   readQueueCounts,
   isProvenQuiescentQueue,
+  classifyManagerTaskRecord,
+  describeManagerTaskVerdict,
   PanelInstallError,
   PANEL_REGISTRY_ID,
   PANEL_VERSION,
@@ -50,6 +52,7 @@ import {
   type PanelInstallerDeps,
 } from "../../services/panel-installer.js";
 import type { PanelPinState } from "../../services/panel-settings.js";
+import type { ManagerTaskHistoryEntry } from "../../services/node-management.js";
 
 const COMFY = "/fake/comfy";
 const CUSTOM_NODES = join(COMFY, "custom_nodes");
@@ -67,6 +70,8 @@ interface Harness {
   gitPulls: string[];
   /** Live call counts for the stubs that answer in sequence. */
   counters: { liveQueueProbes: number };
+  /** #1999 — every ui_id the per-task history lookup was asked about. */
+  taskRecordLookups: string[];
 }
 
 function makeDeps(opts: {
@@ -83,6 +88,20 @@ function makeDeps(opts: {
   pin?: PanelPinState;
   /** Raw ComfyUI-Manager queue status the `update` mock returns as details. */
   updateDetails?: unknown;
+  /**
+   * #1999 — the `ui_id` the `update` mock reports its Manager task was enqueued
+   * under. Defaults to a fixed id so the correlated lookup is exercised;
+   * `null` models a path that could not capture one at all.
+   */
+  updateTaskUiId?: string | null;
+  /**
+   * #1999 — what the Manager's per-task history answers for that ui_id.
+   * `undefined` (the default) is "could not be trusted / pre-v4"; `null` is the
+   * Manager PROVING no such completed task exists.
+   */
+  managerTaskRecord?: ManagerTaskHistoryEntry | null;
+  /** #1999 — make the per-task lookup THROW, to prove it is contained. */
+  managerTaskRecordThrows?: string;
   /** Queue status the `install`/`reinstall` mocks return as details. */
   installDetails?: unknown;
   reinstallDetails?: unknown;
@@ -163,6 +182,7 @@ function makeDeps(opts: {
   // Call counters the sequenced stubs above index into, and that #824 cases
   // assert on (the live re-probe must actually have been taken).
   const counters: Harness["counters"] = { liveQueueProbes: 0 };
+  const taskRecordLookups: Harness["taskRecordLookups"] = [];
   let statusCalls = 0;
 
   const deps: PanelInstallerDeps = {
@@ -186,6 +206,11 @@ function makeDeps(opts: {
       return statusCalls < (opts.gitStatusSeq?.length ?? 0)
         ? (opts.gitStatusSeq as string[])[statusCalls++]
         : ((statusCalls++, opts.gitStatus) ?? "");
+    },
+    fetchManagerTaskRecord: async (uiId: string) => {
+      taskRecordLookups.push(uiId);
+      if (opts.managerTaskRecordThrows) throw new Error(opts.managerTaskRecordThrows);
+      return opts.managerTaskRecord;
     },
     fetchLiveQueueCounts: async () => {
       const i = counters.liveQueueProbes++;
@@ -234,6 +259,8 @@ function makeDeps(opts: {
         mechanism: "manager-http",
         message: "updated",
         details: opts.updateDetails,
+        taskUiId:
+          opts.updateTaskUiId === null ? undefined : (opts.updateTaskUiId ?? "task-1999"),
       };
     },
     reinstall: async (o) => {
@@ -242,7 +269,7 @@ function makeDeps(opts: {
       return { mechanism: "manager-http", message: "reinstalled", details: opts.reinstallDetails };
     },
   };
-  return { deps, installs, updates, reinstalls, gitPulls, counters };
+  return { deps, installs, updates, reinstalls, gitPulls, counters, taskRecordLookups };
 }
 
 beforeEach(() => {
@@ -846,9 +873,14 @@ describe("runPanelAction", () => {
       files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.28") },
       reinstallDetails: { total_count: 0, done_count: 2, is_processing: false },
     });
-    await expect(runPanelAction("reinstall", h.deps)).rejects.toThrow(
-      /did NOT execute|stale ComfyUI-Manager/,
+    // #1999 — it must still fail closed, and it must NOT assert the stale-3.x
+    // cause: `total_count:0` is what an idle ComfyUI-Manager v4 always reports.
+    const err = await runPanelAction("reinstall", h.deps).then(
+      () => undefined,
+      (e: unknown) => e as Error,
     );
+    expect(String(err?.message ?? err)).toMatch(/did NOT change the pack on disk/);
+    expect(String(err?.message ?? err)).not.toMatch(/stale ComfyUI-Manager 3\.x silent no-op/);
   });
 
   it("#639: install on a PRE-EXISTING panel + stale no-op counts → throws (present ≠ executed)", async () => {
@@ -859,9 +891,13 @@ describe("runPanelAction", () => {
       files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.28") },
       installDetails: { total_count: 0, done_count: 2, is_processing: false },
     });
-    await expect(runPanelAction("install", h.deps)).rejects.toThrow(
-      /did NOT execute|stale ComfyUI-Manager/,
+    // #1999 — same: fail closed, but do not name a cause the counters cannot show.
+    const err = await runPanelAction("install", h.deps).then(
+      () => undefined,
+      (e: unknown) => e as Error,
     );
+    expect(String(err?.message ?? err)).toMatch(/did NOT change the pack on disk/);
+    expect(String(err?.message ?? err)).not.toMatch(/stale ComfyUI-Manager 3\.x silent no-op/);
   });
 
   it("#639: reinstall that ACTUALLY moves the version SUCCEEDS despite stale queue-wide counts", async () => {
@@ -1074,7 +1110,10 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     expect(r.restartRequired).toBe(false);
     expect(r.message).toMatch(/already at the upstream tip/);
     // The cause named must be the incoherent counts, never the unproven stale-3.x no-op.
-    expect(r.message).toMatch(/incoherent/);
+    // #1999 — the counters are reported as the queue-WIDE drain counters they
+    // are, not as a contradiction: on ComfyUI-Manager v4 `done > total` is the
+    // ordinary drained state (total_count is live-only, done_count cumulative).
+    expect(r.message).toMatch(/cannot say what this task did/);
     expect(r.message).not.toMatch(/stale legacy 3\.x/);
     expect(r.result.message).toBe(r.message);
   });
@@ -1100,7 +1139,10 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     expect(r.installedVersion).toBe("0.11.35");
     expect(r.restartRequired).toBe(true);
     expect(r.message).toMatch(/git merge --ff-only/);
-    expect(r.message).toMatch(/incoherent/);
+    // #1999 — the counters are reported as the queue-WIDE drain counters they
+    // are, not as a contradiction: on ComfyUI-Manager v4 `done > total` is the
+    // ordinary drained state (total_count is live-only, done_count cumulative).
+    expect(r.message).toMatch(/cannot say what this task did/);
     expect(r.message).not.toMatch(/stale legacy 3\.x/);
   });
 
@@ -1186,7 +1228,7 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     expect(err).toBeInstanceOf(PanelInstallError);
     expect(String(err?.message ?? err)).toMatch(/UNCOMMITTED|dirty checkout/);
     // The refusal must not assert the stale-3.x cause it cannot prove.
-    expect(String(err?.message ?? err)).toMatch(/incoherent/);
+    expect(String(err?.message ?? err)).toMatch(/cannot say what this task did/);
     expect(String(err?.message ?? err)).not.toMatch(/stale legacy 3\.x/);
     expect(h.gitPulls).toEqual([]);
   });
@@ -3043,5 +3085,302 @@ describe("resolveGitRevision (real fs)", () => {
     mkdirSync(join(root, ".git", "refs", "heads"), { recursive: true });
     writeFileSync(join(root, ".git", "refs", "heads", "main"), "deadbee\n"); // 7 hex
     expect(resolveGitRevision(root)).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1999 — a DRAINED queue is not a COMPLETED one, and on ComfyUI-Manager v4 the
+// counters cannot tell the two apart.
+//
+// Every payload below is the shape a live ComfyUI-Manager 4.2.2 actually
+// produced when driven on the rig (see the block comment in panel-installer.ts):
+// an idle v4 answers `total_count:0` with a `done_count` that is the CUMULATIVE
+// session history length, so `{total:0, done:4}` is the ordinary drained state
+// and reads identically whether the tasks succeeded or failed. The four
+// `error`s and one `success` recorded in that same session were distinguishable
+// ONLY through the per-task history route.
+// ---------------------------------------------------------------------------
+describe("#1999 drained Manager queue: report what was observed", () => {
+  const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+  const pyPath = join(dir, "pyproject.toml");
+  const REV_A = "a".repeat(40);
+  /** The reporter's exact wire payload, captured from a live v4.2.2 host. */
+  const V4_DRAINED = {
+    total_count: 0,
+    done_count: 4,
+    in_progress_count: 0,
+    pending_count: 0,
+    is_processing: false,
+  };
+  /** The per-task record a live v4.2.2 returned for a failing pack update. */
+  const FAILED_RECORD = {
+    uiId: "task-1999",
+    kind: "update",
+    result: "An error occurred while updating 'comfyui-mcp-panel'.",
+    statusStr: "error",
+  };
+
+  describe("classifyManagerTaskRecord", () => {
+    it("a structured error status is a FAILURE, and carries the cause", () => {
+      expect(classifyManagerTaskRecord(FAILED_RECORD)).toEqual({
+        kind: "failed",
+        result: "An error occurred while updating 'comfyui-mcp-panel'.",
+      });
+      expect(
+        classifyManagerTaskRecord({ uiId: "x", statusStr: "failed", result: "boom" }),
+      ).toEqual({ kind: "failed", result: "boom" });
+    });
+
+    it("a structured success/skip status is a SUCCESS", () => {
+      expect(
+        classifyManagerTaskRecord({ uiId: "x", statusStr: "success", result: "success" }),
+      ).toEqual({ kind: "succeeded", result: "success" });
+      expect(classifyManagerTaskRecord({ uiId: "x", statusStr: "skip" })).toEqual({
+        kind: "succeeded",
+        result: "skip",
+      });
+    });
+
+    it("`null` (Manager proved no such completed task) is NEVER-RAN", () => {
+      expect(classifyManagerTaskRecord(null)).toEqual({ kind: "never-ran" });
+    });
+
+    it("`undefined` (pre-v4 / untrustworthy answer) is UNKNOWN, not a failure", () => {
+      expect(classifyManagerTaskRecord(undefined)).toEqual({ kind: "unknown" });
+    });
+
+    it("ASYMMETRY: unrecognised prose is UNKNOWN, never inferred as a failure", () => {
+      // No structured status, and a `result` that is not one of Manager's two
+      // literal success values. Guessing "failed" here would be the mirror
+      // image of the fabricated-success bug.
+      expect(
+        classifyManagerTaskRecord({ uiId: "x", result: "Installation reserved: pack" }),
+      ).toEqual({ kind: "unknown" });
+      expect(classifyManagerTaskRecord({ uiId: "x", statusStr: "weird" })).toEqual({
+        kind: "unknown",
+      });
+      // …but the two literals task_worker itself compares against still count.
+      expect(classifyManagerTaskRecord({ uiId: "x", result: "success" })).toEqual({
+        kind: "succeeded",
+        result: "success",
+      });
+    });
+  });
+
+  describe("describeManagerTaskVerdict", () => {
+    const counts = { total: 0, done: 4, inProgress: 0, pending: 0 };
+
+    it("v4 drained counts are NOT narrated as incoherent or as a stale-3.x no-op", () => {
+      const text = describeManagerTaskVerdict({ kind: "unknown" }, counts, false);
+      expect(text).not.toMatch(/incoherent/);
+      expect(text).not.toMatch(/never enqueued/);
+      expect(text).not.toMatch(/stale legacy ComfyUI-Manager 3\.x/);
+      expect(text).toMatch(/could NOT be established/);
+      expect(text).toMatch(/queue\/history\?ui_id=/);
+    });
+
+    it("an all-zero counter set may still OFFER the legacy-3.x cause", () => {
+      const zero = { total: 0, done: 0, inProgress: 0, pending: 0 };
+      expect(describeManagerTaskVerdict({ kind: "unknown" }, zero, true)).toMatch(
+        /no record of running ANY task/,
+      );
+    });
+
+    it("clamps a runaway Manager result, and SAYS it clamped it", () => {
+      // An unhandled Manager exception puts a full Python repr in `result` — one
+      // measured on the rig ran to several hundred characters of
+      // QueueTaskItem(...). Quoting it whole buries the diagnostic; truncating
+      // it silently is its own small dishonesty.
+      const huge = "E".repeat(900);
+      const text = describeManagerTaskVerdict({ kind: "failed", result: huge }, counts, false);
+      expect(text.length).toBeLessThan(huge.length);
+      expect(text).toMatch(/truncated — the full text is in the ComfyUI server log/);
+    });
+
+    it("a failure quotes the Manager's own result and never claims success", () => {
+      const text = describeManagerTaskVerdict(
+        { kind: "failed", result: "An error occurred while updating 'comfyui-mcp-panel'." },
+        counts,
+        false,
+      );
+      expect(text).toMatch(/RAN the task and it FAILED/);
+      expect(text).toMatch(/An error occurred while updating 'comfyui-mcp-panel'\./);
+    });
+  });
+
+  it("v4 drained counts + a FAILED task record → the refusal names the real failure", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.13.6") },
+      revs: { [dir]: REV_A },
+      updateDetails: V4_DRAINED,
+      managerTaskRecord: FAILED_RECORD,
+      // The reporter's checkout was dirty, so the git fallback correctly refuses.
+      gitStatus: " M web/js/comfyui-mcp-panel.js",
+      onGitPull: () => "merge output",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    const msg = String(err?.message ?? err);
+    // The correlated lookup used the ui_id the update result carried.
+    expect(h.taskRecordLookups).toEqual(["task-1999"]);
+    // What Manager actually did is now IN the message…
+    expect(msg).toMatch(/RAN the task and it FAILED/);
+    expect(msg).toMatch(/An error occurred while updating 'comfyui-mcp-panel'\./);
+    // …and the claims it could never support are gone.
+    expect(msg).not.toMatch(/incoherent/);
+    expect(msg).not.toMatch(/never enqueued/);
+    expect(msg).not.toMatch(/stale legacy 3\.x/);
+    // The dirty-checkout refusal is UNCHANGED — still refused, still no pull.
+    expect(msg).toMatch(/UNCOMMITTED/);
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("v4 drained counts with NO readable task record → says the outcome is UNKNOWN, claims neither", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.13.6") },
+      revs: { [dir]: REV_A },
+      updateDetails: V4_DRAINED,
+      // Pre-v4 Manager, or an answer that could not be trusted.
+      managerTaskRecord: undefined,
+      gitStatus: " M web/js/comfyui-mcp-panel.js",
+      onGitPull: () => "merge output",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    const msg = String(err?.message ?? err);
+    expect(msg).toMatch(/cannot say what this task did/);
+    // Neither verdict may be asserted from an absence of evidence.
+    expect(msg).not.toMatch(/RAN the task and it FAILED/);
+    expect(msg).not.toMatch(/Panel updated/);
+    expect(msg).not.toMatch(/incoherent/);
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("a task record proving NEVER-RAN is reported as such, not as a failure", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.13.6") },
+      revs: { [dir]: REV_A },
+      updateDetails: V4_DRAINED,
+      // {"history": {}} — the Manager PROVING it holds no such completed task.
+      managerTaskRecord: null,
+      gitStatus: " M web/js/comfyui-mcp-panel.js",
+      onGitPull: () => "merge output",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    const msg = String(err?.message ?? err);
+    expect(msg).toMatch(/holds NO completed task under the id/);
+    expect(msg).not.toMatch(/RAN the task and it FAILED/);
+  });
+
+  it("a task Manager recorded as SUCCESS that moved nothing is not called a failure", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.13.6") },
+      revs: { [dir]: REV_A },
+      updateDetails: V4_DRAINED,
+      managerTaskRecord: { uiId: "task-1999", statusStr: "success", result: "success" },
+      gitStatus: " M web/js/comfyui-mcp-panel.js",
+      onGitPull: () => "merge output",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    const msg = String(err?.message ?? err);
+    expect(msg).toMatch(/recorded this task as "success"/);
+    expect(msg).toMatch(/could NOT be established/);
+    expect(msg).not.toMatch(/FAILED/);
+  });
+
+  it("a THROWING history lookup is contained — the outcome degrades to unknown", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.13.6") },
+      revs: { [dir]: REV_A },
+      updateDetails: V4_DRAINED,
+      managerTaskRecordThrows: "ECONNREFUSED",
+      gitStatus: " M web/js/comfyui-mcp-panel.js",
+      onGitPull: () => "merge output",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    const msg = String(err?.message ?? err);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(msg).toMatch(/UNCOMMITTED/);
+    expect(msg).toMatch(/cannot say what this task did/);
+  });
+
+  it("an update path that captured NO ui_id never looks the task up at all", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.13.6") },
+      revs: { [dir]: REV_A },
+      updateDetails: V4_DRAINED,
+      updateTaskUiId: null,
+      managerTaskRecord: FAILED_RECORD,
+      gitStatus: " M web/js/comfyui-mcp-panel.js",
+      onGitPull: () => "merge output",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    // No id means no correlation: asking about someone else's task, or about
+    // nothing at all, must never produce a verdict about OURS.
+    expect(h.taskRecordLookups).toEqual([]);
+    expect(String(err?.message ?? err)).not.toMatch(/RAN the task and it FAILED/);
+  });
+
+  // The branches above all leave through the #724/#824 git fallback (the panel
+  // dir is a checkout). A registry-ZIP install has no `previousRev`, so it
+  // leaves through finalizeUpdate instead — a SEPARATE narrator that made the
+  // same false claim, and would keep making it if only the fallback were fixed.
+  it("registry-ZIP install (no git): finalizeUpdate names the real failure too", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.13.6") },
+      // No `revs` entry → no git-HEAD → not a checkout → no fallback to take.
+      updateDetails: V4_DRAINED,
+      managerTaskRecord: FAILED_RECORD,
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    const msg = String(err?.message ?? err);
+    expect(msg).toMatch(/did NOT apply/);
+    expect(msg).toMatch(/RAN the task and it FAILED/);
+    expect(msg).toMatch(/An error occurred while updating 'comfyui-mcp-panel'\./);
+    // The remedy follows the evidence: fix what Manager reported, not "your
+    // ComfyUI-Manager is stale" — the advice this issue was handed four times.
+    expect(msg).toMatch(/traceback is in the ComfyUI server log/);
+    expect(msg).not.toMatch(/never actually enqueued/);
+    expect(msg).not.toMatch(/stale ComfyUI-Manager 3\.x silent no-op/);
+  });
+
+  it("registry-ZIP install with NO readable record: finalizeUpdate says UNKNOWN", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.13.6") },
+      updateDetails: V4_DRAINED,
+      managerTaskRecord: undefined,
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    const msg = String(err?.message ?? err);
+    expect(msg).toMatch(/could NOT be established/);
+    expect(msg).toMatch(/queue\/history\?ui_id=/);
+    expect(msg).not.toMatch(/RAN the task and it FAILED/);
+    expect(msg).not.toMatch(/never actually enqueued/);
+  });
+
+  it("a PROVEN update still succeeds — the lookup never vetoes disk evidence", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.13.6") },
+      revs: { [dir]: REV_A },
+      updateDetails: V4_DRAINED,
+      // Manager errored on some OTHER task in the same session; the disk moved.
+      managerTaskRecord: FAILED_RECORD,
+      onUpdate: ({ files }) => {
+        files[pyPath] = pyproject(PANEL_REGISTRY_ID, "0.15.32");
+      },
+    });
+    const r = await runPanelAction("update", h.deps);
+    expect(r.message).toMatch(/Panel updated \(0\.13\.6 → 0\.15\.32\)/);
+    // Nothing moved-on-disk ever consults the history, so it was not asked.
+    expect(h.taskRecordLookups).toEqual([]);
   });
 });
