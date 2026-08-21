@@ -1,0 +1,173 @@
+{
+  "//": [
+    "comfyui-mcp-4x5 — non-test files under src/ that exceed 1000 lines, with their counts.",
+    "A file named here may shrink and never grow; a file not named here may not cross the limit.",
+    "The way to extend one of these is to split it. A genuine exception adds or bumps its entry",
+    "in the same PR with a one-line \"reason\" — the reason is what the reviewer reads.",
+    "Entries without a reason are grandfathered debt from when the gate landed.",
+    "Regenerate deliberately:  node scripts/check-file-size.mjs --baseline  (reasons are preserved)"
+  ],
+  "limit": 1000,
+  "files": [
+    {
+      "path": "comfyui/client.ts",
+      "lines": 1282
+    },
+    {
+      "path": "comfyui/json-guard.ts",
+      "lines": 1445
+    },
+    {
+      "path": "config.ts",
+      "lines": 1087
+    },
+    {
+      "path": "orchestrator/ask-answer-journal.ts",
+      "lines": 1775
+    },
+    {
+      "path": "orchestrator/claude-backend.ts",
+      "lines": 1339
+    },
+    {
+      "path": "orchestrator/codex-backend.ts",
+      "lines": 1757
+    },
+    {
+      "path": "orchestrator/gemini-backend.ts",
+      "lines": 1169
+    },
+    {
+      "path": "orchestrator/grok-backend.ts",
+      "lines": 1657
+    },
+    {
+      "path": "orchestrator/index.ts",
+      "lines": 6849
+    },
+    {
+      "path": "orchestrator/ollama-backend.ts",
+      "lines": 1920
+    },
+    {
+      "path": "orchestrator/panel-agent.ts",
+      "lines": 3970
+    },
+    {
+      "path": "orchestrator/panel-tools.ts",
+      "lines": 17813
+    },
+    {
+      "path": "orchestrator/qwen-backend.ts",
+      "lines": 1123
+    },
+    {
+      "path": "orchestrator/run-completion-journal.ts",
+      "lines": 1561
+    },
+    {
+      "path": "services/download-cache.ts",
+      "lines": 3530
+    },
+    {
+      "path": "services/download-jobs.ts",
+      "lines": 2207
+    },
+    {
+      "path": "services/download-progress.ts",
+      "lines": 1182
+    },
+    {
+      "path": "services/env-capabilities.ts",
+      "lines": 1151
+    },
+    {
+      "path": "services/extra-paths.ts",
+      "lines": 1660
+    },
+    {
+      "path": "services/image-management.ts",
+      "lines": 1185
+    },
+    {
+      "path": "services/lora-catalog.ts",
+      "lines": 1130
+    },
+    {
+      "path": "services/manifest.ts",
+      "lines": 1479
+    },
+    {
+      "path": "services/model-resolver.ts",
+      "lines": 3572
+    },
+    {
+      "path": "services/node-dev.ts",
+      "lines": 1252
+    },
+    {
+      "path": "services/node-management.ts",
+      "lines": 5211
+    },
+    {
+      "path": "services/output-dir.ts",
+      "lines": 1351
+    },
+    {
+      "path": "services/panel-installer.ts",
+      "lines": 6131
+    },
+    {
+      "path": "services/panel-pin-guard.ts",
+      "lines": 1773
+    },
+    {
+      "path": "services/panel-secrets.ts",
+      "lines": 2887
+    },
+    {
+      "path": "services/port-owner.ts",
+      "lines": 1081
+    },
+    {
+      "path": "services/process-control.ts",
+      "lines": 5304
+    },
+    {
+      "path": "services/self-update.ts",
+      "lines": 1003
+    },
+    {
+      "path": "services/training-jobs.ts",
+      "lines": 1955
+    },
+    {
+      "path": "services/ui-bridge.ts",
+      "lines": 5560
+    },
+    {
+      "path": "services/workflow-composer.ts",
+      "lines": 1099
+    },
+    {
+      "path": "services/workflow-converter.ts",
+      "lines": 3682
+    },
+    {
+      "path": "services/workspace-env.ts",
+      "lines": 2080
+    },
+    {
+      "path": "tools/image-management.ts",
+      "lines": 1058
+    },
+    {
+      "path": "tools/model-management.ts",
+      "lines": 1551
+    },
+    {
+      "path": "tools/vocabulary.ts",
+      "lines": 2624
+    }
+  ]
+}

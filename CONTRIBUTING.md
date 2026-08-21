@@ -20,7 +20,7 @@ npm test           # vitest
 ```
 
 - `npm run build` type-checks and compiles to `dist/` (`tsc`).
-- `npm run lint` type-checks only (`tsc --noEmit`).
+- `npm run lint` type-checks (`tsc --noEmit`) and runs the file-size ratchet (see [Conventions](#conventions)).
 - `npm test` and `npm run test:watch` run the vitest suite.
 - `npm run dev` runs the server from source via `tsx`.
 - `npm run docs:gen` rebuilds the docs tool reference from the live schemas (see [Docs](#documentation)).
@@ -63,6 +63,14 @@ Business logic lives in `src/services/<name>.ts`. The matching
   - Validate filesystem paths against traversal and symlink escapes (resolve the path, then check it stays inside the intended root).
   - Validate values that reach a subprocess argv (reject a leading `-` and control chars; use
     `--end-of-options` for git, and the equivalent for other tools).
+- **File size.** `npm run lint` fails if a non-test file under `src/` crosses 1,000 lines, or if
+  one of the files already past that mark (named with its line count in
+  `scripts/file-size-baseline.json`) grows at all. The way to extend a monolith is to split it,
+  never to append to it. A genuine exception, such as a generated table or a file mid-split, adds
+  or bumps its entry in the same PR with a one-line `"reason"`
+  (`{"path": …, "lines": …, "reason": "…"}`); the reason is what the reviewer reads. Shrinking a
+  baselined file makes the baseline stale: run `node scripts/check-file-size.mjs --baseline` (it
+  preserves reasons) and commit the result.
 - **Plugin skills.** Every skill (`plugin/skills/<name>/SKILL.md`) ends with a
   `## Sources` section that separates **Official** sources (vendor docs, node README,
   `/object_info`) from **Empirical** ones (working graphs, observed behaviour). A skill
