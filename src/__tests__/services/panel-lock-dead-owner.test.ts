@@ -167,12 +167,13 @@ describe("#1489 a provably dead lock owner is reported at once", () => {
   });
 
   it("a FRESH lock with a dead owner is NOT fast-failed, however long we wait", async () => {
-    // The age gate. `reclaimAbandonedPanelLock` refuses on AGE before it ever
-    // consults a pid, and this module must not hold a second opinion about what
-    // freshness means. The budget is long enough for several probes, so a
-    // missing age gate would fire here rather than hide behind a short timeout —
-    // which is exactly how mutation M3 slipped through a first version of these
-    // tests once the two-observation rule slowed the fast path down.
+    // Acquire still age-gates the fast-fail: this loop must not delete, and a
+    // young dead-owner lock is reclaimable via unlock / hello auto-sync (#1953)
+    // rather than by this wait. The budget is long enough for several probes,
+    // so a missing age gate would fire here rather than hide behind a short
+    // timeout — which is exactly how mutation M3 slipped through a first
+    // version of these tests once the two-observation rule slowed the fast
+    // path down.
     writeLock(DEAD_PID, 60_000); // a minute old: dead owner, but FRESH
     const { withPanelMutationLock } = await lockModule();
 

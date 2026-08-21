@@ -135,6 +135,7 @@ import {
   panelPendingOpsPath,
   reclaimAbandonedPanelLock,
   recordPanelPendingOp,
+  releaseOwnedPanelLock,
   targetsPanelPack,
   targetsPanelPackExactly,
   withPanelMutationLock,
@@ -369,9 +370,10 @@ describe("withPanelMutationLock — a FILE lock, so it holds across processes", 
     expect(order).toEqual(["holder:start", "nested", "holder:end", "outsider"]);
   });
 
-  it("does NOT reclaim a fresh lock even when its recorded pid is dead", async () => {
-    // Age is a mandatory part of the proof. A just-created lock can still be
-    // in the small window before its writer has committed its pid record.
+  it("does NOT auto-reclaim a fresh lock even when its recorded pid is dead", async () => {
+    // #779: the acquire loop never deletes. A young dead-owner lock is
+    // reclaimable via unlock / hello auto-sync (#1953); this path times out
+    // and leaves the file, naming that recovery.
     writeFileSync(panelLockPath(), JSON.stringify({ pid: 999999 }));
     await expect(
       withPanelMutationLock(async () => "should not run", { timeoutMs: 300 }),
@@ -576,14 +578,17 @@ describe("reclaimAbandonedPanelLock — the explicit recovery for a wedged lock 
     expect(existsSync(path)).toBe(true);
   });
 
-  it("REFUSES a recent lock even when its recorded pid is dead", async () => {
-    // A just-taken lock can be in the window before its writer committed the
-    // pid record; youth means "cannot call it abandoned", not "abandoned".
+  it("RECLAIMS a recent lock when its recorded pid is dead (#1953)", async () => {
+    // The 10-minute window protects a slow live ComfyUI-Manager op, not a
+    // lock whose owner has already exited. Self-restart leaves exactly this
+    // shape: seconds old, owner pid gone, unlock used to refuse it.
     const path = await plantLock(JSON.stringify({ pid: DEAD_PID }));
     const res = reclaimAbandonedPanelLock();
-    expect(res.outcome).toBe("refused");
-    expect(res.detail).toMatch(/window/);
-    expect(existsSync(path)).toBe(true);
+    expect(res.outcome).toBe("reclaimed");
+    expect(existsSync(path)).toBe(false);
+    await expect(
+      withPanelMutationLock(async () => "recovered", { timeoutMs: 500 }),
+    ).resolves.toBe("recovered");
   });
 
   it("REFUSES an old lock whose content is not valid JSON", async () => {
@@ -672,7 +677,10 @@ describe("reclaimAbandonedPanelLock — the explicit recovery for a wedged lock 
     // pid, and a young lock gets reclaimed. The observation is descriptor-
     // pinned, so the age and the owner bytes always come from one instance.
     const path = await plantLock(JSON.stringify({ pid: DEAD_PID }), 60 * 60_000);
-    const fresh = JSON.stringify({ pid: DEAD_PID - 1, startedAt: "fresh" });
+    // A LIVE young replacement: a dead-owner fresh lock is now reclaimable
+    // (#1953), so this test would no longer prove the age was read from the
+    // replacement instance if the replacement's pid were also dead.
+    const fresh = JSON.stringify({ pid: process.pid, startedAt: "fresh" });
     fsyncTracker.onBeforeOpen = (p, flags) => {
       if (p === path && flags === "r") {
         // Replace the stale lock with a fresh one just before observation.
@@ -1282,5 +1290,103 @@ describe("#836 — a reclaimable lock needs ownership proofs everywhere", () => 
     expect(res.detail).toMatch(/inside the/i);
     expect(res.detail).not.toMatch(/STILL RUNNING/);
     expect(res.detail).not.toMatch(/cannot be determined/i);
+  });
+
+  it("reclaims a lock whose pid is ours but whose owner start predates this process (#1953)", async () => {
+    // pid reuse onto US: the number matches, kill(0) says alive, but the
+    // recorded process start is from a previous life. That is the identity
+    // `ownerStartedMs` exists to answer without treating existence as identity.
+    const path = await plantLock(
+      JSON.stringify({
+        pid: process.pid,
+        startedAt: "long ago",
+        ownerStartedMs: Date.now() - process.uptime() * 1000 - 60_000,
+      }),
+      60 * 60_000,
+    );
+    const res = reclaimAbandonedPanelLock();
+    expect(res.outcome).toBe("reclaimed");
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it("refuses an old lock that still names THIS process's start time as live", async () => {
+    // With a matching start time the pid IS us, even 50 hours later. Refusing
+    // as "may have been reused" would be the lie identity was added to stop.
+    const path = await plantLock(
+      JSON.stringify({
+        pid: process.pid,
+        startedAt: "long ago",
+        ownerStartedMs: Date.now() - process.uptime() * 1000,
+      }),
+      7 * 24 * 60 * 60_000,
+    );
+    const res = reclaimAbandonedPanelLock();
+    expect(res.outcome).toBe("refused");
+    expect(res.detail).toMatch(/still running/i);
+    expect(existsSync(path)).toBe(true);
+  });
+
+  it("reclaims when kill(0) claims the pid exists but the OS process table does not (#1953)", async () => {
+    // The 50-hour wedge: unlock said pid 26864 existed; Get-Process did not
+    // find it. kill(0) is not the process table.
+    const fakePid = 424242;
+    const path = await plantLock(
+      JSON.stringify({ pid: fakePid, startedAt: "long ago" }),
+      50 * 60 * 60_000,
+    );
+    const realKill = process.kill.bind(process);
+    const spy = vi.spyOn(process, "kill").mockImplementation(((
+      pid: number,
+      sig?: Parameters<typeof process.kill>[1],
+    ) => {
+      if (pid === fakePid) return true as unknown as void;
+      return realKill(pid, sig);
+    }) as typeof process.kill);
+    try {
+      const res = reclaimAbandonedPanelLock();
+      expect(res.outcome).toBe("reclaimed");
+      expect(existsSync(path)).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe("releaseOwnedPanelLock — drop a lock this process owns on the way out (#1953)", () => {
+  it("releases a lock naming this pid so the next acquire proceeds", async () => {
+    const path = panelLockPath();
+    writeFileSync(
+      path,
+      JSON.stringify({
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+        token: "self-restart",
+      }),
+    );
+    const res = releaseOwnedPanelLock();
+    expect(res.outcome).toBe("released");
+    expect(existsSync(path)).toBe(false);
+    await expect(
+      withPanelMutationLock(async () => "next-op", { timeoutMs: 500 }),
+    ).resolves.toBe("next-op");
+  });
+
+  it("leaves a lock owned by another pid in place", async () => {
+    const path = panelLockPath();
+    const payload = JSON.stringify({
+      pid: 0x7fffffff,
+      startedAt: new Date().toISOString(),
+      token: "someone-else",
+    });
+    writeFileSync(path, payload);
+    const res = releaseOwnedPanelLock();
+    expect(res.outcome).toBe("not-ours");
+    expect(existsSync(path)).toBe(true);
+    expect(readFileSync(path, "utf-8")).toBe(payload);
+  });
+
+  it("reports no-lock when the path is empty", () => {
+    const res = releaseOwnedPanelLock();
+    expect(res.outcome).toBe("no-lock");
   });
 });
