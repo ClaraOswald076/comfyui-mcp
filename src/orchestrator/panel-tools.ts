@@ -2423,20 +2423,21 @@ export type RestartIdentityBlocker =
   | { kind: "no-boot-base" }
   /** The configured ComfyUI is off-box, so this host cannot account for it. */
   | { kind: "boot-base-not-loopback"; bootBase: string }
+  /** COMFYUI_URL is `localhost`: loopback, but with no concrete family, so
+   *  `isLoopbackOrigin` rejects it and no tab can ever bind to it. Split out from
+   *  `boot-base-not-loopback` because that verdict's prose — "not a loopback
+   *  address" — is FALSE about localhost and sends the reader looking for a remote
+   *  install they do not have. Found in review of this change (grok on #1927). */
+  | { kind: "boot-base-dns-ambiguous"; bootBase: string }
   /** The tab's socket did not arrive on the token-less loopback listener. */
   | { kind: "tab-not-local" }
   /** The WS handshake carried no usable Origin (an older panel / non-browser client). */
   | { kind: "origin-absent"; bootBase: string }
-  /** `localhost` on ONE side: no concrete loopback family, so no match is possible.
-   *  `concrete` is the OTHER side's literal — the address that resolves the ambiguity,
-   *  and which side it belongs to decides which remedy is the right one to name. */
-  | {
-      kind: "origin-dns-ambiguous";
-      bootBase: string;
-      origin: string;
-      concrete: string;
-      ambiguousSide: "panel" | "boot";
-    }
+  /** The PANEL is at `localhost`: no concrete loopback family, so it cannot be matched
+   *  against the boot base. Only the panel side can be ambiguous here — an ambiguous
+   *  boot base never reaches the origin comparison (it is caught by
+   *  `boot-base-dns-ambiguous` above), so there is no second direction to carry. */
+  | { kind: "origin-dns-ambiguous"; bootBase: string; origin: string }
   /** The boot base is mounted under a basePath the pathless Origin cannot prove. */
   | { kind: "origin-path-ambiguous"; bootBase: string; origin: string }
   /** Proven a different scheme/host/port — the #851 wrong-server case. */
@@ -2453,6 +2454,12 @@ function resolveRebootHealthBinding(ctx: PanelToolCtx): {
   if (isCloudMode() || isRemoteMode()) return no({ kind: "not-local-mode" });
   const bootBase = getBootLocalComfyUIBaseUrl(); // server-authorized, hello-immutable
   if (!bootBase) return no({ kind: "no-boot-base" });
+  // `localhost` fails isLoopbackOrigin (loopbackFamily returns null for it by
+  // design), so it lands here — NOT in the origin comparison below, which never
+  // sees an ambiguous boot base. Naming it separately is the difference between
+  // "your ComfyUI is not on this machine" (false) and a config line to change.
+  if (isDnsAmbiguousLoopback(bootBase))
+    return no({ kind: "boot-base-dns-ambiguous", bootBase });
   if (!isLoopbackOrigin(bootBase)) return no({ kind: "boot-base-not-loopback", bootBase });
   const base = bootBase.replace(/\/+$/, "");
   // Server-trusted provenance: the tab arrived on the token-less loopback listener.
@@ -2512,9 +2519,11 @@ export function classifyOriginBlocker(
   RestartIdentityBlocker,
   { kind: "origin-dns-ambiguous" | "origin-path-ambiguous" | "origin-different" }
 > {
-  const originAmbiguous = isDnsAmbiguousLoopback(origin);
-  const bootAmbiguous = isDnsAmbiguousLoopback(bootBase);
-  if (originAmbiguous !== bootAmbiguous) {
+  // Callers reach here only past `isLoopbackOrigin(bootBase)`, which rejects
+  // `localhost` — so the boot base is always a concrete literal and the panel is
+  // the only side that can be ambiguous. Asserted, not assumed: an ambiguous boot
+  // base would make the comparison below meaningless rather than merely wrong.
+  if (isDnsAmbiguousLoopback(origin) && !isDnsAmbiguousLoopback(bootBase)) {
     let sameSpot = false;
     try {
       const o = new URL(origin);
@@ -2534,15 +2543,7 @@ export function classifyOriginBlocker(
     } catch {
       sameSpot = false;
     }
-    if (sameSpot) {
-      return {
-        kind: "origin-dns-ambiguous",
-        bootBase,
-        origin,
-        concrete: originAmbiguous ? bootBase : origin,
-        ambiguousSide: originAmbiguous ? "panel" : "boot",
-      };
-    }
+    if (sameSpot) return { kind: "origin-dns-ambiguous", bootBase, origin };
   }
   // The Origin is pathless by construction, so a boot base under a basePath mount
   // can be same-ORIGIN yet unprovable as the same INSTANCE. Distinguish that from a
@@ -2593,6 +2594,15 @@ export function restartIdentityBlockerNote(blocker: RestartIdentityBlocker | nul
         `${why}the ComfyUI this server booted against (${blocker.bootBase}) is not a loopback address, ` +
         "so it is not a process on this machine that I can account for."
       );
+    case "boot-base-dns-ambiguous":
+      return (
+        `${why}this server is configured with COMFYUI_URL=${blocker.bootBase}. That IS loopback, but ` +
+        `"localhost" does not say which address it resolves to — 127.0.0.1 and ::1 can be DIFFERENT ` +
+        "ComfyUI instances on the same port — so I cannot tie it to a specific local process, and no " +
+        "panel tab can be matched against it. This disables the panel restart for every tab, not just " +
+        "this one. FIX: set COMFYUI_URL to the literal your ComfyUI actually listens on " +
+        "(http://127.0.0.1:<port>, or http://[::1]:<port> for an IPv6-only bind) and restart this server."
+      );
     case "tab-not-local":
       return (
         `${why}this panel tab did not arrive on the local loopback listener — it reached me over a relay, ` +
@@ -2604,22 +2614,14 @@ export function restartIdentityBlockerNote(blocker: RestartIdentityBlocker | nul
         `${why}this tab's WebSocket handshake carried no Origin, so there is nothing to check against ` +
         `the boot instance (${blocker.bootBase}). An older panel build does this; updating the panel restores the proof.`
       );
-    case "origin-dns-ambiguous": {
-      // Name the remedy for the side that is ACTUALLY ambiguous. Telling a user
-      // whose browser is already on 127.0.0.1 to "open the panel at localhost"
-      // would be advice that re-creates the problem.
-      const ambiguous = blocker.ambiguousSide === "panel" ? blocker.origin : blocker.bootBase;
-      const fix =
-        blocker.ambiguousSide === "panel"
-          ? `FIX: open the panel at ${loopbackProbeUrl(blocker.concrete)} — the same ComfyUI, addressed by its literal.`
-          : `FIX: set COMFYUI_URL to ${loopbackProbeUrl(blocker.concrete)} — the same ComfyUI, addressed by the literal your browser is already on.`;
+    case "origin-dns-ambiguous":
       return (
-        `${why}${blocker.ambiguousSide === "panel" ? "this panel is open at" : "this server booted against"} ` +
-        `${ambiguous}, and "localhost" does not say which loopback address was actually reached — it can ` +
-        `be 127.0.0.1 or ::1, and those can be DIFFERENT ComfyUI instances on the same port. The other ` +
-        `side is ${blocker.concrete}, so I cannot show the two are one server. ${fix}`
+        `${why}this panel is open at ${blocker.origin}, and "localhost" does not say which loopback ` +
+        `address the browser actually reached — it can be 127.0.0.1 or ::1, and those can be DIFFERENT ` +
+        `ComfyUI instances on the same port. The boot instance I account for is ${blocker.bootBase}, so ` +
+        `I cannot show the two are one server. FIX: open the panel at ${loopbackProbeUrl(blocker.bootBase)} ` +
+        `— the same ComfyUI, addressed by its literal.`
       );
-    }
     case "origin-path-ambiguous":
       return (
         `${why}the boot instance is mounted under a path (${blocker.bootBase}) and a handshake Origin ` +

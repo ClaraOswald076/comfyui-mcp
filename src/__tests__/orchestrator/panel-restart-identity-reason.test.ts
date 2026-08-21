@@ -25,6 +25,21 @@ vi.mock("../../comfyui/client.js", () => ({
   resetObjectInfoCache: () => resetObjectInfoCache(),
 }));
 
+// The boot base is captured at PROCESS START and immutable, so a `localhost`
+// COMFYUI_URL has no fixture unless it is overridable. It needs one: grok's review
+// of #1927 found that branch reachable in production and unreachable in my tests,
+// which is how a wrong message ("not a loopback address", about a loopback address)
+// survived a green suite. Overriding here drives the REAL resolveRebootHealthBinding
+// through the REAL handler.
+const hoistedBoot = vi.hoisted(() => ({ base: { value: null as string | null } }));
+vi.mock("../../config.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../config.js")>();
+  return {
+    ...actual,
+    getBootLocalComfyUIBaseUrl: () => hoistedBoot.base.value ?? actual.getBootLocalComfyUIBaseUrl(),
+  };
+});
+
 const {
   buildPanelToolDefs,
   restartIdentityBlockerNote,
@@ -118,9 +133,11 @@ beforeEach(() => {
   __panelToolsTestHooks.setDeclineProbeTiming({ windowMs: 20, intervalMs: 5, probeTimeoutMs: 5 });
   __panelToolsTestHooks.setLocalRestartPreflight(async () => ({ ok: true }));
   __processControlTestHooks.reset();
+  hoistedBoot.base.value = null;
 });
 
 afterEach(() => {
+  hoistedBoot.base.value = null;
   __panelToolsTestHooks.setPanelRebootTiming(null);
   __panelToolsTestHooks.setHealthProbe(null);
   __panelToolsTestHooks.setLocalRestartPreflight(null);
@@ -254,18 +271,46 @@ describe("panel#1546 — `localhost` is blamed only when resolving it would sett
   it("same port, no mount, panel side ambiguous → the DNS verdict, panel remedy", () => {
     const b = classifyOriginBlocker("http://localhost:8188", "http://127.0.0.1:8188");
     expect(b.kind).toBe("origin-dns-ambiguous");
-    expect(b).toMatchObject({ ambiguousSide: "panel", concrete: "http://127.0.0.1:8188" });
     expect(restartIdentityBlockerNote(b)).toMatch(/FIX: open the panel at http:\/\/127\.0\.0\.1:8188/);
   });
 
-  it("BOOT side ambiguous → the remedy is COMFYUI_URL, not 'open the panel at localhost'", () => {
+  // grok's review of #1927. `isLoopbackOrigin` is `loopbackFamily(host) !== null`
+  // and loopbackFamily rejects `localhost` BY DESIGN, so a localhost COMFYUI_URL
+  // never reaches the origin comparison at all — it is caught two branches earlier.
+  // Driven through the real handler, because the previous version of this test
+  // called the classifier directly and therefore "covered" a branch production
+  // could not reach, while the branch production DID reach said the wrong thing.
+  it("a `localhost` COMFYUI_URL is caught before the origin compare, with a config remedy", async () => {
+    hoistedBoot.base.value = "http://localhost:8188";
+    const note = await refusalNote({ serverOrigin: "http://localhost:8188" });
+
+    // NOT the off-box verdict: localhost IS loopback, and saying otherwise sent
+    // the reader looking for a remote install they do not have.
+    expect(note).not.toMatch(/is not a loopback address/);
+    expect(note).toMatch(/COMFYUI_URL=http:\/\/localhost:8188/);
+    expect(note).toMatch(/That IS loopback/);
+    expect(note).toMatch(/FIX: set COMFYUI_URL to the literal/);
+    // And it must say the scope: this disables the panel restart for EVERY tab.
+    expect(note).toMatch(/every tab/);
+  });
+
+  it("the localhost COMFYUI_URL reason is distinct from the genuinely off-box one", async () => {
+    hoistedBoot.base.value = "http://localhost:8188";
+    const ambiguous = await refusalNote({ serverOrigin: "http://localhost:8188" });
+    hoistedBoot.base.value = "http://192.168.1.50:8188";
+    const offBox = await refusalNote({ serverOrigin: "http://192.168.1.50:8188" });
+
+    expect(ambiguous).not.toBe(offBox);
+    expect(offBox).toMatch(/is not a loopback address/);
+    expect(offBox).not.toMatch(/That IS loopback/);
+  });
+
+  it("classifyOriginBlocker never sees an ambiguous boot base, so it has no boot direction", () => {
+    // Documents the invariant the removed branch was pretending to handle: past
+    // isLoopbackOrigin, the boot base is always a concrete literal.
     const b = classifyOriginBlocker("http://127.0.0.1:8188", "http://localhost:8188");
-    expect(b.kind).toBe("origin-dns-ambiguous");
-    expect(b).toMatchObject({ ambiguousSide: "boot", concrete: "http://127.0.0.1:8188" });
-    const note = restartIdentityBlockerNote(b);
-    expect(note).toMatch(/this server booted against http:\/\/localhost:8188/);
-    expect(note).toMatch(/FIX: set COMFYUI_URL to http:\/\/127\.0\.0\.1:8188/);
-    expect(note).not.toMatch(/FIX: open the panel at/);
+    expect(b.kind).toBe("origin-different");
+    expect(b).not.toHaveProperty("ambiguousSide");
   });
 
   it("a DIFFERENT PORT is a different server even when one side says localhost", () => {
@@ -291,7 +336,6 @@ describe("panel#1546 — `localhost` is blamed only when resolving it would sett
     // that as a port mismatch and misfiled it as a different server.
     const b = classifyOriginBlocker("http://localhost:80", "http://127.0.0.1");
     expect(b.kind).toBe("origin-dns-ambiguous");
-    expect(b).toMatchObject({ ambiguousSide: "panel" });
   });
 
   it("localhost on BOTH sides is not this branch — those canonicalize equal", () => {
