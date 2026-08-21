@@ -3057,15 +3057,17 @@ async function installCustomNodeImpl(
       // LOCAL tree that is not the server we are connected to, so "the Manager
       // refused" is the honest and complete answer there.
       if (refusedBy === undefined || isRemoteMode()) throw err;
-      logger.info("Manager refused the git install enqueue — cloning directly", {
-        status: refusedBy,
-        gitId,
-      });
+      // BEFORE the log line, which says "cloning directly" and would otherwise be
+      // recording an action that then does not happen.
       if (localWriteMismatch) {
         throw new ProcessControlError(
           wrongInstallRefusal(localWriteMismatch, 'install_custom_node (action:"install", git clone)', managerBase),
         );
       }
+      logger.info("Manager refused the git install enqueue — cloning directly", {
+        status: refusedBy,
+        gitId,
+      });
       return withCliNote(
         await cloneCustomNodeFallback(gitId, repoName, gitRef, { manager_refused: refusedBy }, cliWorkspace, {
           refFromVersion,
