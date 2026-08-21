@@ -432,16 +432,24 @@ export async function runSegmentedDownload(
     ? AbortSignal.any([opts.signal, abandon.signal])
     : abandon.signal;
 
-  // `open(..., "w")` creates AND truncates, discarding any `.seg` a killed run
-  // left behind. Nothing else reads that name, so this is unconditional.
-  const created = await open(scratch, "w");
-  await created.close();
+  try {
+    // `open(..., "w")` creates AND truncates, discarding any `.seg` a killed run
+    // left behind. Nothing else reads that name, so this is unconditional.
+    const created = await open(scratch, "w");
+    await created.close();
 
-  // Drop any stale bytes at the target NOW, exactly when the single-connection
-  // path's `flags: "w"` would have truncated them. Without this, a restart over a
-  // large existing `.partial` would hold the old bytes AND the growing `.seg` at
-  // once — up to double the peak disk the volume-space check upstream reserved.
-  await truncate(opts.targetPath, 0).catch(() => {});
+    // Drop any stale bytes at the target NOW, exactly when the single-connection
+    // path's `flags: "w"` would have truncated them. Without this, a restart over
+    // a large existing `.partial` would hold the old bytes AND the growing `.seg`
+    // at once — up to double the peak disk the volume-space check upstream
+    // reserved.
+    await truncate(opts.targetPath, 0).catch(() => {});
+  } catch (err) {
+    // Nothing has read the probe's 206 yet, and nobody downstream will — release
+    // its socket rather than leaving it pinned until GC.
+    await probe.response.body?.cancel().catch(() => {});
+    throw err;
+  }
 
   let firstFailure: unknown;
 
