@@ -759,6 +759,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.42] - 2026-08-20
+
+### MCP
+
+#### Added
+- multi-connection model downloads, with the single-connection path proven as fallback (#1956)
+
+#### Fixed
+- self-restart no longer leaves an unreclaimable panel-op.lock (#1955)
+
+
 ## [0.52.41] - 2026-08-20
 
 ### MCP
