@@ -4018,34 +4018,37 @@ function isLoraManagerAutocompleteRefusal(res: ToolResult): boolean {
 }
 
 /**
- * #1944 — the panel's add-node socket proof read "which datatypes does some
- * installed node output?" off a single-class `/object_info/<class_type>`
+ * #1944 / #2008 — the panel's add-node socket proof read "which datatypes does
+ * some installed node output?" off a single-class `/object_info/<class_type>`
  * payload (or a whole-schema widen that did not land). Custom link types a
- * SIBLING node produces — SeedVR2LoadDiTModel → SEEDVR2_DIT — then look
- * unproven, and the refusal claims "no installed node outputs X" while that
- * very node sits on the canvas. Retrying the add re-runs the same proof;
- * panel_refresh_nodes re-registers the class, which is what arms the
- * single-class path. The live graph is the authority the guard did not consult.
+ * SIBLING node produces — SeedVR2LoadDiTModel → SEEDVR2_DIT, ConvertAny2Dict →
+ * DICT — then look unproven, and the refusal claims "no installed node outputs
+ * X" while that very node sits on the canvas. Retrying the add re-runs the
+ * same proof; panel_refresh_nodes re-registers the class, which is what arms
+ * the single-class path. The live graph is the authority the guard did not
+ * consult.
+ *
+ * #2008's DictGetNode refusal is a SHORTER sentence of the same guard
+ * (`required input py_dict (DICT) has no widget; no installed node outputs
+ * DICT`) and must not be keyed on the 5s-wait wording #1944 used.
  */
 function isMissingInstalledOutputsRefusal(res: ToolResult): boolean {
   if (!res.isError) return false;
-  const text = textOfToolResult(res);
-  return (
-    /had no widget after .+ waiting for node extensions to register/i.test(text) &&
-    /no installed node outputs/i.test(text)
-  );
+  return /no installed node outputs/i.test(textOfToolResult(res));
 }
 
-/** Types the panel named as unproven in a #1944-shaped refusal. */
+/** Types the panel named as unproven in a #1944/#2008-shaped refusal. */
 function parseUnprovenSocketTypes(text: string): string[] {
   const types: string[] = [];
   const add = (raw: string) => {
-    const v = raw.trim();
+    const v = raw.trim().replace(/^"+|"+$/g, "");
     if (v && !types.includes(v)) types.push(v);
   };
   for (const re of [
     /no installed node outputs "([^"]+)"/gi,
     /declared type "([^"]+)": no installed node outputs/gi,
+    /no installed node outputs ([A-Za-z0-9_*]+)/gi,
+    /required input \S+ \(([^)]+)\)/gi,
   ]) {
     re.lastIndex = 0;
     let m: RegExpExecArray | null;
@@ -4054,23 +4057,46 @@ function parseUnprovenSocketTypes(text: string): string[] {
   return types;
 }
 
+function isWildcardSocketType(t: string): boolean {
+  const v = t.trim();
+  return v === "*" || v.toUpperCase() === "ANY";
+}
+
+function socketTypeMatches(declared: string, socketType: string): boolean {
+  if (declared === socketType) return true;
+  return declared.split(",").map((part) => part.trim()).includes(socketType);
+}
+
 function nodeOutputDeclaresType(node: Record<string, unknown>, socketType: string): boolean {
   const outputs = node.outputs;
   if (Array.isArray(outputs)) {
     for (const out of outputs) {
       if (!out || typeof out !== "object" || Array.isArray(out)) continue;
-      const t = (out as { type?: unknown }).type;
-      if (typeof t !== "string" || !t) continue;
-      if (t === socketType) return true;
-      if (t.split(",").map((part) => part.trim()).includes(socketType)) return true;
+      const rec = out as { type?: unknown; name?: unknown };
+      const t = rec.type;
+      const name = typeof rec.name === "string" ? rec.name : "";
+      if (typeof t === "string" && t) {
+        if (socketTypeMatches(t, socketType)) return true;
+        // Typed converter (ConvertAny2Dict): the live slot can still be wildcard
+        // `*` while the declared output NAME is the type the guard asked for.
+        if (isWildcardSocketType(t) && name === socketType) return true;
+      }
     }
   }
   const matchedOn = node.matched_on;
   if (!Array.isArray(matchedOn)) return false;
   const needle = `(${socketType.toLowerCase()})`;
-  return matchedOn.some(
-    (entry) => typeof entry === "string" && entry.toLowerCase().includes(needle),
-  );
+  return matchedOn.some((entry) => {
+    if (typeof entry !== "string") return false;
+    const parsed = /^output:([^(]*)\(([^)]*)\)$/i.exec(entry);
+    if (parsed) {
+      const slotName = parsed[1];
+      const slotType = parsed[2];
+      if (socketTypeMatches(slotType, socketType)) return true;
+      if (isWildcardSocketType(slotType) && slotName === socketType) return true;
+    }
+    return entry.toLowerCase().includes(needle);
+  });
 }
 
 type LiveSocketProducer = { id: string; type: string };
@@ -4147,6 +4173,8 @@ async function withLiveSocketProducerNote(
   if (!isMissingInstalledOutputsRefusal(res)) return res;
   // #1708 is a Vue-widget miss, not a sibling-producer miss. Querying the
   // canvas for AUTOCOMPLETE_TEXT_* would only delay the named remedy.
+  // Checked AFTER the #1944/#2008 shape so a LoRA Manager wait (which also
+  // says "no installed node outputs") stays on its own note.
   if (isLoraManagerAutocompleteRefusal(res)) return res;
   const missing = parseUnprovenSocketTypes(textOfToolResult(res));
   if (!missing.length) return res;
@@ -13037,7 +13065,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_add_node",
-      "Add a node to the user's OPEN ComfyUI graph by class_type (e.g. 'KSampler', 'CheckpointLoaderSimple'). The user sees it appear live; Ctrl+Z undoes it. Returns the created node's id, slots, and default widget values. Frontend-only virtual types are addable too: 'Note' and 'MarkdownNote' — the supported way to ANNOTATE a workflow with on-canvas instructions (add the node, then put the text in its 'text' widget via panel_set_widget) — plus 'Reroute' and 'PrimitiveNode'. These are LiteGraph-native and never appear in the backend node registry, so they legitimately bypass the backend class_type check. ComfyUI-LoRA-Manager's 'Lora Loader (LoraManager)' (and other AUTOCOMPLETE_TEXT_* nodes) cannot be added: the pack is healthy, but the add-node guard cannot see its Vue autocomplete widget. Use 'LoRA Text Loader (LoraManager)' — same outputs, lora_syntax is a STRING — or core LoraLoader; reload/retry will not clear it. A 'no installed node outputs' refusal for a custom link type (SEEDVR2_DIT, SEEDVR2_VAE, …) after sibling producer nodes were just added is the guard looking at a single-class /object_info, not the live graph; retry/refresh will not clear it — copy the node from another workflow (panel_copy_nodes / panel_paste_nodes) or reload the tab. ADD NODES ONE AT A TIME, not as a parallel batch: each add carries a fresh /object_info payload and those register SERIALLY, so N concurrent adds become N sequential refresh cycles. On a large install that outruns the 30s per-command deadline and the later adds time out WHILE STILL QUEUED — they then apply when their turn arrives, leaving nodes you were told had failed (panel#767). Sequential adds each get the refresh to themselves and stay well inside the deadline.",
+      "Add a node to the user's OPEN ComfyUI graph by class_type (e.g. 'KSampler', 'CheckpointLoaderSimple'). The user sees it appear live; Ctrl+Z undoes it. Returns the created node's id, slots, and default widget values. Frontend-only virtual types are addable too: 'Note' and 'MarkdownNote' — the supported way to ANNOTATE a workflow with on-canvas instructions (add the node, then put the text in its 'text' widget via panel_set_widget) — plus 'Reroute' and 'PrimitiveNode'. These are LiteGraph-native and never appear in the backend node registry, so they legitimately bypass the backend class_type check. ComfyUI-LoRA-Manager's 'Lora Loader (LoraManager)' (and other AUTOCOMPLETE_TEXT_* nodes) cannot be added: the pack is healthy, but the add-node guard cannot see its Vue autocomplete widget. Use 'LoRA Text Loader (LoraManager)' — same outputs, lora_syntax is a STRING — or core LoraLoader; reload/retry will not clear it. A 'no installed node outputs' refusal for a custom link type (SEEDVR2_DIT, SEEDVR2_VAE, DICT, …) after sibling producer nodes were just added (ConvertAny2Dict on the canvas while DictGetNode is refused) is the guard looking at a single-class /object_info, not the live graph; retry/refresh will not clear it — copy the node from another workflow (panel_copy_nodes / panel_paste_nodes) or reload the tab. ADD NODES ONE AT A TIME, not as a parallel batch: each add carries a fresh /object_info payload and those register SERIALLY, so N concurrent adds become N sequential refresh cycles. On a large install that outruns the 30s per-command deadline and the later adds time out WHILE STILL QUEUED — they then apply when their turn arrives, leaving nodes you were told had failed (panel#767). Sequential adds each get the refresh to themselves and stay well inside the deadline.",
       {
         class_type: z.string().describe("Exact ComfyUI node class_type to create."),
         pos: xy()
