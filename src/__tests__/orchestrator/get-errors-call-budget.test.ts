@@ -75,14 +75,13 @@ function detailText(
 
 async function runGetErrors(
   replies: (cmd: Record<string, unknown>) => Record<string, unknown>,
+  opts: { rebindAfterPrimary?: string } = {},
 ): Promise<{ payload: Record<string, unknown>; cmds: string[]; keys: string[] }> {
   const def = buildPanelToolDefs().find((d) => d.name === "panel_get_errors");
   if (!def) throw new Error("panel_get_errors is not registered");
   const cmds: string[] = [];
   let primaryViewing: unknown;
-  const res = (await def.handler(
-    {},
-    {
+  const ctx = {
       call: async (cmd: Record<string, unknown>) => {
         cmds.push(String(cmd.cmd));
         const reply = replies(cmd);
@@ -94,11 +93,14 @@ async function runGetErrors(
           cmd.cmd === "graph_query" && !Object.hasOwn(reply, "viewing")
             ? { viewing: primaryViewing ?? { kind: "root", workflow_uuid: "workflow-a" }, ...reply }
             : reply;
+        if (cmd.cmd === "graph_get_errors" && opts.rebindAfterPrimary) {
+          ctx.tabId = opts.rebindAfterPrimary;
+        }
         return { content: [{ type: "text" as const, text: JSON.stringify(withViewing, null, 2) }] };
       },
       tabId: "test-tab",
-    } as unknown as PanelToolCtx,
-  )) as ToolResult;
+    } as unknown as PanelToolCtx;
+  const res = (await def.handler({}, ctx)) as ToolResult;
   const text = res.content.find((c) => c.type === "text")?.text;
   if (typeof text !== "string") throw new Error("panel_get_errors returned no text");
   const payload = JSON.parse(text) as Record<string, unknown>;
@@ -163,6 +165,27 @@ describe("panel_get_errors leftover call-budget audit (#1973)", () => {
     }
     expect(payload.errored_count).toBe(0);
     expect(payload.unavailable_widget_values).toBeUndefined();
+  });
+
+  it("keeps the completion pass on the live route after a primary reconnect rebind", async () => {
+    const panel = budgetExhaustedReply({ extraUnchecked: 0 });
+    const { payload } = await runGetErrors((cmd) => {
+      if (cmd.cmd === "graph_get_errors") return panel;
+      if (cmd.cmd === "graph_query") {
+        return {
+          matched: EXECUTION_NODES.length,
+          shown: EXECUTION_NODES.length,
+          text: detailText(EXECUTION_NODES),
+        };
+      }
+      if (cmd.cmd === "graph_get_object_info") {
+        return { ok: true, object_info: objectInfoFor(EXECUTION_NODES) };
+      }
+      return { ok: false };
+    }, { rebindAfterPrimary: "reconnected-tab" });
+
+    expect(payload.audit_complete).toBe(true);
+    expect(payload.unchecked_nodes).toBeUndefined();
   });
 
   it("reports a combo miss on an execution node the budget skip had hidden", async () => {
