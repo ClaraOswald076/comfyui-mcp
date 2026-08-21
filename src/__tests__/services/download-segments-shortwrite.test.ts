@@ -21,6 +21,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 /** Every writev takes at most this many bytes, so a 1 MiB batch is always short. */
 const SHORT_WRITE_BYTES = 40_961; // deliberately not a chunk or batch multiple
 
+/** Flipped by the over-report test; the fs mock reads it on every writev. */
+const overReport = { on: false };
+
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   return {
@@ -38,7 +41,10 @@ vi.mock("node:fs/promises", async (importOriginal) => {
           capped.push(b.length <= budget ? b : b.subarray(0, budget));
           budget -= Math.min(b.length, budget);
         }
-        return realWritev(capped, position);
+        const r = await realWritev(capped, position);
+        // Claim MORE than we were offered — a filesystem the writer must refuse
+        // to believe rather than clamp.
+        return overReport.on ? { ...r, bytesWritten: r.bytesWritten + 1_000_000 } : r;
       };
       return fh;
     },
@@ -142,5 +148,65 @@ describe("segmented writer under short writes (#1697)", () => {
     expect(Buffer.concat(dropWritten([a, b, c], 3))).toEqual(Buffer.from([4, 5, 6, 7, 8, 9]));
     expect(Buffer.concat(dropWritten([a, b, c], 6))).toEqual(Buffer.from([7, 8, 9]));
     expect(dropWritten([a, b, c], 9)).toEqual([]);
+  });
+});
+
+// A filesystem that reports MORE bytes than it was offered would advance the
+// counter past what the file holds — the same over-reporting bug the short-write
+// loop exists to prevent, arriving by a different route. Clamping would hide it,
+// so the writer fails closed instead.
+describe("segmented writer under a nonsensical write count (#1697)", () => {
+  it("refuses rather than trusting a writev that claims more than it was given", async () => {
+    const { runSegmentedDownload, probeSegmentedRanges, planSegments } = await import(
+      "../../services/download-segments.js"
+    );
+    const body = payload(4 * 1024 * 1024);
+    server = createServer((req, res) => {
+      const m = /^bytes=(\d+)-(\d+)$/.exec(String(req.headers.range || ""));
+      if (!m) {
+        res.writeHead(200, { "content-length": String(body.length), "accept-ranges": "bytes" });
+        return void res.end(body);
+      }
+      const start = Number(m[1]);
+      const end = Number(m[2]);
+      const slice = body.subarray(start, end + 1);
+      res.writeHead(206, {
+        "content-length": String(slice.length),
+        "content-range": `bytes ${start}-${end}/${body.length}`,
+        "accept-ranges": "bytes",
+      });
+      res.end(slice);
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const u = `http://127.0.0.1:${(server.address() as AddressInfo).port}/m.safetensors`;
+
+    const segments = planSegments({
+      status: 200,
+      appendMode: false,
+      acceptRanges: "bytes",
+      contentEncoding: null,
+      contentLength: body.length,
+      expectedTotal: body.length,
+      requestHadRange: false,
+      policy: POLICY,
+    })!;
+    const opts = {
+      url: u,
+      headers: {},
+      targetPath: join(tempDir, "overreport.partial"),
+      totalBytes: body.length,
+      segments,
+      logUrl: u,
+      maxAttemptsPerSegment: 1,
+    };
+    overReport.on = true;
+    try {
+      const probe = await probeSegmentedRanges(opts);
+      await expect(runSegmentedDownload(opts, probe)).rejects.toThrow(
+        /the filesystem reported|Not finalizing/i,
+      );
+    } finally {
+      overReport.on = false;
+    }
   });
 });

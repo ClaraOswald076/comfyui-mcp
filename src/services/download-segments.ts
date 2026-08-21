@@ -394,10 +394,14 @@ async function drainSegmentBody(
     // loops internally.)
     while (remaining > 0) {
       const { bytesWritten } = await fh.writev(buffers, seg.start + state.written);
-      if (!(bytesWritten > 0)) {
+      // Fail closed on BOTH directions of a nonsensical count. Zero would spin
+      // forever; more than we offered would advance `state.written` past what the
+      // file holds, which is the same over-reporting bug by another route — and
+      // clamping it would hide a misbehaving filesystem rather than surface it.
+      if (!(bytesWritten > 0) || bytesWritten > remaining) {
         throw new ModelError(
-          `Download segment ${index} could not write to the staging file (the filesystem accepted ` +
-            `0 of ${remaining} bytes). Not finalizing.`,
+          `Download segment ${index} could not write to the staging file (the filesystem reported ` +
+            `${bytesWritten} of ${remaining} bytes). Not finalizing.`,
           { url: opts.logUrl, retryable: true },
         );
       }
