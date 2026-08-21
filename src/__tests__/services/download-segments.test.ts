@@ -37,6 +37,7 @@ import {
   planSegments,
   probeSegmentedRanges,
   runSegmentedDownload,
+  SegmentedRangeUnsupportedError,
   segmentScratchPath,
   type SegmentedPolicy,
 } from "../../services/download-segments.js";
@@ -66,7 +67,9 @@ type ServerMode =
   /** LIES: advertises `Accept-Ranges: bytes`, then ignores Range and 200s. */
   | "lying"
   /** Advertises ranges, 206s, but reports a Content-Range that is not what we asked for. */
-  | "bad-content-range";
+  | "bad-content-range"
+  /** 206 with a correct Content-Range, then a body that stops short of it. */
+  | "short-segment";
 
 interface Rig {
   server: Server;
@@ -113,6 +116,19 @@ async function startServer(body: Buffer, mode: ServerMode): Promise<Rig> {
       mode === "bad-content-range"
         ? `bytes ${start}-${end}/${body.length + 1}`
         : `bytes ${start}-${end}/${body.length}`;
+    if (mode === "short-segment" && start > 0) {
+      // A Content-Range that promises the WHOLE segment over a body that stops
+      // half way, delivered cleanly. The headers look right; only a byte count
+      // stands between this and a finalized model with a hole in it.
+      const half = Math.max(1, Math.floor(slice.length / 2));
+      res.writeHead(206, {
+        "content-type": "application/octet-stream",
+        "content-length": String(half),
+        "content-range": contentRange,
+        "accept-ranges": "bytes",
+      });
+      return void res.end(slice.subarray(0, half));
+    }
     res.writeHead(206, {
       "content-type": "application/octet-stream",
       "content-length": String(slice.length),
@@ -167,6 +183,7 @@ afterEach(async () => {
   delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
   delete process.env.COMFYUI_DOWNLOAD_CONNECTIONS;
   delete process.env.COMFYUI_DOWNLOAD_SEGMENT_MIN_MB;
+  delete process.env.COMFYUI_DOWNLOAD_MAX_ATTEMPTS;
   await Promise.all(rigs.splice(0).map((s) => new Promise<void>((r) => s.close(() => r()))));
   await rm(tempDir, { recursive: true, force: true });
 });
@@ -349,6 +366,55 @@ describe("segmented download through downloadWithCache (#1697)", () => {
 
     expect(sha(await readFile(dest))).toBe(sha(body));
     expect(rig.requests).toHaveLength(1);
+  });
+});
+
+describe("probeSegmentedRanges — a non-206 is never trusted (#1697)", () => {
+  it("declines a 200 even when it carries a Content-Range that matches the request", async () => {
+    // A proxy that echoes Content-Range onto a full 200 is the one shape where the
+    // Content-Range check alone would wave a whole-file body through as a segment.
+    // The status check is what refuses it.
+    const segments = [
+      { start: 0, end: 511 },
+      { start: 512, end: 1023 },
+    ];
+    const fetchImpl = (async () =>
+      new Response(new Uint8Array(1024), {
+        status: 200,
+        headers: { "content-range": "bytes 512-1023/1024", "accept-ranges": "bytes" },
+      })) as unknown as typeof fetch;
+
+    await expect(
+      probeSegmentedRanges({
+        url: "http://127.0.0.1:1/x",
+        headers: {},
+        targetPath: join(tempDir, "never-written.partial"),
+        totalBytes: 1024,
+        segments,
+        logUrl: "http://127.0.0.1:1/x",
+        fetchImpl,
+      }),
+    ).rejects.toThrow(SegmentedRangeUnsupportedError);
+    // And nothing was written: a declined probe must touch no file.
+    await expect(stat(join(tempDir, "never-written.partial"))).rejects.toThrow();
+    await expect(
+      stat(segmentScratchPath(join(tempDir, "never-written.partial"))),
+    ).rejects.toThrow();
+  });
+});
+
+describe("segmented download refuses to finalize a short segment (#1697)", () => {
+  it("errors rather than landing a file whose middle is missing", async () => {
+    process.env.COMFYUI_DOWNLOAD_MAX_ATTEMPTS = "1";
+    const body = payload(8 * 1024 * 1024);
+    const rig = await rigFor(body, "short-segment");
+    const dest = await destFor("short.safetensors");
+
+    await expect(
+      downloadWithCache({ url: rig.url, headers: {}, targetPath: dest }),
+    ).rejects.toThrow(/truncated|incomplete|Not finalizing/i);
+    // Nothing was landed at the destination under a false success.
+    await expect(stat(dest)).rejects.toThrow();
   });
 });
 
