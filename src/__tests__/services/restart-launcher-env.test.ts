@@ -2769,6 +2769,52 @@ n127.0.0.1:8188
     killSpy.mockRestore();
   });
 
+  it("does not report restart failed when the launched PID exits 0 and the port is serving (#2009)", async () => {
+    // The reporter's Windows-portable shape: scheduled probes miss the bind, the
+    // wrapper we spawned exits 0, then /system_stats answers. `restart_comfyui`
+    // used to return started:false / startup:"failed" / "it was not a slow start"
+    // and push an agent into tearing down a healthy server.
+    process.env.COMFYUI_STARTUP_CHECK_INTERVAL_S = "0.01";
+    process.env.COMFYUI_STARTUP_CHECK_MAX_TRIES = "2";
+    usePlainInstall();
+    mockLivePortThenFree();
+    const children = spawnCapturingChildren();
+    let fetches = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        fetches++;
+        if (fetches <= 2) {
+          children[0]?.emit("exit", 0, null);
+          throw new Error("ECONNREFUSED");
+        }
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(true);
+    expect(result.started).toBe(true);
+    expect(result.ready).toBe(true);
+    expect(result.startup).toBe("unconfirmed");
+    expect(result.listener_ownership).toBe("unconfirmed");
+    expect(result.message).not.toMatch(/could not be started/i);
+    expect(result.message).not.toMatch(/THIS RELAUNCH FAILED/);
+    expect(result.message).not.toMatch(/not a slow start/i);
+    expect(result.message).not.toMatch(/restarted successfully/i);
+    expect(result.message).not.toMatch(/launched process is alive/i);
+    expect(result.message).toMatch(/up and ready after the restart/i);
+    expect(result.message).toMatch(/could not be confirmed as the one serving the port/i);
+    expect(result.message).toMatch(/EXITED \(exit code 0\)/);
+    const serialized = JSON.parse(JSON.stringify(result));
+    expect(serialized.startup).toBe("unconfirmed");
+    expect(serialized.listener_ownership).toBe("unconfirmed");
+
+    killSpy.mockRestore();
+  });
+
   it("states listener ownership on EVERY return path, including 'another launcher took the port'", async () => {
     // After our stop, a different launcher binds the port during the settle delay,
     // so restart_comfyui (action:"start") exits via its "already running" branch. That branch used to

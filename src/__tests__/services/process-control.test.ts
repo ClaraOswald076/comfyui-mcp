@@ -502,7 +502,47 @@ describe("process-control startup readiness", () => {
     expect(result.message).toMatch(/no readiness probe got a healthy response/i);
     expect(result.message).not.toMatch(/no readiness probe got a response\b/i);
     expect(result.message).toMatch(/the last one included/i);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // Two scheduled probes, plus the #2009 extra look before a child-gone
+    // timeout is allowed to become `startup:"failed"`.
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not report a failed start when the launched PID exits 0 and the port is serving (#2009)", async () => {
+    // Windows portable / trampoline: the process we spawned exits 0 after handing
+    // off, the scheduled probes miss the bind, and a look AFTER that loop sees a
+    // healthy /system_stats. Treating the wrapper's exit as "THIS RELAUNCH FAILED"
+    // is how an agent was told to tear down a server that had just started.
+    vi.useFakeTimers();
+    process.env.COMFYUI_STARTUP_CHECK_INTERVAL_S = "0.01";
+    process.env.COMFYUI_STARTUP_CHECK_MAX_TRIES = "2";
+    setLaunchInfo();
+    const children = mockSpawnedChildren();
+    mockNoPortProcess();
+    let fetches = 0;
+    const fetchMock = vi.fn(async () => {
+      fetches++;
+      if (fetches <= 2) {
+        children[0]?.emit("exit", 0, null);
+        throw new Error("ECONNREFUSED");
+      }
+      return { ok: true } as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = startComfyUI();
+    await vi.advanceTimersByTimeAsync(10);
+    const result = await pending;
+
+    expect(result.ready).toBe(true);
+    expect(result.started).toBe(true);
+    expect(result.startup).toBe("unconfirmed");
+    expect(result.listener_ownership).toBe("unconfirmed");
+    expect(result.message).not.toMatch(/THIS RELAUNCH FAILED/);
+    expect(result.message).not.toMatch(/not a slow start/i);
+    expect(result.message).not.toMatch(/launched process is alive/i);
+    expect(result.message).toMatch(/EXITED \(exit code 0\)/);
+    expect(result.message).toMatch(/could not be confirmed as the process this call launched/i);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it("reports child process spawn errors without throwing", async () => {
