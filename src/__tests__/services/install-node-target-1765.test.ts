@@ -321,6 +321,21 @@ describe("#1765 — install_custom_node must not write into an install this sess
     expect(error).toContain("--base-directory");
   });
 
+  it("fails OPEN when --base-directory is relative and unresolvable", async () => {
+    // The server WAS given a base directory, but a relative one with no server
+    // cwd to resolve it against. It scans custom_nodes/ from a directory we
+    // cannot name — and the main.py root, which argv does give us, is then
+    // confidently NOT that directory. Judging the write against it would be
+    // comparing the base to the wrong tree, so nothing is refused.
+    live.argv = [join(CONNECTED, "main.py"), "--base-directory", "data"];
+
+    const { ok, error } = await install({ id: REPO, source: "git" });
+
+    expect(error).toBeUndefined();
+    expect(ok).toMatchObject({ mechanism: "git-clone" });
+    expect(clonedInto()).toBe(join(SAVED_DEFAULT, PACK_DIR));
+  });
+
   it("clones normally when the server's --base-directory IS the configured root", async () => {
     // The #1715/#1770 split shape: main.py in one tree, custom_nodes scanned from
     // the data root — which is exactly the root we were about to write into.
