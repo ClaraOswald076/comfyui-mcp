@@ -125,6 +125,12 @@ async function abandonOnce(h: Harness, question = QUESTION, header = HEADER): Pr
 const textOf = (res: ToolResult): string =>
   res.content.map((c) => (c as { text?: string }).text ?? "").join("\n");
 
+const restartDef = () => {
+  const def = buildPanelToolDefs().find((d) => d.name === "panel_restart_comfyui");
+  if (!def) throw new Error("panel_restart_comfyui is not registered");
+  return def;
+};
+
 describe("panel#1554 a late confirmation is claimed, not discarded", () => {
   beforeEach(() => resetAbandonedConfirmCards());
 
@@ -221,6 +227,34 @@ describe("panel#1554 a late confirmation is claimed, not discarded", () => {
     expect(h.drained).toHaveLength(0);
   });
 
+  it("NEW CHAT: the next restart on the same wf: tab paints a FRESH card", async () => {
+    // The pin the review asked for, by name and at the TOOL level rather than at
+    // confirm's: "next restart on the same `wf:` tab must paint a fresh card". New chat
+    // blanks the feed (`newChat()` → `resetFeed()`), so the card the answer belongs to is
+    // no longer on screen; claiming it would restart the server showing the user nothing.
+    const h = harness();
+
+    // A real first attempt: card dispatched, nobody answers inside the budget.
+    expect(textOf(await restartDef().handler({} as never, h.ctx))).toContain(
+      "No confirmation received within",
+    );
+    expect(h.cards).toHaveLength(1);
+    // …then they click it.
+    h.late.set(String(h.cards[0].ask_id), "Yes, go ahead");
+
+    // New chat: exactly what the `new_session` handler does for each member tab.
+    forgetAbandonedConfirmCards(TAB);
+
+    // A SECOND CARD, not a silent restart on the strength of the first one.
+    const second = textOf(await restartDef().handler({} as never, h.ctx));
+    expect(h.cards).toHaveLength(2);
+    expect(second).toContain("No confirmation received within");
+    expect(second).not.toContain("NO NEW CONFIRMATION CARD WAS SHOWN");
+    // The click is left where it was rather than consumed by a conversation that
+    // never showed it.
+    expect(h.late.get(String(h.cards[0].ask_id))).toBe("Yes, go ahead");
+  });
+
   it("a TAKEOVER of the route key drops it — the newcomer never answered that card", async () => {
     // `wf:` keys recur: close the browser tab, open the same workflow elsewhere, and the
     // newcomer inherits the address. #486 calls that a conversation boundary and retires
@@ -250,12 +284,46 @@ describe("panel#1554 a late confirmation is claimed, not discarded", () => {
     expect(await h.ctx.confirm(QUESTION, HEADER, 500, RECOVER)).toBe("yes");
   });
 
+  it("WIRING: every boundary that BLANKS THE FEED retires the confirmation too", () => {
+    // A review found the boundary I originally chose (takeover only) was too narrow, and
+    // for a reason my own argument had missed. The leak is not attribution — a restart
+    // consent is not conversation content — it is VISIBILITY. New chat blanks the feed
+    // (the panel's newChat() calls resetFeed()), a rewind discards everything after the
+    // anchor, and resume_session repaints the log from another thread. In all three the
+    // card is gone from the screen, so acting on its answer afterwards restarts the
+    // server on a surface showing nothing the user can point at.
+    //
+    // Behavioural tests cannot see WHICH handlers call it, and this is a set that is
+    // easy to silently shrink back to one, so the call sites are what is pinned.
+    const src = readFileSync(new URL("../../orchestrator/index.ts", import.meta.url), "utf8");
+    for (const event of ["new_session", "rewind", "resume_session"]) {
+      const at = src.indexOf(`event.type === "${event}"`);
+      expect(at, `${event} handler not found`).toBeGreaterThan(-1);
+      // Bounded to the handler: the next one starts at the following `event.type ===`.
+      const next = src.indexOf("event.type === ", at + 20);
+      const block = src.slice(at, next > at ? next : at + 4000);
+      expect(block, `${event} must retire the abandoned confirmation`).toMatch(
+        /^\s*forgetAbandonedConfirmCards\(t\);\s*$/m,
+      );
+      // …and it stays alongside #486's retirement, not instead of it.
+      expect(block, `${event} must still retire ask state`).toContain("AskAnswers.closeAsks(t)");
+    }
+    // A PROVIDER SWITCH is deliberately absent: it leaves the card painted, so the
+    // consent is still on screen and still answerable. Asserted so that adding it later
+    // is a deliberate act rather than a copy-paste.
+    const providerAt = src.indexOf("if (providerSwitched) AskAnswers.closeAsks(panelTab);");
+    expect(providerAt).toBeGreaterThan(-1);
+    expect(src.slice(providerAt, providerAt + 200)).not.toContain("forgetAbandonedConfirmCards");
+  });
+
   it("WIRING: the takeover listener retires confirmations as well as asks", () => {
     // The bridge takes ONE takeover listener (a setter, not an adder), so this fix had
     // to join the existing call rather than add a second one — a second
     // setTabTakenOverListener would have silently replaced #486's and un-shipped it.
     // Behavioural tests above cannot see that; this is the shape of the call site.
-    const src = readFileSync("src/orchestrator/index.ts", "utf8");
+    // Resolved from THIS module, not from the cwd — a cwd-relative read passes or fails
+    // on where vitest was launched rather than on what the source says.
+    const src = readFileSync(new URL("../../orchestrator/index.ts", import.meta.url), "utf8");
     const at = src.indexOf("bridge.setTabTakenOverListener(");
     expect(at).toBeGreaterThan(-1);
     const call = src.slice(at, at + 200);
@@ -274,12 +342,6 @@ describe("panel#1554 a late confirmation is claimed, not discarded", () => {
 
 describe("panel#1554 the recovered decision is disclosed, not slipped in", () => {
   beforeEach(() => resetAbandonedConfirmCards());
-
-  const restartDef = () => {
-    const def = buildPanelToolDefs().find((d) => d.name === "panel_restart_comfyui");
-    if (!def) throw new Error("panel_restart_comfyui is not registered");
-    return def;
-  };
 
   it("THE CALL SITE opts in — the helper alone proves nothing about production", async () => {
     // Verified by mutation: dropping the options object from the ctx.confirm(...) call
