@@ -469,7 +469,11 @@ describe("runSegmentedDownload — the hole invariant and the byte sink (#1697)"
   });
 
   it("leaves a CONTIGUOUS prefix (never a hole) when a segment fails mid-transfer", async () => {
-    const body = payload(4 * 1024 * 1024);
+    // 16 MiB / 4 segments = 4 MiB each, and segment 0 hands over 2 MiB before it
+    // dies. Sized deliberately above the 1 MiB write batch: below it nothing is
+    // ever flushed, the preserved prefix is legitimately 0, and the assertion
+    // that a valid prefix SURVIVES would have no teeth.
+    const body = payload(16 * 1024 * 1024);
     // Segment 0 always dies part-way; the others would serve fine. Without the
     // prefix truncation the file would end up full-size with a zero-filled gap
     // where segment 0 should be — a correct SIZE over corrupt bytes.
@@ -492,8 +496,9 @@ describe("runSegmentedDownload — the hole invariant and the byte sink (#1697)"
         "accept-ranges": "bytes",
       });
       if (start < quarter) {
-        // Inside segment 0: hand over a little, then kill the connection.
-        res.write(slice.subarray(0, 4096));
+        // Inside segment 0: hand over 2 MiB — past the write batch, so a flush
+        // really happened — then kill the connection.
+        res.write(slice.subarray(0, 2 * 1024 * 1024));
         return void setTimeout(() => res.destroy(), 5);
       }
       res.end(slice);
