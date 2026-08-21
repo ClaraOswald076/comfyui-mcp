@@ -72,7 +72,9 @@ type ServerMode =
   /** Advertises ranges, 206s, but reports a Content-Range that is not what we asked for. */
   | "bad-content-range"
   /** 206 with a correct Content-Range, then a body that stops short of it. */
-  | "short-segment";
+  | "short-segment"
+  /** Correct, but paced slowly enough that a cancel can land mid-transfer. */
+  | "slow-ranges";
 
 interface Rig {
   server: Server;
@@ -143,13 +145,14 @@ async function startServer(body: Buffer, mode: ServerMode): Promise<Rig> {
     // Deliberately dribble the body so the segments genuinely overlap in time —
     // an instant end() could complete each request before the next one starts and
     // the concurrency assertion would pass without any parallelism.
-    const step = Math.max(1, Math.floor(slice.length / 4));
+    const slices = mode === "slow-ranges" ? 64 : 4;
+    const step = Math.max(1, Math.floor(slice.length / slices));
     let off = 0;
     const push = (): void => {
       if (off >= slice.length) return void res.end();
       res.write(slice.subarray(off, Math.min(off + step, slice.length)));
       off += step;
-      setTimeout(push, 5);
+      setTimeout(push, mode === "slow-ranges" ? 25 : 5);
     };
     push();
   });
@@ -609,5 +612,38 @@ describe("segmented download interference between processes (#1697)", () => {
     await expect(runSegmentedDownload(opts, probe)).rejects.toThrow(
       /Another process finished staging/i,
     );
+  });
+});
+
+describe("cancelling a segmented download through downloadWithCache (#1697)", () => {
+  it("leaves a hole-free resumable prefix at the staged file, and no scratch", async () => {
+    // The unit test on runSegmentedDownload covers the mechanism; this covers the
+    // JOB contract — what a user's `download_model action:"cancel"` actually
+    // leaves behind on the shared staged `.partial`.
+    const body = payload(16 * 1024 * 1024);
+    const rig = await rigFor(body, "slow-ranges");
+    const dest = await destFor("cancelled.safetensors");
+    const staged = `${__downloadCacheTestHooks.cachePathForUrl(rig.url, {})}.partial`;
+    const ac = new AbortController();
+
+    const run = downloadWithCache({
+      url: rig.url,
+      headers: {},
+      targetPath: dest,
+      signal: ac.signal,
+    });
+    await new Promise((r) => setTimeout(r, 400));
+    ac.abort();
+    await expect(run).rejects.toThrow();
+
+    // Nothing was landed at the destination under a false success.
+    await expect(stat(dest)).rejects.toThrow();
+    // The scratch never survives its own run.
+    await expect(stat(segmentScratchPath(staged))).rejects.toThrow();
+    // Whatever was kept is a strict, hole-free PREFIX of the real file — the
+    // exact state a resume needs, and the state a holey file would fail.
+    const kept = await readFile(staged).catch(() => Buffer.alloc(0));
+    expect(kept.length).toBeLessThan(body.length);
+    if (kept.length > 0) expect(sha(kept)).toBe(sha(body.subarray(0, kept.length)));
   });
 });
