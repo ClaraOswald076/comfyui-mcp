@@ -37,16 +37,16 @@
 //                real frame would have used.
 //
 // WHY A GRACE RATHER THAN IMMEDIATELY. The panel's frame is the better one — it
-// carries the output images, the duration and the metadata. Ours used to carry
-// only a terminal status and a pointer (#1789); #1853 fills the images from
-// the same completed /history record JobWatcher already parses, so a dropped
-// panel frame still yields the output filenames. Never fabricated: no history
-// entry, no usable media refs, or a fetch failure ⇒ images stay []. The normal
-// path lands within a second or two, and the panel's OWN recovery sweep
-// re-reconciles every 20 s, so a grace comfortably past both lets the real
-// frame win every time it is coming. Past the grace there are exactly two
-// shapes, and NEITHER loses anything — stated precisely, because the coalescing
-// one is the narrower case, not the general one (gate finding):
+// carries duration and metadata the history record does not. #1853 already
+// fills images from that record, so a dropped panel frame is not a missing
+// output. The normal path lands within a second or two; that is the only race
+// the grace has to win. Waiting past the panel's own 20 s recovery sweep
+// (#1789) left a successful run silent for 45 s when that sweep also missed
+// (#1556). A reconnect / missed-WS recovery does not wait at all: reconcile()
+// looks the still-owed prompt ids up in /history and synthesises immediately.
+// Past the grace there are exactly two shapes, and NEITHER loses anything —
+// stated precisely, because the coalescing one is the narrower case, not the
+// general one (gate finding):
 //   • nothing took the synthesised entry (no live agent at that instant), so it
 //     is still `pending` — the journal COALESCES the real payload onto it
 //     (record()), and the agent sees ONE turn, with the images. This is the only
@@ -92,18 +92,25 @@ export interface RunCompletionWatchdogDeps {
    * is the #1789 status-only notice, never a fabricated image.
    */
   resolveOutputs?: (promptId: string) => Promise<CompletionPayload["images"]>;
-  /** How long to let the panel's own frame (and its 20 s reconcile sweep) win
-   *  before filling in. */
+  /**
+   * Terminal status of a prompt in ComfyUI history, or null if it is missing /
+   * still running / unreadable. Wired to `resolveHistoryCompletionStatus` in
+   * production. Used by reconcile() so a reconnect does not have to wait for
+   * QueueMonitor to observe the same finish again.
+   */
+  lookupStatus?: (promptId: string) => Promise<CompletionStatus | null>;
+  /** How long to let the panel's own in-flight frame win before filling in. */
   graceMs?: number;
   now?: () => number;
 }
 
 /**
- * Longer than the panel's own run-reconcile sweep period (20 s) plus a full
- * reconcile round trip, so the panel's recovery — which delivers the IMAGES —
- * is given every chance before we fill in with a pointer.
+ * Past the panel's normal 1–2 s `executed` frame, not past its 20 s recovery
+ * sweep. #1853 already attaches history outputs, so waiting for that sweep
+ * only prolonged the silence when the sweep itself was the thing that missed
+ * (#1556). Reconnect skips this entirely (see reconcile()).
  */
-export const DEFAULT_SYNTHESIS_GRACE_MS = 45_000;
+export const DEFAULT_SYNTHESIS_GRACE_MS = 5_000;
 
 /** Cap on armed observations. A run's arm is dropped the moment it expires, so
  *  this only ever bounds a burst of self-queued renders finishing at once. */
@@ -114,6 +121,14 @@ export interface RunCompletionWatchdog {
   observe(events: ReadonlyArray<{ promptId: string; status: CompletionStatus }>): void;
   /** Expire armed observations; synthesise for the ones still unanswered. */
   tick(): Promise<void>;
+  /**
+   * #1556 — deliver NOW for still-owed runs that ComfyUI history already
+   * shows finished. Used on panel hello/reconnect (and any other missed-WS
+   * recovery) so the agent is not left idle for the grace. Already-armed
+   * observations are flushed immediately even without a history lookup.
+   * Never throws. Exactly-once: a run the journal already holds is skipped.
+   */
+  reconcile(promptIds: readonly string[]): Promise<void>;
   /** Diagnostics/tests: how many completions are currently armed. */
   armedCount(): number;
 }
@@ -222,6 +237,46 @@ export async function resolveHistoryCompletionImages(
 }
 
 /**
+ * Terminal status of a /history record, or null when the run is not proven
+ * finished. Fail-closed: a missing entry, a missing status, or a still-running
+ * record must not synthesise a completion. Interrupted is recognised from the
+ * execution_interrupted message even when status_str is not "interrupted".
+ */
+export function completionStatusFromHistoryEntry(entry: unknown): CompletionStatus | null {
+  if (!entry || typeof entry !== "object") return null;
+  const st = (entry as { status?: unknown }).status;
+  if (!st || typeof st !== "object") return null;
+  const status = st as { status_str?: unknown; completed?: unknown; messages?: unknown };
+  const messages = Array.isArray(status.messages) ? status.messages : [];
+  const has = (type: string) => messages.some((m) => Array.isArray(m) && m[0] === type);
+  if (has("execution_interrupted")) return "interrupted";
+  if (has("execution_error") || status.status_str === "error") return "error";
+  if (status.completed === true || status.status_str === "success") return "success";
+  return null;
+}
+
+/**
+ * Fetch `/history/<promptId>` and return its terminal status, or null when the
+ * record is missing, unreadable, or not yet complete. Never invents a finish.
+ */
+export async function resolveHistoryCompletionStatus(
+  promptId: string,
+  fetchHistory: (id: string) => Promise<Record<string, HistoryEntry>> = getHistory,
+): Promise<CompletionStatus | null> {
+  const id = typeof promptId === "string" ? promptId.trim() : "";
+  if (!id) return null;
+  try {
+    const history = await fetchHistory(id);
+    return completionStatusFromHistoryEntry(history?.[id]);
+  } catch (err) {
+    logger.debug(
+      `[run-completion-watchdog] history status for ${id} failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+}
+
+/**
  * Compose the synthesised completion payload.
  *
  * Every claim in it is one the orchestrator actually observed. Output refs are
@@ -291,6 +346,7 @@ export function createRunCompletionWatchdog({
   awaiting,
   deliver,
   resolveOutputs,
+  lookupStatus,
   graceMs = DEFAULT_SYNTHESIS_GRACE_MS,
   now = () => Date.now(),
 }: RunCompletionWatchdogDeps): RunCompletionWatchdog {
@@ -299,23 +355,98 @@ export function createRunCompletionWatchdog({
    *  re-reported completion would never expire and the agent would wait
    *  forever — the exact failure being fixed). */
   const armed = new Map<string, ArmedCompletion>();
+  /** promptIds currently being synthesised. Reconcile must not re-arm one
+   *  tick() has already spent — that would double-deliver if the history
+   *  fetch is still in flight. */
+  const inflight = new Set<string>();
+
+  const arm = (promptId: string, status: CompletionStatus, observedAt: number): void => {
+    if (armed.has(promptId) || inflight.has(promptId)) return;
+    armed.set(promptId, { promptId, status, observedAt });
+    while (armed.size > MAX_ARMED) {
+      const oldest = armed.keys().next().value;
+      if (oldest === undefined) break;
+      armed.delete(oldest);
+    }
+  };
+
+  const expire = async (ignoreGrace: boolean): Promise<void> => {
+    if (armed.size === 0) return;
+    const at = now();
+    for (const entry of [...armed.values()]) {
+      if (!ignoreGrace && at - entry.observedAt < graceMs) continue;
+      // Disarm FIRST and unconditionally: whatever happens below, this
+      // observation is spent. Leaving it armed on a throwing deliver() would
+      // re-fire it on every later tick.
+      armed.delete(entry.promptId);
+      inflight.add(entry.promptId);
+      let ticket: RunTicket | undefined;
+      try {
+        ticket = awaiting(entry.promptId);
+      } catch (err) {
+        inflight.delete(entry.promptId);
+        logger.debug(
+          `[run-completion-watchdog] could not re-check prompt ${entry.promptId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        continue;
+      }
+      // The panel's own frame landed inside the grace — the normal case, and
+      // the one this must stay quiet for.
+      if (!ticket) {
+        inflight.delete(entry.promptId);
+        continue;
+      }
+      try {
+        let images: CompletionImage[] = [];
+        if (resolveOutputs) {
+          try {
+            images = usableHistoryImages(await resolveOutputs(entry.promptId));
+          } catch (err) {
+            logger.debug(
+              `[run-completion-watchdog] history outputs for ${entry.promptId} unavailable: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+          // A panel frame that landed DURING the fetch still wins.
+          try {
+            ticket = awaiting(entry.promptId);
+          } catch (err) {
+            logger.debug(
+              `[run-completion-watchdog] could not re-check prompt ${entry.promptId} after history fetch: ${err instanceof Error ? err.message : String(err)}`,
+            );
+            continue;
+          }
+          if (!ticket) continue;
+        }
+        // #1789 item 3 — the failure is OBSERVABLE from here on. Until now the
+        // only detector of a lost completion was a human noticing the agent had
+        // gone quiet.
+        logger.warn(
+          `[run-completion-watchdog] prompt ${entry.promptId} finished (${entry.status}) ${Math.round(
+            (at - entry.observedAt) / 1000,
+          )}s ago and the panel NEVER reported its completion — synthesising one from the orchestrator's own ComfyUI observation so the agent that was told to end its turn and wait is not left idle (#1789)`,
+        );
+        deliver(synthesizeCompletionPayload(entry, { deliveredAt: at, images }), ticket);
+      } catch (err) {
+        logger.warn(
+          `[run-completion-watchdog] could not deliver the synthesised completion for prompt ${entry.promptId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      } finally {
+        inflight.delete(entry.promptId);
+      }
+    }
+  };
 
   return {
     observe(events) {
       for (const ev of events ?? []) {
         try {
           const promptId = typeof ev?.promptId === "string" ? ev.promptId.trim() : "";
-          if (!promptId || armed.has(promptId)) continue;
+          if (!promptId) continue;
           // Only runs THIS session queued and is still owed a completion for.
           // A foreign render (the user pressed Queue Prompt) has no ticket and
           // was never promised anything, so it must never wake the agent.
           if (!awaiting(promptId)) continue;
-          armed.set(promptId, { promptId, status: ev.status, observedAt: now() });
-          while (armed.size > MAX_ARMED) {
-            const oldest = armed.keys().next().value;
-            if (oldest === undefined) break;
-            armed.delete(oldest);
-          }
+          arm(promptId, ev.status, now());
         } catch (err) {
           logger.debug(
             `[run-completion-watchdog] observe skipped an event: ${err instanceof Error ? err.message : String(err)}`,
@@ -325,61 +456,44 @@ export function createRunCompletionWatchdog({
     },
 
     async tick() {
-      if (armed.size === 0) return;
-      const at = now();
-      for (const entry of [...armed.values()]) {
-        if (at - entry.observedAt < graceMs) continue;
-        // Disarm FIRST and unconditionally: whatever happens below, this
-        // observation is spent. Leaving it armed on a throwing deliver() would
-        // re-fire it on every later tick.
-        armed.delete(entry.promptId);
-        let ticket: RunTicket | undefined;
-        try {
-          ticket = awaiting(entry.promptId);
-        } catch (err) {
-          logger.debug(
-            `[run-completion-watchdog] could not re-check prompt ${entry.promptId}: ${err instanceof Error ? err.message : String(err)}`,
-          );
-          continue;
-        }
-        // The panel's own frame landed inside the grace — the normal case, and
-        // the one this must stay quiet for.
-        if (!ticket) continue;
-        try {
-          let images: CompletionImage[] = [];
-          if (resolveOutputs) {
+      await expire(false);
+    },
+
+    async reconcile(promptIds) {
+      try {
+        if (lookupStatus) {
+          for (const raw of promptIds ?? []) {
             try {
-              images = usableHistoryImages(await resolveOutputs(entry.promptId));
+              const promptId = typeof raw === "string" ? raw.trim() : "";
+              if (!promptId || armed.has(promptId) || inflight.has(promptId)) continue;
+              if (!awaiting(promptId)) continue;
+              let status: CompletionStatus | null = null;
+              try {
+                status = await lookupStatus(promptId);
+              } catch (err) {
+                logger.debug(
+                  `[run-completion-watchdog] history status for ${promptId} unavailable: ${err instanceof Error ? err.message : String(err)}`,
+                );
+                continue;
+              }
+              if (!status) continue;
+              // A panel frame that landed DURING the lookup still wins.
+              if (!awaiting(promptId)) continue;
+              // observedAt = now: we just learned it finished. expire(true)
+              // skips the grace; waitedS in the note is the lookup latency.
+              arm(promptId, status, now());
             } catch (err) {
               logger.debug(
-                `[run-completion-watchdog] history outputs for ${entry.promptId} unavailable: ${err instanceof Error ? err.message : String(err)}`,
+                `[run-completion-watchdog] reconcile skipped a prompt: ${err instanceof Error ? err.message : String(err)}`,
               );
             }
-            // A panel frame that landed DURING the fetch still wins.
-            try {
-              ticket = awaiting(entry.promptId);
-            } catch (err) {
-              logger.debug(
-                `[run-completion-watchdog] could not re-check prompt ${entry.promptId} after history fetch: ${err instanceof Error ? err.message : String(err)}`,
-              );
-              continue;
-            }
-            if (!ticket) continue;
           }
-          // #1789 item 3 — the failure is OBSERVABLE from here on. Until now the
-          // only detector of a lost completion was a human noticing the agent had
-          // gone quiet.
-          logger.warn(
-            `[run-completion-watchdog] prompt ${entry.promptId} finished (${entry.status}) ${Math.round(
-              (at - entry.observedAt) / 1000,
-            )}s ago and the panel NEVER reported its completion — synthesising one from the orchestrator's own ComfyUI observation so the agent that was told to end its turn and wait is not left idle (#1789)`,
-          );
-          deliver(synthesizeCompletionPayload(entry, { deliveredAt: at, images }), ticket);
-        } catch (err) {
-          logger.warn(
-            `[run-completion-watchdog] could not deliver the synthesised completion for prompt ${entry.promptId}: ${err instanceof Error ? err.message : String(err)}`,
-          );
         }
+        await expire(true);
+      } catch (err) {
+        logger.debug(
+          `[run-completion-watchdog] reconcile failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
     },
 

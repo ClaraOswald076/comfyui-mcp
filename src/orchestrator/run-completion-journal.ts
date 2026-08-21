@@ -1151,6 +1151,22 @@ export class RunCompletionJournalImpl {
     return ticket;
   }
 
+  /**
+   * Every run still owed the completion `panel_run` promised it (#1556).
+   *
+   * The reconnect recovery looks these up in ComfyUI `/history` immediately
+   * rather than waiting for QueueMonitor to re-observe the finish. Same
+   * predicate as `awaitingCompletion` — one implementation, iterated.
+   */
+  owedCompletions(): RunTicket[] {
+    const out: RunTicket[] = [];
+    for (const promptId of this.tickets.keys()) {
+      const ticket = this.awaitingCompletion(promptId);
+      if (ticket) out.push(ticket);
+    }
+    return out;
+  }
+
   /** Is ANY completion still undelivered anywhere? The orchestrator's
    *  self-restart gate reads this: the journal is in-memory, so restarting while
    *  an entry is outstanding would silently drop a render result the agent was

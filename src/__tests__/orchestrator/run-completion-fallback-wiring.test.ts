@@ -44,6 +44,10 @@ describe("#1789 — the history fallback is WIRED into the orchestrator, not mer
     // pointer. A second path that invented filenames would be the over-claim.
     expect(block).toContain("resolveOutputs:");
     expect(block).toContain("resolveHistoryCompletionImages(");
+    // #1556 — reconnect looks the still-owed ids up in /history, not only in
+    // the QueueMonitor drain that may have already missed them.
+    expect(block).toContain("lookupStatus:");
+    expect(block).toContain("resolveHistoryCompletionStatus(");
   });
 
   it("SOURCE: QueueMonitor's completions are TEED to the watchdog from the broadcaster's single drain", () => {
@@ -55,7 +59,7 @@ describe("#1789 — the history fallback is WIRED into the orchestrator, not mer
     expect(start).toBeGreaterThan(-1);
     const block = src.slice(start, start + 900);
     expect(block).toContain("QueueMonitor.drainCompletions()");
-    expect(block).toContain("runCompletionWatchdog.observe(");
+    expect(block).toContain(".observe(completions)");
   });
 
   it("SOURCE: the watchdog is ticked on the poll timer, AFTER the drain that feeds it", () => {
@@ -63,12 +67,25 @@ describe("#1789 — the history fallback is WIRED into the orchestrator, not mer
     const start = src.indexOf("const queueStatusTimer = setInterval(");
     expect(start).toBeGreaterThan(-1);
     const block = src.slice(start, start + 700);
-    expect(block).toContain("runCompletionWatchdog.tick()");
+    expect(block).toContain("wd.tick()");
     // Ordering matters: the broadcaster tick is what arms the watchdog, so
     // expiring first would delay every arm by a whole poll interval.
     expect(block.indexOf("queueStatusBroadcaster.tick()")).toBeLessThan(
-      block.indexOf("runCompletionWatchdog.tick()"),
+      block.indexOf("wd.tick()"),
     );
+  });
+
+  it("SOURCE: a panel hello reconciles owed panel_run ids against ComfyUI history immediately", () => {
+    const src = indexSrc();
+    const helloAt = src.indexOf('if (event.type === "hello" && event.tab_id)');
+    expect(helloAt).toBeGreaterThan(-1);
+    // The hello handler is large; pin the reconcile next to the queue_status
+    // seed that already runs on connect, not some unrelated later hello.
+    const seedAt = src.indexOf("buildQueueStatusFrame(QueueMonitor.snapshot())", helloAt);
+    expect(seedAt).toBeGreaterThan(helloAt);
+    const block = src.slice(seedAt, seedAt + 900);
+    expect(block).toContain("runCompletionWatchdog?.reconcile(");
+    expect(block).toContain("RunCompletions.owedCompletions()");
   });
 });
 
