@@ -9963,6 +9963,9 @@ export interface PanelToolCtx {
    *  (image screenshots, secret collection). */
   bridge: UiBridge;
   tabId: string;
+  /** Notifies the completion watchdog when panel_run opens a ticket after a
+   * fast completion was already observed. Optional for lightweight contexts. */
+  onRunTicketOpened?: (promptIds: readonly string[]) => void;
   /** Per-tab workflow pin store (optional for tests). */
   workflowTarget?: WorkflowTargetStore;
   /**
@@ -10065,6 +10068,7 @@ export function makePanelToolCtx(
   bridge: UiBridge,
   tabId: string,
   workflowTargets?: WorkflowTargetStore,
+  onRunTicketOpened?: (promptIds: readonly string[]) => void,
 ): PanelToolCtx {
   // The routing tab id is held on the returned ctx object (NOT captured by
   // value) so an explicit rebind can re-point this session in place: call/
@@ -10073,6 +10077,7 @@ export function makePanelToolCtx(
     bridge,
     tabId,
     workflowTarget: workflowTargets,
+    onRunTicketOpened,
   } as PanelToolCtx;
 
   // AUTO-HEAL an orphaned session in place. When THIS session's captured tabId no
@@ -14515,10 +14520,19 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // Every id gets its own ticket. `correlatable` stays the promise the
         // anti-poll note is allowed to make — true only if at least one run can
         // actually be correlated back.
+        const ticketedPromptIds: string[] = [];
         const correlatable =
           queuedIds.length === 0
             ? RunCompletions.openRun(undefined, ticketOpts)
-            : queuedIds.map((id) => RunCompletions.openRun(id, ticketOpts)).some(Boolean);
+            : queuedIds.map((id) => {
+                const opened = RunCompletions.openRun(id, ticketOpts);
+                if (opened) ticketedPromptIds.push(id);
+                return opened;
+              }).some(Boolean);
+        // A fast QueueMonitor observation can be held before the panel reply
+        // returns. Promote that in-memory arm immediately after its journal
+        // ticket opens, so a completion burst cannot evict this owed run.
+        if (ticketedPromptIds.length) ctx.onRunTicketOpened?.(ticketedPromptIds);
         // Append anti-poll guidance: the agent should go idle after queuing so the
         // executed event auto-injects the output image, rather than busy-polling.
         //
@@ -18894,8 +18908,9 @@ export function createPanelMcpServer(
   bridge: UiBridge,
   tabId: string,
   workflowTargets?: WorkflowTargetStore,
+  onRunTicketOpened?: (promptIds: readonly string[]) => void,
 ): McpSdkServerConfigWithInstance {
-  const ctx = makePanelToolCtx(bridge, tabId, workflowTargets);
+  const ctx = makePanelToolCtx(bridge, tabId, workflowTargets, onRunTicketOpened);
   // #873 — THE SECOND PANEL REGISTRATION PATH. This one serves the Anthropic Agent SDK
   // (Claude backend, in-process transport); registerPanelTools serves the MCP SDK. They
   // build from the SAME buildPanelToolDefs(), so filtering only the other one left

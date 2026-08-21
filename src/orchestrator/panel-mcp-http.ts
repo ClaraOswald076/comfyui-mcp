@@ -81,6 +81,7 @@ export function startPanelMcpHttpServer(
   port: number,
   host = "127.0.0.1",
   workflowTargets?: WorkflowTargetStore,
+  onRunTicketOpened?: (promptIds: readonly string[]) => void,
 ): Promise<PanelMcpHttpServer> {
   // tabId -> (sessionId -> Session). A tab can hold multiple Codex sessions
   // across reconnects; each is its own server+transport over the SAME tab ctx.
@@ -103,7 +104,7 @@ export function startPanelMcpHttpServer(
     );
     // Tab-bound context: every tool forwards to the bridge for THIS tab — the
     // same surface the Claude in-process server exposes (shared defs).
-    registerPanelTools(server, makePanelToolCtx(bridge, tabId, workflowTargets));
+    registerPanelTools(server, makePanelToolCtx(bridge, tabId, workflowTargets, onRunTicketOpened));
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       // Defense in depth against DNS rebinding (a malicious page resolving its own

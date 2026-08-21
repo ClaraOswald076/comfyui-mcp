@@ -127,6 +127,43 @@ describe("#1789: a completion the panel never reported is filled in from ComfyUI
     expect(delivered[0].ticket.promptId).toBe(PID);
   });
 
+  it("#2021 promotes a fast-render arm so a completion burst cannot evict it", async () => {
+    const clock = { t: 1_600_000 };
+    const { wd, delivered } = makeWatchdog(clock);
+    wd.observe([{ promptId: PID, status: "success" }]);
+    expect(RunCompletions.openRun(PID, { tabId: TAB, conversation: CONV })).toBe(true);
+    wd.markTicketed([PID]);
+
+    for (let i = 0; i < 300; i++) {
+      wd.observe([{ promptId: `burst-${i}`, status: "success" }]);
+    }
+    clock.t += DEFAULT_SYNTHESIS_GRACE_MS;
+    await wd.tick();
+
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0].payload.prompt_id).toBe(PID);
+  });
+
+  it("#2021 refuses an unknown arm observed before a reused prompt dispatch", async () => {
+    const clock = { t: 1_700_000 };
+    const { wd, delivered } = makeWatchdog(clock);
+    wd.observe([{ promptId: PID, status: "success" }]);
+    clock.t += 100;
+    expect(
+      RunCompletions.openRun(PID, {
+        tabId: TAB,
+        conversation: CONV,
+        dispatchedAt: clock.t,
+      }),
+    ).toBe(true);
+    wd.markTicketed([PID]);
+    clock.t += DEFAULT_SYNTHESIS_GRACE_MS;
+    await wd.tick();
+
+    expect(delivered).toHaveLength(0);
+    expect(RunCompletions.awaitingCompletion(PID)).toBeTruthy();
+  });
+
   it("the synthesised completion is CORRELATED as the run the agent queued, and reaches an agent", () => {
     const clock = { t: 2_000_000 };
     const { wd } = makeWatchdog(clock);

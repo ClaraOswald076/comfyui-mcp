@@ -182,6 +182,9 @@ const MAX_ARMED = 256;
 export interface RunCompletionWatchdog {
   /** Feed QueueMonitor's drained completions in. Never throws. */
   observe(events: ReadonlyArray<{ promptId: string; status: CompletionStatus }>): void;
+  /** Mark a just-opened panel_run ticket so a fast completion arm cannot be
+   * evicted as an unknown observation during a completion burst. */
+  markTicketed(promptIds: readonly string[]): void;
   /** Expire armed observations; synthesise for the ones still unanswered. */
   tick(): Promise<void>;
   /**
@@ -491,6 +494,14 @@ export function createRunCompletionWatchdog({
         inflight.delete(entry.promptId);
         continue;
       }
+      // An unknown arm observed before this dispatch cannot be the run whose
+      // ticket just opened. The journal's claimRaced timestamp guard already
+      // applies to journaled entries; apply the same fail-closed boundary to
+      // the watchdog's in-memory, not-yet-journaled arm (#2021).
+      if (typeof ticket.dispatchedAt === "number" && entry.observedAt < ticket.dispatchedAt) {
+        inflight.delete(entry.promptId);
+        continue;
+      }
       try {
         let images: CompletionImage[] = [];
         if (resolveOutputs) {
@@ -586,6 +597,15 @@ export function createRunCompletionWatchdog({
             `[run-completion-watchdog] observe skipped an event: ${err instanceof Error ? err.message : String(err)}`,
           );
         }
+      }
+    },
+
+    markTicketed(promptIds) {
+      for (const raw of promptIds ?? []) {
+        const promptId = typeof raw === "string" ? raw.trim() : "";
+        if (!promptId) continue;
+        const entry = armed.get(promptId);
+        if (entry) entry.ticketedAtObservation = true;
       }
     },
 

@@ -2022,7 +2022,13 @@ export async function runPanelOrchestrator(): Promise<void> {
   {
     const panelMcpPort = Number(process.env.COMFYUI_MCP_PANEL_MCP_PORT) || ports.panelMcp;
     try {
-      panelMcpHttp = await startPanelMcpHttpServer(bridge, panelMcpPort, "127.0.0.1", workflowTargets);
+      panelMcpHttp = await startPanelMcpHttpServer(
+        bridge,
+        panelMcpPort,
+        "127.0.0.1",
+        workflowTargets,
+        (promptIds) => runCompletionWatchdog?.markTicketed(promptIds),
+      );
     } catch (err) {
       logger.error(
         `[panel-orchestrator] could not start the panel HTTP MCP on :${panelMcpPort} — codex/gemini tabs will lack live-graph tools: ${err instanceof Error ? err.message : String(err)}`,
@@ -2444,7 +2450,12 @@ export async function runPanelOrchestrator(): Promise<void> {
     // one issue-time stamp).
     makePanelServer: (key) =>
       backendOf(key) === "claude"
-        ? createPanelMcpServer(bridge, key, workflowTargets)
+        ? createPanelMcpServer(
+            bridge,
+            key,
+            workflowTargets,
+            (promptIds) => runCompletionWatchdog?.markTicketed(promptIds),
+          )
         : undefined,
     mcpServers: buildMcpServers(),
     // Per-KEY factory — spawns must reflect live state (the Blind gate) and
