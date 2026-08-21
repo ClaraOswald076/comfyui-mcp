@@ -458,3 +458,65 @@ describe("#941: a forwarded /view reference says what 'painted' does not cover",
     expect(textOf(res)).toMatch(/renders BROKEN/);
   });
 });
+
+// #1572 — audio reaches these routes now. Nothing here is audio-SPECIFIC
+// machinery: resolveServableViewRef and stageFileIntoServedDir are path-based
+// and never look at an extension, so the reference and staging routes were
+// always going to work. What was NOT automatic is what the agent is TOLD: both
+// notes had two branches and treated "not a video" as "an image", so an
+// oversized .wav would have been described as displayed "at full size" with
+// get_image offered as the way to LOOK at it. These exercise the whole path
+// rather than the note functions, because a note tested alone cannot show that
+// the right kind reached it.
+describe("panel_show_media: an oversized AUDIO file takes the same routes (#1572)", () => {
+  let bigAudioUnderRoot: string;
+  let bigAudioOutside: string;
+
+  beforeEach(() => {
+    bigAudioUnderRoot = join(outDir, "takes", "voice_00001.wav");
+    writeFileSync(bigAudioUnderRoot, Buffer.alloc(OVERSIZE));
+    bigAudioOutside = join(root, "elsewhere", "voice_00001.wav");
+    writeFileSync(bigAudioOutside, Buffer.alloc(OVERSIZE));
+  });
+
+  it("under a ComfyUI root: forwarded by reference, labelled audio, nothing inlined", async () => {
+    const { res, calls } = await showMedia([{ source: { path: bigAudioUnderRoot } }]);
+    expect(res.isError).toBeFalsy();
+    const items = calls[0].items as Array<Record<string, unknown>>;
+    expect(items[0].kind).toBe("viewRef");
+    expect(items[0].viewRef).toMatchObject({ filename: "voice_00001.wav", subfolder: "takes" });
+    expect(items[0].dataUrl).toBeUndefined();
+    const text = textOf(res);
+    // The forwarded note names it as audio and gives it the audio caveat…
+    expect(text).toContain(", audio)");
+    expect(text).toMatch(/AUDIO is never sent to you/);
+    // …and does not hand the agent the image branch's advice.
+    expect(text).not.toContain("comes back inline");
+  });
+
+  it("outside every root: refused with the AUDIO explanation, not the image one", async () => {
+    const { res } = await showMedia([{ source: { path: bigAudioOutside } }]);
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toMatch(/audio player/i);
+    expect(text).toMatch(/cannot hear it/i);
+    // The two false claims the old two-branch prose would have made about a .wav.
+    expect(text).not.toContain("displays it to the USER at full size");
+    expect(text).not.toContain("returns the image inline");
+    // And it must not borrow the video branch either.
+    expect(text).not.toContain("SAMPLED");
+    // Still the same actionable remedy every other kind gets.
+    expect(text).toContain("stage:true");
+  });
+
+  it("stage:true copies it into the served dir and labels the copy audio", async () => {
+    const { res, calls } = await showMedia([{ source: { path: bigAudioOutside, stage: true } }]);
+    expect(res.isError).toBeFalsy();
+    const items = calls[0].items as Array<Record<string, unknown>>;
+    expect(items[0].kind).toBe("viewRef");
+    expect((items[0].viewRef as { subfolder?: string }).subfolder).toBe("_panel_staged");
+    const text = textOf(res);
+    expect(text).toContain(", audio)");
+    expect(text).toMatch(/real filesystem WRITE/);
+  });
+});
