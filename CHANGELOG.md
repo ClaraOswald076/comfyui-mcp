@@ -759,6 +759,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.40] - 2026-08-20
+
+### MCP
+
+#### Fixed
+- panel_add_node names live sibling socket producers instead of a missing-output dead end (#1947)
+- a completion QUEUED onto an agent is not one the agent has READ (#1946)
+
+
 ## [0.52.39] - 2026-08-20
 
 ### MCP
