@@ -849,26 +849,24 @@ export function unverifiedViewRefNote(
  * The refusal names the limitation, keeps the file's good name (nothing is
  * wrong with it), and gives the two moves that actually work.
  */
-export function headlessAudioRefusal(opts: {
-  /** The path the caller passed, or the /view filename. */
-  what: string;
-  via: "path" | "ref";
-}): string {
-  const { what, via } = opts;
-  const where =
-    via === "path"
-      ? `the file itself is fine and still sits at ${what}`
-      : `the ComfyUI reference "${what}" is fine and still resolves`;
+export function headlessAudioRefusal(
+  items: ReadonlyArray<{ what: string; via: "path" | "ref" }>,
+): string {
+  const one = items.length === 1;
+  const lines = items
+    .map((it) => `  - ${it.what}${it.via === "ref" ? " (ComfyUI reference)" : ""}`)
+    .join("\n");
   return (
-    `this conversation is on a HEADLESS client (a paired phone or remote viewer), which has no audio player: ${what}\n` +
+    `this conversation is on a HEADLESS client (a paired phone or remote viewer), which has no audio player, so ` +
+    `${one ? "this file was" : `these ${items.length} files were`} not sent:\n${lines}\n` +
     `That client renders images and video only — it has no audio card at all, so an audio item sent to it would be ` +
-    `shown as a caption row with an image icon and reported back as delivered. You would then have been told the take ` +
+    `shown as a caption row with an image icon and acknowledged as delivered. You would then have been told the take ` +
     `was played to the user when nobody heard it, which is worse than this refusal. Inlining the bytes does not help: ` +
     `they reach the same image decoder and fail the same way.\n` +
-    `Nothing is wrong with the audio — ${where}.\n` +
+    `Nothing is wrong with the audio — ${one ? "it is" : "they are"} fine and still exactly where named above.\n` +
     `What you can do:\n` +
-    `  1. Ask the USER to open it on the desktop ComfyUI panel, which does have a player, or to play the file locally. ` +
-    `Tell them where it is; do not describe how it sounds, because you have not heard it either.\n` +
+    `  1. Ask the USER to open ${one ? "it" : "them"} on the desktop ComfyUI panel, which does have a player, or to ` +
+    `play the file locally. Tell them where it is; do not describe how it sounds, because you have not heard it either.\n` +
     `  2. Show something this client CAN present instead — a still or a video — and say plainly that the audio is not ` +
     `playable here.`
   );

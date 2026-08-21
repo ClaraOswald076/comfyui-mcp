@@ -48,7 +48,7 @@ import { buildPanelToolDefs, type PanelToolCtx, type ToolResult } from "../../or
 
 type Forwarded = Record<string, unknown>;
 
-function makeCtx(headless: boolean): { ctx: PanelToolCtx; calls: Forwarded[] } {
+function makeCtx(headless: boolean, reachable = true): { ctx: PanelToolCtx; calls: Forwarded[] } {
   const calls: Forwarded[] = [];
   const ctx = {
     call: async (cmd: Forwarded) => {
@@ -56,7 +56,7 @@ function makeCtx(headless: boolean): { ctx: PanelToolCtx; calls: Forwarded[] } {
       return { content: [{ type: "text", text: JSON.stringify(cmd) }] } as ToolResult;
     },
     confirm: async () => "yes" as const,
-    bridge: { isHeadless: () => headless } as unknown as PanelToolCtx["bridge"],
+    bridge: { isHeadless: () => headless, canReach: () => reachable } as unknown as PanelToolCtx["bridge"],
     tabId: "test-tab",
   } as PanelToolCtx;
   return { ctx, calls };
@@ -65,10 +65,11 @@ function makeCtx(headless: boolean): { ctx: PanelToolCtx; calls: Forwarded[] } {
 async function showMedia(
   items: Array<Record<string, unknown>>,
   headless: boolean,
+  reachable = true,
 ): Promise<{ res: ToolResult; calls: Forwarded[] }> {
   const def = buildPanelToolDefs().find((d) => d.name === "panel_show_media");
   if (!def) throw new Error("panel_show_media not found");
-  const { ctx, calls } = makeCtx(headless);
+  const { ctx, calls } = makeCtx(headless, reachable);
   const res = (await def.handler({ items }, ctx)) as ToolResult;
   return { res, calls };
 }
@@ -191,3 +192,81 @@ describe("#1572 the headless gate is narrow — it costs nothing else", () => {
     expect(items[0].kind).toBe("audio");
   });
 });
+
+// #1572 round 3 — the gate's SECOND P1, and the sharper edge of the same idea.
+//
+// The verdict used to be read at the TOP of the handler. `ctx.tabId` is held
+// LIVE on the ctx (makePanelToolCtx says so in as many words) precisely so
+// `ctx.call`'s `ensureReachable()` can rebind an orphaned session in place — and
+// `interactiveTabIds()` filters headless OUT, so a heal can only ever land on a
+// CANVAS tab. So the old read answered a question about a tab the frame was
+// about to stop going to: a phone asleep in a pocket, desktop panel open,
+// `.wav` refused for nothing.
+//
+// Two corrections, and both are load-bearing:
+//   1. the verdict is taken ONCE, immediately before dispatch, after every
+//      await this handler performs;
+//   2. it requires the headless tab to be REACHABLE — connected right now. An
+//      unreachable sticky-headless tab is exactly the session about to be healed
+//      onto a canvas tab (where audio plays), or else one whose call surfaces
+//      the bridge's own tab-listing error, which is a better message than this
+//      refusal.
+describe("#1572 an UNREACHABLE headless tab is not refused — it is about to be rebound", () => {
+  it.each(AUDIO)("a %s PATH is allowed through when the phone is offline", async (ext) => {
+    const { res, calls } = await showMedia(
+      [{ source: { path: filePath(`take${ext}`) } }],
+      true, // sticky isHeadless — this tab once helloed headless
+      false, // …but canReach is false: ensureReachable will heal onto a canvas tab
+    );
+    expect(res.isError).toBeFalsy();
+    const items = calls.find((c) => c.cmd === "show_media")!.items as Array<{ kind?: string }>;
+    expect(items[0].kind).toBe("audio");
+  });
+
+  it("an offline headless tab's /view REF is allowed through too", async () => {
+    const { res, calls } = await showMedia(
+      [{ source: { filename: "take_00001.wav", type: "output" } }],
+      true,
+      false,
+    );
+    expect(res.isError).toBeFalsy();
+    expect(calls.find((c) => c.cmd === "show_media")).toBeTruthy();
+  });
+
+  it("a CONNECTED phone is still refused — the case the gate exists for", async () => {
+    const { res } = await showMedia([{ source: { path: filePath("take.wav") } }], true, true);
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/HEADLESS client/);
+  });
+
+  it("a bridge that cannot answer canReach is treated as reachable, not as absent", async () => {
+    // isHeadless already said "phone". Inventing liveness we cannot observe is
+    // how an unearned claim gets made in the other direction.
+    const def = buildPanelToolDefs().find((d) => d.name === "panel_show_media")!;
+    const calls: Forwarded[] = [];
+    const ctx = {
+      call: async (cmd: Forwarded) => {
+        calls.push(cmd);
+        return { content: [{ type: "text", text: "ok" }] } as ToolResult;
+      },
+      confirm: async () => "yes" as const,
+      bridge: { isHeadless: () => true } as unknown as PanelToolCtx["bridge"], // no canReach
+      tabId: "t",
+    } as PanelToolCtx;
+    const res = (await def.handler(
+      { items: [{ source: { path: filePath("take.wav") } }] },
+      ctx,
+    )) as ToolResult;
+    expect(res.isError).toBe(true);
+    expect(calls.find((c) => c.cmd === "show_media")).toBeFalsy();
+  });
+});
+
+// The "verdict is read LIVE, after the awaits" half of the round-3 fix is
+// exercised in panel-show-media-oversized.test.ts, which is the only route with
+// a real await (resolveServableViewRef / staging) BEFORE the verdict. On the
+// small-file route the handler is synchronous all the way to ctx.call, so a
+// mid-flight rebind cannot be staged here — and ensureReachable itself runs
+// INSIDE ctx.call, i.e. strictly after any check this handler can make. That is
+// exactly why the reachability condition above, not the late placement, is what
+// actually answers the reported false refusal.

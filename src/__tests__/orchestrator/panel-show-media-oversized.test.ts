@@ -520,3 +520,76 @@ describe("panel_show_media: an oversized AUDIO file takes the same routes (#1572
     expect(text).toMatch(/real filesystem WRITE/);
   });
 });
+
+// #1572 round 3 — the LIVE read, on the only route that has a real await before
+// the verdict.
+//
+// `ctx.tabId` is held live on the ctx so `ctx.call`'s `ensureReachable()` can
+// rebind an orphaned session in place. On the small-file route this handler is
+// synchronous all the way to `ctx.call`, so nothing can move underneath it
+// there. The OVERSIZED route is different: `resolveServableViewRef` (and
+// staging) await, and the ctx is shared for the whole orchestrator-scoped
+// session — so the tab CAN move across that boundary. The headless verdict must
+// therefore read `ctx.tabId` at dispatch time, not a boolean captured before
+// the loop, which is what the previous head did.
+describe("panel_show_media: the headless-audio verdict reads the tab LIVE (#1572)", () => {
+  it("a session that stops being headless during the await gets its audio", async () => {
+    const bigAudio = join(outDir, "takes", "voice_big.wav");
+    writeFileSync(bigAudio, Buffer.alloc(OVERSIZE));
+
+    let headless = true; // starts as a phone…
+    const calls: Forwarded[] = [];
+    const ctx = {
+      call: async (cmd: Forwarded) => {
+        calls.push(cmd);
+        return { content: [{ type: "text", text: "ok" }] } as ToolResult;
+      },
+      confirm: async () => "yes" as const,
+      bridge: {
+        isHeadless: () => headless,
+        canReach: () => true,
+      } as unknown as PanelToolCtx["bridge"],
+      tabId: "test-tab",
+    } as PanelToolCtx;
+
+    // …and is rebound onto a canvas tab while resolveServableViewRef is awaiting
+    // the output directory. This is the window ensureReachable occupies.
+    const prev = state.outputDir;
+    state.outputDir = outDir;
+    const def = buildPanelToolDefs().find((d) => d.name === "panel_show_media")!;
+    const p = def.handler({ items: [{ source: { path: bigAudio } }] }, ctx) as Promise<ToolResult>;
+    await Promise.resolve();
+    headless = false;
+    const res = await p;
+    state.outputDir = prev;
+
+    // A verdict captured before the loop would still say "phone" and refuse.
+    expect(res.isError).toBeFalsy();
+    const items = calls.find((c) => c.cmd === "show_media")!.items as Array<Record<string, unknown>>;
+    expect(items[0].kind).toBe("viewRef");
+    expect(textOf(res)).toContain(", audio)");
+  });
+
+  it("a session that is STILL headless at dispatch is refused, even oversized", async () => {
+    const bigAudio = join(outDir, "takes", "voice_big2.wav");
+    writeFileSync(bigAudio, Buffer.alloc(OVERSIZE));
+    const calls: Forwarded[] = [];
+    const ctx = {
+      call: async (cmd: Forwarded) => {
+        calls.push(cmd);
+        return { content: [{ type: "text", text: "ok" }] } as ToolResult;
+      },
+      confirm: async () => "yes" as const,
+      bridge: {
+        isHeadless: () => true,
+        canReach: () => true,
+      } as unknown as PanelToolCtx["bridge"],
+      tabId: "test-tab",
+    } as PanelToolCtx;
+    const def = buildPanelToolDefs().find((d) => d.name === "panel_show_media")!;
+    const res = (await def.handler({ items: [{ source: { path: bigAudio } }] }, ctx)) as ToolResult;
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/HEADLESS client/);
+    expect(calls.find((c) => c.cmd === "show_media")).toBeFalsy();
+  });
+});

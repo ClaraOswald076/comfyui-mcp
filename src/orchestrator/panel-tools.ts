@@ -18053,18 +18053,17 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // HEADLESS (mobile/remote) client does not — it renders images and video
         // only, and replies `{shown:true}` to any show_media without reading the
         // items. Audio sent there is a caption row with an image icon reported
-        // back as delivered. So the target is resolved ONCE, here, and both
-        // item-source branches below consult it; see headlessAudioRefusal for
-        // the client-source evidence and why inlining the bytes is not the fix.
+        // back as delivered. See headlessAudioRefusal for the client-source
+        // evidence and for why inlining the bytes is not the fix.
         //
-        // Sticky `isHeadless` deliberately, matching the inline branch below
-        // rather than `isCurrentHeadless`: this is a RENDERING decision about
-        // the client that will receive the card, including a phone that is
-        // offline right now and will get it on the mailbox flush. The
-        // typeof-guard is the same one every other isHeadless call site in this
-        // file uses — a lightweight bridge need not implement it.
-        const targetIsHeadless =
-          typeof ctx.bridge?.isHeadless === "function" && ctx.bridge.isHeadless(ctx.tabId);
+        // (round 3) — THE DECISION IS MADE LATE, ON PURPOSE. It used to be read
+        // once at the top of the handler, which review showed was reading a
+        // different tab from the one the frame lands on: `ctx.tabId` is held
+        // LIVE on the ctx (see makePanelToolCtx) precisely so `ctx.call`'s
+        // `ensureReachable()` can rebind an orphaned session in place. So the
+        // audio items are only REMEMBERED here and the verdict is taken
+        // immediately before dispatch, after every await this handler performs.
+        const audioTargets: Array<{ what: string; via: "path" | "ref" }> = [];
 
         const resolved: Array<Record<string, unknown>> = [];
         /** Oversized items that took the /view reference route instead (#648). */
@@ -18123,14 +18122,10 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
               mime = VIDEO_MIME[ext];
               kind = "video";
             } else if (AUDIO_EXTS.has(ext)) {
-              // CALL SITE 1 of 2 for the headless-audio gate (the other is in
-              // the /view-ref branch below). Kept as two explicit call sites
-              // rather than one pre-pass so each is greppable and asserted by
-              // name, and so this branch keeps its existing error ORDER —
-              // absolute-path, then stat, then type, then this.
-              if (targetIsHeadless) {
-                return fail(headlessAudioRefusal({ what: p, via: "path" }));
-              }
+              // RECORD SITE 1 of 2 for the headless-audio gate (the other is in
+              // the /view-ref branch below). Recording rather than refusing:
+              // the verdict is taken once, late, just before dispatch.
+              audioTargets.push({ what: p, via: "path" });
               mime = AUDIO_MIME[ext];
               kind = "audio";
             } else {
@@ -18236,16 +18231,15 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
             const filename = p.replace(/.*[\/]/, "");
             resolved.push({ kind, dataUrl, filename, caption: item.caption });
           } else {
-            // CALL SITE 2 of 2 for the headless-audio gate. A /view ref is
+            // RECORD SITE 2 of 2 for the headless-audio gate. A /view ref is
             // forwarded UNCLASSIFIED — the orchestrator never reads the bytes —
             // so the extension on the ref's own filename is the only signal
-            // here, exactly as the panel uses it. Same question as call site 1,
-            // same answer, and it must be asked here too: this branch is how
-            // `SaveAudio` output reaches a client, and it is the branch review
-            // flagged.
+            // here, exactly as the panel uses it. This branch is how `SaveAudio`
+            // output reaches a client, and it is the branch review flagged, so
+            // it must be recorded too.
             const refExt = extname(src.filename).toLowerCase();
-            if (targetIsHeadless && AUDIO_EXTS.has(refExt)) {
-              return fail(headlessAudioRefusal({ what: src.filename, via: "ref" }));
+            if (AUDIO_EXTS.has(refExt)) {
+              audioTargets.push({ what: src.filename, via: "ref" });
             }
             // ComfyUI /view ref. A browser panel fetches it same-origin — but a
             // HEADLESS (mobile/remote) client can't reach ComfyUI, so resolve the
@@ -18306,6 +18300,43 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
                 type: src.type,
               });
             }
+          }
+        }
+
+        // #1572 (round 3) — THE HEADLESS-AUDIO VERDICT, taken here and nowhere
+        // else: this is the last statement before the frame goes out, so
+        // `ctx.tabId` has stopped moving for every reason this handler controls.
+        //
+        // TWO CONDITIONS, and the second one is the correction review forced.
+        //
+        //  isHeadless  — sticky by design: a tab that EVER helloed headless
+        //                stays headless while offline.
+        //  canReach    — and that stickiness is exactly the trap. An UNREACHABLE
+        //                sticky-headless tab is precisely the session
+        //                `ctx.call`'s `ensureReachable()` is about to rebind:
+        //                `interactiveTabIds()` filters headless OUT, so a heal
+        //                can only ever land on a CANVAS tab, where audio plays
+        //                perfectly. Refusing on stickiness alone therefore
+        //                denied a valid `.wav` to someone whose phone was merely
+        //                asleep while their desktop panel sat right there. And
+        //                when the heal cannot fire (2+ interactive tabs, a
+        //                pinned session, nothing bindable) the call surfaces the
+        //                bridge's own tab-listing error, which is a better
+        //                message than this refusal would have been.
+        //
+        // So the gate fires only for a phone that is CONNECTED RIGHT NOW — the
+        // one case where the audio provably lands somewhere it cannot be played.
+        // A bridge too lightweight to answer `canReach` is treated as reachable:
+        // `isHeadless` already said "phone", and inventing liveness we cannot
+        // observe is how an unearned claim gets made in the other direction.
+        if (audioTargets.length > 0) {
+          const b = ctx.bridge as
+            | { isHeadless?: (id: string) => boolean; canReach?: (id: string) => boolean }
+            | undefined;
+          const headlessNow = typeof b?.isHeadless === "function" && b.isHeadless(ctx.tabId);
+          const reachableNow = typeof b?.canReach === "function" ? b.canReach(ctx.tabId) : true;
+          if (headlessNow && reachableNow) {
+            return fail(headlessAudioRefusal(audioTargets));
           }
         }
 

@@ -196,3 +196,22 @@ describe("#1572 the probe compares FAMILIES, because the panel paints by filenam
     expect(textOf(res)).not.toContain("did NOT return media");
   });
 });
+
+// Closing a gap my own round-3 mutation run exposed: turning the
+// "is this a media body at all" check off SURVIVED, because every case I had
+// written happened to also fail the family comparison. The one case that does
+// not is a non-media body under a filename with no known extension — there is
+// no family to compare, so the media check is the only thing standing between
+// the agent and a silently-blessed HTML error page.
+describe("#1572 the non-media check is load-bearing on its own", () => {
+  it.each(["text/html", "application/json", ""])(
+    "an unclassifiable filename serving %s is still reported",
+    async (ct) => {
+      state.contentType = ct;
+      const { res } = await showMedia([{ source: { filename: "mystery", type: "output" } }]);
+      const text = textOf(res);
+      expect(text).toContain("did NOT return media");
+      expect(text).toContain(ct || "unset");
+    },
+  );
+});
