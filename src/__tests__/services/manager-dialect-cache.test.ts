@@ -89,6 +89,7 @@ const {
   queueUpdateAllCustomNodes,
   setQueueTimingForTests,
   resetManagerApiCacheForTests,
+  fetchManagerTaskHistoryEntry,
 } = await import("../../services/node-management.js");
 const {
   resetManagerApiCache,
@@ -426,6 +427,74 @@ describe("#646 Manager API dialect cache invalidation", () => {
     // … and the queue is started (drained) exactly once, on the live prefix.
     expect(countOf(calls, "/manager/queue/start")).toBe(1);
     expect(countOf(calls, "/v2/manager/queue/start")).toBe(0);
+  });
+
+  // #1999 — the single-pack update must HAND BACK the ui_id it enqueued under.
+  // Without it a drained v4 queue can never be correlated to what our task did:
+  // `/v2/manager/queue/history?ui_id=` is keyed on exactly this value, and the
+  // queue-wide counters read identically for a task that succeeded and one that
+  // errored. This asserts the CALL SITE (updateCustomNodeImpl passing the id
+  // out), not just that the tracked helper exists.
+  it("a single-pack update returns the ui_id it actually enqueued under (#1999)", async () => {
+    const calls = stubServer({ persona: () => "v4" });
+
+    const res = await updateCustomNode({ id: "comfyui-foo" });
+
+    const enqueue = calls.find((c) => c.path === "/v2/manager/queue/task");
+    const sentUiId = (enqueue?.body as { ui_id?: string } | undefined)?.ui_id;
+    expect(sentUiId).toBeTruthy();
+    // The id on the result is the id the Manager was actually given.
+    expect(res.taskUiId).toBe(sentUiId);
+  });
+
+  // The bulk path deliberately does NOT expose one: v4 derives a separate
+  // per-pack task id there, so handing the bare enqueue id to a history lookup
+  // would answer "no such task" about tasks that really ran.
+  it("update-all does NOT claim a correlatable ui_id (#1999)", async () => {
+    stubServer({ persona: () => "v4" });
+    const res = await updateCustomNode({ id: "all" });
+    expect(res.taskUiId).toBeUndefined();
+  });
+
+  // #1999 — the per-task record's STRUCTURED verdict must survive the read.
+  // `result` is free prose; `status.status_str` is Manager's own OperationResult
+  // enum and is the field the classifier decides on, so dropping it would leave
+  // every real failure looking like an unreadable answer. The payload below is
+  // byte-for-byte what a live ComfyUI-Manager 4.2.2 returned for a failing
+  // pack update on this rig.
+  it("reads status.status_str out of the v4 per-task history record (#1999)", async () => {
+    const HISTORY = {
+      history: {
+        ui_id: "task-abc",
+        client_id: "comfyui-mcp",
+        kind: "update",
+        result: "An error occurred while updating 'mcp1999-repro'.",
+        status: {
+          status_str: "error",
+          completed: true,
+          messages: ["An error occurred while updating 'mcp1999-repro'."],
+        },
+      },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string): Promise<Response> => {
+        const path = new URL(url).pathname;
+        if (path === "/v2/manager/queue/status") return jsonResponse(DRAINED);
+        if (path === "/v2/manager/is_legacy_manager_ui") {
+          return jsonResponse({ is_legacy_manager_ui: false });
+        }
+        if (path === "/v2/manager/queue/history") return jsonResponse(HISTORY);
+        return new Response("", { status: 200 });
+      }),
+    );
+
+    await expect(fetchManagerTaskHistoryEntry("task-abc", BASE)).resolves.toEqual({
+      uiId: "task-abc",
+      kind: "update",
+      result: "An error occurred while updating 'mcp1999-repro'.",
+      statusStr: "error",
+    });
   });
 
   it("keeps a dialect self-heal retry and drain on its original target after retarget", async () => {

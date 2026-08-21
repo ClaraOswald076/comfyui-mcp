@@ -47,6 +47,7 @@ import {
   reinstallCustomNode,
   nonInteractiveGitEnv,
   type NodeOpResult,
+  type ManagerTaskHistoryEntry,
 } from "./node-management.js";
 import { getSystemStats } from "../comfyui/client.js";
 import {
@@ -291,6 +292,19 @@ export interface PanelInstallerDeps {
    * the real fetchManagerQueueCounts; tests stub it.
    */
   fetchLiveQueueCounts?: ((base?: string) => Promise<LiveQueueCounts | undefined>) | undefined;
+  /**
+   * #1999 — look up ONE Manager task by the exact `ui_id` it was enqueued
+   * under. Manager v4 keeps a per-task record (result + a structured
+   * status_str) for the whole session; the queue-wide counts do not. Resolves
+   * to the entry, `null` when the Manager PROVES there is no such completed
+   * task, and `undefined` when the answer cannot be trusted — a pre-v4 dialect
+   * that has no such route, or an unreadable response. Callers must treat
+   * `undefined` as "the outcome is unknown", never as either verdict. Default
+   * is the real fetchManagerTaskHistoryEntry; tests stub it.
+   */
+  fetchManagerTaskRecord?:
+    | ((uiId: string, base?: string) => Promise<ManagerTaskHistoryEntry | null | undefined>)
+    | undefined;
   /** Is the target ComfyUI reachable right now? Never throws. */
   isReachable: () => Promise<boolean>;
   install: (opts: { id: string; version?: string }) => Promise<NodeOpResult>;
@@ -2273,6 +2287,201 @@ function describeLiveQueue(c: LiveQueueCounts | undefined): string {
     : `the live queue could not be read at all`;
 }
 
+// ---------------------------------------------------------------------------
+// #1999 — WHAT DID *OUR* TASK ACTUALLY DO?
+//
+// The queue counts cannot answer that, and on ComfyUI-Manager v4 they are not
+// even the shape this file historically read them as. Measured against
+// ComfyUI-Manager 4.2.2 (`glob/manager_server.py`, class TaskQueue):
+//
+//   total_count = len(pending_tasks) + len(running_tasks)   <- LIVE only
+//   done_count  = len(history_tasks)                        <- CUMULATIVE, whole session
+//
+// They count different populations, so on v4 an idle queue ALWAYS reports
+// `total_count:0` alongside a `done_count` equal to however many tasks have
+// ever run in that session. Driven live against a v4.2.2 host, one FAILING
+// update drained to `{total_count:0, done_count:1, in_progress_count:0,
+// pending_count:0, is_processing:false}`; four tasks later the same shape read
+// `done_count:5`, and the per-task history held four `error`s and one
+// `success`. The counts were BYTE-IDENTICAL across both outcomes.
+//
+// So on v4 `total_count:0` is not "nothing was ever enqueued", and
+// `done_count > total_count` is not a contradiction — it is simply the drained
+// state. Narrating either as the stale-3.x silent no-op asserts an outcome that
+// was never observed. (On legacy 3.x the counters really do all collapse to 0
+// at drain, which is why isProvenLegacyEmptyQueue additionally requires
+// done_count === 0 and is dialect-gated at the sites that mutate.)
+//
+// What CAN answer the question is the per-task record, keyed by the exact ui_id
+// we enqueued under: GET /v2/manager/queue/history?ui_id=... carries the task's
+// `result` and a structured `status.status_str`. v4 only — the legacy-UI
+// history route knows only a file-based `?id=` form and rejects this query — so
+// on anything older the honest answer stays "unknown", with the way to find out.
+// ---------------------------------------------------------------------------
+
+/**
+ * What ComfyUI-Manager recorded for OUR task. `unknown` is a first-class
+ * outcome, not a failure: it is the answer whenever the Manager cannot be asked
+ * (pre-v4), was not asked (no correlatable id), or did not answer in a shape
+ * that can be trusted.
+ */
+export type ManagerTaskVerdict =
+  | { kind: "failed"; result: string }
+  | { kind: "succeeded"; result: string }
+  | { kind: "never-ran" }
+  | { kind: "unknown" };
+
+/**
+ * Turn a queue-history record into a verdict.
+ *
+ * Deliberately ASYMMETRIC. `status.status_str` is Manager's own structured enum
+ * (OperationResult: success | failed | skipped | error | skip) and is the only
+ * field classified on. When it is absent — it is Optional in Manager's model,
+ * so an older v4 may omit it — a `result` that is EXACTLY the literal "success"
+ * or "skip" is still accepted, because those two literals are what Manager's
+ * own task_worker compares against to decide the status it would have written.
+ * Nothing else is accepted: an unrecognised `result` is free prose, and
+ * inferring FAILURE from prose would commit the mirror image of the bug this
+ * file exists to prevent — reporting a failure that was never observed.
+ * Unrecognised means `unknown`.
+ */
+export function classifyManagerTaskRecord(
+  record: ManagerTaskHistoryEntry | null | undefined,
+): ManagerTaskVerdict {
+  // `undefined` = we could not ask, or could not trust the answer.
+  if (record === undefined) return { kind: "unknown" };
+  // `null` = the Manager PROVED it holds no completed task under that id.
+  if (record === null) return { kind: "never-ran" };
+  const status = record.statusStr?.trim().toLowerCase();
+  const result = record.result?.trim();
+  if (status === "success" || status === "skip" || status === "skipped") {
+    return { kind: "succeeded", result: result || status };
+  }
+  if (status === "failed" || status === "error") {
+    // The prose is the only place the CAUSE lives, so it is quoted — but the
+    // decision to call this a failure came from the structured field.
+    return { kind: "failed", result: result || status };
+  }
+  if (status === undefined && (result === "success" || result === "skip")) {
+    return { kind: "succeeded", result };
+  }
+  return { kind: "unknown" };
+}
+
+/**
+ * The Manager-side clause that every "nothing moved" message narrates around.
+ *
+ * It states what was OBSERVED and nothing more. The stale-3.x cause is asserted
+ * only where it is actually proven (`provenLegacyEmptyQueue`); everywhere else
+ * the counters are reported as the drain counters they are, and the sentence
+ * ends in an honest "could not be determined" plus the way to determine it.
+ */
+export function describeManagerTaskVerdict(
+  verdict: ManagerTaskVerdict,
+  counts: QueueCounts,
+  provenLegacyEmptyQueue: boolean,
+): string {
+  const c =
+    `total_count=${counts.total ?? "?"}, done_count=${counts.done ?? "?"}, ` +
+    `pending_count=${counts.pending ?? "?"}, in_progress_count=${counts.inProgress ?? "?"}`;
+  switch (verdict.kind) {
+    case "failed":
+      return (
+        `ComfyUI-Manager RAN the task and it FAILED — its own per-task record ` +
+        `reports: "${verdict.result}". The queue drained afterwards (${c}), which ` +
+        `is why the drain on its own looked like a success`
+      );
+    case "succeeded":
+      return (
+        `ComfyUI-Manager recorded this task as "${verdict.result}", yet nothing ` +
+        `moved on disk (${c}) — the task ran, and whether it changed anything ` +
+        `could NOT be established`
+      );
+    case "never-ran":
+      return (
+        `ComfyUI-Manager holds NO completed task under the id this operation was ` +
+        `enqueued with, so it never ran (${c})`
+      );
+    default:
+      return provenLegacyEmptyQueue
+        ? `ComfyUI-Manager has no record of running ANY task: every queue counter ` +
+          `is zero (${c}). On a legacy ComfyUI-Manager 3.x that is the known silent ` +
+          `no-op (#639/#424) — the enqueue is accepted and nothing runs`
+        : `ComfyUI-Manager's queue drained (${c}) and what THIS task did could NOT ` +
+          `be established. Those are queue-WIDE drain counters, not a per-task ` +
+          `result: on ComfyUI-Manager v4 an idle queue always reports ` +
+          `total_count=0 with done_count as the whole session's history length, so ` +
+          `they read identically whether the task succeeded or failed. The record ` +
+          `that would say (GET /v2/manager/queue/history?ui_id=...) could not be ` +
+          `read here, and ComfyUI-Manager older than v4 does not keep one at all`;
+  }
+}
+
+/**
+ * The remedy half of the message, chosen by what was OBSERVED rather than by a
+ * single assumed cause. Sending a user to "update ComfyUI-Manager, it is stale"
+ * when the Manager in fact ran the task and reported an error is what made
+ * #1999 unfixable from the report: the advice named a cause the evidence did
+ * not support, and the evidence that did exist was never read.
+ */
+export function describeManagerTaskRemedy(
+  verdict: ManagerTaskVerdict,
+  dir: string | undefined,
+): string {
+  const gitPull = `update the panel repo manually (git pull in ${dir ?? "the panel's custom_nodes dir"})`;
+  switch (verdict.kind) {
+    case "failed":
+      return (
+        `Fix what ComfyUI-Manager reported — its full traceback is in the ComfyUI ` +
+        `server log next to that message — then retry. If the pack is a git ` +
+        `checkout, ${gitPull} is the direct route, and a checkout with local ` +
+        `modifications must be committed or stashed first. Then RESTART ComfyUI.`
+      );
+    case "succeeded":
+      return (
+        `RESTART ComfyUI and re-check the version with ` +
+        `${describeInstallPanelAction("status", "a re-check on the ComfyUI host")}: ` +
+        `ComfyUI-Manager cannot swap a directory the running server is serving, so ` +
+        `it may have reserved the switch for the next startup. Do NOT reinstall ` +
+        `from source before checking that.`
+      );
+    default:
+      return (
+        `Check the ComfyUI server log for what ComfyUI-Manager did with the task, ` +
+        `and confirm what is on disk with ` +
+        `${describeInstallPanelAction("status", "a re-check on the ComfyUI host")}. ` +
+        `Then either update ComfyUI-Manager on the host (pip install -U ` +
+        `comfyui_manager, or git pull in custom_nodes/ComfyUI-Manager) and retry, ` +
+        `or ${gitPull}. Then RESTART ComfyUI.`
+      );
+  }
+}
+
+/**
+ * Ask ComfyUI-Manager what OUR task did. NEVER throws: any failure — and any
+ * answer that cannot be correlated — is `{kind:"unknown"}`, which callers
+ * report as an unknown outcome and never as either verdict.
+ *
+ * A missing `uiId` is `unknown` too, never `never-ran`: a path that did not
+ * capture an id has proved nothing about whether a task ran.
+ */
+async function readManagerTaskVerdict(
+  deps: PanelInstallerDeps,
+  uiId: string | undefined,
+  base: string | undefined,
+): Promise<ManagerTaskVerdict> {
+  if (!uiId) return { kind: "unknown" };
+  try {
+    if (deps.fetchManagerTaskRecord) {
+      return classifyManagerTaskRecord(await deps.fetchManagerTaskRecord(uiId, base));
+    }
+    const { fetchManagerTaskHistoryEntry } = await import("./node-management.js");
+    return classifyManagerTaskRecord(await fetchManagerTaskHistoryEntry(uiId, base));
+  } catch {
+    return { kind: "unknown" };
+  }
+}
+
 export type UpdateOutcome =
   | "updated" // version OR git-HEAD moved on disk → the update definitely applied.
   | "downgraded" // the version PROVABLY went backwards — applied, but not an update.
@@ -2405,14 +2614,29 @@ export function classifyPanelUpdate(
  * confirmed") — replacing a working could-not-determine with a false definite
  * is a regression whichever definite you pick.
  */
-/** Turn an update verdict into an honest result — or throw when it did not apply. */
+/** Turn an update verdict into an honest result — or throw when it did not apply.
+ *
+ * `taskVerdict` (#1999) is what ComfyUI-Manager recorded for the EXACT task this
+ * update enqueued, where that could be established. It is the only evidence that
+ * can explain a drained queue which moved nothing, so both fail-closed branches
+ * narrate it instead of asserting a cause from the queue-wide counters. Callers
+ * that could not correlate a task pass `{kind:"unknown"}`, which reports the
+ * outcome as undetermined and says how to determine it — never as a failure and
+ * never as a success. */
 function finalizeUpdate(
   verdict: UpdateVerdict,
   post: PanelDetection,
   result: NodeOpResult,
+  taskVerdict: ManagerTaskVerdict = { kind: "unknown" },
 ): PanelActionResult {
   const { outcome, previousVersion, installedVersion, counts } = verdict;
   const dirNote = post.dir ? ` at ${post.dir}` : "";
+  const managerSaid = () =>
+    describeManagerTaskVerdict(
+      taskVerdict,
+      counts,
+      isProvenLegacyEmptyQueue(result.details),
+    );
 
   if (outcome === "updated") {
     const from = verdict.previousVersion ?? verdict.previousRev?.slice(0, 8) ?? "?";
@@ -2479,14 +2703,8 @@ function finalizeUpdate(
   if (outcome === "no-op") {
     throw new PanelInstallError(
       `Panel update did NOT apply: nothing changed on disk${dirNote} (installed ` +
-        `version still ${previousVersion ?? "unknown"}) after ComfyUI-Manager ` +
-        `reported the queue drained. Manager reported done_count=` +
-        `${counts.done ?? "?"} with total_count=${counts.total ?? "?"} — it never ` +
-        `actually enqueued the update. This is the stale ComfyUI-Manager 3.x silent ` +
-        `no-op (#639, same root cause as #424). Fix: update ComfyUI-Manager on the ` +
-        `host (git pull in custom_nodes/ComfyUI-Manager, or pip install -U ` +
-        `comfyui_manager) and retry, or reinstall the panel from source (git pull ` +
-        `the panel dir / reinstall the pack), then RESTART ComfyUI.`,
+        `version still ${previousVersion ?? "unknown"}). ${managerSaid()}. NOT ` +
+        `reporting success. ${describeManagerTaskRemedy(taskVerdict, post.dir)}`,
     );
   }
 
@@ -2494,11 +2712,9 @@ function finalizeUpdate(
   throw new PanelInstallError(
     `Could not verify the panel update applied: the installed version ` +
       `(${installedVersion ?? "unreadable"}) and git-HEAD did not change` +
-      `${dirNote} after ComfyUI-Manager reported the queue drained. NOT reporting ` +
-      `success — an unchanged checkout can't prove you are at the latest nightly ` +
-      `versus a silent no-op. You may already be current; otherwise ComfyUI-Manager ` +
-      `may be stale (#424). RESTART ComfyUI and re-check the version, or reinstall ` +
-      `the panel from source.`,
+      `${dirNote}. ${managerSaid()}. NOT reporting success — an unchanged checkout ` +
+      `cannot prove you are at the latest nightly versus a silent no-op, and you ` +
+      `may already be current. ${describeManagerTaskRemedy(taskVerdict, post.dir)}`,
   );
 }
 
@@ -2729,9 +2945,12 @@ async function updateViaGitCheckoutFallback(opts: {
         `${porcelain}\ncomfyui-mcp never mutates a dirty checkout — a ` +
         `fast-forward could carry or clobber that local state. Commit, stash, or ` +
         `discard the changes (or update the panel repo manually), then retry. ` +
-        `(The Manager path also produced no update here — ${managerReason} — so ` +
-        `updating ComfyUI-Manager on the host restores that path: git pull in ` +
-        `custom_nodes/ComfyUI-Manager, or pip install -U comfyui_manager.)`,
+        // #1999 — this used to end "so updating ComfyUI-Manager on the host
+        // restores that path", which asserts that a stale Manager is the cause.
+        // It sometimes is; when the Manager in fact RAN the task and reported an
+        // error, upgrading it fixes nothing and sends the user down a dead end.
+        // State the Manager's own reason and let it name its own remedy.
+        `(The Manager path also produced no update here — ${managerReason}.)`,
     );
   }
 
@@ -5797,6 +6016,10 @@ async function runPanelActionCore(
       },
       result.details,
     );
+    /** #1999 — what ComfyUI-Manager recorded for THIS update's task, once the
+     *  on-disk check has shown nothing moved. Stays `unknown` on every path
+     *  that never got that far, and on every Manager that cannot answer. */
+    let managerTaskVerdict: ManagerTaskVerdict = { kind: "unknown" };
     // A PROVEN REGRESSION SHORT-CIRCUITS EVERYTHING. It must not fall through
     // to the no-op/zip fallbacks: those would quietly re-install over the top
     // and the user would never learn that ComfyUI-Manager had just moved them
@@ -5825,6 +6048,18 @@ async function runPanelActionCore(
     // change on disk a leftover line would describe some earlier reservation,
     // not this update — "moved-unknown-direction" keeps its own verdict.
     if (verdict.outcome === "no-op" || verdict.outcome === "unverified") {
+      // #1999 — NOTHING MOVED, so ask the one surface that can say why: the
+      // per-task record for the EXACT ui_id this update was enqueued under.
+      // Read here, once, before any fallback narrates a cause — a drained queue
+      // on ComfyUI-Manager v4 reads the same whether our task succeeded or
+      // errored, and this is the only place the difference survives. It never
+      // throws and it never changes what any branch DOES; it changes only what
+      // they are able to say (and on a pre-v4 Manager it honestly says nothing).
+      managerTaskVerdict = await readManagerTaskVerdict(
+        deps,
+        result.taskUiId,
+        result.managerBase,
+      );
       const reservation = readManagerReservation(comfyPath, PANEL_REGISTRY_ID, deps);
       if (reservation === "reserved") {
         assertSameTarget("before reporting a staged panel update");
@@ -5866,16 +6101,27 @@ async function runPanelActionCore(
       // field is unproven, not contradictory).
       const countsContradict =
         c.total !== undefined && c.done !== undefined && c.done > c.total;
-      const managerReason = provenLegacyEmptyQueue
-        ? `ComfyUI-Manager never enqueued the update (the stale legacy 3.x silent no-op, #639/#724)`
-        : countsContradict
-          ? `ComfyUI-Manager's drained-queue counts are incoherent (total=` +
-            `${c.total ?? "?"}, done=${c.done ?? "?"}, pending=${c.pending ?? "?"}, ` +
-            `in_progress=${c.inProgress ?? "?"}) and can neither confirm nor explain the no-op`
-          : `ComfyUI-Manager's drained-queue status is partial (total=` +
-            `${c.total ?? "?"}, done=${c.done ?? "?"}, pending=${c.pending ?? "?"}, ` +
-            `in_progress=${c.inProgress ?? "?"} — fields the status contract requires ` +
-            `are missing or malformed) and can neither confirm nor explain the no-op`;
+      // #1999 — the per-task record OUTRANKS the counters whenever it exists.
+      // `done > total` was narrated here as "incoherent … can neither confirm
+      // nor explain", which is what the reporter was handed four times. On
+      // ComfyUI-Manager v4 those counters are not contradictory at all
+      // (total_count is live-only, done_count is the session history length),
+      // and the thing that CAN explain the no-op — the task's own error — was
+      // sitting one request away the whole time.
+      const managerReason =
+        managerTaskVerdict.kind !== "unknown"
+          ? describeManagerTaskVerdict(managerTaskVerdict, c, provenLegacyEmptyQueue)
+          : provenLegacyEmptyQueue
+            ? `ComfyUI-Manager never enqueued the update (the stale legacy 3.x silent no-op, #639/#724)`
+            : countsContradict
+              ? `ComfyUI-Manager's drained queue reported done_count=${c.done ?? "?"} ` +
+                `against total_count=${c.total ?? "?"} (pending=${c.pending ?? "?"}, ` +
+                `in_progress=${c.inProgress ?? "?"}) — queue-WIDE drain counters that ` +
+                `cannot say what this task did, and no per-task record was readable`
+              : `ComfyUI-Manager's drained-queue status is partial (total=` +
+                `${c.total ?? "?"}, done=${c.done ?? "?"}, pending=${c.pending ?? "?"}, ` +
+                `in_progress=${c.inProgress ?? "?"} — fields the status contract requires ` +
+                `are missing or malformed) and can neither confirm nor explain the no-op`;
       if (!provenLegacyEmptyQueue) {
         // #824 — SIGNATURE GATE, second form. An incoherent/partial signature
         // (e.g. total 0, done 1) is not proof of the stale-3.x no-op, so it
@@ -6005,7 +6251,7 @@ async function runPanelActionCore(
       });
     }
     assertSameTarget("before reporting the update verdict");
-    return finalizeUpdate(verdict, post, result);
+    return finalizeUpdate(verdict, post, result, managerTaskVerdict);
   }
 
   // install / reinstall. Same final pin check as the update path above.
@@ -6026,14 +6272,25 @@ async function runPanelActionCore(
   // with its specific remedy, even when the canonical install itself did not land.
   assertNoPanelShadow(action, post.dir, deps);
   if (!post.installed || !post.version) {
+    // #1999 — the queue drained; that alone never said WHY the pack is not
+    // there, and asserting the stale-3.x no-op unconditionally named a cause the
+    // counters cannot establish (on ComfyUI-Manager v4 a drained queue always
+    // reports total_count=0, whatever the task did). Report the counters as the
+    // drain counters they are, and only offer the 3.x cause where the whole
+    // counter set is zero.
     throw new PanelInstallError(
       `Panel ${action} did NOT land: the pack is ${
         post.installed ? "present but its version is unreadable" : "not present"
-      } in custom_nodes after ComfyUI-Manager reported the queue drained. This is ` +
-        `the stale ComfyUI-Manager 3.x silent no-op (#639, same root cause as #424): ` +
-        `NOT reporting success. Fix: update ComfyUI-Manager on the host (git pull in ` +
-        `custom_nodes/ComfyUI-Manager, or pip install -U comfyui_manager) and retry, ` +
-        `or install the panel from source, then RESTART ComfyUI.`,
+      } in custom_nodes. ` +
+        `${describeManagerTaskVerdict(
+          { kind: "unknown" },
+          readQueueCounts(result.details),
+          isProvenLegacyEmptyQueue(result.details),
+        )}. NOT reporting success. Check the ComfyUI server log for what ` +
+        `ComfyUI-Manager did with the task, then either update ComfyUI-Manager on ` +
+        `the host (pip install -U comfyui_manager, or git pull in ` +
+        `custom_nodes/ComfyUI-Manager) and retry, or install the panel from ` +
+        `source. Then RESTART ComfyUI.`,
     );
   }
 
@@ -6087,17 +6344,24 @@ async function runPanelActionCore(
     // Nothing provably changed. Use the stale-3.x no-op count signature ONLY here
     // (not as a veto above) to sharpen the failure diagnostic.
     if (looksLikeManagerNoOp(result.details)) {
-      const c = readQueueCounts(result.details);
+      // #1999 — same correction as the branch above. `total_count === 0` is the
+      // stale-3.x signature ONLY when the rest of the counter set is zero too;
+      // on ComfyUI-Manager v4 it is simply what an idle queue reports, so
+      // "without actually enqueuing the task" was asserting an outcome that had
+      // not been observed. The counters still fail this closed — they just no
+      // longer testify to a cause they cannot see.
       throw new PanelInstallError(
-        `Panel ${action} did NOT execute: ComfyUI-Manager reported the queue ` +
-          `drained without actually enqueuing the task (total_count=` +
-          `${c.total ?? "?"}, done_count=${c.done ?? "?"}), so the pack on disk ` +
-          `(${PANEL_REGISTRY_ID} ${post.version}) is unchanged — likely a stale ` +
-          `pre-existing copy. This is the stale ComfyUI-Manager 3.x silent no-op ` +
-          `(#639, same root cause as #424): NOT reporting success. Fix: update ` +
-          `ComfyUI-Manager on the host (git pull in custom_nodes/ComfyUI-Manager, ` +
-          `or pip install -U comfyui_manager) and retry, or install the panel from ` +
-          `source, then RESTART ComfyUI.`,
+        `Panel ${action} did NOT change the pack on disk (${PANEL_REGISTRY_ID} ` +
+          `${post.version}) — likely a stale pre-existing copy. ` +
+          `${describeManagerTaskVerdict(
+            { kind: "unknown" },
+            readQueueCounts(result.details),
+            isProvenLegacyEmptyQueue(result.details),
+          )}. NOT reporting success. Check the ComfyUI server log for what ` +
+          `ComfyUI-Manager did with the task, then either update ComfyUI-Manager ` +
+          `on the host (pip install -U comfyui_manager, or git pull in ` +
+          `custom_nodes/ComfyUI-Manager) and retry, or install the panel from ` +
+          `source. Then RESTART ComfyUI.`,
       );
     }
     throw new PanelInstallError(
