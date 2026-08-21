@@ -86,13 +86,45 @@ vi.mock("../../comfyui/client.js", () => ({
   resetObjectInfoCache: vi.fn(),
 }));
 
-// ── ComfyUI-Manager REFUSES the git-URL enqueue (HTTP 403 — a 3.x
-//    security_level / allow_git_url_install gate), which is the #1129 divert
-//    into the direct-clone fallback the reporter landed on. ──────────────────
-vi.mock("../../comfyui/fetch.js", () => ({
-  comfyuiFetch: async () =>
-    new Response("gated by security_level", { status: 403, statusText: "Forbidden" }),
+// ── ComfyUI-Manager. BOTH roads to the direct-clone fallback are exercised:
+//
+//   "refuse-enqueue"  HTTP 403 on the enqueue — a 3.x security_level /
+//                     allow_git_url_install gate; the #1129 divert.
+//   "accept-enqueue"  the queue ACCEPTS and drains, but the pack is not in the
+//                     installed list afterwards, because it is unregistered —
+//                     the reporter's own shape ("reported git-clone success").
+//
+// They reach `cloneCustomNodeFallback` from two different call sites, and a
+// guard on only one of them is a guard that is not there. ────────────────────
+const http = vi.hoisted(() => ({
+  mode: "refuse-enqueue" as "refuse-enqueue" | "accept-enqueue",
 }));
+vi.mock("../../comfyui/fetch.js", () => {
+  const json = (body: unknown) =>
+    new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  return {
+    comfyuiFetch: async (url: string) => {
+      if (http.mode === "refuse-enqueue") {
+        return new Response("gated by security_level", {
+          status: 403,
+          statusText: "Forbidden",
+        });
+      }
+      const { pathname } = new URL(url);
+      if (pathname === "/manager/queue/install") return json({ ui_id: "queued" });
+      if (pathname === "/manager/queue/start") return json({});
+      if (pathname === "/manager/queue/status") {
+        return json({ is_processing: false, done_count: 1, total_count: 1 });
+      }
+      // Unregistered: the Manager drained the task without installing anything.
+      if (pathname === "/customnode/installed") return json([]);
+      return new Response("no such route", { status: 404, statusText: "Not Found" });
+    },
+  };
+});
 
 // ── `git clone` stands in as a directory creation, so nothing hits the network
 //    and the destination it was handed is observable. ────────────────────────
@@ -134,6 +166,8 @@ const { configureWorkspace, resetWorkspaceConfig } = await import(
   "../../services/workspace-env.js"
 );
 const { setManagerApiCacheForTests } = await import("../../services/manager-api-cache.js");
+const { setQueueTimingForTests } = await import("../../services/node-management.js");
+setQueueTimingForTests({ pollIntervalMs: 1, startupGraceMs: 0, timeoutMs: 5_000 });
 
 /** The reporter's shape: an unregistered repository, installed by git URL. */
 const REPO = "https://github.com/someone/unregistered-pack";
@@ -159,6 +193,7 @@ let priorEnvPath: string | undefined;
 
 beforeEach(() => {
   git.calls = [];
+  http.mode = "refuse-enqueue";
   live.reachable = true;
   live.statsCalls = 0;
   live.argv = [join(CONNECTED, "main.py"), "--port", "8189"];
@@ -211,6 +246,32 @@ describe("#1765 — install_custom_node must not write into an install this sess
   });
 
   it("clones normally when the configured root IS the connected install", async () => {
+    live.argv = [join(SAVED_DEFAULT, "main.py"), "--port", "8189"];
+
+    const { ok, error } = await install({ id: REPO, source: "git" });
+
+    expect(error).toBeUndefined();
+    expect(ok).toMatchObject({ mechanism: "git-clone" });
+    expect(clonedInto()).toBe(join(SAVED_DEFAULT, PACK_DIR));
+  });
+
+  it("REFUSES on the other road to the same clone — the Manager accepted, then had nothing", async () => {
+    // The reporter's own shape: the queue takes the task, drains, and the pack is
+    // still not installed because it is unregistered. That reaches
+    // cloneCustomNodeFallback from a DIFFERENT call site than the 403 divert.
+    http.mode = "accept-enqueue";
+
+    const { ok, error } = await install({ id: REPO, source: "git" });
+
+    expect(ok).toBeUndefined();
+    expect(clonedInto()).toBeUndefined();
+    expect(existsSync(join(SAVED_DEFAULT, PACK_DIR))).toBe(false);
+    expect(error).toMatch(/two DIFFERENT ComfyUI installs/);
+    expect(error).toContain(CONNECTED);
+  });
+
+  it("still clones on that road when the configured root IS the connected install", async () => {
+    http.mode = "accept-enqueue";
     live.argv = [join(SAVED_DEFAULT, "main.py"), "--port", "8189"];
 
     const { ok, error } = await install({ id: REPO, source: "git" });
