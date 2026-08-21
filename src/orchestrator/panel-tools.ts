@@ -113,6 +113,7 @@ import {
   successProvesSwitchCleared,
 } from "./switch-hold.js";
 import { NO_ORIGIN_REMEDY } from "./fence-refusal.js";
+import { completeGetErrorsAudit } from "./get-errors-audit.js";
 
 /** #884 — journal TICKETS (run completions #468, ask answers #486) must be
  *  keyed by the REAL tab a run/card was routed to: the panel reports back under
@@ -1149,6 +1150,22 @@ function sleep(ms: number): Promise<void> {
 // is not mistaken for a dead tab — still capped (never Infinity) so a genuinely
 // frozen/backgrounded tab fails in bounded time instead of hanging forever.
 const OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS = 30_000;
+
+/** #1973 — the budget for get_errors' ELECTIVE completion follow-ups, deliberately a
+ *  fraction of the ack timeout above and NOT the same number.
+ *
+ *  By the time those follow-ups run, the panel's reply is already in hand. Spending
+ *  the full 30 s ack budget on them would make the handler's worst case 30 s + 30 s
+ *  and put a reply we ALREADY HAVE behind an elective completeness improvement — for
+ *  a tool whose entire reason for existing is that an agent staring at red nodes has
+ *  no other error surface. #589 is precisely that failure, and the shared panel-side
+ *  budget exists to prevent it; re-introducing it from the orchestrator side would be
+ *  a fix that costs more than the bug it closes.
+ *
+ *  So the completion fails toward "answer promptly and say the audit is incomplete"
+ *  rather than "wait longer for a chance at completeness". 8 s is the same elective
+ *  probe budget the graph_query / graph_serialize probes in this file already use. */
+const GET_ERRORS_COMPLETION_BUDGET_MS = 8_000;
 
 // #1639 — while a ComfyUI prompt is running the frontend main thread often
 // cannot service graph_* at all. Waiting out the 20/30 s ack bound only
@@ -14491,7 +14508,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_get_errors",
-      "WHY IS THAT NODE RED / WHY DID THE RUN FAIL? The single error surface for the user's open tab: every errored node JOINED TO ITS CAUSE, which ComfyUI itself does not show — LiteGraph only paints a red outline and stores no reason, which is why users report \"red node, no error message\". Call this whenever the user mentions a red/highlighted/erroring node, a failed run, or \"required models are missing\" — instead of guessing from widget values. Each entry in `nodes[]` is the node's full detail summary plus `red_outline` and `reasons[]`, drawn from every source: `missing_model` (exact file, its models directory, the widget holding it, and a download URL when known), `missing_media` (a referenced input image/video that isn't on disk — the usual cause of a red LoadImage), `validation` (per-input errors from the last queue attempt: message, details, offending input), and `execution` (runtime failure with `exception_type`, e.g. PIL.UnidentifiedImageError). TWO THINGS THAT MAKE THIS ESSENTIAL: (1) missing model/media assets paint nodes red AS SOON AS THE WORKFLOW LOADS, long before any queue attempt — so the raw validation map is still EMPTY while the user is staring at red nodes; (2) a node that throws AT RUNTIME is never painted red at all, so it can't be spotted on the canvas — it appears here with red_outline:false. Also returns graph-level `missing_models`, `missing_media`, `missing_node_types` (or `missing_node_count`), plus the raw `node_errors` map and `last_execution_error` for reference. A ⚠️ GRAPH VALIDATION block is auto-injected at your turn start when this state changes; call this to re-check on demand (e.g. after you edit widgets/links). Read-only.",
+      "WHY IS THAT NODE RED / WHY DID THE RUN FAIL? The single error surface for the user's open tab: every errored node JOINED TO ITS CAUSE, which ComfyUI itself does not show — LiteGraph only paints a red outline and stores no reason, which is why users report \"red node, no error message\". Call this whenever the user mentions a red/highlighted/erroring node, a failed run, or \"required models are missing\" — instead of guessing from widget values. Each entry in `nodes[]` is the node's full detail summary plus `red_outline` and `reasons[]`, drawn from every source: `missing_model` (exact file, its models directory, the widget holding it, and a download URL when known), `missing_media` (a referenced input image/video that isn't on disk — the usual cause of a red LoadImage), `validation` (per-input errors from the last queue attempt: message, details, offending input), and `execution` (runtime failure with `exception_type`, e.g. PIL.UnidentifiedImageError). TWO THINGS THAT MAKE THIS ESSENTIAL: (1) missing model/media assets paint nodes red AS SOON AS THE WORKFLOW LOADS, long before any queue attempt — so the raw validation map is still EMPTY while the user is staring at red nodes; (2) a node that throws AT RUNTIME is never painted red at all, so it can't be spotted on the canvas — it appears here with red_outline:false. Also returns graph-level `missing_models`, `missing_media`, `missing_node_types` (or `missing_node_count`), plus the raw `node_errors` map and `last_execution_error` for reference. Whenever the panel's live scan leaves ANY node unjudged â budget exhausted, file-probe cap, a lookup that failed â the reply LEADS with audit_complete:false plus checked_count/unchecked_count instead of a clean errored_count:0, and the nodes it skipped for budget are re-checked from one batched object_info read. A ⚠️ GRAPH VALIDATION block is auto-injected at your turn start when this state changes; call this to re-check on demand (e.g. after you edit widgets/links). Read-only.",
       {},
       // #1493 — graph_get_errors belongs to the #599 refresh-ack cohort above, and was the
       // one member of it left on the generic read default.
@@ -14517,8 +14534,29 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       // refresh-before-validate siblings already use. This read is idempotent, so waiting longer
       // costs a slow reply and never a double-applied write; it stays BOUNDED (never Infinity), so
       // a genuinely frozen tab still fails, just at 30 s instead of 20 s.
-      async (_args, ctx) =>
-        withTruncationHints(await ctx.call({ cmd: "graph_get_errors" }, OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS), [
+      //
+      // #1973 — even a reply that BEATS that bound can still be a false-clean 0: the
+      // panel gives the live combo scan only the 4 s STEP cap, so a ~77-node graph
+      // returns unchecked_budget_exhausted with the sampler / decoder / SaveVideo
+      // still unjudged. After the panel returns we finish those leftover nodes from
+      // one batched graph_get_object_info (not another per-class wait) and never
+      // lead with errored_count:0 while the audit is incomplete.
+      //
+      // COMPLETENESS IS JUDGED FROM THE ABSTENTION LIST, NOT THE BUDGET FLAG. The
+      // panel abstains for five reasons and only two raise unchecked_budget_exhausted;
+      // the file-probe cap and a failed /object_info lookup produce the same
+      // false-clean payload with no flag at all. See get-errors-audit.ts.
+      async (_args, ctx) => {
+        const primaryTabId = ctx.tabId;
+        const primary = await ctx.call({ cmd: "graph_get_errors" }, OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS);
+        return withTruncationHints(
+          await completeGetErrorsAudit(
+            ctx,
+            primary,
+            GET_ERRORS_COMPLETION_BUDGET_MS,
+            primaryTabId,
+          ),
+          [
           {
             flag: "truncated",
             key: "truncation_hint",
@@ -14544,7 +14582,8 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 "An unknown number more were cut (this panel build reports no total). They are cosmetic leftovers, not errors; the cap is fixed and there is no parameter to page it.",
               ),
           },
-        ]),
+        ]);
+      },
     ),
     def(
       "panel_refresh_nodes",
