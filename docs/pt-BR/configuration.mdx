@@ -197,6 +197,12 @@ originalmente contribuídos por
   Tamanho máximo do cache de download em GB. `0` desativa a evicção; acima do limite, os
   arquivos em cache menos usados recentemente são apagados depois que um download termina.
 </ParamField>
+<ParamField path="COMFYUI_DOWNLOAD_CONNECTIONS" type="number" default="4">
+  Conexões paralelas por download de modelo. Uma única conexão é limitada pelo tempo de ida e volta e, em muitas CDNs de modelos, por um limite de taxa por conexão; buscar intervalos de bytes em paralelo supera os dois. `1` desativa o recurso e baixa por uma única conexão. Usado apenas quando o host anuncia suporte a intervalos de bytes e o comprova em uma requisição de sondagem — caso contrário, o download ocorre por uma única conexão exatamente como antes.
+</ParamField>
+<ParamField path="COMFYUI_DOWNLOAD_SEGMENT_MIN_MB" type="number" default="64">
+  Tamanho mínimo de arquivo, em MB, que vale dividir entre várias conexões. Abaixo disso, as requisições extras custam mais do que o paralelismo devolve.
+</ParamField>
 
 ## Supervisão de processos (instalações locais)
 

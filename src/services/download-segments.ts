@@ -437,6 +437,12 @@ export async function runSegmentedDownload(
   const created = await open(scratch, "w");
   await created.close();
 
+  // Drop any stale bytes at the target NOW, exactly when the single-connection
+  // path's `flags: "w"` would have truncated them. Without this, a restart over a
+  // large existing `.partial` would hold the old bytes AND the growing `.seg` at
+  // once — up to double the peak disk the volume-space check upstream reserved.
+  await truncate(opts.targetPath, 0).catch(() => {});
+
   let firstFailure: unknown;
 
   const runSegment = async (index: number): Promise<void> => {
@@ -506,6 +512,7 @@ export async function runSegmentedDownload(
       );
     }
     await rename(scratch, opts.targetPath);
+    abandon.abort();
     return { connections: segments.length, bytesWritten };
   } catch (err) {
     // Keep only the hole-free prefix and publish it under the resumable name, so

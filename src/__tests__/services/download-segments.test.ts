@@ -14,7 +14,7 @@
 
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
-import { mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -30,7 +30,10 @@ vi.mock("../../config.js", () => {
 });
 
 import { config } from "../../config.js";
-import { downloadWithCache } from "../../services/download-cache.js";
+import {
+  downloadWithCache,
+  __downloadCacheTestHooks,
+} from "../../services/download-cache.js";
 import {
   contiguousPrefix,
   parseContentRange,
@@ -523,5 +526,26 @@ describe("runSegmentedDownload — the hole invariant and the byte sink (#1697)"
     expect(landed.length).toBeGreaterThan(0);
     expect(landed.length).toBeLessThan(body.length);
     expect(sha(landed)).toBe(sha(body.subarray(0, landed.length)));
+  });
+});
+
+describe("segmented download over a stale partial (#1697)", () => {
+  it("replaces an existing .partial rather than failing on the rename", async () => {
+    // The restart case: bytes are already staged, but with no validator sidecar
+    // the download starts fresh (a 200, not a 206). The segmented path reaches
+    // the staged file only by renaming its scratch over it — on Windows that is
+    // the operation most likely to hit EPERM, so drive it explicitly.
+    const body = payload(8 * 1024 * 1024);
+    const rig = await rigFor(body, "ranges");
+    const staged = `${__downloadCacheTestHooks.cachePathForUrl(rig.url, {})}.partial`;
+    await mkdir(dirname(staged), { recursive: true });
+    await writeFile(staged, payload(3 * 1024 * 1024));
+    const dest = await destFor("restart.safetensors");
+
+    await downloadWithCache({ url: rig.url, headers: {}, targetPath: dest });
+
+    expect(sha(await readFile(dest))).toBe(sha(body));
+    // Segmentation was used, not a silent fall back to one connection.
+    expect(rig.requests.filter((r) => r.range).length).toBeGreaterThanOrEqual(4);
   });
 });

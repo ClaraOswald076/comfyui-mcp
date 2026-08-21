@@ -212,6 +212,12 @@ lèvent une erreur `CLOUD_UNSUPPORTED` claire. Architecture et dispatcher
   au-dessus de la limite, les fichiers en cache les moins récemment utilisés
   sont supprimés après qu'un téléchargement se termine.
 </ParamField>
+<ParamField path="COMFYUI_DOWNLOAD_CONNECTIONS" type="number" default="4">
+  Connexions parallèles par téléchargement de modèle. Une connexion unique est bornée par le temps d'aller-retour et, sur beaucoup de CDN de modèles, par une limite de débit par connexion ; récupérer des plages d'octets en parallèle lève les deux. `1` désactive le mécanisme et télécharge sur une seule connexion. Utilisé uniquement lorsque l'hôte annonce la prise en charge des plages d'octets et la prouve sur une requête de sondage — sinon le téléchargement se fait sur une seule connexion, exactement comme avant.
+</ParamField>
+<ParamField path="COMFYUI_DOWNLOAD_SEGMENT_MIN_MB" type="number" default="64">
+  Taille minimale de fichier, en Mo, qui vaut la peine d'être répartie sur plusieurs connexions. En dessous, les allers-retours supplémentaires coûtent plus que ce que le parallélisme rapporte.
+</ParamField>
 
 ## Supervision des processus (installations locales)
 

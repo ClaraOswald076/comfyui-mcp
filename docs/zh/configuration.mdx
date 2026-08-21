@@ -171,6 +171,12 @@ WebSocket 和本地 FS / 进程工具会抛出明确的 `CLOUD_UNSUPPORTED` 错�
   下载缓存的最大体积，单位 GB。`0` 禁用驱逐；超过上限后，下载完成时会删除最近最少使用
   的缓存文件。
 </ParamField>
+<ParamField path="COMFYUI_DOWNLOAD_CONNECTIONS" type="number" default="4">
+  每个模型下载使用的并行连接数。单条连接受往返时延限制，在许多模型 CDN 上还受每连接限速；并行拉取字节范围可以突破这两者。设为 `1` 则关闭该机制，使用单连接下载。仅在文件主机声明支持字节范围、并在探测请求中证实时才启用——否则下载与此前完全一样走单连接。
+</ParamField>
+<ParamField path="COMFYUI_DOWNLOAD_SEGMENT_MIN_MB" type="number" default="64">
+  值得拆分到多条连接的最小文件大小（MB）。低于该值时，额外往返的开销会超过并行带来的收益。
+</ParamField>
 
 ## 进程监管（本地安装）
 

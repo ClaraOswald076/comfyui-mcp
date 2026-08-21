@@ -171,6 +171,12 @@ WebSocket 和本機 FS / 行程工具會擲出明確的 `CLOUD_UNSUPPORTED` 錯�
   下載快取的最大體積，單位 GB。`0` 停用驅逐；超過上限後，下載完成時會刪除最近最少使用
   的快取檔案。
 </ParamField>
+<ParamField path="COMFYUI_DOWNLOAD_CONNECTIONS" type="number" default="4">
+  每個模型下載使用的平行連線數。單一連線受往返時延限制，在許多模型 CDN 上還受每連線限速；平行抓取位元組範圍可突破這兩者。設為 `1` 會關閉此機制，改用單一連線下載。僅在檔案主機宣告支援位元組範圍、並在探測請求中證實時才啟用——否則下載與先前完全一樣走單一連線。
+</ParamField>
+<ParamField path="COMFYUI_DOWNLOAD_SEGMENT_MIN_MB" type="number" default="64">
+  值得拆分到多條連線的最小檔案大小（MB）。低於此值時，額外往返的成本會超過平行化帶來的收益。
+</ParamField>
 
 ## 行程監管（本機安裝）
 

@@ -178,6 +178,12 @@ error. Architecture and `cloud-client` dispatcher originally contributed by
 <ParamField path="COMFYUI_LRU_CACHE_SIZE_GB" type="number" default="0">
   Max size of the download cache in GB. `0` disables eviction; above the limit, least-recently-used cached files are deleted after a download completes.
 </ParamField>
+<ParamField path="COMFYUI_DOWNLOAD_CONNECTIONS" type="number" default="4">
+  Parallel connections per model download. A single connection is capped by round-trip time and, on many model CDNs, by a per-connection rate limit; fetching byte ranges in parallel lifts both. `1` disables it and downloads over one connection. Used only when the file host advertises byte-range support and proves it on a probe request — otherwise the download runs over a single connection exactly as before.
+</ParamField>
+<ParamField path="COMFYUI_DOWNLOAD_SEGMENT_MIN_MB" type="number" default="64">
+  Minimum file size, in MB, worth splitting across multiple connections. Below it the extra round-trips cost more than the parallelism returns.
+</ParamField>
 
 ## Process supervision (local installs)
 
