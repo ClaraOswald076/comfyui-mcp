@@ -32,7 +32,7 @@ vi.mock("../../config.js", () => {
 import { config } from "../../config.js";
 import {
   downloadWithCache,
-  __downloadCacheTestHooks,
+  stagedPartialPathForUrl,
 } from "../../services/download-cache.js";
 import {
   contiguousPrefix,
@@ -105,7 +105,19 @@ async function startServer(body: Buffer, mode: ServerMode): Promise<Rig> {
         "content-length": String(body.length),
         ...extra,
       });
-      res.end(body);
+      if (mode !== "slow-ranges") return void res.end(body);
+      // Pace the WHOLE-file response too, so the single-connection arm of a
+      // cancel comparison is actually still in flight when the abort lands.
+      // Without this it finishes instantly and the comparison is meaningless.
+      const step = Math.max(1, Math.floor(body.length / 64));
+      let off = 0;
+      const push = (): void => {
+        if (off >= body.length) return void res.end();
+        res.write(body.subarray(off, Math.min(off + step, body.length)));
+        off += step;
+        setTimeout(push, 25);
+      };
+      push();
     };
 
     if (mode === "no-ranges") return full();
@@ -309,8 +321,13 @@ describe("segmented download through downloadWithCache (#1697)", () => {
     expect(ranged.length).toBeGreaterThanOrEqual(4);
     expect(rig.maxConcurrent).toBeGreaterThan(1);
 
-    // The scratch file is gone — it only ever reaches the target by rename.
-    await expect(stat(segmentScratchPath(dest))).rejects.toThrow();
+    // The scratch file is gone — it only ever reaches the staged file by rename.
+    // Assert on the path the writer actually uses (beside the CACHE `.partial`);
+    // `dest + ".seg"` is a path that never exists either way, so checking it
+    // would pass whether or not the scratch was cleaned up.
+    const stagedPartial = stagedPartialPathForUrl(rig.url);
+    await expect(stat(segmentScratchPath(stagedPartial))).rejects.toThrow();
+    await expect(stat(stagedPartial)).rejects.toThrow();
   });
 
   it("is byte-identical to the same file fetched over ONE connection", async () => {
@@ -357,7 +374,10 @@ describe("segmented download through downloadWithCache (#1697)", () => {
     // It advertised ranges, so a probe WAS issued; the 200 answer sent us back to
     // the single-connection path rather than failing the download.
     expect(rig.requests.some((r) => r.range)).toBe(true);
-    await expect(stat(segmentScratchPath(dest))).rejects.toThrow();
+    // A declined probe must not have created a scratch at all.
+    await expect(
+      stat(segmentScratchPath(stagedPartialPathForUrl(rig.url))),
+    ).rejects.toThrow();
   });
 
   it("falls back when the 206's Content-Range does not describe what was asked for", async () => {
@@ -552,7 +572,7 @@ describe("segmented download over a stale partial (#1697)", () => {
     // the operation most likely to hit EPERM, so drive it explicitly.
     const body = payload(8 * 1024 * 1024);
     const rig = await rigFor(body, "ranges");
-    const staged = `${__downloadCacheTestHooks.cachePathForUrl(rig.url, {})}.partial`;
+    const staged = stagedPartialPathForUrl(rig.url);
     await mkdir(dirname(staged), { recursive: true });
     await writeFile(staged, payload(3 * 1024 * 1024));
     const dest = await destFor("restart.safetensors");
@@ -620,10 +640,22 @@ describe("cancelling a segmented download through downloadWithCache (#1697)", ()
     // The unit test on runSegmentedDownload covers the mechanism; this covers the
     // JOB contract — what a user's `download_model action:"cancel"` actually
     // leaves behind on the shared staged `.partial`.
+    //
+    // It keeps LESS than the single-connection path does, and that is a real,
+    // measured trade-off rather than an accident (see the PR body). Two causes,
+    // both inherent to segmenting:
+    //   - writes land in 1 MiB batches, so up to 1 MiB per segment is in memory
+    //     rather than on disk when the abort arrives;
+    //   - only the CONTIGUOUS prefix may be published, so segment 0's bytes are
+    //     all that survive even when every segment has written some.
+    // Measured on this rig, aborting mid-transfer: one connection keeps
+    // 1.8/2.6/3.4/5.0 MB at 200/300/400/600 ms; four connections keep nothing
+    // until the first flush lands and 1.0 MB at 600 ms. What is kept is always a
+    // valid prefix — never a hole — which is what this asserts.
     const body = payload(16 * 1024 * 1024);
     const rig = await rigFor(body, "slow-ranges");
     const dest = await destFor("cancelled.safetensors");
-    const staged = `${__downloadCacheTestHooks.cachePathForUrl(rig.url, {})}.partial`;
+    const staged = stagedPartialPathForUrl(rig.url);
     const ac = new AbortController();
 
     const run = downloadWithCache({
@@ -632,7 +664,10 @@ describe("cancelling a segmented download through downloadWithCache (#1697)", ()
       targetPath: dest,
       signal: ac.signal,
     });
-    await new Promise((r) => setTimeout(r, 400));
+    // Late enough that at least one 1 MiB batch has certainly flushed; earlier
+    // than that the honest answer is "nothing durable yet", which is covered by
+    // the measurement in the comment above rather than by an assertion here.
+    await new Promise((r) => setTimeout(r, 900));
     ac.abort();
     await expect(run).rejects.toThrow();
 
@@ -642,8 +677,12 @@ describe("cancelling a segmented download through downloadWithCache (#1697)", ()
     await expect(stat(segmentScratchPath(staged))).rejects.toThrow();
     // Whatever was kept is a strict, hole-free PREFIX of the real file — the
     // exact state a resume needs, and the state a holey file would fail.
-    const kept = await readFile(staged).catch(() => Buffer.alloc(0));
+    // Read it WITHOUT a catch: a missing staged file must fail this test rather
+    // than be read as "zero bytes kept" — that is how a wrong path passes
+    // vacuously.
+    const kept = await readFile(staged);
+    expect(kept.length).toBeGreaterThan(0);
     expect(kept.length).toBeLessThan(body.length);
-    if (kept.length > 0) expect(sha(kept)).toBe(sha(body.subarray(0, kept.length)));
+    expect(sha(kept)).toBe(sha(body.subarray(0, kept.length)));
   });
 });
