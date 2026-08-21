@@ -181,6 +181,12 @@ COMFYUI_URL=https://comfy.example.com CF_ACCESS_CLIENT_ID=<id>.access CF_ACCESS_
   ダウンロードキャッシュの最大サイズ（GB）。`0` は追い出しを無効にします。上限を超えると、
   ダウンロード完了後に最も使われていないキャッシュファイルが削除されます。
 </ParamField>
+<ParamField path="COMFYUI_DOWNLOAD_CONNECTIONS" type="number" default="4">
+  モデルダウンロード 1 件あたりの並列接続数。単一接続はラウンドトリップ時間に縛られ、多くのモデル CDN では接続あたりの速度制限も受けます。バイト範囲を並列に取得すると両方を回避できます。`1` で無効化し、単一接続でダウンロードします。ホストがバイト範囲対応を公表し、プローブ要求で実証した場合にのみ使われます。それ以外は従来どおり単一接続でダウンロードします。
+</ParamField>
+<ParamField path="COMFYUI_DOWNLOAD_SEGMENT_MIN_MB" type="number" default="64">
+  複数接続に分割する価値がある最小ファイルサイズ（MB）。これを下回ると、追加のラウンドトリップのコストが並列化の利得を上回ります。
+</ParamField>
 
 ## プロセス監視（ローカルインストール）
 

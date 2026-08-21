@@ -216,6 +216,12 @@ local lanzan un error `CLOUD_UNSUPPORTED` claro. Arquitectura y despachador
   por encima del límite, los archivos cacheados menos usados recientemente
   se eliminan después de que termina una descarga.
 </ParamField>
+<ParamField path="COMFYUI_DOWNLOAD_CONNECTIONS" type="number" default="4">
+  Conexiones paralelas por descarga de modelo. Una sola conexión está limitada por el tiempo de ida y vuelta y, en muchas CDN de modelos, por un límite de velocidad por conexión; descargar rangos de bytes en paralelo supera ambos. `1` lo desactiva y descarga por una sola conexión. Solo se usa cuando el servidor anuncia soporte de rangos de bytes y lo demuestra en una petición de sondeo; si no, la descarga se hace por una sola conexión exactamente como antes.
+</ParamField>
+<ParamField path="COMFYUI_DOWNLOAD_SEGMENT_MIN_MB" type="number" default="64">
+  Tamaño mínimo de archivo, en MB, que merece repartirse entre varias conexiones. Por debajo, las peticiones adicionales cuestan más de lo que aporta el paralelismo.
+</ParamField>
 
 ## Supervisión de procesos (instalaciones locales)
 

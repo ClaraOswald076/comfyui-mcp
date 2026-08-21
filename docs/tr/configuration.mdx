@@ -200,6 +200,12 @@ olarak [@picoSols](https://github.com/picoSols) tarafından katkılandı.
   sınırın üzerinde, bir indirme bittikten sonra en az kullanılan önbellek
   dosyaları silinir.
 </ParamField>
+<ParamField path="COMFYUI_DOWNLOAD_CONNECTIONS" type="number" default="4">
+  Model indirmesi başına paralel bağlantı sayısı. Tek bir bağlantı gidiş-dönüş süresiyle ve pek çok model CDN'inde bağlantı başına hız sınırıyla kısıtlıdır; bayt aralıklarını paralel çekmek her ikisini de aşar. `1` bunu kapatır ve tek bağlantıyla indirir. Yalnızca dosya sunucusu bayt aralığı desteğini duyurduğunda ve bir yoklama isteğiyle kanıtladığında kullanılır — aksi hâlde indirme tam olarak eskisi gibi tek bağlantı üzerinden yapılır.
+</ParamField>
+<ParamField path="COMFYUI_DOWNLOAD_SEGMENT_MIN_MB" type="number" default="64">
+  Birden çok bağlantıya bölmeye değer en küçük dosya boyutu (MB). Bunun altında ek gidiş-dönüşlerin maliyeti paralelliğin getirisini aşar.
+</ParamField>
 
 ## Süreç gözetimi (yerel kurulumlar)
 
