@@ -34,6 +34,9 @@ All notable changes to this project are documented here. This project adheres to
   a `plate.png` that serves `audio/wav` paints an `<img>` at audio bytes and
   breaks, and a `take.wav` serving `image/png` was accepted just as wrongly
   before any of this.
+  The headless verdict asks about the tab the frame RESOLVES to rather than
+  the address it names, so a scope-bound session (`orchestrator::<backend>`)
+  sitting on a connected phone can no longer walk past it.
 
 - **Ollama refuses audio unless the model is a verified listener (#1972).** Native
   `/api/chat` carries audio in `message.images[]`. Most models HTTP 400 (fail
