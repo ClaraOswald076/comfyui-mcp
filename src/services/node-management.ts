@@ -2515,9 +2515,7 @@ function wrongInstallRefusal(m: LocalWriteTargetMismatch, what: string): string 
   const provenBy =
     m.liveSource === "base-directory"
       ? "its own --base-directory"
-      : m.liveSource === "argv"
-        ? "its own /system_stats launch argv"
-        : "the OS process listening on that port";
+      : "its own /system_stats launch argv";
   return (
     `${what} would write into ${m.base}, but this session is connected to ` +
     `${getComfyUIBaseUrl()}, which runs from ${m.liveRoot} (established from ${provenBy}). ` +

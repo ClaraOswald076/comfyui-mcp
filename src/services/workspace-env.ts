@@ -293,8 +293,8 @@ export interface LocalWriteTargetMismatch {
   baseSource: GuessedBaseSource;
   /** The root the CONNECTED server actually scans `custom_nodes/` from. */
   liveRoot: string;
-  /** What established `liveRoot` — all three are observations of the running server. */
-  liveSource: "base-directory" | "argv" | "observed-process";
+  /** What established `liveRoot`. Both are the server's OWN self-report. */
+  liveSource: "base-directory" | "argv";
 }
 
 /** Canonical spelling for comparing two install roots. realpath resolves the
@@ -376,8 +376,9 @@ export async function detectLocalWriteTargetMismatch(
   if (!base || isRemoteMode()) return undefined;
   if (comfyuiPathWasNamedExplicitly()) return undefined;
 
+  const savedDefault = getSavedDefaultWorkspaceSync();
   const baseSource: GuessedBaseSource =
-    getSavedDefaultWorkspaceSync() && sameInstallRoot(getSavedDefaultWorkspaceSync()!, base)
+    savedDefault && sameInstallRoot(savedDefault, base)
       ? "saved-default-workspace"
       : "auto-detected";
 
@@ -398,17 +399,28 @@ export async function detectLocalWriteTargetMismatch(
   // below. Nothing is provable here.
   if (hasUnresolvableRelativeBaseDirFlag(snapshot.argv, snapshot.cwd)) return undefined;
 
-  // 2. The server's own install root. Without --base-directory this is where it
-  //    scans custom_nodes/ from.
-  const live = resolveLiveServerRoot(snapshot.argv, snapshot.cwd, { remote: false });
-  if (!live.root || live.source === "unresolved") return undefined;
-  if (!safeExists(live.root)) return undefined;
-  if (!safeExists(join(live.root, "models")) && !safeExists(join(live.root, "custom_nodes"))) {
+  // 2. The server's own main.py root, from its argv. Without --base-directory
+  //    this is where it scans custom_nodes/ from. Same two observations, same
+  //    on-disk checks, and in the same order as `resolveEffectiveComfyUIBaseLive`
+  //    — so what this reports is precisely "configuration shadowed a live answer
+  //    that disagrees with it".
+  //
+  //    Deliberately `liveRootFromArgv` and NOT `resolveLiveServerRoot`: that
+  //    resolver's `observed-process` tier anchors on where the interpreter
+  //    BINARY lives, which its own docstring documents as not being proof of
+  //    where the SCRIPT was resolved from ("KNOWN GAP, measured and filed").
+  //    That is a fine basis for finding a root when there is otherwise none; it
+  //    is not a fine basis for REFUSING a user's write. It also keeps this off
+  //    the process-table probe entirely, so no install pays for a netstat/WMI
+  //    scan it cannot act on.
+  const liveRoot = liveRootFromArgv(snapshot.argv, snapshot.cwd);
+  if (!liveRoot || !safeExists(liveRoot)) return undefined;
+  if (!safeExists(join(liveRoot, "models")) && !safeExists(join(liveRoot, "custom_nodes"))) {
     return undefined;
   }
-  return sameInstallRoot(live.root, base)
+  return sameInstallRoot(liveRoot, base)
     ? undefined
-    : { base, baseSource, liveRoot: live.root, liveSource: live.source };
+    : { base, baseSource, liveRoot, liveSource: "argv" };
 }
 
 /**

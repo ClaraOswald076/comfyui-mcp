@@ -161,6 +161,23 @@ vi.mock("node:child_process", async () => {
   };
 });
 
+// The OS process-table probe. `resolveLiveServerRoot`'s `observed-process` tier
+// anchors on where the interpreter BINARY lives, which workspace-env.ts itself
+// documents as "KNOWN GAP … not proof of where the SCRIPT was resolved from".
+// A resolution with a documented soundness gap may FIND a root; it may not be
+// what REFUSES a user's write, so this must never be consulted here.
+const probe = vi.hoisted(() => ({ calls: 0 }));
+vi.mock("../../services/live-interpreter.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../services/live-interpreter.js")>();
+  return {
+    ...actual,
+    observeLiveServerProcess: (...args: unknown[]) => {
+      probe.calls += 1;
+      return (actual.observeLiveServerProcess as (...a: unknown[]) => unknown)(...args);
+    },
+  };
+});
+
 const { installCustomNode } = await import("../../services/node-management.js");
 const { configureWorkspace, resetWorkspaceConfig } = await import(
   "../../services/workspace-env.js"
@@ -193,6 +210,7 @@ let priorEnvPath: string | undefined;
 
 beforeEach(() => {
   git.calls = [];
+  probe.calls = 0;
   http.mode = "refuse-enqueue";
   live.reachable = true;
   live.statsCalls = 0;
@@ -329,9 +347,11 @@ describe("#1765 — install_custom_node must not write into an install this sess
     expect(clonedInto()).toBe(join(SAVED_DEFAULT, PACK_DIR));
   });
 
-  it("fails OPEN when the server's main.py root cannot be resolved", async () => {
-    // ComfyUI Desktop reports a RELATIVE main.py and no cwd. Nothing here is
-    // provable, so nothing is refused.
+  it("fails OPEN on the Desktop/portable shape, without probing the process table", async () => {
+    // ComfyUI Desktop and the Windows portable bundle both report a RELATIVE
+    // main.py and no cwd. The server's SELF-REPORT cannot resolve a root there,
+    // and the interpreter-anchored tier that can is not sound enough to refuse
+    // on — so nothing is refused, and the OS probe is never even taken.
     live.argv = ["ComfyUI/main.py", "--port", "8189"];
 
     const { ok, error } = await install({ id: REPO, source: "git" });
@@ -339,6 +359,7 @@ describe("#1765 — install_custom_node must not write into an install this sess
     expect(error).toBeUndefined();
     expect(ok).toMatchObject({ mechanism: "git-clone" });
     expect(clonedInto()).toBe(join(SAVED_DEFAULT, PACK_DIR));
+    expect(probe.calls).toBe(0);
   });
 
   it("refuses the comfy-cli branch too — --workspace has the identical hazard", async () => {
