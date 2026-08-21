@@ -851,11 +851,35 @@ export function unverifiedViewRefNote(
  */
 export function headlessAudioRefusal(
   items: ReadonlyArray<{ what: string; via: "path" | "ref" }>,
+  opts: { mailboxedToUnknown?: boolean } = {},
 ): string {
   const one = items.length === 1;
   const lines = items
     .map((it) => `  - ${it.what}${it.via === "ref" ? " (ComfyUI reference)" : ""}`)
     .join("\n");
+  // A DIFFERENT refusal for a different fact, because merging them would tell
+  // the caller their session is on a phone when nobody knows what it is on. The
+  // buffered case is the one review caught last: `show_media` is the only
+  // mailboxable command, so an unroutable audio frame is not refused by the
+  // bridge — it is QUEUED and replayed to whichever client hellos next, which
+  // `flushMailbox` picks for a scope address. Queuing audio for an
+  // unidentified recipient is the same unearned claim as sending it to a phone,
+  // only deferred, and nothing can take it back afterwards.
+  if (opts.mailboxedToUnknown) {
+    return (
+      `no tab is currently routable for this session, and audio must not be QUEUED, so ` +
+      `${one ? "this file was" : `these ${items.length} files were`} not sent:\n${lines}\n` +
+      `Images and video would have been buffered and replayed to whichever client connects next — that is what ` +
+      `this command does when nothing is reachable. Audio cannot take that route: the client that eventually ` +
+      `collects it may be a paired phone or remote viewer, which has no audio player and would acknowledge the ` +
+      `file as shown anyway. Rather than queue a sound for a recipient nobody has identified yet, it is refused now.\n` +
+      `Nothing is wrong with the audio — ${one ? "it is" : "they are"} fine and still exactly where named above.\n` +
+      `What you can do:\n` +
+      `  1. Wait until the desktop ComfyUI panel is connected and call this again — that panel has a real player.\n` +
+      `  2. Tell the USER where the file is so they can play it themselves. Do not describe how it sounds; you ` +
+      `have not heard it either.`
+    );
+  }
   return (
     `this conversation is on a HEADLESS client (a paired phone or remote viewer), which has no audio player, so ` +
     `${one ? "this file was" : `these ${items.length} files were`} not sent:\n${lines}\n` +

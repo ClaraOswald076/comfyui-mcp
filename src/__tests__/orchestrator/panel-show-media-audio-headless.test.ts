@@ -193,50 +193,102 @@ describe("#1572 the headless gate is narrow — it costs nothing else", () => {
   });
 });
 
-// #1572 round 3 — the gate's SECOND P1, and the sharper edge of the same idea.
+// #1572 rounds 3 AND 5 — an UNREACHABLE target, and the correction to the
+// correction.
 //
-// The verdict used to be read at the TOP of the handler. `ctx.tabId` is held
-// LIVE on the ctx (makePanelToolCtx says so in as many words) precisely so
-// `ctx.call`'s `ensureReachable()` can rebind an orphaned session in place — and
-// `interactiveTabIds()` filters headless OUT, so a heal can only ever land on a
-// CANVAS tab. So the old read answered a question about a tab the frame was
-// about to stop going to: a phone asleep in a pocket, desktop panel open,
-// `.wav` refused for nothing.
+// Round 3 established that a sticky-headless tab which is merely OFFLINE must
+// not be refused, because `ensureReachable()` is about to rebind it onto a
+// canvas tab where audio plays. That much is right, and the first test below
+// keeps it.
 //
-// Two corrections, and both are load-bearing:
-//   1. the verdict is taken ONCE, immediately before dispatch, after every
-//      await this handler performs;
-//   2. it requires the headless tab to be REACHABLE — connected right now. An
-//      unreachable sticky-headless tab is exactly the session about to be healed
-//      onto a canvas tab (where audio plays), or else one whose call surfaces
-//      the bridge's own tab-listing error, which is a better message than this
-//      refusal.
-describe("#1572 an UNREACHABLE headless tab is not refused — it is about to be rebound", () => {
-  it.each(AUDIO)("a %s PATH is allowed through when the phone is offline", async (ext) => {
-    const { res, calls } = await showMedia(
-      [{ source: { path: filePath(`take${ext}`) } }],
-      true, // sticky isHeadless — this tab once helloed headless
-      false, // …but canReach is false: ensureReachable will heal onto a canvas tab
-    );
+// But round 3's REASON was wrong, and round 5 caught it: I wrote that when the
+// heal cannot fire "the call surfaces the bridge's own tab-listing error, which
+// is a better message than this refusal". It does not. `isMailboxable()` is
+// exactly `cmd.cmd === "show_media"` — this one command, alone among all of
+// them, is BUFFERED when `resolveTarget` throws and replayed on the next hello,
+// answering `{ok:true, mailboxed:true}`. So an unroutable audio frame was being
+// queued for the phone and delivered later as `shown:true`.
+//
+// The distinction that actually matters is therefore not reachable-vs-not, it
+// is HEALABLE-vs-not:
+//   - healable  → the heal runs, the session lands on a canvas tab, audio flows;
+//   - not       → the frame is mailboxed under ctx.tabId, so a concrete id names
+//                 its own recipient (refuse if that is a phone) and a scope
+//                 address names nobody at all (refuse).
+describe("#1572 an unreachable target is judged by where the frame would actually GO", () => {
+  it.each(AUDIO)("a %s PATH is allowed once the heal lands on a canvas tab", async (ext) => {
+    // awaitReachable stands in for ctx.call's own ensureReachable(): it rebinds
+    // the orphaned session onto the sole live desktop tab. After that the
+    // address resolves, and it resolves to something with a player.
+    const calls: Forwarded[] = [];
+    const ctx = {
+      call: async (cmd: Forwarded) => {
+        calls.push(cmd);
+        return { content: [{ type: "text", text: "ok" }] } as ToolResult;
+      },
+      confirm: async () => "yes" as const,
+      awaitReachable: async () => {
+        ctx.tabId = "desktop-1";
+        return true;
+      },
+      bridge: {
+        isHeadless: (id: string) => id === "phone-1",
+        canReach: (id: string) => id === "desktop-1",
+        liveTabIdFor: (id: string) => (id === "desktop-1" ? "desktop-1" : undefined),
+      } as unknown as PanelToolCtx["bridge"],
+      tabId: "phone-1",
+    } as PanelToolCtx;
+    const def = buildPanelToolDefs().find((d) => d.name === "panel_show_media")!;
+    const res = (await def.handler(
+      { items: [{ source: { path: filePath(`take${ext}`) } }] },
+      ctx,
+    )) as ToolResult;
     expect(res.isError).toBeFalsy();
     const items = calls.find((c) => c.cmd === "show_media")!.items as Array<{ kind?: string }>;
     expect(items[0].kind).toBe("audio");
   });
 
-  it("an offline headless tab's /view REF is allowed through too", async () => {
+  it("an offline phone that CANNOT be healed is refused — the frame would be mailboxed to it", async () => {
+    // 2+ interactive tabs, a pinned session, or nothing bindable: ensureReachable
+    // leaves ctx.tabId alone, resolveTarget throws, and show_media is buffered
+    // under this very tab id. flushMailbox then hands it to that phone.
+    const { res, calls } = await showMedia(
+      [{ source: { path: filePath("take.wav") } }],
+      true,
+      false,
+    );
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/HEADLESS client/);
+    expect(calls.find((c) => c.cmd === "show_media")).toBeFalsy();
+  });
+
+  it("…and its /view ref form too", async () => {
     const { res, calls } = await showMedia(
       [{ source: { filename: "take_00001.wav", type: "output" } }],
       true,
       false,
     );
-    expect(res.isError).toBeFalsy();
-    expect(calls.find((c) => c.cmd === "show_media")).toBeTruthy();
+    expect(res.isError).toBe(true);
+    expect(calls.find((c) => c.cmd === "show_media")).toBeFalsy();
   });
 
   it("a CONNECTED phone is still refused — the case the gate exists for", async () => {
     const { res } = await showMedia([{ source: { path: filePath("take.wav") } }], true, true);
     expect(res.isError).toBe(true);
     expect(textOf(res)).toMatch(/HEADLESS client/);
+  });
+
+  it("an unreachable NON-headless tab still gets its audio — the mailbox names a real player", async () => {
+    // The false-refusal guard on the other side: a desktop tab that is briefly
+    // unroutable owns its own mailbox, so the buffered frame reaches a client
+    // that can play it. Refusing here would be over-broad.
+    const { res, calls } = await showMedia(
+      [{ source: { path: filePath("take.wav") } }],
+      false,
+      false,
+    );
+    expect(res.isError).toBeFalsy();
+    expect(calls.find((c) => c.cmd === "show_media")).toBeTruthy();
   });
 
   it("a bridge that cannot answer canReach is treated as reachable, not as absent", async () => {
@@ -340,9 +392,27 @@ describe("#1572 a SCOPE address is judged by what it RESOLVES to", () => {
     expect(items[0].kind).toBe("audio");
   });
 
-  it("a scope that resolves to NOTHING is not refused — the call surfaces the bridge's own error", async () => {
+  // Round 5. This asserted the opposite until review showed the premise was
+  // false: an unroutable scope address does not surface an error, it MAILBOXES —
+  // and `flushMailbox` hands a scope-keyed box to "the first tab that hellos",
+  // which may be the phone. Queuing a sound for a recipient nobody has
+  // identified is the same unearned claim as sending it to one, only deferred.
+  it("a scope that resolves to NOTHING is refused — the frame would be queued for an unknown client", async () => {
     const { ctx, calls } = scopeCtx({ resolvesTo: undefined, headlessTabs: ["phone-1"] });
     const res = await run(ctx, { source: { path: filePath("take.wav") } });
+    expect(res.isError).toBe(true);
+    expect(calls.find((c) => c.cmd === "show_media")).toBeFalsy();
+    const text = textOf(res);
+    // A DIFFERENT message from the phone refusal — saying "you are on a phone"
+    // here would assert something nobody knows.
+    expect(text).toMatch(/must not be QUEUED/);
+    expect(text).toMatch(/whichever client connects next/);
+    expect(text).not.toMatch(/this conversation is on a HEADLESS client/);
+  });
+
+  it("an unroutable scope still lets IMAGES through — only audio is held back", async () => {
+    const { ctx, calls } = scopeCtx({ resolvesTo: undefined, headlessTabs: ["phone-1"] });
+    const res = await run(ctx, { source: { path: filePath("plate.png") } });
     expect(res.isError).toBeFalsy();
     expect(calls.find((c) => c.cmd === "show_media")).toBeTruthy();
   });

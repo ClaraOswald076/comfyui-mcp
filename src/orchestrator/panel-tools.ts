@@ -18307,38 +18307,42 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // else: this is the last statement before the frame goes out, so
         // `ctx.tabId` has stopped moving for every reason this handler controls.
         //
-        // ASK ABOUT THE TAB THE FRAME WILL LAND ON, WHICH IS NOT ALWAYS THE ONE
-        // `ctx.tabId` NAMES. Two rounds of review were spent on this, and both
-        // corrections come down to the same mistake — judging the address
-        // instead of the destination:
+        // WILL THIS AUDIO END UP SOMEWHERE IT CAN BE PLAYED? Four review rounds
+        // went into this question and three of my answers were wrong in the same
+        // way — I kept judging the ADDRESS the caller holds instead of the
+        // CLIENT the frame reaches. The three corrections, in order:
         //
-        //  - `ctx.tabId` can be a SCOPE ADDRESS (`orchestrator`,
-        //    `orchestrator::<backend>`). It is not a tab, so `isHeadless()` on
-        //    it is a lookup miss that answers FALSE — and `resolveTarget`'s
-        //    scope branch ends "…else the most recent headless one", so a
-        //    scope-bound session sitting on a connected phone sailed straight
-        //    through the gate and had its audio acknowledged as shown.
-        //  - a concrete but UNREACHABLE sticky-headless id is the opposite
-        //    error: `isHeadless` is sticky by design (a tab that ever helloed
-        //    headless stays headless while offline), and that is exactly the
-        //    session `ctx.call`'s `ensureReachable()` is about to rebind —
-        //    `interactiveTabIds()` filters headless OUT, so a heal can only land
-        //    on a CANVAS tab, where audio plays perfectly. Refusing on
-        //    stickiness alone denied a valid `.wav` to someone whose phone was
-        //    merely asleep while their desktop panel sat right there.
+        //  1. `ctx.tabId` can be a SCOPE ADDRESS (`orchestrator::<backend>`).
+        //     It is not a tab, so `isHeadless()` on it is a lookup miss that
+        //     answers FALSE — while `resolveTarget`'s scope branch ends "…else
+        //     the most recent headless one".
+        //  2. A concrete sticky-headless id that is UNREACHABLE is the opposite
+        //     error: `ensureReachable()` may be about to rebind it onto a canvas
+        //     tab, where audio plays perfectly.
+        //  3. And "unroutable is therefore safe" — my own round-3 answer — is
+        //     FALSE for this command specifically. `isMailboxable()` is exactly
+        //     `cmd.cmd === "show_media"`: when `resolveTarget` throws, this one
+        //     command is not refused, it is BUFFERED and replayed on the next
+        //     hello, answering `{ok:true, mailboxed:true}`. So an unroutable
+        //     audio frame is not dropped — it is queued for a client nobody has
+        //     identified yet, and delivered later as `shown:true`.
         //
-        // `liveTabIdFor` answers both at once, because it is `resolveTarget`
-        // itself: it resolves a scope address, a prefix, or a migration alias to
-        // the CONCRETE tab a command would reach, and returns undefined when
-        // nothing resolves — which is precisely the unroutable case that must
-        // NOT be refused, since the call is about to be healed or to surface the
-        // bridge's own tab-listing error, a better message than this refusal.
+        // So the question is answered in the order the bridge itself will answer
+        // it:
         //
-        // Three tiers, best signal first, so a lightweight bridge degrades
-        // instead of throwing: routing → reachability → the bare id. This is
-        // still one instant's answer and `ctx.call` re-resolves a moment later;
-        // that residual window only ever moves TOWARD a canvas tab, which is the
-        // safe direction.
+        //   a. run the PRODUCTION heal first (`awaitReachable`, which is
+        //      `ensureReachable` — the same call `ctx.call` makes moments later,
+        //      just earlier), so a session that can be rebound already has been;
+        //   b. if the address RESOLVES, judge the concrete tab it resolves to;
+        //   c. if it does not resolve, the frame will be mailboxed under
+        //      `ctx.tabId` — so for a concrete id the recipient is that exact
+        //      tab (sticky `isHeadless` is then precisely right), and for a
+        //      SCOPE address `flushMailbox` delivers to "the first tab that
+        //      hellos", which is unknowable here and may be the phone.
+        //
+        // An unknowable recipient is refused rather than queued. Buffering audio
+        // for whoever reconnects first is the same unearned claim as sending it
+        // to a phone, only deferred — and this tool has no way to take it back.
         if (audioTargets.length > 0) {
           const b = ctx.bridge as
             | {
@@ -18347,20 +18351,38 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
                 liveTabIdFor?: (id: string) => string | undefined;
               }
             | undefined;
-          let judgeId: string | undefined;
-          if (typeof b?.liveTabIdFor === "function") {
-            judgeId = b.liveTabIdFor(ctx.tabId);
-          } else if (typeof b?.canReach === "function") {
-            judgeId = b.canReach(ctx.tabId) ? ctx.tabId : undefined;
-          } else {
-            judgeId = ctx.tabId;
+          // Best-effort: the heal is what `ctx.call` would do anyway, so failing
+          // here must not turn a displayable batch into an error.
+          try {
+            await ctx.awaitReachable?.(0);
+          } catch {
+            /* the send will re-attempt the same heal and report its own outcome */
           }
-          if (
-            judgeId != null &&
+          const routed =
+            typeof b?.liveTabIdFor === "function" ? b.liveTabIdFor(ctx.tabId) : undefined;
+          const resolvable =
+            typeof b?.liveTabIdFor === "function"
+              ? routed != null
+              : typeof b?.canReach === "function"
+                ? b.canReach(ctx.tabId)
+                : true;
+          let verdictId: string | undefined;
+          let mailboxedToUnknown = false;
+          if (resolvable) {
+            verdictId = routed ?? ctx.tabId;
+          } else if (isScopeAddress(ctx.tabId)) {
+            mailboxedToUnknown = true;
+          } else {
+            verdictId = ctx.tabId;
+          }
+          const headlessTarget =
+            verdictId != null &&
             typeof b?.isHeadless === "function" &&
-            b.isHeadless(judgeId)
-          ) {
-            return fail(headlessAudioRefusal(audioTargets));
+            b.isHeadless(verdictId);
+          if (headlessTarget || mailboxedToUnknown) {
+            return fail(
+              headlessAudioRefusal(audioTargets, { mailboxedToUnknown }),
+            );
           }
         }
 
