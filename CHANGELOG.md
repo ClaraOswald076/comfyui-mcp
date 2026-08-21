@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.45] - 2026-08-21
+
+### MCP
+
+#### Fixed
+- segmented downloads can write a hole INSIDE a segment — the review landed one minute after the merge (#1977)
+
+
 ## [0.52.44] - 2026-08-21
 
 ### Added
