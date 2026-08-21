@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.47] - 2026-08-21
+
 ### Fixed
 
 - **`panel_get_errors` no longer presents a clean `errored_count: 0` while most of
@@ -23,6 +25,15 @@ All notable changes to this project are documented here. This project adheres to
   abstains rather than guessing wherever the panel's own scanner would have —
   notably on UPLOAD inputs, whose values ComfyUI's combo list structurally cannot
   enumerate and which it has no `/view` probe to adjudicate.
+
+### MCP
+
+#### Fixed
+- panel_get_errors no longer reports a clean 0 while execution nodes stay unchecked (#1981)
+- uncollapse expands a title-chip; schema and save timeouts are named honestly (#2027)
+- panel_add_node names the live ConvertAny2Dict sibling instead of a missing-DICT dead end (#2026)
+- restart_comfyui reports a serving server as ready, not a failed start (#2025)
+
 
 ## [0.52.46] - 2026-08-21
 
