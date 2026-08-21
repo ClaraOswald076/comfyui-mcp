@@ -46,8 +46,13 @@ function bridge(opts: {
   activeUuid: string;
   /** "ok" passes; "mismatch" is a real fence refusal; "timeout" is an inconclusive failure. */
   graphRead: "ok" | "mismatch" | "timeout";
-  /** true/false answer the write-capability probe; "unknown" leaves it unanswerable. */
-  canMutate?: boolean | "unknown";
+  /**
+   * true/false answer the write-capability probe.
+   * "unknown" stays unanswerable even after the settling read.
+   * "unknown-until-read" is the post-restart race (#1696): unknown until
+   * graph_query has round-tripped, then observed can-mutate.
+   */
+  canMutate?: boolean | "unknown" | "unknown-until-read";
 }) {
   return {
     send: async (cmd: Record<string, unknown>) => {
@@ -91,22 +96,31 @@ function bridge(opts: {
     resolveActiveTabId: () => TAB,
     refreshWorkflowUuid: () => true,
     workflowUuidFor: () => ({ known: true, uuid: SAME_UUID }),
-    tabCanMutateGraph: () => (opts.canMutate === "unknown" ? undefined : opts.canMutate !== false),
-    tabGraphMutationCapability: () =>
-      opts.canMutate === "unknown"
-        ? { known: false }
-        : {
-            known: true,
-            canMutate: opts.canMutate !== false,
-            ...(opts.canMutate === false ? { because: "capability" as const } : {}),
-          },
+    tabCanMutateGraph: () =>
+      opts.canMutate === "unknown" ||
+      (opts.canMutate === "unknown-until-read" && !sent.includes("graph_query"))
+        ? undefined
+        : opts.canMutate !== false,
+    tabGraphMutationCapability: () => {
+      if (opts.canMutate === "unknown") return { known: false };
+      if (opts.canMutate === "unknown-until-read") {
+        return sent.includes("graph_query")
+          ? { known: true, canMutate: true }
+          : { known: false };
+      }
+      return {
+        known: true,
+        canMutate: opts.canMutate !== false,
+        ...(opts.canMutate === false ? { because: "capability" as const } : {}),
+      };
+    },
   } as unknown as PanelToolCtx["bridge"];
 }
 
 async function setTargetCurrent(opts: {
   activeUuid: string;
   graphRead: "ok" | "mismatch" | "timeout";
-  canMutate?: boolean | "unknown";
+  canMutate?: boolean | "unknown" | "unknown-until-read";
 }) {
   const ctx = makePanelToolCtx(bridge(opts), TAB, new WorkflowTargetStore());
   const def = buildPanelToolDefs().find((d) => d.name === "panel_set_workflow_target");
@@ -157,6 +171,24 @@ describe("an UNCONFIRMED record whose uuid matches the fence gets its answer up 
     expect(out.text).toMatch(/did NOT restore/);
     expect(out.text).toMatch(/CHECKED FOR YOU/);
     expect(out.text).toMatch(/it SUCCEEDED/);
+  });
+
+  it("reports BOUND when write capability is unknown only until the settling read answers (#1696)", async () => {
+    // The pre-probe snapshot is taken while the tab may still be reconnecting, so
+    // canMutateNow is undefined. The settling graph_query then round-trips; the
+    // write-capability probe must be asked AGAIN of the tab that answered, not
+    // left as the stale unknown (and not rounded up to true without looking).
+    const out = await setTargetCurrent({
+      activeUuid: SAME_UUID,
+      graphRead: "ok",
+      canMutate: "unknown-until-read",
+    });
+
+    expect(sent).toContain("graph_query");
+    expect(out.isError).toBe(false);
+    expect(out.text).toMatch(/"graph_binding":\s*"bound"/);
+    expect(out.text).toMatch(/ACCEPTED by the panel/);
+    expect(out.text).not.toMatch(/did NOT restore/);
   });
 
   it("keeps the failure when the graph read is REFUSED", async () => {
