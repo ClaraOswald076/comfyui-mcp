@@ -6301,10 +6301,13 @@ export async function runPanelOrchestrator(): Promise<void> {
   // observation went only to the `queue_status` UI broadcast. This watchdog is
   // the join: an observed completion whose panel_run ticket is still unanswered
   // after the grace is synthesised into the SAME journal the real frame uses.
+  // A fast completion may precede the ticket itself, so the watchdog also holds
+  // unknown ids briefly and re-checks them after panel_run's reply can arrive.
   // See run-completion-watchdog.ts for why it waits, and why the panel's frame
   // still wins whenever it is coming.
   const wd = createRunCompletionWatchdog({
     awaiting: (promptId) => RunCompletions.awaitingCompletion(promptId),
+    knownTicket: (promptId) => RunCompletions.ticketFor(promptId),
     resolveOutputs: (promptId) => resolveHistoryCompletionImages(promptId),
     lookupStatus: (promptId) => resolveHistoryCompletionStatus(promptId),
     deliver: (payload, ticket) => {

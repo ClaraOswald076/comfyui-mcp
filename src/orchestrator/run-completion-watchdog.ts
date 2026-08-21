@@ -29,8 +29,10 @@
 // promised was in the orchestrator's hands and thrown away.
 //
 // This module is the join, and only the join:
-//   observe()  — a QueueMonitor completion whose prompt id has an UNANSWERED
-//                panel_run ticket is armed with the time we saw it.
+//   observe()  — a QueueMonitor completion is held with the time we saw it. An
+//                already-open panel_run ticket is the normal case, but a fast
+//                render may arrive before panel_run can open its ticket, so the
+//                expiry check below re-asks whether the run became ours.
 //   tick()     — once the grace has elapsed, ask AGAIN. Still unanswered ⇒ the
 //                panel is never going to report it: synthesise the completion
 //                from what ComfyUI told us and hand it to the same journal the
@@ -99,6 +101,13 @@ interface ArmedCompletion {
   /** Monotonic-ish ms (the injected clock) when WE observed the finish. */
   observedAt: number;
   /**
+   * Whether a live ticket existed when this observation arrived. Unticketed
+   * observations are retained for the dispatch/reply race (#2021), but are
+   * preferred for eviction when the bounded arm set is full. A later
+   * `awaiting()` check at expiry is authoritative.
+   */
+  ticketedAtObservation?: true;
+  /**
    * This arm reached the stills grace and /history showed media the panel has
    * to build a storyboard for, so it was re-armed ONCE against the longer
    * bound. Set on the re-arm and never cleared: the extension is granted at
@@ -113,6 +122,12 @@ export interface RunCompletionWatchdogDeps {
    *  to arm, once at expiry — because the whole point is the state changing in
    *  between (the panel's real frame landing). */
   awaiting: (promptId: string) => RunTicket | undefined;
+  /**
+   * Distinguishes an already-known but no-longer-owed ticket from a prompt id
+   * that has never been ticketed. The latter can be the #2021 dispatch/reply
+   * race; the former is a duplicate observation the journal already owns.
+   */
+  knownTicket?: (promptId: string) => RunTicket | undefined;
   /** Journal + flush a synthesised completion for `ticket`. */
   deliver: (payload: CompletionPayload, ticket: RunTicket) => void;
   /**
@@ -395,6 +410,7 @@ export function synthesizeCompletionPayload(
 
 export function createRunCompletionWatchdog({
   awaiting,
+  knownTicket,
   deliver,
   resolveOutputs,
   lookupStatus,
@@ -412,11 +428,32 @@ export function createRunCompletionWatchdog({
    *  fetch is still in flight. */
   const inflight = new Set<string>();
 
-  const arm = (promptId: string, status: CompletionStatus, observedAt: number): void => {
-    if (armed.has(promptId) || inflight.has(promptId)) return;
-    armed.set(promptId, { promptId, status, observedAt });
+  const arm = (
+    promptId: string,
+    status: CompletionStatus,
+    observedAt: number,
+    ticketedAtObservation = false,
+  ): void => {
+    const existing = armed.get(promptId);
+    if (existing) {
+      // A repeated QueueMonitor observation after panel_run received its reply
+      // upgrades the arm's eviction priority without moving its deadline.
+      if (ticketedAtObservation) existing.ticketedAtObservation = true;
+      return;
+    }
+    if (inflight.has(promptId)) return;
+    armed.set(promptId, {
+      promptId,
+      status,
+      observedAt,
+      ...(ticketedAtObservation ? { ticketedAtObservation: true } : {}),
+    });
     while (armed.size > MAX_ARMED) {
-      const oldest = armed.keys().next().value;
+      // Unknown/foreign completions are only held for the ticket-opening race;
+      // do not let a burst of them evict arms that were already owed by a
+      // panel_run ticket. If every arm is ticketed, retain FIFO eviction.
+      const unticketed = [...armed.entries()].find(([, entry]) => !entry.ticketedAtObservation);
+      const oldest = unticketed?.[0] ?? armed.keys().next().value;
       if (oldest === undefined) break;
       armed.delete(oldest);
     }
@@ -526,11 +563,24 @@ export function createRunCompletionWatchdog({
         try {
           const promptId = typeof ev?.promptId === "string" ? ev.promptId.trim() : "";
           if (!promptId) continue;
-          // Only runs THIS session queued and is still owed a completion for.
-          // A foreign render (the user pressed Queue Prompt) has no ticket and
-          // was never promised anything, so it must never wake the agent.
-          if (!awaiting(promptId)) continue;
-          arm(promptId, ev.status, now());
+          // Usually this is an open ticket. A fast render can finish before the
+          // panel's graph_run reply returns its prompt id to panel_run (#2021),
+          // though, so retain an unticketed observation until expiry and ask
+          // again there. A genuinely foreign render is then discarded silently.
+          let ticketedAtObservation = false;
+          try {
+            ticketedAtObservation = Boolean(awaiting(promptId));
+            // `awaiting()` is intentionally false once the journal has a
+            // completion, including after ACK. Do not retain those duplicate
+            // observations; only a prompt id with no known ticket is a
+            // candidate for the pre-openRun race.
+            if (!ticketedAtObservation && knownTicket?.(promptId)) continue;
+          } catch (err) {
+            logger.debug(
+              `[run-completion-watchdog] could not check prompt ${promptId} while observing: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+          arm(promptId, ev.status, now(), ticketedAtObservation);
         } catch (err) {
           logger.debug(
             `[run-completion-watchdog] observe skipped an event: ${err instanceof Error ? err.message : String(err)}`,
@@ -565,7 +615,7 @@ export function createRunCompletionWatchdog({
               if (!awaiting(promptId)) continue;
               // observedAt = now: we just learned it finished. expire(true)
               // skips the grace; waitedS in the note is the lookup latency.
-              arm(promptId, status, now());
+              arm(promptId, status, now(), true);
             } catch (err) {
               logger.debug(
                 `[run-completion-watchdog] reconcile skipped a prompt: ${err instanceof Error ? err.message : String(err)}`,
