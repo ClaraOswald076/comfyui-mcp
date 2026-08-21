@@ -5732,13 +5732,16 @@ function openedNormalizedContentResult(destPath: string): ToolResult {
 async function tryAcceptNormalizedOpenContent(
   ctx: PanelToolCtx,
   destPath: string,
+  liveGraph?: Record<string, unknown> | null,
 ): Promise<{ status: "accepted" } | { status: "skipped" }> {
-  let live: Record<string, unknown> | null = null;
-  try {
-    const serialized = await ctx.call({ cmd: "graph_serialize" }, 8000);
-    live = workflowFromSerializeReply(parseToolResultJson(serialized));
-  } catch {
-    return { status: "skipped" };
+  let live = liveGraph ?? null;
+  if (!live) {
+    try {
+      const serialized = await ctx.call({ cmd: "graph_serialize" }, 8000);
+      live = workflowFromSerializeReply(parseToolResultJson(serialized));
+    } catch {
+      return { status: "skipped" };
+    }
   }
   if (!live) return { status: "skipped" };
 
@@ -5755,16 +5758,206 @@ async function tryAcceptNormalizedOpenContent(
   return { status: "accepted" };
 }
 
-function identityClaimedButLiveGraphUnchangedNote(ctx: PanelToolCtx): string {
+/**
+ * panel#1555 — post-reconnect handshake before treating an identity-proven
+ * content warning as a hard PREVIOUS-workflow mismatch.
+ *
+ * After a ComfyUI restart the tab can answer `workflow_open` (and even
+ * `graph_query`) before `workflow_list.active_confirmed` and the live serialize
+ * have finished one synchronized handshake. Comparing content in that window
+ * produced a false CONTENT MISMATCH for the workflow that was already the
+ * active canvas; a later panel_query_graph showed the requested graph.
+ *
+ * Same cost-on-failure discipline as #1292: this runs only after dest-vs-live
+ * already missed. dest-vs-live itself is unchanged; the wait only buys a
+ * confirmed list + readable serialize to judge.
+ */
+const OPEN_CONTENT_HANDSHAKE_STEPS_MS = [400, 900, 1600] as const;
+let openContentHandshakeStepsMsOverride: readonly number[] | null = null;
+
+function openContentHandshakeStepsMs(): readonly number[] {
+  return openContentHandshakeStepsMsOverride ?? OPEN_CONTENT_HANDSHAKE_STEPS_MS;
+}
+
+function workflowRoutingKey(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  const rec = value as { routing_key?: unknown; path?: unknown; key?: unknown };
+  if (typeof rec.routing_key === "string" && rec.routing_key) return rec.routing_key;
+  const fromPath = canonicalRequestedSavedIdentity(rec.path);
+  if (fromPath) return fromPath;
+  if (typeof rec.path === "string" && rec.path) return rec.path;
+  if (typeof rec.key === "string" && rec.key) return rec.key;
+  return null;
+}
+
+function openMismatchRoutingNote(
+  expected: string | null,
+  observed: string | null,
+  uuid?: string,
+): string {
+  const exp = expected ?? "(none)";
+  const obs = observed ?? "(none)";
+  const id = uuid ? `, workflow_uuid ${uuid}` : "";
+  return `expected routing ${exp}; observed routing ${obs}${id}`;
+}
+
+type LiveSerializeRead =
+  | { status: "graph"; live: Record<string, unknown> }
+  | { status: "answered" }
+  | { status: "unread" };
+
+async function readLiveSerialize(ctx: PanelToolCtx): Promise<LiveSerializeRead> {
+  try {
+    const serialized = await ctx.call({ cmd: "graph_serialize" }, 8000);
+    if (serialized?.isError) {
+      const text = toolResultText(serialized);
+      if (isAckTimeout(serialized) || /did not reply/i.test(text)) return { status: "unread" };
+      const live = workflowFromSerializeReply(parseToolResultJson(serialized));
+      return live ? { status: "graph", live } : { status: "answered" };
+    }
+    const live = workflowFromSerializeReply(parseToolResultJson(serialized));
+    return live ? { status: "graph", live } : { status: "answered" };
+  } catch (err) {
+    if (isWorkflowInstanceMismatch(err)) return { status: "answered" };
+    return { status: "unread" };
+  }
+}
+
+interface OpenContentHandshake {
+  list: Record<string, unknown> | null;
+  live: Record<string, unknown> | null;
+  confirmed: boolean;
+  expectedRouting: string | null;
+  observedRouting: string | null;
+  observedUuid: string | undefined;
+}
+
+async function waitForOpenContentHandshake(
+  ctx: PanelToolCtx,
+  destPath: string,
+): Promise<OpenContentHandshake> {
+  const expectedRouting = canonicalRequestedSavedIdentity(destPath) ?? destPath;
+
+  const attempt = async (): Promise<OpenContentHandshake & { settles: boolean; liveUnread: boolean }> => {
+    let list: Record<string, unknown> | null = null;
+    try {
+      const res = await ctx.call({ cmd: "workflow_list" }, 6000);
+      if (!res?.isError) list = parseToolResultJson(res);
+    } catch {
+      list = null;
+    }
+    // `active_confirmed:false` is the post-restart window. Fence-adoption
+    // corroboration (empty/mixed `workflows`) is a different question — waiting
+    // on that here would add the #1292 budget to every identity-proven failure
+    // whose list is merely incomplete.
+    const unconfirmed = list?.active_confirmed === false;
+    const confirmed = Boolean(list && !unconfirmed && list.active);
+    const serialize = await readLiveSerialize(ctx);
+    const live = serialize.status === "graph" ? serialize.live : null;
+    const active = list?.active;
+    return {
+      list,
+      live,
+      confirmed,
+      expectedRouting,
+      observedRouting: workflowRoutingKey(active),
+      observedUuid: responseWorkflowUuid(active),
+      settles: !list || unconfirmed,
+      liveUnread: serialize.status === "unread",
+    };
+  };
+
+  let last = await attempt();
+  if (last.confirmed && !last.liveUnread) return last;
+  for (const waitMs of openContentHandshakeStepsMs()) {
+    if (last.confirmed && !last.liveUnread) break;
+    if (!last.settles && !last.liveUnread) break;
+    await sleep(waitMs);
+    last = await attempt();
+  }
+  return last;
+}
+
+type IdentityProvenHandshakeKind = "previous" | "same" | "unconfirmed";
+
+function identityProvenOpenAfterHandshake(
+  ctx: PanelToolCtx,
+  destPath: string,
+  handshake: OpenContentHandshake,
+): IdentityProvenHandshakeKind {
+  if (!handshake.confirmed) return "unconfirmed";
+  const reading = readOpenActiveAgainstTarget(
+    handshake.list?.active,
+    destPath,
+    handshake.list?.active_confirmed,
+  );
+  if (reading === "indeterminate") return "unconfirmed";
+  const fence = currentWorkflowFence(ctx);
+  const answeringIsListed =
+    fence.known &&
+    Boolean(fence.uuid) &&
+    Boolean(handshake.observedUuid) &&
+    fence.uuid === handshake.observedUuid;
+  // Graph still answers THIS session's stamp. That stamp names dest only when
+  // it equals the confirmed live uuid. Otherwise the previous instance is what
+  // answered (#1639). After restart of the SAME file, hello (or this session's
+  // existing fence) already names dest — that is not the previous workflow.
+  if (reading === "same" && answeringIsListed) return "same";
+  if (reading === "different" || !answeringIsListed) return "previous";
+  return "unconfirmed";
+}
+
+async function acceptNormalizedOpenContentAfterHandshake(
+  ctx: PanelToolCtx,
+  destPath: string,
+): Promise<{ status: "accepted"; handshake: OpenContentHandshake } | { status: "skipped"; handshake: OpenContentHandshake }> {
+  const handshake = await waitForOpenContentHandshake(ctx, destPath);
+  if (!handshake.live) return { status: "skipped", handshake };
+  const accepted = await tryAcceptNormalizedOpenContent(ctx, destPath, handshake.live);
+  return accepted.status === "accepted"
+    ? { status: "accepted", handshake }
+    : { status: "skipped", handshake };
+}
+
+function identityClaimedActiveUnconfirmedNote(handshake: OpenContentHandshake): string {
+  return (
+    `\n\nFENCE: NOT cleared (active identity UNCONFIRMED after reconnect handshake). The panel ` +
+    `asserted the canvas IS bound to the requested workflow, but the frontend workflow list and ` +
+    `active-canvas graph have not completed one synchronized handshake yet ` +
+    `(${openMismatchRoutingNote(handshake.expectedRouting, handshake.observedRouting, handshake.observedUuid)}). ` +
+    `active_confirmed is still unknown, so this is NOT a proven content mismatch and NOT the ` +
+    `previous workflow. Retry panel_open_workflow or read the graph (panel_query_graph) once ` +
+    `the tab finishes reconciling after restart.`
+  );
+}
+
+function identityClaimedSameWorkflowContentUnknownNote(handshake: OpenContentHandshake): string {
+  return (
+    `\n\nFENCE: NOT cleared (same workflow still answers). The canvas identity matches the ` +
+    `requested workflow after the reconnect handshake ` +
+    `(${openMismatchRoutingNote(handshake.expectedRouting, handshake.observedRouting, handshake.observedUuid)}), ` +
+    `but dest-vs-live content still does not match. This is NOT the previous workflow. ` +
+    `Re-read the graph (panel_query_graph / panel_graph_outline) before editing.`
+  );
+}
+
+function identityClaimedButLiveGraphUnchangedNote(
+  ctx: PanelToolCtx,
+  handshake?: OpenContentHandshake,
+): string {
   const fence = currentWorkflowFence(ctx);
   const fenceTxt =
     fence.known && fence.uuid
       ? `under this session's existing fence (${fence.uuid})`
       : `without being refused by a workflow-instance fence`;
+  const routing =
+    handshake
+      ? ` (${openMismatchRoutingNote(handshake.expectedRouting, handshake.observedRouting, handshake.observedUuid)})`
+      : "";
   return (
     `\n\nFENCE: NOT cleared (live graph still answers). CONTENT MISMATCH: the panel asserted the ` +
     `canvas IS bound to the requested workflow, but a live graph read still answers ${fenceTxt} — ` +
-    `the graph on screen is the PREVIOUS workflow, not the one just opened. That is the failure ` +
+    `the graph on screen is the PREVIOUS workflow, not the one just opened.${routing} That is the failure ` +
     `the fence exists to prevent: clearing it here would let later reads of this graph succeed ` +
     `as if they were the opened file. Do NOT trust "you are on the right workflow" / ` +
     `"You are NOT on the wrong workflow". Do NOT edit or save expecting the opened file. ` +
@@ -5799,6 +5992,31 @@ async function clearFenceOnIdentityProvenOpen(
       if (accepted.status === "accepted") {
         return { res: openedNormalizedContentResult(requestedPath), repaired: true };
       }
+      // panel#1555 — dest-vs-live missed, possibly because the post-restart
+      // list/graph handshake had not finished. Wait for one synchronized
+      // snapshot, then compare again. A confirmed DIFFERENT identity is still
+      // #1639 (previous workflow). An unconfirmed active is not a hard mismatch.
+      const after = await acceptNormalizedOpenContentAfterHandshake(ctx, requestedPath);
+      if (after.status === "accepted") {
+        return { res: openedNormalizedContentResult(requestedPath), repaired: true };
+      }
+      const kind = identityProvenOpenAfterHandshake(ctx, requestedPath, after.handshake);
+      if (kind === "unconfirmed") {
+        return {
+          res: appendToolResultText(res, identityClaimedActiveUnconfirmedNote(after.handshake)),
+          repaired: false,
+        };
+      }
+      if (kind === "same") {
+        return {
+          res: appendToolResultText(res, identityClaimedSameWorkflowContentUnknownNote(after.handshake)),
+          repaired: false,
+        };
+      }
+      return {
+        res: appendToolResultText(res, identityClaimedButLiveGraphUnchangedNote(ctx, after.handshake)),
+        repaired: false,
+      };
     }
     return { res: appendToolResultText(res, identityClaimedButLiveGraphUnchangedNote(ctx)), repaired: false };
   }
@@ -5837,6 +6055,12 @@ async function clearFenceOnIdentityProvenOpen(
   if (repaired && requestedPath) {
     const accepted = await tryAcceptNormalizedOpenContent(ctx, requestedPath);
     if (accepted.status === "accepted") {
+      return { res: openedNormalizedContentResult(requestedPath), repaired: true };
+    }
+    // panel#1555 — same post-restart handshake as the still-answering path:
+    // list identity and the live serialize can settle one snapshot later.
+    const after = await acceptNormalizedOpenContentAfterHandshake(ctx, requestedPath);
+    if (after.status === "accepted") {
       return { res: openedNormalizedContentResult(requestedPath), repaired: true };
     }
   }
@@ -8207,6 +8431,10 @@ export const __openWorkflowTestHooks = {
   /** Inject fast open-verify timing so tests don't wait the real ~6s budget. */
   setOpenVerifyTiming(timing: OpenVerifyTiming | null): void {
     openVerifyTimingOverride = timing;
+  },
+  /** Inject fast panel#1555 handshake rechecks so tests don't wait ~2.9s. */
+  setOpenContentHandshakeStepsMs(steps: readonly number[] | null): void {
+    openContentHandshakeStepsMsOverride = steps;
   },
   isAckTimeout,
   activeMatchesTarget,
