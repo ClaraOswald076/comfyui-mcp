@@ -1309,6 +1309,29 @@ describe("#836 — a reclaimable lock needs ownership proofs everywhere", () => 
     expect(existsSync(path)).toBe(false);
   });
 
+  it("refuses a FRESH lock naming our pid with a mismatched start — a clock step is not a death (#1955 review)", async () => {
+    // `ownerStartedMs` is derived from `Date.now() - uptime*1000`. The recorded
+    // value is written at lock take; this reading is recomputed now. Only
+    // Date.now() follows a wall-clock step, so a resume from sleep or an NTP
+    // correction shifts them apart with no process having died — here modelled
+    // as a recorded start an hour "earlier" than the live one.
+    //
+    // Without the stale-window floor this reclaims: a live orchestrator deletes
+    // the lock guarding its own in-flight panel op. Inside the window a
+    // mismatch has to be read as clock drift, not as a recycled pid.
+    const path = await plantLock(
+      JSON.stringify({
+        pid: process.pid,
+        startedAt: "just now",
+        ownerStartedMs: Date.now() - process.uptime() * 1000 - 60 * 60_000,
+      }),
+      2 * 60_000,
+    );
+    const res = reclaimAbandonedPanelLock();
+    expect(res.outcome).toBe("refused");
+    expect(existsSync(path)).toBe(true);
+  });
+
   it("refuses an old lock that still names THIS process's start time as live", async () => {
     // With a matching start time the pid IS us, even 50 hours later. Refusing
     // as "may have been reused" would be the lie identity was added to stop.

@@ -455,13 +455,33 @@ function startTimesMatch(obs: PanelLockObservation): boolean {
  *   - kill(0) says yes, but the OS process table does not list it (Windows
  *     kill(0) false-positive, #1953).
  *   - the pid is ours, but the recorded process start predates this life
- *     (the number was recycled onto us).
+ *     (the number was recycled onto us) AND the lock is past the stale window.
  */
 function ownerProvablyDead(obs: PanelLockObservation): boolean {
   if (obs.pid === undefined) return false;
   if (obs.pid === process.pid) {
     if (obs.ownerStartedMs !== undefined) {
-      if (obs.ownerStartedMs < processStartMs() - OWNER_START_TOLERANCE_MS) return true;
+      // The age floor is load-bearing, not belt-and-braces (review of #1955).
+      // `processStartMs()` is `Date.now() - uptime*1000`: the recorded value is
+      // written once at lock take, the live one is recomputed here, and only
+      // Date.now() absorbs a wall-clock step. A forward step of more than the
+      // tolerance (a resume from sleep, an NTP correction) therefore makes THIS
+      // process read its OWN live lock as a recycled pid and delete the lock
+      // guarding its own in-flight op — the concurrent-mutation case this
+      // module exists to prevent, reachable because hello auto-sync calls
+      // reclaim outside `lockHolderContext`.
+      //
+      // Requiring the stale window puts the floor exactly where the identity
+      // signal is weakest. It costs nothing real: for this to matter our pid
+      // must have been recycled onto us AND the dead predecessor's lock be
+      // under ten minutes old. Past that window the branch still fires, which
+      // is the wedge it was added for.
+      if (
+        obs.ageMs > STALE_LOCK_MS &&
+        obs.ownerStartedMs < processStartMs() - OWNER_START_TOLERANCE_MS
+      ) {
+        return true;
+      }
       if (startTimesMatch(obs)) return false;
     }
     // The number is ours. Without a recorded start we cannot tell this life
