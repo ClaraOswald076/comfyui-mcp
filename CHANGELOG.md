@@ -8,6 +8,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **`panel_show_media` plays audio (panel #1572).** The tool refused every audio
+  file — `unsupported file type ".wav"` — so a TTS/voice-clone session could not
+  play a generated take back to the user at all, and the agent worked around it
+  by wrapping each `.wav` in an mp4 with an ffmpeg `showwaves` filter. Nothing
+  had to be built: the panel has shipped a real `<audio controls>` card since
+  panel #710, and this orchestrator-side extension allowlist was the only closed
+  door. It now accepts `.wav/.mp3/.flac/.ogg/.oga/.opus/.m4a/.aac` — the panel
+  renderer’s own set, which covers what ComfyUI’s `SaveAudio`/`SaveAudioMP3`/
+  `SaveAudioOpus` actually write. It is still an explicit allowlist: `.wma`,
+  `.aiff` and every other unlisted type are refused exactly as before. The MIME
+  for each was measured in Chromium rather than copied from a table — `.opus` as
+  `audio/opus` and `.flac` as `audio/x-flac` are both refused by the browser
+  before any decoder runs.
+
 - **Ollama refuses audio unless the model is a verified listener (#1972).** Native
   `/api/chat` carries audio in `message.images[]`. Most models HTTP 400 (fail
   closed). `huihui_ai/gemma-4-abliterated:E4b-qat` accepts the payload and

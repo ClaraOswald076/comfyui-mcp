@@ -560,6 +560,17 @@ export async function stageFileIntoServedDir(
   }
 }
 
+/**
+ * What panel_show_media decided a file is, from its extension.
+ *
+ * #1572 added "audio". It is one type rather than three copies of the union so
+ * that the next kind cannot be added to the gate and forgotten in a note — the
+ * compiler named all four call sites when this widened, which is the only
+ * reason the "displays it at full size" prose below was not left claiming a
+ * `.wav` had been shown to someone.
+ */
+export type ShownMediaKind = "image" | "video" | "audio";
+
 /** One item that was staged into a served directory and forwarded by reference. */
 export type StagedForDisplay = {
   /** The original path the caller passed. */
@@ -567,7 +578,7 @@ export type StagedForDisplay = {
   /** The copy the panel was pointed at. */
   stagedPath: string;
   sizeBytes: number;
-  kind: "image" | "video";
+  kind: ShownMediaKind;
   ref: ComfyServableRef;
 };
 
@@ -614,15 +625,21 @@ export function oversizedInlineRefusal(opts: {
   path: string;
   sizeBytes: number;
   capBytes: number;
-  kind: "image" | "video";
+  kind: ShownMediaKind;
   resolution: ViewRefResolution;
 }): string {
   const { path, sizeBytes, capBytes, kind, resolution } = opts;
 
+  // Three kinds, three honest answers. The old two-branch form treated "not a
+  // video" as "an image", so once audio reached this gate (#1572) a `.wav`
+  // would have been described as displayed "at full size" and the agent told to
+  // call get_image to look at it — a claim about a file nobody can look at.
   const seeItYourself =
     kind === "video"
       ? "The panel then builds a SAMPLED contact sheet of the video for you; you are still not sent the video itself."
-      : "The panel then displays it to the USER at full size. To look at it YOURSELF, call get_image (action:\"get\") with its filename/subfolder/type — that returns the image inline.";
+      : kind === "audio"
+        ? "The panel then gives the USER an audio player for it. You are not sent the audio and cannot hear it — say what you generated, never what it sounds like, and ask the user if you need to know."
+        : "The panel then displays it to the USER at full size. To look at it YOURSELF, call get_image (action:\"get\") with its filename/subfolder/type — that returns the image inline.";
 
   const head =
     `file too large to send inline (${mb(sizeBytes)} > ${mb(capBytes)} cap): ${path}\n` +
@@ -684,7 +701,7 @@ export function oversizedInlineRefusal(opts: {
 export type ForwardedByReference = {
   path: string;
   sizeBytes: number;
-  kind: "image" | "video";
+  kind: ShownMediaKind;
   ref: ComfyServableRef;
 };
 
@@ -708,12 +725,19 @@ export function forwardedByReferenceNote(
   });
   const anyVideo = items.some((it) => it.kind === "video");
   const anyImage = items.some((it) => it.kind === "image");
+  const anyAudio = items.some((it) => it.kind === "audio");
   const howToSee = [
     anyImage
       ? `To look at an IMAGE yourself, call get_image (action:"get") with the filename/type/subfolder above — it comes back inline.`
       : null,
     anyVideo
       ? `A VIDEO is never sent to you inline; the panel's reply above carries a sampled contact sheet and says what it does and does not show. get_image (action:"get") on a video saves it to disk and returns the path.`
+      : null,
+    // #1572 — audio has no equivalent of the contact sheet, and saying nothing
+    // about it would leave the one kind an agent is most likely to narrate
+    // unheard as the only kind with no caveat attached.
+    anyAudio
+      ? `AUDIO is never sent to you either, and there is no sampled preview of it: the user gets a player, you get this note. Do not describe how it sounds.`
       : null,
   ]
     .filter(Boolean)
