@@ -18347,20 +18347,57 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
               const mime = resp.headers.get("content-type") ?? "";
               if (!resp.ok) {
                 probe.nonMedia.push({ filename: ref.filename, detail: `HTTP ${resp.status}` });
-              } else if (
-                !mime.startsWith("image/") &&
-                !mime.startsWith("video/") &&
-                // #1572 — audio is media. The panel classifies a /view ref by
-                // its FILENAME and has painted `.wav`/`.flac`/… into an
-                // `<audio>` card since #710, so a probe that called an
-                // `audio/wav` body "not media" was reporting a defect that did
-                // not exist, about a file the user could already hear.
-                !mime.startsWith("audio/")
-              ) {
-                probe.nonMedia.push({
-                  filename: ref.filename,
-                  detail: `content-type "${mime || "unset"}"`,
-                });
+              } else {
+                // #1572 (round 3, review P1) — "IS IT MEDIA" WAS ALWAYS THE
+                // WRONG QUESTION. This probe exists to predict a card that will
+                // render BROKEN, and the panel picks its painter from the ref's
+                // FILENAME, never from the body. So the test that matters is
+                // whether the served family MATCHES the family the filename
+                // promises — a `plate.png` that serves `audio/wav` paints an
+                // `<img>` at audio bytes and breaks, no matter that both halves
+                // are individually "media".
+                //
+                // The previous round widened the old image-or-video test to
+                // accept `audio/*` and, in doing so, blessed exactly that
+                // mismatch. Matching families instead is strictly better than
+                // either version: it stops flagging the `take.wav`-serves-audio
+                // case that was never broken (the reason for the widening), and
+                // it starts catching `take.wav` serving `image/png`, which the
+                // ORIGINAL code accepted just as wrongly in the other direction.
+                //
+                // When the filename yields no family we accept any media body.
+                // That is a deliberate false-NEGATIVE: an unclassifiable name
+                // gets a link card from the panel, which is not a broken card,
+                // and a diagnostic that cries wolf gets ignored. Note this uses
+                // the ORCHESTRATOR's extension sets, which are narrower than the
+                // panel renderer's — so an exotic-but-real image (`.bmp`,
+                // `.avif`) lands in that same accept-anything fallback rather
+                // than being wrongly accused.
+                const refExt = extname(ref.filename).toLowerCase();
+                const expected = IMAGE_EXTS.has(refExt)
+                  ? "image"
+                  : VIDEO_EXTS.has(refExt)
+                    ? "video"
+                    : AUDIO_EXTS.has(refExt)
+                      ? "audio"
+                      : null;
+                const isMediaBody =
+                  mime.startsWith("image/") ||
+                  mime.startsWith("video/") ||
+                  mime.startsWith("audio/");
+                if (!isMediaBody) {
+                  probe.nonMedia.push({
+                    filename: ref.filename,
+                    detail: `content-type "${mime || "unset"}"`,
+                  });
+                } else if (expected && !mime.startsWith(`${expected}/`)) {
+                  probe.nonMedia.push({
+                    filename: ref.filename,
+                    detail:
+                      `content-type "${mime}" but the filename says ${expected} — the panel picks its ` +
+                      `painter from the NAME, so this card renders broken`,
+                  });
+                }
               }
             } catch {
               // An unreachable /view from HERE says nothing reliable about the

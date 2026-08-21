@@ -131,3 +131,68 @@ describe("#1572 the probe still catches a genuinely non-media body", () => {
     expect(textOf(res)).toContain("HTTP 404");
   });
 });
+
+// #1572 round 3 — raised as a P1 by the gate on the previous head.
+//
+// Widening the probe to accept `audio/*` fixed one false alarm and created a
+// false CLEARANCE: `{filename:"plate.png"}` whose /view answers `audio/wav` is
+// two individually-valid media halves that do not belong together. The panel
+// picks its painter from the NAME, so it paints an `<img>` at audio bytes — a
+// broken card — and the probe, asking only "is this media", blessed it.
+//
+// "Is it media" was always the wrong question; the right one is "does the served
+// family match the family the filename promises". That also closes a hole the
+// ORIGINAL code had in the other direction, which nobody had reported: a
+// `take.wav` serving `image/png` passed the old image-or-video test.
+describe("#1572 the probe compares FAMILIES, because the panel paints by filename", () => {
+  const cases: Array<[string, string, string]> = [
+    // [filename, served content-type, why it is broken]
+    ["plate.png", "audio/wav", "the gate's exact case — image name, audio body"],
+    ["plate.png", "video/mp4", "image name, video body"],
+    ["take_00001.wav", "image/png", "audio name, image body — the ORIGINAL code accepted this"],
+    ["take_00001.wav", "video/mp4", "audio name, video body"],
+    ["clip.mp4", "audio/wav", "video name, audio body"],
+    ["clip.mp4", "image/png", "video name, image body"],
+  ];
+
+  it.each(cases)("%s served as %s is reported (%s)", async (filename, ct) => {
+    state.contentType = ct;
+    const { res } = await showMedia([{ source: { filename, type: "output" } }]);
+    const text = textOf(res);
+    expect(state.asked.length).toBe(1);
+    expect(text).toContain("did NOT return media");
+    expect(text).toContain(ct);
+    // The note must say WHY, or the agent cannot act on it.
+    expect(text).toMatch(/the panel picks its painter from the NAME/);
+  });
+
+  it.each([
+    ["take_00001.wav", "audio/wav"],
+    ["take_00001.flac", "audio/flac"],
+    ["plate.png", "image/png"],
+    ["clip.mp4", "video/mp4"],
+  ])("%s served as %s still counts as media", async (filename, ct) => {
+    state.contentType = ct;
+    const { res } = await showMedia([{ source: { filename, type: "output" } }]);
+    const text = textOf(res);
+    expect(text).toContain("all 1 probed returned media");
+    expect(text).not.toContain("did NOT return media");
+  });
+
+  it("a filename with no known extension accepts any media body — deliberately", async () => {
+    // The panel gives an unclassifiable name a LINK card, which is not a broken
+    // card. Flagging it would be a false alarm, and a diagnostic that cries wolf
+    // gets ignored. Pinned so the fallback is a decision, not an oversight.
+    state.contentType = "audio/wav";
+    const { res } = await showMedia([{ source: { filename: "mystery", type: "output" } }]);
+    expect(textOf(res)).toContain("all 1 probed returned media");
+  });
+
+  it("an exotic-but-real image extension is not accused", async () => {
+    // .bmp is in the PANEL's image set but not the orchestrator's, so it takes
+    // the accept-anything fallback rather than being wrongly flagged.
+    state.contentType = "image/bmp";
+    const { res } = await showMedia([{ source: { filename: "plate.bmp", type: "output" } }]);
+    expect(textOf(res)).not.toContain("did NOT return media");
+  });
+});
