@@ -465,7 +465,7 @@ function targetTemplateId(opts: RunpodCreateOptions): string {
 
 /** Container disk (GB) this deploy will request (#2014). ONE source of truth:
  *  deployOnce sends it and the tests assert against it. */
-export function effectiveContainerDiskGb(opts: RunpodCreateOptions): number {
+function effectiveContainerDiskGb(opts: RunpodCreateOptions): number {
   if (opts.containerDiskInGb !== undefined) return opts.containerDiskInGb;
   return targetTemplateId(opts) === DEFAULT_TEMPLATE_ID
     ? RUNPOD_STOCK_CONTAINER_DISK_GB
@@ -475,7 +475,7 @@ export function effectiveContainerDiskGb(opts: RunpodCreateOptions): number {
 /** The CUDA allow-list this deploy will send, or undefined/[] for no filter
  *  (#2016). ONE source of truth: deployOnce sends it AND createPod's
  *  everything-failed error explains it, so the two can never disagree. */
-export function effectiveAllowedCudaVersions(opts: RunpodCreateOptions): string[] | undefined {
+function effectiveAllowedCudaVersions(opts: RunpodCreateOptions): string[] | undefined {
   if (opts.allowedCudaVersions !== undefined) return opts.allowedCudaVersions;
   if (RUNPOD_ALLOWED_CUDA_VERSIONS !== undefined) return RUNPOD_ALLOWED_CUDA_VERSIONS;
   return targetTemplateId(opts) === DEFAULT_TEMPLATE_ID ? RUNPOD_STOCK_ALLOWED_CUDA_VERSIONS : undefined;
