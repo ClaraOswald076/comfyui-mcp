@@ -279,18 +279,20 @@ export async function resolveEffectiveComfyUIBaseLive(): Promise<string | undefi
 // ---------------------------------------------------------------------------
 
 /**
- * How the base a local write is about to land in was chosen — but ONLY for the
- * two answers that are a guess about THE MACHINE rather than a statement about
- * THIS SESSION's target. An explicit `COMFYUI_PATH` is neither, and is never
- * described here (see `detectLocalWriteTargetMismatch`).
+ * Which selector produced the base a local write was about to land in. Every one
+ * of them answers from CONFIGURATION — none is a statement by the running server
+ * about itself, which is the whole point of comparing them against one.
  */
-export type GuessedBaseSource = "saved-default-workspace" | "auto-detected";
+export type ConfiguredBaseSource =
+  | "comfyui-path"
+  | "saved-default-workspace"
+  | "auto-detected";
 
 export interface LocalWriteTargetMismatch {
   /** The root the write was about to land in. */
   base: string;
-  /** Which machine-wide guess produced `base`. */
-  baseSource: GuessedBaseSource;
+  /** Which configuration selector produced `base`. */
+  baseSource: ConfiguredBaseSource;
   /** The root the CONNECTED server actually scans `custom_nodes/` from. */
   liveRoot: string;
   /** What established `liveRoot`. Both are the server's OWN self-report. */
@@ -316,18 +318,6 @@ function canonicalRoot(p: string): string {
 /** Do these two paths name the SAME install? */
 export function sameInstallRoot(a: string, b: string): boolean {
   return canonicalRoot(a) === canonicalRoot(b);
-}
-
-/**
- * Was `COMFYUI_PATH` set explicitly for this process?
- *
- * `config.comfyuiPath` conflates two very different things: the user NAMING an
- * install for this session, and `detectComfyUIPaths()` picking the first of
- * however many installs happen to sit on the machine. Only the env var is the
- * former, so only the env var may outrank the running server's self-report.
- */
-function comfyuiPathWasNamedExplicitly(): boolean {
-  return Boolean(normalizeInstallPathEnv(process.env.COMFYUI_PATH).path);
 }
 
 /**
@@ -357,30 +347,47 @@ function comfyuiPathWasNamedExplicitly(): boolean {
  *
  *   1. the session is LOCAL (a remote target has no local write to misdirect —
  *      the callers refuse that separately, and earlier);
- *   2. `base` came from a machine-wide GUESS. An explicit `COMFYUI_PATH` is the
- *      user naming this install, and keeps winning exactly as documented;
- *   3. the connected server PROVES a pack root — its resolved `--base-directory`,
+ *   2. the connected server PROVES a pack root — its resolved `--base-directory`,
  *      else its own `main.py` root — and that root exists on disk and looks like
  *      an install;
- *   4. the two are not the same tree after canonicalization.
+ *   3. the two are not the same tree after canonicalization.
  *
  * FAILS OPEN everywhere else, deliberately: an unreachable server, a Desktop
  * launch whose relative `main.py` cannot be anchored, or a `--base-directory` we
  * cannot resolve all mean we do not KNOW the write is misdirected — and a refusal
  * on a root we merely failed to prove would break every install that works today.
  * Never throws.
+ *
+ * THERE IS NO "BUT THE USER SET COMFYUI_PATH" CARVE-OUT, and the first revision
+ * of this function had one. It was wrong: the panel orchestrator resolves
+ * `envComfyuiPath || detectLocalComfyUIPath()` and forwards the RESULT to every
+ * child MCP as `COMFYUI_PATH` (orchestrator/index.ts), so in a panel-spawned
+ * child an auto-detected guess is byte-identical to a user's deliberate setting.
+ * A carve-out keyed on "the env var is set" would therefore have disabled this
+ * check in exactly the sessions it exists for, while reading as careful scoping.
+ *
+ * KNOWN FALSE POSITIVE, stated rather than implied: a deployment that adds
+ * `custom_nodes` to the live server's `extra_model_paths` config pointing at the
+ * configured base IS read by that server, and this cannot see that — it would be
+ * refused. The refusal names both roots and NOTHING is written, and the Manager
+ * install route (which targets the connected server directly) is untouched, so
+ * the cost is a refusal on an exotic layout rather than a wrong write on a
+ * common one. Corroborating against the server's own extra paths is the fix if
+ * that shape shows up; it is a different seam and is not claimed here.
  */
 export async function detectLocalWriteTargetMismatch(
   base: string | undefined,
 ): Promise<LocalWriteTargetMismatch | undefined> {
   if (!base || isRemoteMode()) return undefined;
-  if (comfyuiPathWasNamedExplicitly()) return undefined;
 
+  const envPath = normalizeInstallPathEnv(process.env.COMFYUI_PATH).path;
   const savedDefault = getSavedDefaultWorkspaceSync();
-  const baseSource: GuessedBaseSource =
-    savedDefault && sameInstallRoot(savedDefault, base)
-      ? "saved-default-workspace"
-      : "auto-detected";
+  const baseSource: ConfiguredBaseSource =
+    envPath && sameInstallRoot(envPath, base)
+      ? "comfyui-path"
+      : savedDefault && sameInstallRoot(savedDefault, base)
+        ? "saved-default-workspace"
+        : "auto-detected";
 
   const snapshot = await getLiveServerSnapshot();
   if (!snapshot.reachable) return undefined;

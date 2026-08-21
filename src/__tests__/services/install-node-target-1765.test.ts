@@ -254,6 +254,7 @@ describe("#1765 — install_custom_node must not write into an install this sess
     expect(error).toContain(CONNECTED);
     expect(error).toContain("http://127.0.0.1:8189");
     expect(error).toContain("SAVED DEFAULT WORKSPACE");
+    expect(error).toContain("--base-directory");
     expect(error).toMatch(/two DIFFERENT ComfyUI installs/);
     expect(error).toContain(`COMFYUI_PATH=${CONNECTED}`);
   });
@@ -322,13 +323,29 @@ describe("#1765 — install_custom_node must not write into an install this sess
     expect(clonedInto()).toBe(join(SAVED_DEFAULT, PACK_DIR));
   });
 
-  it("leaves an EXPLICIT COMFYUI_PATH in charge — that is #1766's shipped contract", async () => {
-    // A named COMFYUI_PATH is the user stating which install this session acts on
-    // (and, on a split deployment, which DATA root packs belong in). Only a
-    // machine-wide GUESS — the saved default workspace, or auto-detection across
-    // six installs — may be overruled by the running server.
+  it("refuses a COMFYUI_PATH that disagrees too — the env var is not proof of intent", async () => {
+    // The panel orchestrator resolves `COMFYUI_PATH || detectLocalComfyUIPath()`
+    // and forwards the RESULT to every child MCP as COMFYUI_PATH, so "the env var
+    // is set" cannot distinguish a deliberate setting from an auto-detected guess.
+    // A carve-out keyed on it would have switched this check off in exactly the
+    // panel sessions it exists for.
     process.env.COMFYUI_PATH = SAVED_DEFAULT;
     cfg.comfyuiPath = SAVED_DEFAULT;
+
+    const { ok, error } = await install({ id: REPO, source: "git" });
+
+    expect(ok).toBeUndefined();
+    expect(clonedInto()).toBeUndefined();
+    expect(error).toContain("COMFYUI_PATH");
+    expect(error).toMatch(/two DIFFERENT ComfyUI installs/);
+    // …and it names the supported way to make that data root authoritative.
+    expect(error).toContain(`--base-directory ${SAVED_DEFAULT}`);
+  });
+
+  it("clones normally when COMFYUI_PATH names the connected install", async () => {
+    process.env.COMFYUI_PATH = SAVED_DEFAULT;
+    cfg.comfyuiPath = SAVED_DEFAULT;
+    live.argv = [join(SAVED_DEFAULT, "main.py"), "--port", "8189"];
 
     const { ok, error } = await install({ id: REPO, source: "git" });
 

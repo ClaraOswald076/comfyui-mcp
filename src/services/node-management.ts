@@ -2509,9 +2509,11 @@ function managerEnqueueRefusal(err: unknown): number | undefined {
  */
 function wrongInstallRefusal(m: LocalWriteTargetMismatch, what: string): string {
   const chosenBy =
-    m.baseSource === "saved-default-workspace"
-      ? 'the SAVED DEFAULT WORKSPACE (workspace action:"set_default")'
-      : "AUTO-DETECTION of ComfyUI installs on this machine";
+    m.baseSource === "comfyui-path"
+      ? "COMFYUI_PATH"
+      : m.baseSource === "saved-default-workspace"
+        ? 'the SAVED DEFAULT WORKSPACE (workspace action:"set_default")'
+        : "AUTO-DETECTION of ComfyUI installs on this machine";
   const provenBy =
     m.liveSource === "base-directory"
       ? "its own --base-directory"
@@ -2521,10 +2523,11 @@ function wrongInstallRefusal(m: LocalWriteTargetMismatch, what: string): string 
     `${getComfyUIBaseUrl()}, which runs from ${m.liveRoot} (established from ${provenBy}). ` +
     `Those are two DIFFERENT ComfyUI installs, so NOTHING was written: the pack would have ` +
     `landed in a custom_nodes/ the connected server never scans, and this call would have ` +
-    `reported success. ${m.base} was chosen by ${chosenBy} — a guess about this MACHINE, ` +
-    `not a statement about which install this session targets. Set ` +
-    `COMFYUI_PATH=${m.liveRoot} (or to whichever install you actually mean) and retry, or ` +
-    `point the session at the install you want to modify.`
+    `reported success. ${m.base} was chosen by ${chosenBy} — configuration, which describes ` +
+    `this MACHINE; the root above is what the running server says about ITSELF. To install ` +
+    `into the connected server, set COMFYUI_PATH=${m.liveRoot} and retry. If ${m.base} really ` +
+    `is where you want packs for this server, launch it with --base-directory ${m.base} — ` +
+    `that is the flag that makes a data root authoritative, and it is honored here.`
   );
 }
 
