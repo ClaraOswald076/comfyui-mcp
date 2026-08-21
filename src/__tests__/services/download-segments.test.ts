@@ -116,10 +116,12 @@ async function startServer(body: Buffer, mode: ServerMode): Promise<Rig> {
       mode === "bad-content-range"
         ? `bytes ${start}-${end}/${body.length + 1}`
         : `bytes ${start}-${end}/${body.length}`;
-    if (mode === "short-segment" && start > 0) {
-      // A Content-Range that promises the WHOLE segment over a body that stops
-      // half way, delivered cleanly. The headers look right; only a byte count
-      // stands between this and a finalized model with a hole in it.
+    // A MIDDLE segment short, with the FIRST and LAST segments complete. That
+    // shape is the whole reason the byte counts exist: the finished file reaches
+    // its full declared SIZE (the last segment writes the final byte) with a
+    // zero-filled hole in the middle, so the size check the caller already runs
+    // cannot see it. Only counting what each segment actually wrote can.
+    if (mode === "short-segment" && start > 0 && end < body.length - 1) {
       const half = Math.max(1, Math.floor(slice.length / 2));
       res.writeHead(206, {
         "content-type": "application/octet-stream",
