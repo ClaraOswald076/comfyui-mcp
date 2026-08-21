@@ -3315,6 +3315,46 @@ describe("#1999 drained Manager queue: report what was observed", () => {
     expect(String(err?.message ?? err)).not.toMatch(/RAN the task and it FAILED/);
   });
 
+  // The branches above all leave through the #724/#824 git fallback (the panel
+  // dir is a checkout). A registry-ZIP install has no `previousRev`, so it
+  // leaves through finalizeUpdate instead — a SEPARATE narrator that made the
+  // same false claim, and would keep making it if only the fallback were fixed.
+  it("registry-ZIP install (no git): finalizeUpdate names the real failure too", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.13.6") },
+      // No `revs` entry → no git-HEAD → not a checkout → no fallback to take.
+      updateDetails: V4_DRAINED,
+      managerTaskRecord: FAILED_RECORD,
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    const msg = String(err?.message ?? err);
+    expect(msg).toMatch(/did NOT apply/);
+    expect(msg).toMatch(/RAN the task and it FAILED/);
+    expect(msg).toMatch(/An error occurred while updating 'comfyui-mcp-panel'\./);
+    // The remedy follows the evidence: fix what Manager reported, not "your
+    // ComfyUI-Manager is stale" — the advice this issue was handed four times.
+    expect(msg).toMatch(/traceback is in the ComfyUI server log/);
+    expect(msg).not.toMatch(/never actually enqueued/);
+    expect(msg).not.toMatch(/stale ComfyUI-Manager 3\.x silent no-op/);
+  });
+
+  it("registry-ZIP install with NO readable record: finalizeUpdate says UNKNOWN", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.13.6") },
+      updateDetails: V4_DRAINED,
+      managerTaskRecord: undefined,
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    const msg = String(err?.message ?? err);
+    expect(msg).toMatch(/could NOT be established/);
+    expect(msg).toMatch(/queue\/history\?ui_id=/);
+    expect(msg).not.toMatch(/RAN the task and it FAILED/);
+    expect(msg).not.toMatch(/never actually enqueued/);
+  });
+
   it("a PROVEN update still succeeds — the lookup never vetoes disk evidence", async () => {
     const h = makeDeps({
       comfyuiPath: COMFY,
