@@ -43,7 +43,7 @@
 //    a hard kill: a kill leaves the holey bytes in `.seg`, which is not a resume
 //    candidate and is truncated away by the next segmented attempt.
 
-import { open, rename, rm, truncate } from "node:fs/promises";
+import { open, rename, rm, truncate, type FileHandle } from "node:fs/promises";
 import { Readable } from "node:stream";
 import { ModelError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -299,6 +299,35 @@ export async function probeSegmentedRanges(
   return { segments: opts.segments, index, response: res, totalBytes: opts.totalBytes };
 }
 
+/**
+ * Open the scratch file for a positional write.
+ *
+ * The staged `.partial` is SHARED — a second process running the same download
+ * names the same path (that is what `stagedFileIsShared` is about) — so it names
+ * the same `.seg` too, and whichever process finishes first renames it away
+ * underneath the other. Left as a raw ENOENT that reads as a corrupt install and
+ * is not retryable, so the loser's download would fail outright where it used to
+ * succeed. Report it as what it is: interference, and retryable — the retry finds
+ * the winner's file already in the cache.
+ */
+function scratchTakenError(opts: SegmentedRunOptions): ModelError {
+  return new ModelError(
+    `Another process finished staging this download and took the staged file. ` +
+      `Nothing was corrupted; retry to pick up its result.`,
+    { url: opts.logUrl, retryable: true },
+  );
+}
+
+async function openScratch(opts: SegmentedRunOptions): Promise<FileHandle> {
+  try {
+    return await open(segmentScratchPath(opts.targetPath), "r+");
+  } catch (err) {
+    // The loser opened it AFTER the winner renamed it away.
+    if ((err as { code?: string })?.code === "ENOENT") throw scratchTakenError(opts);
+    throw err;
+  }
+}
+
 /** Drain one 206 body into the scratch file at its absolute offset, advancing
  *  `state.written` as bytes land so a retry resumes mid-segment and a failure
  *  can be truncated to a contiguous prefix. */
@@ -310,7 +339,7 @@ async function drainSegmentBody(
   index: number,
 ): Promise<void> {
   const length = seg.end - seg.start + 1;
-  const fh = await open(segmentScratchPath(opts.targetPath), "r+");
+  const fh = await openScratch(opts);
   try {
     const body = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream);
     for await (const chunk of body) {
@@ -519,7 +548,14 @@ export async function runSegmentedDownload(
         { url: opts.logUrl, retryable: true },
       );
     }
-    await rename(scratch, opts.targetPath);
+    try {
+      await rename(scratch, opts.targetPath);
+    } catch (err) {
+      // The loser held its handles open across the winner's rename and only found
+      // the scratch gone at the end. Same interference, same retryable verdict.
+      if ((err as { code?: string })?.code === "ENOENT") throw scratchTakenError(opts);
+      throw err;
+    }
     abandon.abort();
     return { connections: segments.length, bytesWritten };
   } catch (err) {

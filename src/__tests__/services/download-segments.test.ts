@@ -189,7 +189,14 @@ afterEach(async () => {
   delete process.env.COMFYUI_DOWNLOAD_CONNECTIONS;
   delete process.env.COMFYUI_DOWNLOAD_SEGMENT_MIN_MB;
   delete process.env.COMFYUI_DOWNLOAD_MAX_ATTEMPTS;
-  await Promise.all(rigs.splice(0).map((s) => new Promise<void>((r) => s.close(() => r()))));
+  // closeAllConnections first: an aborted segment can leave the server side of a
+  // dribbled response open, and server.close() then never calls back.
+  await Promise.all(
+    rigs.splice(0).map((s) => {
+      s.closeAllConnections();
+      return new Promise<void>((r) => s.close(() => r()));
+    }),
+  );
   await rm(tempDir, { recursive: true, force: true });
 });
 
@@ -547,5 +554,55 @@ describe("segmented download over a stale partial (#1697)", () => {
     expect(sha(await readFile(dest))).toBe(sha(body));
     // Segmentation was used, not a silent fall back to one connection.
     expect(rig.requests.filter((r) => r.range).length).toBeGreaterThanOrEqual(4);
+  });
+});
+
+describe("segmented download interference between processes (#1697)", () => {
+  it("reports a scratch file taken by another process as retryable, not as a corrupt install", async () => {
+    // Two processes staging the same URL name the same `.seg`; whichever finishes
+    // first renames it away underneath the other. The loser must get an error the
+    // retry loop will act on (it will then find the winner's file in the cache),
+    // not a bare ENOENT that reads as a broken install and is never retried.
+    //
+    // The race is forced deterministically: the fetch seam removes the scratch
+    // before it hands back the first segment response, so the write that follows
+    // opens a path that is already gone.
+    const body = payload(4 * 1024 * 1024);
+    const rig = await rigFor(body, "ranges");
+    const target = join(tempDir, "contended.partial");
+    const segments = planSegments({
+      status: 200,
+      appendMode: false,
+      acceptRanges: "bytes",
+      contentEncoding: null,
+      contentLength: body.length,
+      expectedTotal: body.length,
+      requestHadRange: false,
+      policy: POLICY,
+    })!;
+    let stolen = false;
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const res = await fetch(input as string, init);
+      if (!stolen) {
+        stolen = true;
+        await rm(segmentScratchPath(target), { force: true });
+      }
+      return res;
+    }) as unknown as typeof fetch;
+
+    const opts = {
+      url: rig.url,
+      headers: {},
+      targetPath: target,
+      totalBytes: body.length,
+      segments,
+      logUrl: rig.url,
+      maxAttemptsPerSegment: 1,
+      fetchImpl,
+    };
+    const probe = await probeSegmentedRanges({ ...opts, fetchImpl: undefined });
+    await expect(runSegmentedDownload(opts, probe)).rejects.toThrow(
+      /Another process finished staging/i,
+    );
   });
 });
