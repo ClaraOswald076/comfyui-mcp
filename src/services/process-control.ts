@@ -3506,29 +3506,54 @@ export async function startComfyUI(anchor?: {
     };
   }
 
-  const readiness = startupResult.readiness;
+  let readiness = startupResult.readiness;
+  // WHAT A DEADLINE ACTUALLY ESTABLISHES (#367).
+  //
+  // The budget expiring is a fact about how long WE waited, not a fact about the
+  // server. It says startup was not confirmed WITHIN it. Only an observation of
+  // the launched process being GONE turns that into a failure — and we can make
+  // that observation, so the two stop sharing a verdict whose message asserted
+  // whichever it happened to name.
+  //
+  // The old branch reported the #776 failure shape (ComfyUI aborting during
+  // import) for BOTH, because for a dead child it was right and nobody separated
+  // the live one. #776's truthfulness is preserved exactly — a child that died
+  // still reports DOWN, with the same sentence — while the live child stops being
+  // told it failed.
+  //
+  // `launchedChildStillRunning` is tri-state on purpose: `undefined` is "cannot
+  // tell", and it must not be spent as either answer, so it falls on the
+  // unconfirmed side with the uncertainty stated. Only a DEFINITE death fails.
+  const childAlive = launchedChildStillRunning(launched.child);
+  const childIsGone =
+    launchedSpawnFailed || launchedChildExit != null || childAlive === false;
+  // #2009: the launched PID exiting is NOT proof the server is down. A Windows
+  // portable / venv trampoline / wrapper exits 0 after handing off, and the last
+  // scheduled probe can miss a bind that happened in the gap after it. Before
+  // declaring THIS CALL's launch failed, re-probe once. A healthy answer falls
+  // through to ownership classification (which already treats a departed child as
+  // unconfirmed unless serving argv positively differs). A spawn that never
+  // happened is not a handoff — skip the extra look.
+  if (!readiness.ready && childIsGone && !launchedSpawnFailed) {
+    const extra = await waitForApiReady({
+      intervalMs: 0,
+      maxTries: 1,
+      probeUrl: readiness.probe_url,
+    });
+    if (extra.ready) {
+      readiness = {
+        ready: true,
+        timed_out: false,
+        attempts: readiness.attempts + extra.attempts,
+        max_tries: readiness.max_tries,
+        interval_ms: readiness.interval_ms,
+        waited_ms: readiness.waited_ms + extra.waited_ms,
+        probe_url: readiness.probe_url,
+      };
+    }
+  }
   if (!readiness.ready) {
     const env = launchEnvInfo(info);
-    // WHAT A DEADLINE ACTUALLY ESTABLISHES (#367).
-    //
-    // The budget expiring is a fact about how long WE waited, not a fact about the
-    // server. It says startup was not confirmed WITHIN it. Only an observation of
-    // the launched process being GONE turns that into a failure — and we can make
-    // that observation, so the two stop sharing a verdict whose message asserted
-    // whichever it happened to name.
-    //
-    // The old branch reported the #776 failure shape (ComfyUI aborting during
-    // import) for BOTH, because for a dead child it was right and nobody separated
-    // the live one. #776's truthfulness is preserved exactly — a child that died
-    // still reports DOWN, with the same sentence — while the live child stops being
-    // told it failed.
-    //
-    // `launchedChildStillRunning` is tri-state on purpose: `undefined` is "cannot
-    // tell", and it must not be spent as either answer, so it falls on the
-    // unconfirmed side with the uncertainty stated. Only a DEFINITE death fails.
-    const childAlive = launchedChildStillRunning(launched.child);
-    const childIsGone =
-      launchedSpawnFailed || launchedChildExit != null || childAlive === false;
     const waitedS = seconds(readiness.waited_ms);
     if (childIsGone) {
       return {
@@ -3725,8 +3750,12 @@ export async function startComfyUI(anchor?: {
         : "") +
       // Undecidable ownership is stated, never implied away: the caller learns that
       // "our relaunch is the healthy server" is unconfirmed rather than proven.
+      // #2009: a departed child is the trampoline/wrapper shape — saying it is
+      // ALIVE would be the same over-claim as calling the relaunch failed.
       (ownershipUnconfirmed
-        ? ` (Could not map the process owning port ${port}, so this could not be confirmed as the process this call launched — the launched process is alive and the API is ready.)`
+        ? launchedChildExit
+          ? ` (The process this call launched EXITED (${exitCause(launchedChildExit)}), so this could not be confirmed as the process this call launched — a wrapper or trampoline can hand off and still leave a healthy server. The API is ready; listener ownership is unconfirmed.)`
+          : ` (Could not map the process owning port ${port}, so this could not be confirmed as the process this call launched — the launched process is alive and the API is ready.)`
         : "") +
       // The port was never observed free, so a healthy API is not evidence WE
       // produced it — it may be the server that was already there.
