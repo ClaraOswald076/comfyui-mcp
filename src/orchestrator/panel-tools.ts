@@ -4221,6 +4221,10 @@ async function annotateAddNodeRefusal(
   classType: unknown,
   ctx: PanelToolCtx,
 ): Promise<ToolResult> {
+  // #2007 — a schema-budget refusal is evidence that schema-guarded edits cannot
+  // obtain /object_info, even when the backend socket is up. Remember it so the
+  // next panel_graph_outline does not keep advertising mutations_ready:true.
+  trackSchemaToolResult(res, ctx);
   return withFrontendOnlyPanelSkewNote(
     withLoraManagerAutocompleteNote(await withLiveSocketProducerNote(res, classType, ctx)),
     classType,
@@ -4307,9 +4311,10 @@ function isObjectInfoStarvationRefusal(res: ToolResult): boolean {
   if (!res.isError) return false;
   const text = textOfToolResult(res);
   return (
-    /no usable \/object_info schema was obtained/i.test(text) ||
-    (/api\.getNodeDefs\(\) did not answer/i.test(text) &&
-      /GET \/object_info did not answer/i.test(text))
+    /no usable \/object_info schema was obtained/i.test(text) &&
+    (/Tried \d+ routes:/i.test(text) ||
+      (/api\.getNodeDefs\(\) did not answer/i.test(text) &&
+        /GET \/object_info did not answer/i.test(text)))
   );
 }
 
@@ -4372,6 +4377,115 @@ async function settleWorkflowSaveTimeout(
     /* keep the timeout refusal; the note below is the honest remainder */
   }
   return appendToolResultText(res, SAVE_TIMEOUT_OUTCOME_UNKNOWN);
+}
+
+/**
+ * #2007 — the schema-budget refusal, covering every wording the panel uses when
+ * a healthy ComfyUI does not answer /object_info inside the fixed 10s/5s shares.
+ *
+ * Broader than {@link isObjectInfoUnavailableRefusal}: that matcher is the #2000
+ * frontend-only note, keyed on one sentence. This one also has to catch
+ * panel_set_widget ("did not answer within its Nms share" / "no whole schema")
+ * so a LoadImage add and a widget write take the same recovery.
+ *
+ * Matched on the panel's own words because that is all it sends here. Used to
+ * RETRY a mutation the guard refused BEFORE creating/writing anything, and to
+ * stop advertising mutations_ready:true after we have observed that schema
+ * edits cannot obtain /object_info. A miss costs a missing retry; a false
+ * positive would re-issue a mutation, so this stays off transport timeouts
+ * (those are tagged, not text-matched) and off any success.
+ */
+function isObjectInfoBudgetRefusal(res: ToolResult): boolean {
+  if (!res.isError) return false;
+  return (
+    isObjectInfoUnavailableRefusal(res) ||
+    /no usable \/?object_info|no whole (?:\/object_info|schema)|object_info_fetch_failed|did not answer within its \d+ms share|exceeded \d+ms share/i.test(
+      textOfToolResult(res),
+    )
+  );
+}
+
+/**
+ * Per-tab: the last schema-guarded panel mutation we observed could not obtain
+ * /object_info. Socket-up is not the same fact — that is why panel_graph_outline
+ * reported mutations_ready:true while panel_add_node(LoadImage) then refused.
+ *
+ * Ready is stored as ABSENCE from the set: we never claim the schema is fetched,
+ * only that we have not observed a budget refusal since the last successful
+ * schema-guarded write.
+ */
+const panelSchemaBlockedTabs = new Set<string>();
+
+function markPanelSchemaBlocked(tabId: string): void {
+  if (tabId) panelSchemaBlockedTabs.add(tabId);
+}
+
+function markPanelSchemaReady(tabId: string): void {
+  if (tabId) panelSchemaBlockedTabs.delete(tabId);
+}
+
+/** Test seam: schema readiness is process-wide, so each file that mutates it resets. */
+export function __resetPanelSchemaReadinessForTest(): void {
+  panelSchemaBlockedTabs.clear();
+}
+
+function trackSchemaToolResult(res: ToolResult, ctx: PanelToolCtx): ToolResult {
+  if (!res.isError) markPanelSchemaReady(ctx.tabId);
+  else if (isObjectInfoBudgetRefusal(res)) markPanelSchemaBlocked(ctx.tabId);
+  return res;
+}
+
+function objectInfoBudgetNote(kind: "add" | "widget"): string {
+  const verb = kind === "add" ? "add" : "widget write";
+  return (
+    `\n\nNOTE: ComfyUI itself is healthy — this is the panel's fixed /object_info fetch ` +
+    `budget (api.getNodeDefs() 10s share, GET /object_info 5s share). A large custom-node ` +
+    `install can exceed those shares while /system_stats and live graph reads still work. ` +
+    `panel_graph_outline's mutations_ready flag means the backend SOCKET is up, not that a ` +
+    `schema-guarded ${verb} can obtain /object_info. This ${verb} was already retried ONCE. ` +
+    `Do NOT call panel_refresh_nodes — that command CLEARS the last-known schema at the ` +
+    `start of the run and then retries the same whole-document fetch, which is how the ` +
+    `next panel_set_widget also finds no snapshot. Wait a few seconds for the tab's ` +
+    `startup seed (it is not cancelled by the timed-out tool) and retry; if it keeps ` +
+    `refusing, reload the ComfyUI browser tab so node defs can finish loading without ` +
+    `the 5s/10s cap.`
+  );
+}
+
+/**
+ * #2007 — panel_graph_outline reported mutations_ready:true (backend socket up)
+ * while every schema-guarded edit then failed to obtain /object_info. The panel
+ * computes that flag from the websocket alone. Once THIS process has observed a
+ * schema-budget refusal on this tab, the outline must not keep advertising that
+ * mutations will work.
+ *
+ * Does not invent mutations_ready on a panel that never sent it, and does not
+ * claim schema_ready:true — absence of a refusal is not proof the next fetch
+ * will land.
+ */
+function withSchemaMutationReadiness(res: ToolResult, ctx: PanelToolCtx): ToolResult {
+  const payload = parseToolResultJson(res);
+  if (!payload) return res;
+  if (payload.mutations_ready !== true) return res;
+  if (!panelSchemaBlockedTabs.has(ctx.tabId)) return res;
+  payload.mutations_ready = false;
+  payload.schema_ready = false;
+  payload.schema_ready_note =
+    "mutations_ready was reported true because the ComfyUI backend socket is up, " +
+    "but a schema-guarded edit on this tab already failed to obtain /object_info " +
+    "inside the panel's fixed 10s/5s fetch shares. Graph reads still work; " +
+    "panel_add_node / panel_set_widget / panel_refresh_nodes will keep failing " +
+    "until that whole-schema fetch lands. Do not call panel_refresh_nodes to " +
+    "clear it (it drops the last-known schema). Wait, then retry the edit; " +
+    "reload the ComfyUI tab if it persists.";
+  const idx = res.content.findIndex((c) => c.type === "text");
+  if (idx < 0) return res;
+  return {
+    ...res,
+    content: res.content.map((c, i) =>
+      i === idx && c.type === "text" ? { ...c, text: JSON.stringify(payload, null, 2) } : c,
+    ),
+  };
 }
 
 function tabAdvertisedPanelVersion(ctx: PanelToolCtx): string | undefined {
@@ -13084,10 +13198,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             // unbounded outline reaches the caller who asked for a bound.
             enforceOutlineBudget(
               // #1184 — an empty outline is re-verified before it is believed.
-              await confirmEmptyOutline(
+              withSchemaMutationReadiness(
+                await confirmEmptyOutline(
+                  ctx,
+                  await ctx.call({ cmd: "graph_outline", max_chars: args.max_chars }),
+                  () => ctx.call({ cmd: "graph_outline", max_chars: args.max_chars }),
+                ),
                 ctx,
-                await ctx.call({ cmd: "graph_outline", max_chars: args.max_chars }),
-                () => ctx.call({ cmd: "graph_outline", max_chars: args.max_chars }),
               ),
               args.max_chars,
             ),
@@ -13426,6 +13543,32 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           );
         const first = await add();
         if (!isStaleNodeSchemaRefusal(first)) {
+          // #2007 — the reporter's LoadImage add: live graph reads work, the
+          // backend socket is up, but the panel's fixed 10s/5s /object_info
+          // shares did not produce a schema, so the guard refused BEFORE
+          // creating anything. Same duplicate-safety as #1329. Do NOT dispatch
+          // refresh_nodes here — that command CLEARS the last-known schema at
+          // the start of the run and then retries the same whole-document
+          // fetch, which is how the next panel_set_widget also found no
+          // snapshot. Retry the add once; the tab's unbounded startup seed is
+          // still running and a second attempt often lands once the server is
+          // no longer serving the first download. Frontend-only types stay on
+          // the #2000 note (a second add cannot put MarkdownNote into /object_info).
+          if (
+            isObjectInfoBudgetRefusal(first) &&
+            typeof args.class_type === "string" &&
+            !PANEL_ADD_NODE_FRONTEND_ONLY_TYPES.has(args.class_type)
+          ) {
+            const second = await add();
+            if (!isObjectInfoBudgetRefusal(second)) {
+              return annotateAddNodeRefusal(second, args.class_type, ctx);
+            }
+            return annotateAddNodeRefusal(
+              appendToolResultText(second, objectInfoBudgetNote("add")),
+              args.class_type,
+              ctx,
+            );
+          }
           return annotateAddNodeRefusal(first, args.class_type, ctx);
         }
 
@@ -14011,8 +14154,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             ),
             echoFull,
           );
-        const first = await write(args.node_id, args.widget as string);
+        let first = await write(args.node_id, args.widget as string);
         if (!first.isError) {
+          markPanelSchemaReady(ctx.tabId);
           return persistUnpromotedControlAfterGenerate(first, ctx, args.node_id);
         }
         // #2004 — both whole-schema routes timed out. The panel refused BEFORE
@@ -14082,6 +14226,20 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         );
         if (ambiguous && String(ambiguous.nodeId) === String(args.node_id)) {
           return explainAmbiguousPromotedWidgetRefusal(first, args, ctx);
+        }
+
+        if (isObjectInfoBudgetRefusal(first)) {
+          // #2007 — same schema-budget refusal as panel_add_node, same
+          // before-write fail-closed, same "do not refresh_nodes" recovery.
+          markPanelSchemaBlocked(ctx.tabId);
+          const retried = await write(args.node_id, args.widget as string);
+          if (!retried.isError) {
+            markPanelSchemaReady(ctx.tabId);
+            return persistUnpromotedControlAfterGenerate(retried, ctx, args.node_id);
+          }
+          first = isObjectInfoBudgetRefusal(retried)
+            ? appendToolResultText(retried, objectInfoBudgetNote("widget"))
+            : retried;
         }
 
         // #1655 — the panel listed this widget as promoted while refusing it as
@@ -14912,11 +15070,34 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "panel_refresh_nodes",
       "Re-pull the live ComfyUI server's /object_info and rebuild every combo/loader option list in the user's open tab, so an asset that appeared server-side AFTER the tab loaded becomes SELECTABLE without a manual reload (the 'press R' step) or a restart. Use this right after upload_image (action:\"stage\") (chaining a stage's output into a LoadImage / VHS_LoadVideo / LoadAudio loader — the returned filename won't be in the loader's dropdown until you refresh), after downloading a model / LoRA / VAE (a freshly downloaded file is otherwise 'not a valid option' in its loader), or after installing a node pack. Then panel_set_widget / panel_add_node will accept the new value. Non-destructive: it only re-registers node defs and refreshes combo option lists — it does NOT change your graph and is undo-neutral. Idempotent (safe to call repeatedly). Returns whether the refresh authoritatively fetched fresh defs.",
       {},
-      async (_args, ctx) =>
+      async (_args, ctx) => {
         // Same bounded ack budget as the refresh-before-validate writes (#599): a
         // fresh /object_info on a large install routinely exceeds the 6000 ms
         // default, and this command's WHOLE purpose is to await that fetch.
-        ctx.call({ cmd: "refresh_nodes" }, OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS),
+        const res = await ctx.call({ cmd: "refresh_nodes" }, OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS);
+        // #2007 — a failed whole-schema refresh is not a down backend. It is also
+        // worse than a no-op: the panel CLEARS the last-known schema at the start
+        // of the run, so a timed-out refresh is why the next panel_set_widget
+        // reports "no whole schema observed".
+        const refreshSchemaNote =
+          "NOTE: refreshed:false / object_info_fetch_failed on a healthy install means " +
+          "the whole /object_info document did not fit this command's fetch budget " +
+          "(megabytes on a large custom-node set). The backend is not down. This " +
+          "command also CLEARS the last-known schema at the start of the run, so a " +
+          "failed refresh can make the next panel_set_widget worse. Wait, then retry " +
+          "the widget write rather than refreshing again.";
+        if (isObjectInfoBudgetRefusal(res)) {
+          markPanelSchemaBlocked(ctx.tabId);
+          return appendReplyNote(res, refreshSchemaNote);
+        }
+        const payload = parseToolResultJson(res);
+        if (payload && payload.refreshed === false && payload.reason === "object_info_fetch_failed") {
+          markPanelSchemaBlocked(ctx.tabId);
+          return appendReplyNote(res, refreshSchemaNote);
+        }
+        if (!res.isError) markPanelSchemaReady(ctx.tabId);
+        return res;
+      },
     ),
     def(
       "panel_reload",
