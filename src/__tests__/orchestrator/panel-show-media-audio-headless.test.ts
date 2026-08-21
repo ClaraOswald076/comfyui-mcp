@@ -270,3 +270,135 @@ describe("#1572 an UNREACHABLE headless tab is not refused — it is about to be
 // INSIDE ctx.call, i.e. strictly after any check this handler can make. That is
 // exactly why the reachability condition above, not the late placement, is what
 // actually answers the reported false refusal.
+
+// #1572 round 4 — the gate's third P1, and the one that mattered most.
+//
+// `ctx.tabId` is not always a tab. #884 introduced SCOPE ADDRESSES
+// (`orchestrator`, `orchestrator::<backend>`): an agent session spans every tab,
+// so the address resolves to a routing target at DISPATCH time. `isHeadless()`
+// on the address itself is a plain lookup miss — `conns.get("orchestrator::codex")`
+// is undefined and `headlessSeen` never holds a scope address — so it answers
+// FALSE. And `resolveTarget`'s scope branch ends, in its own words, "…else the
+// most recent headless one".
+//
+// So a codex-backend session whose scope resolved onto a connected phone walked
+// straight through a gate built entirely to stop it, and the phone acknowledged
+// the audio as shown. The gate was asking about the ADDRESS instead of the
+// DESTINATION.
+//
+// `liveTabIdFor` is `resolveTarget` with the throw swallowed, so it answers for
+// scope addresses, prefixes and migration aliases alike — and returns undefined
+// exactly when nothing resolves, which is the case that must NOT be refused.
+describe("#1572 a SCOPE address is judged by what it RESOLVES to", () => {
+  const scopeCtx = (opts: {
+    resolvesTo: string | undefined;
+    headlessTabs: string[];
+  }): { ctx: PanelToolCtx; calls: Forwarded[] } => {
+    const calls: Forwarded[] = [];
+    const ctx = {
+      call: async (cmd: Forwarded) => {
+        calls.push(cmd);
+        return { content: [{ type: "text", text: "ok" }] } as ToolResult;
+      },
+      confirm: async () => "yes" as const,
+      bridge: {
+        // The real bridge's isHeadless: a scope ADDRESS is never a key here.
+        isHeadless: (id: string) => opts.headlessTabs.includes(id),
+        canReach: () => true,
+        liveTabIdFor: (id: string) => (id === "orchestrator::codex" ? opts.resolvesTo : id),
+      } as unknown as PanelToolCtx["bridge"],
+      tabId: "orchestrator::codex",
+    } as PanelToolCtx;
+    return { ctx, calls };
+  };
+
+  const run = async (ctx: PanelToolCtx, item: Record<string, unknown>) => {
+    const def = buildPanelToolDefs().find((d) => d.name === "panel_show_media")!;
+    return (await def.handler({ items: [item] }, ctx)) as ToolResult;
+  };
+
+  it("a scope resolving onto a CONNECTED PHONE is refused — the gate's exact case", async () => {
+    const { ctx, calls } = scopeCtx({ resolvesTo: "phone-1", headlessTabs: ["phone-1"] });
+    const res = await run(ctx, { source: { path: filePath("take.wav") } });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/HEADLESS client/);
+    expect(calls.find((c) => c.cmd === "show_media")).toBeFalsy();
+  });
+
+  it("…and its /view ref form too", async () => {
+    const { ctx, calls } = scopeCtx({ resolvesTo: "phone-1", headlessTabs: ["phone-1"] });
+    const res = await run(ctx, { source: { filename: "take_00001.wav", type: "output" } });
+    expect(res.isError).toBe(true);
+    expect(calls.find((c) => c.cmd === "show_media")).toBeFalsy();
+  });
+
+  it("a scope resolving onto a DESKTOP tab still gets its audio", async () => {
+    const { ctx, calls } = scopeCtx({ resolvesTo: "desktop-1", headlessTabs: ["phone-1"] });
+    const res = await run(ctx, { source: { path: filePath("take.wav") } });
+    expect(res.isError).toBeFalsy();
+    const items = calls.find((c) => c.cmd === "show_media")!.items as Array<{ kind?: string }>;
+    expect(items[0].kind).toBe("audio");
+  });
+
+  it("a scope that resolves to NOTHING is not refused — the call surfaces the bridge's own error", async () => {
+    const { ctx, calls } = scopeCtx({ resolvesTo: undefined, headlessTabs: ["phone-1"] });
+    const res = await run(ctx, { source: { path: filePath("take.wav") } });
+    expect(res.isError).toBeFalsy();
+    expect(calls.find((c) => c.cmd === "show_media")).toBeTruthy();
+  });
+
+  it("the ADDRESS itself is never what gets asked about", async () => {
+    // The regression test for the finding: a bridge that would answer `true` for
+    // the scope address and `false` for the resolved tab must still allow the
+    // audio. If the gate ever goes back to reading ctx.tabId directly, this
+    // fails.
+    const calls: Forwarded[] = [];
+    const ctx = {
+      call: async (cmd: Forwarded) => {
+        calls.push(cmd);
+        return { content: [{ type: "text", text: "ok" }] } as ToolResult;
+      },
+      confirm: async () => "yes" as const,
+      bridge: {
+        isHeadless: (id: string) => id === "orchestrator::codex",
+        canReach: () => true,
+        liveTabIdFor: () => "desktop-1",
+      } as unknown as PanelToolCtx["bridge"],
+      tabId: "orchestrator::codex",
+    } as PanelToolCtx;
+    const def = buildPanelToolDefs().find((d) => d.name === "panel_show_media")!;
+    const res = (await def.handler(
+      { items: [{ source: { path: filePath("take.wav") } }] },
+      ctx,
+    )) as ToolResult;
+    expect(res.isError).toBeFalsy();
+    expect(calls.find((c) => c.cmd === "show_media")).toBeTruthy();
+  });
+
+  it("a concrete tab id is still resolved through the same path (prefix / migration alias)", async () => {
+    // liveTabIdFor is resolveTarget: an 8-char prefix or a migration alias
+    // resolves to the full live id. Judging the SHORT id directly would miss a
+    // headless tab addressed by prefix.
+    const calls: Forwarded[] = [];
+    const ctx = {
+      call: async (cmd: Forwarded) => {
+        calls.push(cmd);
+        return { content: [{ type: "text", text: "ok" }] } as ToolResult;
+      },
+      confirm: async () => "yes" as const,
+      bridge: {
+        isHeadless: (id: string) => id === "phone-1-full-id",
+        canReach: () => true,
+        liveTabIdFor: (id: string) => (id === "phone-1" ? "phone-1-full-id" : id),
+      } as unknown as PanelToolCtx["bridge"],
+      tabId: "phone-1",
+    } as PanelToolCtx;
+    const def = buildPanelToolDefs().find((d) => d.name === "panel_show_media")!;
+    const res = (await def.handler(
+      { items: [{ source: { path: filePath("take.wav") } }] },
+      ctx,
+    )) as ToolResult;
+    expect(res.isError).toBe(true);
+    expect(calls.find((c) => c.cmd === "show_media")).toBeFalsy();
+  });
+});

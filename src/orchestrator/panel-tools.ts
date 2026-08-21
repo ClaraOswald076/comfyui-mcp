@@ -18307,35 +18307,59 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // else: this is the last statement before the frame goes out, so
         // `ctx.tabId` has stopped moving for every reason this handler controls.
         //
-        // TWO CONDITIONS, and the second one is the correction review forced.
+        // ASK ABOUT THE TAB THE FRAME WILL LAND ON, WHICH IS NOT ALWAYS THE ONE
+        // `ctx.tabId` NAMES. Two rounds of review were spent on this, and both
+        // corrections come down to the same mistake — judging the address
+        // instead of the destination:
         //
-        //  isHeadless  — sticky by design: a tab that EVER helloed headless
-        //                stays headless while offline.
-        //  canReach    — and that stickiness is exactly the trap. An UNREACHABLE
-        //                sticky-headless tab is precisely the session
-        //                `ctx.call`'s `ensureReachable()` is about to rebind:
-        //                `interactiveTabIds()` filters headless OUT, so a heal
-        //                can only ever land on a CANVAS tab, where audio plays
-        //                perfectly. Refusing on stickiness alone therefore
-        //                denied a valid `.wav` to someone whose phone was merely
-        //                asleep while their desktop panel sat right there. And
-        //                when the heal cannot fire (2+ interactive tabs, a
-        //                pinned session, nothing bindable) the call surfaces the
-        //                bridge's own tab-listing error, which is a better
-        //                message than this refusal would have been.
+        //  - `ctx.tabId` can be a SCOPE ADDRESS (`orchestrator`,
+        //    `orchestrator::<backend>`). It is not a tab, so `isHeadless()` on
+        //    it is a lookup miss that answers FALSE — and `resolveTarget`'s
+        //    scope branch ends "…else the most recent headless one", so a
+        //    scope-bound session sitting on a connected phone sailed straight
+        //    through the gate and had its audio acknowledged as shown.
+        //  - a concrete but UNREACHABLE sticky-headless id is the opposite
+        //    error: `isHeadless` is sticky by design (a tab that ever helloed
+        //    headless stays headless while offline), and that is exactly the
+        //    session `ctx.call`'s `ensureReachable()` is about to rebind —
+        //    `interactiveTabIds()` filters headless OUT, so a heal can only land
+        //    on a CANVAS tab, where audio plays perfectly. Refusing on
+        //    stickiness alone denied a valid `.wav` to someone whose phone was
+        //    merely asleep while their desktop panel sat right there.
         //
-        // So the gate fires only for a phone that is CONNECTED RIGHT NOW — the
-        // one case where the audio provably lands somewhere it cannot be played.
-        // A bridge too lightweight to answer `canReach` is treated as reachable:
-        // `isHeadless` already said "phone", and inventing liveness we cannot
-        // observe is how an unearned claim gets made in the other direction.
+        // `liveTabIdFor` answers both at once, because it is `resolveTarget`
+        // itself: it resolves a scope address, a prefix, or a migration alias to
+        // the CONCRETE tab a command would reach, and returns undefined when
+        // nothing resolves — which is precisely the unroutable case that must
+        // NOT be refused, since the call is about to be healed or to surface the
+        // bridge's own tab-listing error, a better message than this refusal.
+        //
+        // Three tiers, best signal first, so a lightweight bridge degrades
+        // instead of throwing: routing → reachability → the bare id. This is
+        // still one instant's answer and `ctx.call` re-resolves a moment later;
+        // that residual window only ever moves TOWARD a canvas tab, which is the
+        // safe direction.
         if (audioTargets.length > 0) {
           const b = ctx.bridge as
-            | { isHeadless?: (id: string) => boolean; canReach?: (id: string) => boolean }
+            | {
+                isHeadless?: (id: string) => boolean;
+                canReach?: (id: string) => boolean;
+                liveTabIdFor?: (id: string) => string | undefined;
+              }
             | undefined;
-          const headlessNow = typeof b?.isHeadless === "function" && b.isHeadless(ctx.tabId);
-          const reachableNow = typeof b?.canReach === "function" ? b.canReach(ctx.tabId) : true;
-          if (headlessNow && reachableNow) {
+          let judgeId: string | undefined;
+          if (typeof b?.liveTabIdFor === "function") {
+            judgeId = b.liveTabIdFor(ctx.tabId);
+          } else if (typeof b?.canReach === "function") {
+            judgeId = b.canReach(ctx.tabId) ? ctx.tabId : undefined;
+          } else {
+            judgeId = ctx.tabId;
+          }
+          if (
+            judgeId != null &&
+            typeof b?.isHeadless === "function" &&
+            b.isHeadless(judgeId)
+          ) {
             return fail(headlessAudioRefusal(audioTargets));
           }
         }
