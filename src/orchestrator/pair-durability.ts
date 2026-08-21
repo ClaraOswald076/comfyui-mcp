@@ -97,13 +97,13 @@ export function pairUrlDurability(input: PairDurabilityInput): PairUrlDurability
       "quick tunnel, and COMFYUI_MCP_TUNNEL_BACKEND=relay does not apply to it. To keep a link " +
       "that survives restarts, pair over LAN (the token is persisted, so a LAN URL keeps " +
       "working); otherwise re-pair from the panel after a restart. " +
-      // #875 — the reassurance that matters mid-session: an automatic restart
-      // will NOT yank this tunnel out from under a connected phone. Stated here
-      // because pair time is where the user is looking; the deferral itself is a
-      // gate on the self-restarter, and a log would not reach them.
-      "While a phone is connected over this tunnel, automatic update-restarts are DEFERRED until " +
-      "it disconnects, so an update cannot break the link mid-session (a tunnel left connected " +
-      "indefinitely therefore postpones updates indefinitely)." +
+      // #1963 — CHECK still runs (and the panel is told); APPLY does not, because
+      // a restart mints a new hostname. Sticky on the pairing itself, not the
+      // live socket: a locked screen is still paired. The pair-time toggle
+      // (default ON) and Update now are how a desk session moves forward.
+      "While this tunnel pairing is active, automatic updates are CHECK-ONLY — they will not " +
+      "restart and disconnect this device. They apply when you are back at the desk, when you " +
+      "turn off “Don't update while my phone is paired”, or when you choose Update now." +
       (rotates.includes("token")
         ? " (Pinning COMFYUI_MCP_PAIR_TOKEN alone will not help here — the hostname still rotates.)"
         : "")

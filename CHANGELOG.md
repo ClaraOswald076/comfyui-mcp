@@ -4,6 +4,22 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## Unreleased
+
+### Added
+
+- **Transport-aware auto-update (#1963).** At the desk (LAN / no pairing tunnel)
+  the orchestrator still checks and applies, and the sidebar panel is checked
+  against the published pyproject — not just the floor — so a pack three
+  versions behind is no longer reported healthy. While a phone is paired over a
+  cloudflared quick-tunnel, both checks still run and a one-line notice says an
+  update is waiting, but APPLY (disk mutate + restart) does not: that restart
+  rotates the hostname and disconnects the phone. Pairing is sticky on the
+  tunnel handle, not the live socket, so a locked screen or a 5G/wifi handoff
+  cannot open the gate. Pair time carries a toggle defaulted ON ("Don't update
+  while my phone is paired") and an `apply_updates_now` affordance for when the
+  user is back at the desk. Relay and LAN remain safe to apply.
+
 ## 0.51.35
 
 ### Fixed

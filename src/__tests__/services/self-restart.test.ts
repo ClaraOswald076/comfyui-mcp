@@ -29,6 +29,8 @@ function makeHarness(opts: {
   spawnOk?: boolean;
   mtime?: number;
   releasePanelLock?: () => void;
+  applyAllowed?: () => boolean;
+  panelTick?: SelfRestartDeps["panelTick"];
 }): Harness {
   const calls: string[] = [];
   const spawns: Array<{ npxVersion?: string }> = [];
@@ -53,6 +55,8 @@ function makeHarness(opts: {
     latestVersion: async () => opts.latest,
     entryMtime: () => mtime,
     allIdle: () => idle,
+    applyAllowed: opts.applyAllowed ?? (() => true),
+    panelTick: opts.panelTick,
     announce: (t) => announces.push(t),
     teardown: async () => {
       calls.push("teardown");
@@ -184,6 +188,94 @@ describe("SelfRestarter — published installs", () => {
     h.restarter.start();
     await h.restarter.updateTick();
     expect(h.calls).toEqual([]);
+  });
+});
+
+describe("SelfRestarter — transport-aware check vs apply (#1963)", () => {
+  it("a quick-tunnel pairing CHECKs but does not APPLY (no disk mutate, no restart)", async () => {
+    const h = makeHarness({
+      mode: "global",
+      currentVersion: "0.52.41",
+      latest: "0.52.42",
+      updateResult: { action: "updated", mode: "global", from: "0.52.41", to: "0.52.42" },
+      applyAllowed: () => false,
+    });
+    h.restarter.start();
+    await h.restarter.updateTick();
+    await Promise.resolve();
+    expect(h.calls).toEqual([]); // latestVersion is a probe, checkAndSelfUpdate is APPLY
+    expect(h.announces.some((a) => a.includes("0.52.41") && a.includes("0.52.42"))).toBe(true);
+    expect(h.announces.some((a) => /mobile tunnel/i.test(a))).toBe(true);
+  });
+
+  it("npx: check-only while the gate is closed — no respawn", async () => {
+    const h = makeHarness({
+      mode: "npx",
+      currentVersion: "1.0.0",
+      latest: "2.0.0",
+      applyAllowed: () => false,
+    });
+    h.restarter.start();
+    await h.restarter.updateTick();
+    await Promise.resolve();
+    expect(h.calls).toEqual([]);
+    expect(h.announces.some((a) => a.includes("1.0.0") && a.includes("2.0.0"))).toBe(true);
+  });
+
+  it("forceApply bypasses the gate — the Update now path", async () => {
+    const h = makeHarness({
+      mode: "npx",
+      currentVersion: "1.0.0",
+      latest: "2.0.0",
+      applyAllowed: () => false,
+    });
+    h.restarter.start();
+    await h.restarter.updateTick({ forceApply: true });
+    await Promise.resolve();
+    expect(h.calls).toEqual(["spawn", "releasePanelLock", "teardown", "exit"]);
+    expect(h.spawns[0]?.npxVersion).toBe("2.0.0");
+  });
+
+  it("an armed restart still refuses to fire after a phone pairs", async () => {
+    let allowed = true;
+    const h = makeHarness({
+      mode: "npx",
+      currentVersion: "1.0.0",
+      latest: "2.0.0",
+      applyAllowed: () => allowed,
+    });
+    h.restarter.start();
+    h.setIdle(false);
+    await h.restarter.updateTick(); // arms, but busy
+    expect(h.calls).toEqual([]);
+    allowed = false; // phone pairs over the tunnel before idle
+    h.setIdle(true);
+    h.restarter.tryRestart();
+    await Promise.resolve();
+    expect(h.calls).toEqual([]); // still held
+    allowed = true;
+    h.restarter.requestApplyPolicyRefresh();
+    await Promise.resolve();
+    expect(h.calls).toEqual(["spawn", "releasePanelLock", "teardown", "exit"]);
+  });
+
+  it("the same tick checks the panel with the same apply bit", async () => {
+    const panel: Array<{ apply: boolean }> = [];
+    const h = makeHarness({
+      mode: "global",
+      currentVersion: "1.0.0",
+      latest: "1.1.0",
+      applyAllowed: () => false,
+      panelTick: async ({ apply }) => {
+        panel.push({ apply });
+        return { action: "deferred", from: "0.15.28", to: "0.15.31" };
+      },
+    });
+    h.restarter.start();
+    await h.restarter.updateTick();
+    expect(panel).toEqual([{ apply: false }]);
+    expect(h.calls).toEqual([]); // orchestrator not applied
+    expect(h.announces.some((a) => /panel/i.test(a) && a.includes("0.15.28"))).toBe(true);
   });
 });
 

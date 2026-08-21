@@ -51,8 +51,17 @@ import { panelRecoveryContext } from "../services/panel-recovery.js";
 import { isPanelAutoInstallDisabled } from "../services/panel-installer.js";
 import { releaseOwnedPanelLock } from "../services/panel-pin-guard.js";
 import { SelfRestarter, canSelfRestart } from "../services/self-restart.js";
+import { tickPanelAutoUpdate } from "../services/panel-auto-update.js";
 import { pairUrlDurability } from "./pair-durability.js";
 import { loadOrCreatePairToken } from "./pair-token-store.js";
+import {
+  autoUpdateApplyAllowed,
+  pairAutoUpdateDisclosure,
+  pairingActiveOf,
+  pairingTransportOf,
+  type AutoUpdateApplyInput,
+} from "../services/auto-update-gate.js";
+import { loadPairUpdatePrefs, savePairUpdatePrefs } from "./pair-update-prefs.js";
 import { SessionStore, workflowIdentityParts, carryWorkflowCommandStamp } from "./session-store.js";
 import { unreachableReason, noPanelTabReason, identityReason } from "./fence-refusal.js";
 import {
@@ -1238,20 +1247,25 @@ export async function runPanelOrchestrator(): Promise<void> {
   let pairToken: string | null = envPairToken;
   let pairListenerStarted = false;
   let pairTunnel: { url: string; stop: () => void } | null = null;
+  // Forward declaration — assigned after teardownCore exists. Declared here so
+  // pair / apply_updates_now handlers can refresh the restarter without hitting
+  // the TDZ if a frame arrives before that assignment.
+  let selfRestarter: SelfRestarter | null = null;
   /**
-   * #875 — is a phone paired over a TUNNEL right now?
+   * #1963 — APPLY gate for auto-update. Checking still runs.
    *
-   * Gates the self-restarter (see its allIdle below). A tunnel URL cannot survive
-   * a restart: cloudflared mints a fresh quick-tunnel hostname per run and there
-   * is no way to pin it, so restarting under a live tunnel breaks a phone that is
-   * connected at that moment. A LAN URL is fine — the token persists now — which
-   * is why this is narrowed to the tunnel rather than to pairing in general.
+   * pairingActive is STICKY on `pairTunnel` (the handle exists from mint until
+   * process exit). A live-socket test is the hole a locked-screen phone falls
+   * through: the OS has closed the socket, the gate opened, the hostname
+   * rotated. The pair-time toggle (default ON) is how a desk session applies
+   * anyway; apply_updates_now is the one-shot override.
    */
-  // Requires BOTH: a tunnel exists AND a client is connected through it right
-  // now. `pairTunnel` alone is not liveness — nothing stops the tunnel until the
-  // process exits, so gating on it would postpone every future update after a
-  // single pairing, rather than deferring to the next disconnect as intended.
-  const tunnelPairingLive = (): boolean => pairTunnel !== null && bridge.hasLiveHeadlessClient();
+  const autoUpdateGateInput = (): AutoUpdateApplyInput => ({
+    activeTransport: pairingTransportOf(pairTunnel),
+    pairingActive: pairingActiveOf(pairTunnel),
+    deferWhilePaired: loadPairUpdatePrefs().deferWhilePaired,
+  });
+  const applyAutoUpdateAllowed = (): boolean => autoUpdateApplyAllowed(autoUpdateGateInput());
   // #875 — the token is PERSISTED, not per-session. It used to be minted fresh on
   // every run, so a self-restart (on by default, hourly npm check) invalidated the
   // URL the phone had saved. The reporter experienced that as "updating the npm
@@ -4925,6 +4939,21 @@ export async function runPanelOrchestrator(): Promise<void> {
     if (event.type === "pair" && event.tab_id) {
       const mode = (event as { mode?: unknown }).mode === "tunnel" ? "tunnel" : "lan";
       const tabId = event.tab_id;
+      // Pair-time toggle, default ON. An explicit boolean is the only thing we
+      // persist — a missing field leaves the last saved (or default) value.
+      const rawDefer = (event as { defer_while_paired?: unknown }).defer_while_paired;
+      if (typeof rawDefer === "boolean") {
+        try {
+          savePairUpdatePrefs({ deferWhilePaired: rawDefer });
+        } catch (err) {
+          logger.warn(
+            `[panel-orchestrator] could not persist pair-update prefs: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+        selfRestarter?.requestApplyPolicyRefresh();
+      }
       void (async () => {
         const token = await ensurePairListener();
         let url: string;
@@ -4971,13 +5000,66 @@ export async function runPanelOrchestrator(): Promise<void> {
               ? "survives restart"
               : `rotates on restart: ${durability.rotates.join(", ")}`),
         );
-        bridge.push({ type: "pair_url", mode, url, durability }, tabId);
+        const auto_update = pairAutoUpdateDisclosure(autoUpdateGateInput());
+        bridge.push({ type: "pair_url", mode, url, durability, auto_update }, tabId);
       })().catch((err) => {
         bridge.push(
           { type: "pair_error", mode, error: err instanceof Error ? err.message : String(err) },
           tabId,
         );
       });
+      return;
+    }
+
+    // #1963 — flip the pair-time "Don't update while my phone is paired" toggle
+    // after the URL is already minted (the checkbox on the QR modal).
+    if (event.type === "set_pair_update_pref" && event.tab_id) {
+      const tabId = event.tab_id;
+      const rawDefer = (event as { defer_while_paired?: unknown }).defer_while_paired;
+      if (typeof rawDefer !== "boolean") {
+        bridge.push(
+          { type: "pair_update_pref", ok: false, error: "defer_while_paired must be a boolean" },
+          tabId,
+        );
+        return;
+      }
+      try {
+        const prefs = savePairUpdatePrefs({ deferWhilePaired: rawDefer });
+        bridge.push(
+          {
+            type: "pair_update_pref",
+            ok: true,
+            defer_while_paired: prefs.deferWhilePaired,
+            apply: autoUpdateApplyAllowed({
+              ...autoUpdateGateInput(),
+              deferWhilePaired: prefs.deferWhilePaired,
+            }),
+          },
+          tabId,
+        );
+        selfRestarter?.requestApplyPolicyRefresh();
+      } catch (err) {
+        bridge.push(
+          {
+            type: "pair_update_pref",
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          },
+          tabId,
+        );
+      }
+      return;
+    }
+
+    // #1963 — "Update now" from the desk (or from the deferred-update notice).
+    // One-shot: ignores the tunnel gate for this tick only.
+    if (event.type === "apply_updates_now") {
+      const tabId = event.tab_id;
+      logger.info("[panel-orchestrator] apply_updates_now — checking and applying updates (bypass tunnel gate)");
+      void selfRestarter?.updateTick({ forceApply: true });
+      if (tabId) {
+        bridge.push({ type: "ack", ok: true, kind: "apply_updates_now" }, tabId);
+      }
       return;
     }
 
@@ -6709,9 +6791,6 @@ export async function runPanelOrchestrator(): Promise<void> {
   );
 
   let shuttingDown = false;
-  // Forward declaration — assigned right after teardownCore exists; teardownCore
-  // stops its timers so no update-check tick can fire mid-teardown.
-  let selfRestarter: SelfRestarter | null = null;
   /** Everything shutdown does EXCEPT exiting — shared with the self-restarter,
    *  which spawns its replacement first and exits itself after this settles. */
   const teardownCore = async () => {
@@ -6832,24 +6911,12 @@ export async function runPanelOrchestrator(): Promise<void> {
       // …and the same for an ask answer the user actually gave that has not
       // reached the agent yet (#486). Restarting would destroy it silently.
       !AskAnswers.hasOutstanding() &&
-      !QueueMonitor.isBusy() &&
-      // #875 — a LIVE TUNNEL PAIRING SESSION defers the restart to the next
-      // disconnect. The token now persists, so a LAN URL survives a restart; a
-      // tunnel URL cannot, because cloudflared mints a fresh quick-tunnel
-      // hostname every run and there is no way to pin it. Restarting under a live
-      // tunnel therefore breaks a phone that is connected RIGHT NOW, to install
-      // an update nobody asked for at that moment — which is what the reporter
-      // experienced and (reasonably) blamed on the npm version.
-      //
-      // Deferral, not cancellation: the update check still runs and the restart
-      // stays armed, so it fires as soon as the tunnel goes away. The cost is
-      // that a tunnel left up indefinitely postpones updates indefinitely, so it
-      // is DISCLOSED — in pair-durability's tunnel note, which the panel shows at
-      // pair time. Deliberately not announced from here: this is a predicate the
-      // restarter polls, and emitting from it would either fire repeatedly or
-      // need its own state to suppress itself. Pair time is also where the user
-      // is actually looking (#1077: an orchestrator log may be unreachable).
-      !tunnelPairingLive(),
+      !QueueMonitor.isBusy(),
+    // #1963 — transport gate is applyAllowed, not allIdle. Idle is in-flight
+    // work; this is "would a restart rotate the phone's tunnel hostname?"
+    // Checking still runs; APPLY (disk + restart, and the panel pack) does not.
+    applyAllowed: applyAutoUpdateAllowed,
+    panelTick: async ({ apply }) => tickPanelAutoUpdate({ apply }),
     announce: (text) => void bridge.push({ type: "say", text }),
     teardown: teardownCore,
   });

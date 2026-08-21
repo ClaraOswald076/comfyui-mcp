@@ -48,6 +48,7 @@ import {
 } from "./self-update.js";
 import { releaseOwnedPanelLock } from "./panel-pin-guard.js";
 import { logger } from "../utils/logger.js";
+import { deferredAutoUpdateNote } from "./auto-update-gate.js";
 
 /** Registry re-check period. An hour keeps update latency low at ~24 tiny
  *  registry GETs a day; override for tuning/tests. */
@@ -73,6 +74,26 @@ export interface SelfRestartDeps {
   entryMtime: () => number | undefined;
   /** Every agent idle + nothing queued (caller may fold in extra gates). */
   allIdle: () => boolean;
+  /**
+   * #1963 — may we APPLY (disk mutate + restart)? Checking still runs when this
+   * is false. Default true so MCP-stdio / tests without a pairing context apply
+   * as they always have. The orchestrator wires the transport gate here; it is
+   * NOT folded into allIdle, because idle is about in-flight work and this is
+   * about a phone whose tunnel URL would die on a restart.
+   */
+  applyAllowed: () => boolean;
+  /**
+   * Same periodic tick as the orchestrator check, for the sidebar panel. The
+   * restarter passes the same `apply` bit so a tunnel pairing cannot update
+   * one and not the other. Optional: stdio / tests without a panel skip it.
+   * The restarter owns deferred/updated announcements so they fire once.
+   */
+  panelTick?: (opts: { apply: boolean }) => Promise<{
+    action: string;
+    from?: string;
+    to?: string;
+    note?: string;
+  } | void>;
   /** Broadcast a chat line to every panel tab. */
   announce: (text: string) => void;
   /** Clean teardown (close bridge/listeners, stop agents) — NO process.exit. */
@@ -139,6 +160,7 @@ export const defaultSelfRestartDeps: SelfRestartDeps = {
   latestVersion: () => getLatestPublishedVersion(),
   entryMtime: defaultEntryMtime,
   allIdle: () => true,
+  applyAllowed: () => true,
   announce: () => {},
   teardown: async () => {},
   spawnReplacement: defaultSpawnReplacement,
@@ -181,6 +203,8 @@ export class SelfRestarter {
   private restarting = false;
   /** Versions already announced when restart is disabled — once each. */
   private announced = new Set<string>();
+  /** apply_updates_now: one tick (and its armed restart) may ignore the gate. */
+  private forceApply = false;
   stopped = false;
 
   constructor(deps: Partial<SelfRestartDeps> = {}) {
@@ -249,15 +273,50 @@ export class SelfRestarter {
     this.arm({ reason: "a new dev build landed" });
   }
 
-  /** PUBLISHED: run the self-update policy engine; arm a restart on change. */
-  async updateTick(): Promise<void> {
+  /**
+   * Re-evaluate after the pair-time toggle flips. An armed restart that was
+   * waiting on the tunnel gate can fire; otherwise a fresh check runs so an
+   * update found while deferred is not stuck until the next hourly tick.
+   */
+  requestApplyPolicyRefresh(): void {
+    this.tryRestart();
+    if (!this.pending && !this.restarting && !this.stopped) {
+      void this.updateTick();
+    }
+  }
+
+  /** PUBLISHED: CHECK the registry; APPLY only when the transport gate allows. */
+  async updateTick(opts: { forceApply?: boolean } = {}): Promise<void> {
     if (this.stopped || this.pending || this.restarting) return;
+    if (opts.forceApply) this.forceApply = true;
+    const apply = this.forceApply || this.deps.applyAllowed();
     try {
+      if (this.deps.panelTick) {
+        const panelRes = await this.deps.panelTick({ apply });
+        if (panelRes?.action === "deferred" && panelRes.from && panelRes.to) {
+          this.noteDeferred("panel", panelRes.from, panelRes.to);
+        } else if (panelRes?.action === "updated" && panelRes.note) {
+          this.deps.announce(`⬆️ ${panelRes.note}`);
+        }
+      }
+      if (!apply) {
+        // CHECK-ONLY. Must not call checkAndSelfUpdate — that mutates on disk.
+        const latest = await this.deps.latestVersion();
+        const current = this.info.currentVersion;
+        if (latest && current && isNewer(latest, current)) {
+          this.noteDeferred("orchestrator", current, latest);
+        }
+        this.forceApply = false;
+        return;
+      }
       if (this.info.mode === "npx") {
         // npx can't be updated on disk — respawn pinned to the new version.
         const latest = await this.deps.latestVersion();
         const current = this.info.currentVersion;
-        if (!latest || !current || !isNewer(latest, current)) return;
+        if (!latest || !current || !isNewer(latest, current)) {
+          if (!this.pending) this.forceApply = false;
+          return;
+        }
         this.arm({ reason: `updating ${current} → ${latest}`, npxVersion: latest });
         return;
       }
@@ -266,10 +325,22 @@ export class SelfRestarter {
       const res = await this.deps.checkAndSelfUpdate();
       if (res.action === "updated") {
         this.arm({ reason: `updated ${res.from ?? "?"} → ${res.to ?? "?"}` });
+      } else if (!this.pending) {
+        this.forceApply = false;
       }
     } catch (err) {
+      if (!this.pending) this.forceApply = false;
       logger.debug(`[self-restart] update check failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  private noteDeferred(component: "orchestrator" | "panel", from: string, to: string): void {
+    const key = `deferred:${component}:${from}:${to}`;
+    if (this.announced.has(key)) return;
+    this.announced.add(key);
+    const note = deferredAutoUpdateNote({ component, from, to });
+    logger.info(`[self-restart] ${note}`);
+    this.deps.announce(note);
   }
 
   /** Record the restart intent. With AUTORESTART off, notify once instead. */
@@ -293,6 +364,10 @@ export class SelfRestarter {
   tryRestart(): void {
     if (!this.pending || this.restarting || this.stopped) return;
     if (this.deps.uptimeMs() < MIN_UPTIME_MS) return;
+    // #1963 — a restart armed at the desk must still refuse to fire after a
+    // phone pairs over a quick-tunnel. Pending stays set; the next policy
+    // refresh or disconnect (pairTunnel cleared) lets it through.
+    if (!this.forceApply && !this.deps.applyAllowed()) return;
     if (!this.deps.allIdle()) return;
     this.restarting = true;
     const { reason, npxVersion } = this.pending;
@@ -311,6 +386,7 @@ export class SelfRestarter {
       logger.error("[self-restart] could not spawn the replacement — staying on the current process");
       this.deps.announce("⚠️ Restart failed to launch a replacement — still running the current version.");
       this.restarting = false;
+      this.forceApply = false;
       return;
     }
     // The successor is already running. Drop any panel-op.lock we still hold

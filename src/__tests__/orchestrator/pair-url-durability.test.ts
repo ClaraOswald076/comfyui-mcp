@@ -62,6 +62,14 @@ describe("#875: what the pairing URL actually promises", () => {
     expect(d.note).toMatch(/will not help here/);
   });
 
+  it("tells a tunnel user updates are check-only while the pairing is active (#1963)", () => {
+    const d = pairUrlDurability({ mode: "tunnel", stableToken: true, autoRestart: true });
+    expect(d.note).toMatch(/CHECK-ONLY/);
+    expect(d.note).toMatch(/Don't update while my phone is paired/);
+    expect(d.note).toMatch(/Update now/);
+    expect(d.note).not.toMatch(/DEFERRED until it disconnects/);
+  });
+
   // A warning about spontaneous restarts is false when they are switched off.
   it("only blames automatic restarts when they are actually armed", () => {
     const on = pairUrlDurability({ mode: "lan", stableToken: false, autoRestart: true });
