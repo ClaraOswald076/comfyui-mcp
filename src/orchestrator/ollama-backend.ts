@@ -39,7 +39,9 @@ import {
   audioUnverifiedModelNote,
   audioUserNotice,
   fetchAudioAttachment,
+  isKnownAudioCapableOllamaModel,
   modelLacksAudioText,
+  modelNotVerifiedAudioText,
   openAiAudioFormat,
   tooManyAudioText,
 } from "./audio-attachment.js";
@@ -1316,6 +1318,13 @@ export class OllamaBackend implements AgentBackend {
    * Order matters: establish the model's capability BEFORE fetching anything, so
    * a model that cannot hear produces a refusal naming a model that can rather
    * than a download plus a shrug.
+   *
+   * Native `/api/chat` then has a second gate (#1972). Audio rides
+   * `message.images[]` — the same slot as pictures — so a model that ACCEPTS
+   * the payload is not a model that can hear. `/api/show` reporting `audio` is
+   * an architecture flag inherited by namespaced forks; at least one such fork
+   * returns a fluent fabricated transcript instead of HTTP 400. Bytes go on
+   * that carrier only for the Ollama-tested allowlist.
    */
   protected async attachAudio(
     userMsg: ChatMessage,
@@ -1334,8 +1343,24 @@ export class OllamaBackend implements AgentBackend {
       }
       return { outcomes, confidence: "established" };
     }
-    // caps === null → the probe could not run. That is not a refusal (a guard
-    // that fails is not a verdict): attempt delivery and mark it unconfirmed.
+    // Native images[] is a picture slot. A model outside the verified set is
+    // refused even when /api/show lists `audio`, and even when the probe could
+    // not run — sending would be hoping, which is how a fabricated transcript
+    // reaches the user as if it were heard.
+    if (this.api === "ollama" && !isKnownAudioCapableOllamaModel(this.model)) {
+      for (const ref of refs) {
+        outcomes.push({
+          status: "refused",
+          filename: ref.filename,
+          reason: "model-not-verified-audio",
+          text: modelNotVerifiedAudioText(this.model, ref.filename),
+        });
+      }
+      return { outcomes, confidence: "established" };
+    }
+    // caps === null → the probe could not run. On the OpenAI dialect (and on
+    // an allowlisted native tag) that is not a refusal: a guard that fails is
+    // not a verdict. Attempt delivery and mark it unconfirmed.
     const confidence: AudioConfidence = caps ? "established" : "unverified";
     for (const [i, ref] of refs.entries()) {
       if (i >= MAX_AUDIO_ATTACHMENTS) {

@@ -467,7 +467,7 @@ export const OLLAMA_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: true, // attempted for every model; graceful strip-and-retry on rejection
-  audio: true, // native /api/chat images[] and openai input_audio, both live-verified; per-model gate via /api/show (#790)
+  audio: true, // native /api/chat images[] and openai input_audio, both live-verified; per-model gate via /api/show (#790) plus verified-tag allowlist on the native image slot (#1972)
   turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 

@@ -6,6 +6,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### Fixed
+
+- **Ollama refuses audio unless the model is a verified listener (#1972).** Native
+  `/api/chat` carries audio in `message.images[]`. Most models HTTP 400 (fail
+  closed). `huihui_ai/gemma-4-abliterated:E4b-qat` accepts the payload and
+  returns a fluent, run-to-run-varying fabricated transcript instead — `/api/show`
+  listing `audio` is an architecture flag, not proof these weights can hear.
+  The panel now also requires the tag to be one of the Ollama-tested set
+  (`gemma4:e2b`, `gemma4:e4b`, `nemotron3:33b`) before putting bytes on that
+  carrier, and refuses namespaced forks (including the default fine-tune) out
+  loud with a pull command.
+
 ## [0.52.44] - 2026-08-21
 
 ### Added
