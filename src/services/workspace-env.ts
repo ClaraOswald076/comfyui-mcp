@@ -273,6 +273,49 @@ export async function resolveEffectiveComfyUIBaseLive(): Promise<string | undefi
   return configured;
 }
 
+/**
+ * The install base whose `custom_nodes/` the running ComfyUI actually scans.
+ *
+ * `resolveEffectiveComfyUIBaseLive` answers the DATA/base root: `--base-directory`
+ * when present, else `COMFYUI_PATH` / the saved workspace. That is correct for
+ * models and output, and for custom nodes ONLY when `--base-directory` is set —
+ * `folder_paths.py` then points `custom_nodes` at `<base-directory>/custom_nodes`.
+ * Without the flag, `folder_paths.base_path` is the `main.py` directory, so a
+ * split install's data workspace is NOT scanned (#2031: `node_pack` scaffolded
+ * into `workspace_path/custom_nodes`; the class never appeared in `/object_info`;
+ * copying the same pack to `code_path/custom_nodes` loaded it).
+ *
+ * Matches ComfyUI `folder_paths.py`:
+ *   1. Live `--base-directory` when it exists on disk (#1715/#1770 Desktop).
+ *   2. Else the live `main.py` root (#2031 portable/split without the flag).
+ *   3. Fail closed on an unresolvable relative `--base-directory`.
+ *   4. Else the configured data base (offline / unreachable).
+ *
+ * Remote mode → undefined. Never throws. `node_pack` (scaffold / verify /
+ * write / read / patch / git / publish-by-name) threads this so authoring and
+ * verification cannot target different roots.
+ */
+export async function resolveCustomNodesScanBaseLive(): Promise<string | undefined> {
+  if (isRemoteMode()) return undefined;
+
+  const snapshot = await getLiveServerSnapshot();
+  if (snapshot.reachable) {
+    const baseDir = parseBaseDirFromArgv(snapshot.argv, snapshot.cwd);
+    if (baseDir && existsSync(baseDir)) return baseDir;
+    if (hasUnresolvableRelativeBaseDirFlag(snapshot.argv, snapshot.cwd)) {
+      return undefined;
+    }
+    // Without --base-directory, folder_paths.base_path is the checkout that
+    // holds main.py — NOT COMFYUI_PATH / workspace_path, which may only be
+    // the extra_model_paths data root.
+    const live = resolveLiveServerRoot(snapshot.argv, snapshot.cwd, { remote: false });
+    if (live.root && existsSync(live.root) && hasMainPy(live.root)) {
+      return live.root;
+    }
+  }
+  return resolveEffectiveComfyUIBase();
+}
+
 // ---------------------------------------------------------------------------
 // #1765 (recurrence on 0.52.35) — a local WRITE aimed at an install the session
 // is not connected to.

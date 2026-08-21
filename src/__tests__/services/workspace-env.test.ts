@@ -104,6 +104,7 @@ import {
   resolveComfyuiPython,
   resolveEffectiveComfyUIBase,
   resolveEffectiveComfyUIBaseLive,
+  resolveCustomNodesScanBaseLive,
   resolveEffectiveComfyUICodeBase,
   resolveEffectiveComfyUICodeBaseLive,
   resolveLocalWorkspaceBase,
@@ -1893,6 +1894,82 @@ describe("resolveEffectiveComfyUIBaseLive (#1653 — configuration first, live s
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("resolveCustomNodesScanBaseLive (#2031 — scan path, not data workspace)", () => {
+  it("uses the live main.py checkout when COMFYUI_PATH is a different data root and there is no --base-directory", async () => {
+    // The portable split the reporter hit: workspace_path ~/ComfyUI (models via
+    // extra_model_paths), code_path ~/ComfyUI/ComfyUI (main.py + custom_nodes).
+    // folder_paths.base_path is the checkout; writing under the data workspace
+    // lands in a directory the runtime never scans.
+    const dir = await tmpDir();
+    try {
+      const workspace = join(dir, "ComfyUI");
+      const code = join(workspace, "ComfyUI");
+      await mkdir(join(workspace, "custom_nodes"), { recursive: true });
+      await mkdir(join(code, "custom_nodes"), { recursive: true });
+      await writeFile(join(code, "main.py"), "", "utf-8");
+      mockConfig.comfyuiPath = workspace;
+      mockConfig.comfyuiCodePath = code;
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: [join(code, "main.py"), "--listen"] },
+      });
+
+      expect(await resolveCustomNodesScanBaseLive()).toBe(code);
+      // The data resolver still answers the workspace — models/output belong
+      // there. Only custom_nodes scan must not follow it.
+      expect(await resolveEffectiveComfyUIBaseLive()).toBe(workspace);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still prefers --base-directory over the checkout (#1770 Desktop)", async () => {
+    const dir = await tmpDir();
+    try {
+      const workspace = join(dir, "user-data");
+      const code = join(dir, "install", "ComfyUI");
+      await mkdir(workspace, { recursive: true });
+      await mkdir(code, { recursive: true });
+      await writeFile(join(code, "main.py"), "", "utf-8");
+      mockConfig.comfyuiPath = workspace;
+      mockGetSystemStats.mockResolvedValue({
+        system: {
+          argv: [join(code, "main.py"), "--base-directory", workspace],
+        },
+      });
+
+      expect(await resolveCustomNodesScanBaseLive()).toBe(workspace);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed on an unresolvable relative --base-directory", async () => {
+    const root = await tmpDir();
+    try {
+      await mkdir(join(root, "custom_nodes"), { recursive: true });
+      await writeFile(join(root, "main.py"), "", "utf-8");
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: ["python", "main.py", "--base-directory", "data"] },
+      });
+      expect(await resolveCustomNodesScanBaseLive()).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns undefined in remote mode without probing /system_stats", async () => {
+    h.remoteMode.value = true;
+    expect(await resolveCustomNodesScanBaseLive()).toBeUndefined();
+    expect(mockGetSystemStats).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the configured data base when the server is unreachable", async () => {
+    mockConfig.comfyuiPath = IS_WIN ? "C:\\cfg\\ComfyUI" : "/cfg/ComfyUI";
+    mockGetSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
+    expect(await resolveCustomNodesScanBaseLive()).toBe(mockConfig.comfyuiPath);
   });
 });
 

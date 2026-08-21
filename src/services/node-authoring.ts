@@ -260,15 +260,19 @@ function toClassName(slug: string): string {
  * (#506). Returns undefined only in remote mode or when no local install is known —
  * then we refuse with a clear, actionable error.
  *
- * `resolvedBase` is the caller's ASYNC, live-aware resolution
- * (`resolveEffectiveComfyUIBaseLive`, #1653/#1715) and is AUTHORITATIVE when
- * given: that resolver already encodes the full precedence — the live server's
- * `--base-directory` (where the running runtime actually scans custom_nodes/
- * from, #1715), then configuration, then the running LOCAL server's own
- * install root. Re-preferring configuration here would resurrect the Desktop
- * split-root bug, where scaffold wrote under the code install root while the
- * runtime loaded from its base directory. The sync configured-only resolution
- * remains the fallback for callers that never resolved one.
+ * `resolvedBase` is the caller's ASYNC, live-aware scan-root resolution
+ * (`resolveCustomNodesScanBaseLive`, #1653/#1715/#2031) and is AUTHORITATIVE
+ * when given: that resolver already encodes the full precedence — the live
+ * server's `--base-directory` (where folder_paths scans custom_nodes/ from
+ * when the flag is set, #1715), else the live main.py checkout on a split
+ * install that has no `--base-directory` (the data workspace is not scanned
+ * unless the flag said so, #2031), then configuration. Re-preferring
+ * configuration here would resurrect either the Desktop split-root bug
+ * (scaffold under the code install root while the runtime loaded from its
+ * base directory) or the portable split-root bug (scaffold under the data
+ * workspace while the runtime loaded from the checkout). The sync
+ * configured-only resolution remains the fallback for callers that never
+ * resolved one.
  */
 function customNodesRoot(resolvedBase?: string): string {
   const base = resolvedBase ?? resolveEffectiveComfyUIBase();
