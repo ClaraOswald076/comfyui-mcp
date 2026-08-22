@@ -575,7 +575,7 @@ async function main() {
                     tr("cli.connect_label_secure", "Secure"),
                     tr(
                       "cli.connect_secure_note",
-                      "the pod's HTTPS panel connects automatically over an\nencrypted tunnel — the ready-to-paste URL is printed when the tunnel is ready, works in any browser.",
+                      "the pod's HTTPS panel connects automatically over an\nencrypted tunnel — the URL is printed when ready.",
                     ),
                   ],
                 ] as const)

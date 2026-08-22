@@ -29,7 +29,7 @@
     "connect_label_secure": "Secure",
     "connect_next_steps": "Next steps:",
     "connect_quiet_note": "Until you click Connect this window stays quiet — that's expected, not\na hang. The agent runs HERE on your Claude/Codex login; nothing is\ninstalled on the ComfyUI box. Keep this terminal open.",
-    "connect_secure_note": "the pod's HTTPS panel connects automatically over an\nencrypted tunnel — the ready-to-paste URL is printed when the tunnel is ready, works in any browser.",
+    "connect_secure_note": "the pod's HTTPS panel connects automatically over an\nencrypted tunnel — the URL is printed when ready.",
     "connect_step_click_connect": "Click Connect in the panel (the Agent panel's Connect dropdown).",
     "connect_step_open_comfyui": "Open that ComfyUI in your browser: {url}",
     "connect_title": "local agent bridge is starting",
