@@ -43,6 +43,6 @@ describe("tool-reach corpus stays valid against the shipped surface", () => {
   });
 
   it("is the advertised size", () => {
-    expect(rows.length).toBe(100);
+    expect(rows.length).toBe(101);
   });
 });

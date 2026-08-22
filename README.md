@@ -29,7 +29,7 @@ Works on **macOS**, **Linux**, and **Windows**. Auto-detects your ComfyUI instal
 
 **Stuck or have a question? [Join the Discord](https://discord.gg/cW9arBhzCu)** — help, model tips, and release announcements.
 
-**37 MCP tools** | **41 AI skills** (Flux · WAN · LTX 2.3 video · MiniMax H3 · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **56 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
+**38 MCP tools** | **41 AI skills** (Flux · WAN · LTX 2.3 video · MiniMax H3 · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **56 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
 
 The plugin ships **expert skills that grow with every release** — model-specific generation guides with curated download URLs, workflow recipes, troubleshooting, and custom-node authoring — so Claude knows the right sampler, CFG, resolution, and model files for each architecture without trial and error.
 
@@ -263,7 +263,7 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 
 ## MCP Tools
 
-37 tools across workflow execution, generation, iteration, composition, models, and more:
+38 tools across workflow execution, generation, iteration, composition, models, and more:
 
 ### Image Generation (high-level)
 
@@ -370,6 +370,7 @@ Install [comfy-cli](https://docs.comfy.org/comfy-cli/getting-started#install-cli
 | Tool | Description |
 |------|-------------|
 | `get_system_stats (action:"logs")` | Get ComfyUI server logs with optional keyword filter (e.g., `error`, `warning`, a node name) |
+| `kitchen` | See what comfy-kitchen can do on this GPU (`status`), find where a graph leaves it on the table (`assess`), and apply the faster path (`apply`) — a failed probe is unknown, never a no |
 | `get_history` `action: "list"` | Get execution history with full error details, Python tracebacks, timing, and cached node info |
 | `get_history` `action: "diagnose"` | Explain a FAILED run in one call — the failed node and traceback PLUS the missing models (file + widget) and missing node types |
 

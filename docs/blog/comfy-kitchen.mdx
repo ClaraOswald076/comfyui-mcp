@@ -1,0 +1,66 @@
+---
+title: "comfy-kitchen in ComfyUI: see the faster path, then prove it"
+description: "kitchen and panel_kitchen report what comfy-kitchen can do on this GPU, name the UNETLoader still on default dtype, and apply fp8 / INT8 attention / NVFP4 with a before/after run — or revert."
+keywords:
+  - comfy-kitchen ComfyUI
+  - ComfyUI NVFP4
+  - ComfyUI fp8 faster
+  - --use-ck-attention
+  - ComfyUI INT8 attention without sageattention
+  - Blackwell ComfyUI speed
+  - ROCm ComfyUI triton backend
+---
+
+_by [artokun](https://github.com/artokun) · August 21, 2026 · kitchen · fp8 · NVFP4 · ComfyUI_
+
+The agent could not even say whether [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen) was present. Users asked it to make their graph faster with kitchen; it guessed. `kitchen` and `panel_kitchen` are the see / assess / apply tools for that, and apply is not done until a before/after run on the same seed says so — or until the widget is reverted.
+
+Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — then start the agent with `npx -y comfyui-mcp@latest connect` and click **Connect** in the panel (no API keys; sign in with `claude` once).
+
+## What a `panel_kitchen apply` report is
+
+The deliverable is a line like this, filled from **that run**, not from a canned bench:
+
+```
+s/it 1.92 → 1.40, peak VRAM 14.1 → 9.8 GB, output non-black, 1 widget changed, 0 flags changed
+```
+
+If the after-run is black, NaN, or **slower**, the widget is reverted and the same line is the failure report. Numbers in docs are the **shape** of that report. The values come off `panel_kitchen apply` on your graph.
+
+Call `kitchen` action:"status" first if you are not on the canvas; `panel_kitchen` if you are.
+
+## What kitchen actually is
+
+comfy-kitchen 0.2.31 (PyPI and GitHub tag `v0.2.31`; ComfyUI master pins that version) is the kernel library: fp8 / NVFP4 / MXFP8 / INT8 tensors and GEMMs, fused RoPE and AdaLN, INT8 attention, backends `hip` / `cuda` / `triton` / `eager`. A June ComfyUI checkout still pins 0.2.10 and lacks `--use-ck-attention`. `status` reports ComfyUI-side **flag support**, not only the kitchen version.
+
+ComfyUI wires it in at four places the tool reads:
+
+- **Startup log:** `comfy-kitchen version: X`, `Found comfy_kitchen backend {name}: {status}`, `Found triton X. Enabling comfy-kitchen triton backend.`, `Using Comfy Kitchen attention`.
+- **Flags:** `--use-ck-attention` (INT8 attention, **no sageattention wheel**), `--enable-triton-backend` / `--disable-triton-backend`, `--fast fp8_matrix_mult`, `--fast cublas_ops`. These are ComfyUI master flags. `--enable-triton-backend` is not SwarmUI-only.
+- **Hardware:** fp8 compute at SM ≥ 8.9 (Ada), NVFP4 / MXFP8 at SM ≥ 10.0 (Blackwell).
+- **Quantized checkpoints:** safetensors `_quantization_metadata` / `.comfy_quant` in `fp8_e4m3fn` / `fp8_e5m2` / `nvfp4` / `mxfp8`. `UNETLoader.weight_dtype` `fp8_e4m3fn_fast` turns on `fp8_optimizations`.
+
+## Three actions
+
+### status
+
+Kitchen version, backends loaded, INT8 attention, GPU fp8 / NVFP4 / MXFP8, launch flags. Remote (`--comfyui-url`, Comfy Cloud) gets log + `/system_stats` only; the import probe and `model.quant` are `unknown`. A failed probe is unknown, never a no.
+
+### assess
+
+Walks UNETLoaders. A rec fires only when every input is known:
+
+1. `weight_dtype: default` on a bf16 UNETLoader, GPU has fp8, kitchen present → `fp8_e4m3fn_fast`. Reversible widget, no restart.
+2. `--use-sage-attention` absent, sageattention not installed, kitchen INT8 available → `--use-ck-attention`. Restart, confirm.
+3. Blackwell GPU, model in bf16/fp8, an NVFP4 sibling **already on disk** → swap. No URL guessed from the filename.
+4. ROCm host, kitchen present, triton ≥ 3.7, triton backend off → `--enable-triton-backend`. Restart.
+
+MXFP8 is reported in status, not recommended, until a loader path exposes it.
+
+### apply
+
+One `recommendation_id` from assess. Widget edits do not need confirm. Flags and downloads need `confirm: true`. Flag apply **names** the launch flag; `restart_comfyui` / `panel_restart_comfyui` replay the previous argv and do not inject a new one — add the flag to the launch line, then restart. `panel_kitchen apply` then queues a `panel_run` on the current seed and reverts on black / NaN / slower.
+
+## INT8 attention without sageattention
+
+The `triton-sageattention` skill used to send you through a wheel-matched install. If `kitchen` action:"status" says INT8 attention is available, use `--use-ck-attention` and skip that dance. See the [kitchen usage page](../kitchen).

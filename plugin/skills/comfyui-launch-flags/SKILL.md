@@ -16,12 +16,17 @@ matter most for making a graph *run* — rather than OOM or crawl — are the
 **VRAM strategy**, the **attention backend**, and the **cache mode**. This skill
 is the decision matrix for choosing them.
 
-> ⚠️ **Verification note (June 2026).** Every flag below was checked against
-> upstream [`comfy/cli_args.py`](https://github.com/comfyanonymous/ComfyUI/blob/master/comfy/cli_args.py).
-> ComfyUI adds/renames flags often — when in doubt run `python main.py --help`
-> in the target install and prefer that over this list. One common non-upstream
-> flag: **`--enable-triton-backend` is a SwarmUI backend flag, NOT a ComfyUI
-> `main.py` flag** — don't pass it to ComfyUI directly.
+> ⚠️ **Verification note (August 2026).** Every flag below was checked against
+> upstream [`comfy/cli_args.py`](https://github.com/comfyanonymous/ComfyUI/blob/master/comfy/cli_args.py)
+> on current master. ComfyUI adds/renames flags often — when in doubt run
+> `python main.py --help` in the target install and prefer that over this list.
+> **`--enable-triton-backend` / `--disable-triton-backend` ARE ComfyUI `main.py`
+> flags on master** (they used to be documented as SwarmUI-only; that is stale).
+> `--use-ck-attention` is kitchen INT8 attention — no `sageattention` wheel.
+> A June ComfyUI checkout still pins comfy-kitchen 0.2.10 and lacks
+> `--use-ck-attention`; `kitchen` action:"status" reports ComfyUI-side flag
+> support, not only the kitchen version. Use `kitchen` / `panel_kitchen` to see
+> what this GPU can actually run.
 
 > ℹ️ **How to apply today.** The MCP's `restart_comfyui` (with `action: "start"`)
 > currently *replays the exact argv of the previous run* — it does not compose
@@ -44,9 +49,10 @@ GPU slows to a crawl, spills into "shared GPU        ▶ --reserve-vram 2..4
 RAM blows up switching between models, or a huge     ▶ --cache-none
   text encoder (FLUX 2 / Mistral) won't unload
 Plenty of VRAM (48GB+), want max throughput         ▶ --gpu-only  or  --highvram
-Want faster sampling on NVIDIA                       ▶ --use-sage-attention   (see caveats)
+Want faster sampling on NVIDIA                       ▶ --use-ck-attention if kitchen INT8 is available (skip the sage wheel); else --use-sage-attention
 Z-Image produces BLACK / wrong output               ▶ --use-pytorch-cross-attention (NOT sage)
 Sage gives black output on some models              ▶ --use-pytorch-cross-attention (or fix dtype)
+ROCm, kitchen present, triton ≥ 3.7                  ▶ --enable-triton-backend
 ```
 
 VRAM strategy and attention backend are each **mutually exclusive groups** —
@@ -83,8 +89,10 @@ Modifiers (combine with the above):
 
 | Flag | Notes |
 |------|-------|
-| `--use-sage-attention` | Quantized SageAttention kernel, ~20–40% faster sampling. Needs the `sageattention` package installed and version-matched — see [`triton-sageattention`](../triton-sageattention/SKILL.md). |
+| `--use-ck-attention` | Comfy Kitchen INT8 attention. **No `sageattention` wheel.** Needs comfy-kitchen present and `int8_attention_is_available()` on this GPU. Prefer this over the sage wheel-matching install when `kitchen` action:"status" says INT8 is available. Restart required. |
+| `--use-sage-attention` | Quantized SageAttention kernel, ~20–40% faster sampling. Needs the `sageattention` package installed and version-matched — see [`triton-sageattention`](../triton-sageattention/SKILL.md). Skip this dance when `--use-ck-attention` is available. |
 | `--use-flash-attention` | FlashAttention kernels. Needs `flash-attn` built for your torch/CUDA. |
+| `--enable-triton-backend` / `--disable-triton-backend` | Enable or disable the comfy-kitchen **triton** backend. ComfyUI master flags (not SwarmUI-only). ROCm hosts with kitchen + triton ≥ 3.7 want `--enable-triton-backend`. Restart required. |
 | `--use-pytorch-cross-attention` | PyTorch SDPA. **Highest quality, always available, no extra deps.** The safe default and the correct fallback. |
 | `--use-split-cross-attention` / `--use-quad-cross-attention` | Memory-optimized math attention for older/low-VRAM cards. |
 
@@ -137,8 +145,10 @@ Long video OOM (LTX 2 / WAN, 24GB):   --novram --cache-none
 Windows shared-VRAM creep:            --reserve-vram 3
 FLUX 2 / huge text-encoder swaps:     --cache-none
 High-VRAM throughput (48GB+):         --gpu-only        (or --highvram)
-Fast NVIDIA sampling (most models):   --use-sage-attention
+Fast NVIDIA sampling (most models):   --use-ck-attention   (if kitchen INT8 is available)
+                                      --use-sage-attention (otherwise; needs the wheel)
 Z-Image (any):                        --use-pytorch-cross-attention
+ROCm + kitchen + triton ≥ 3.7:        --enable-triton-backend
 ```
 
 Cross-refs: video OOM specifics in
@@ -196,5 +206,5 @@ Operational facts worth carrying:
 
 ## Sources
 
-- **Official:** ComfyUI CLI args at https://github.com/comfyanonymous/ComfyUI/blob/master/comfy/cli_args.py and startup flags at https://docs.comfy.org/development/comfyui-server/startup-flags
-- **Empirical:** operational flag/stack recipes distilled from community auto-installer changelogs (SECourses); flags cross-checked against upstream above.
+- **Official:** ComfyUI CLI args at https://github.com/comfyanonymous/ComfyUI/blob/master/comfy/cli_args.py (`--use-ck-attention`, `--enable-triton-backend`, `--disable-triton-backend`, `--fast`); hardware gates in `comfy/model_management.py` (`supports_fp8_compute` SM ≥ 8.9, `supports_nvfp4_compute` / `supports_mxfp8_compute` SM ≥ 10.0); kitchen backends in the comfy-kitchen README https://github.com/Comfy-Org/comfy-kitchen
+- **Empirical:** operational flag/stack recipes distilled from community auto-installer changelogs (SECourses); flags cross-checked against upstream above. The SwarmUI-only note for `--enable-triton-backend` is retracted as of ComfyUI master.

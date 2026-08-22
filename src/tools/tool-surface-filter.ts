@@ -56,6 +56,8 @@ export const MUTATING_TOOLS = [
   "get_defaults",
   "install_comfyui",
   "install_custom_node",
+  // action:"apply" writes a widget, names a restart flag, or swaps a checkpoint.
+  "kitchen",
   // action:"remove" deletes a model FILE; add_path/remove_path rewrite
   // extra_model_paths.yaml.
   "list_local_models",

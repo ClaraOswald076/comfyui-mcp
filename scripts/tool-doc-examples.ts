@@ -98,6 +98,52 @@ const FRAGMENT_NOTE =
   "get_workflow, or the one it built for you.";
 
 export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
+  kitchen: {
+    gloss:
+      "comfy-kitchen is ComfyUI's kernel library (fp8 / NVFP4 / MXFP8 / INT8 " +
+      "attention). This tool reports what the connected GPU can run, walks a " +
+      "graph for the faster path, and applies a recommendation. A failed probe " +
+      "is unknown, never a no — a recommendation fires only when every fact it " +
+      "needs is known. For the open canvas use panel_kitchen.",
+    examples: [
+      {
+        ask: "Is kitchen even installed on this GPU, and can it do fp8?",
+        args: { action: "status" },
+        returns:
+          "Kitchen version (or unknown), which backends loaded, whether INT8 " +
+          "attention is on, GPU fp8/NVFP4/MXFP8, and the launch flags in argv. " +
+          "Remote sessions skip the import probe and model.quant.",
+      },
+      {
+        ask: "Where is this workflow leaving kitchen speed on the table?",
+        args: {
+          action: "assess",
+          workflow: {
+            "12": {
+              class_type: "UNETLoader",
+              inputs: { unet_name: "flux1-dev.safetensors", weight_dtype: "default" },
+            },
+          },
+        },
+        returns:
+          "Per-loader facts plus recommendations that fired. A default " +
+          "UNETLoader on a bf16 file, with kitchen present and an fp8 GPU, " +
+          "yields fp8_e4m3fn_fast. Missing facts stay unknown; they do not " +
+          "invent a rec.",
+      },
+      {
+        ask: "Apply that fp8 widget change.",
+        args: { action: "apply", recommendation_id: "fp8_unet_fast:12" },
+        returns:
+          "The widget edit on the supplied workflow, or a needs_confirm " +
+          "refusal for a flag that would restart. Flag apply names the launch " +
+          "flag; restart_comfyui replays argv and does not inject it.",
+        caution:
+          "A flag or download recommendation needs confirm:true. Proof of a " +
+          "faster non-black after-run is panel_kitchen apply.",
+      },
+    ],
+  },
   // -------------------------------------------------------------------------
   // Image & Audio Generation
   // -------------------------------------------------------------------------

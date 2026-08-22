@@ -94,6 +94,7 @@ const MARKER = /sign in with `claude` once/;
  */
 const EXPECTED_CARRIERS = new Set([
   'anima-comfyui.mdx',
+  'comfy-kitchen.mdx',
   'ernie-image-comfyui.mdx',
   'ideogram-4-comfyui.mdx',
   'lora-trainer-p1.mdx',

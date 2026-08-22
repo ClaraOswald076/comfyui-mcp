@@ -13,6 +13,17 @@ globs:
 > broken under `--use-sage-attention` → launch it with
 > `--use-pytorch-cross-attention` instead.
 
+## Prefer kitchen INT8 attention when it is available
+
+If `kitchen` action:"status" (or `panel_kitchen`) reports kitchen present and
+`int8_attention_is_available` on this GPU, launch with **`--use-ck-attention`**
+and **skip the sageattention wheel dance**. Kitchen INT8 attention is a ComfyUI
+flag; it does not need a version-matched `sageattention` wheel. Restart
+required, consent-gated like every restart.
+
+Only fall through to the Triton + SageAttention install below when kitchen INT8
+is **unknown** or **not available**. A failed kitchen probe is unknown, not a no.
+
 ## Overview
 
 Two **optional accelerators** that many modern video graphs (especially kijai's
@@ -56,11 +67,14 @@ Workflow crashes "No module named 'sageattention'"  ──┐
                                                        ▼
               1. APPLY THE SDPA / NO-COMPILE FALLBACK  → render works now
                                                        ▼
-              2. OFFER acceleration:
-                 "Want me to install Triton + SageAttention for ~20–40%
-                  faster sampling? It's a version-matched install that
-                  touches your torch env — I'll verify torch/CUDA/python
-                  first and can roll back."
+              2. OFFER acceleration, in this order:
+                 a. If kitchen INT8 attention is available:
+                    "Want --use-ck-attention? No sageattention wheel."
+                 b. Else:
+                    "Want me to install Triton + SageAttention for ~20–40%
+                     faster sampling? It's a version-matched install that
+                     touches your torch env — I'll verify torch/CUDA/python
+                     first and can roll back."
                                                        ▼
               3. Only on YES → install per-OS below → verify → re-enable
                  sageattn + torch.compile in the workflow.
@@ -360,5 +374,5 @@ rather than trying to satisfy the dependency.
 
 ## Sources
 
-- **Official:** triton-windows https://github.com/woct0rdho/triton-windows and SageAttention Windows wheels https://github.com/woct0rdho/SageAttention/releases
+- **Official:** triton-windows https://github.com/woct0rdho/triton-windows and SageAttention Windows wheels https://github.com/woct0rdho/SageAttention/releases; ComfyUI `--use-ck-attention` in `comfy/cli_args.py`; comfy-kitchen `int8_attention_is_available()` at https://github.com/Comfy-Org/comfy-kitchen
 - **Empirical:** sdpa / no-compile fallback, wheel-matching recipes, and WanVideoWrapper attention_mode notes from observed loader crashes.

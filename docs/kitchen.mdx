@@ -1,0 +1,61 @@
+---
+title: "kitchen and panel_kitchen"
+description: "See what comfy-kitchen can do on this GPU, find where the open graph is leaving it on the table, and apply the faster path with proof."
+---
+
+# kitchen and panel_kitchen
+
+[comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen) is ComfyUI's kernel library — fp8 / NVFP4 / MXFP8 / INT8 quantized tensors and GEMMs, fused RoPE and AdaLN, and its own INT8 attention, with `hip` / `cuda` / `triton` / `eager` backends. It is not a workflow library.
+
+Two tools share the same actions:
+
+- **`kitchen`** `{ action: "status" | "assess" | "apply" }` — MCP clients. `assess` takes a workflow JSON.
+- **`panel_kitchen`** — the same actions against the live canvas, fenced like every other panel mutation.
+
+A failed probe is **unknown**, never a no. A recommendation fires only when every fact it needs is known.
+
+## status — what this GPU can run
+
+`status` reports:
+
+| Field | Meaning of `unknown` |
+|---|---|
+| `present` | No version line, no `comfy_package_versions[comfy-kitchen]`, and no import probe. Not a report that kitchen is missing. |
+| `version` | Kitchen is present but the version token was not in the log, packages, or probe. |
+| `backends.hip/cuda/triton/eager` | No `Found comfy_kitchen backend …` line and no `ck.list_backends()` probe. |
+| `attention.ck` | Need **both** `--use-ck-attention` in argv **and** `Using Comfy Kitchen attention` in the log. A missing log line is not a no. |
+| `gpu.fp8` | SM ≥ 8.9 (Ada). Unknown when the GPU name is not in the known table and there is no compute-capability probe. |
+| `gpu.nvfp4` / `gpu.mxfp8` | SM ≥ 10.0 (Blackwell). Same unknown rule. |
+| `gpu.int8Attention` | `ck.int8_attention_is_available()` was not probed (remote, no python, or timeout). |
+| `flagSupport.ckAttention` | `comfy/cli_args.py` was not readable and argv does not already carry `--use-ck-attention`. A June ComfyUI checkout pins kitchen 0.2.10 and lacks the flag. |
+| `model.quant` | Remote session, or `COMFYUI_PATH` unset, or the safetensors header was unreadable. Filename is not used as a substitute. |
+
+**Local vs remote.** `--comfyui-url` / Comfy Cloud gets log + `/system_stats` only. The import probe and `model.quant` stay `unknown` there; the tool says so rather than guessing from the filename.
+
+## assess — four recommendations
+
+`assess` walks UNETLoaders. Each rec is a conjunction:
+
+| id prefix | Facts that must all be known | Change |
+|---|---|---|
+| `fp8_unet_fast:<node>` | kitchen present, GPU fp8, `weight_dtype` is `default`, file quant is unquantized (`none`) | set `weight_dtype` to `fp8_e4m3fn_fast`. Widget, no restart. |
+| `ck_attention` | `--use-sage-attention` absent, sageattention **not** installed (a log import-failure or a trusted probe, not silence), kitchen present, INT8 available, flag not already on | add `--use-ck-attention`. Restart, `confirm: true`. |
+| `nvfp4_swap:<node>` | GPU nvfp4, loader is bf16/fp8, an NVFP4 sibling of that filename is **already listed** locally | swap `unet_name`. No download guess. |
+| `triton_backend` | ROCm host, kitchen present, triton ≥ 3.7, `--enable-triton-backend` not on argv | add `--enable-triton-backend`. Restart, `confirm: true`. |
+
+MXFP8, SVDQuant, and AWQ appear in `status` but are not recommended until a loader path in ComfyUI exposes them.
+
+## apply — change, then prove or revert
+
+- **Widget recs** (`fp8_unet_fast`, `nvfp4_swap`) do not need `confirm`. `kitchen` mutates the supplied workflow JSON. `panel_kitchen` writes through `graph_set_widget` (Ctrl+Z).
+- **Flag recs** need `confirm: true`. `restart_comfyui` / `panel_restart_comfyui` **replay the previous argv** and do not inject a new flag. Apply names the flag and tells you to add it to the launch line, then restart. That is not a new restart path.
+- **Proof.** `panel_kitchen apply` queues a `panel_run` on the current seed after a widget change. The report shape is `s/it A → B, peak VRAM C → D GB, output non-black, N widget changed, M flags changed`. A black or NaN after-run, or a slower after-run, **reverts** the widget. `kitchen apply` without a runner reports `proof.status: "not_run"` rather than claiming a bench it did not run.
+- Pass `skip_proof: true` on `panel_kitchen` to apply without queueing a run.
+
+## Proactive hint
+
+Once per process, when kitchen is present and rec 1 or rec 2 is certain, `status` / `assess` includes one sentence naming the gap and the tool. Nothing runs unasked.
+
+## Flags this tool can name
+
+`--use-ck-attention`, `--enable-triton-backend`, `--disable-triton-backend`, `--fast fp8_matrix_mult`, `--fast cublas_ops`. On master these are ComfyUI flags. `--enable-triton-backend` is **not** SwarmUI-only.

@@ -35,6 +35,7 @@ panel_get_subgraph
 panel_get_workflow_target
 panel_graph_outline
 panel_install_node
+panel_kitchen
 panel_list_mcp
 panel_list_nodes
 panel_list_subgraphs

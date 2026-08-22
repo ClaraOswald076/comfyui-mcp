@@ -11,6 +11,8 @@ This registry grows with every release — if a model you need is missing, use
 `action:"search"` (HuggingFace) or `action:"download_civitai"` and consider
 contributing the row.
 
+**Quant column (kitchen).** Filenames in this registry are mostly bf16 / fp8. NVFP4 and MXFP8 siblings, when a vendor publishes them, are the same stem with `nvfp4` / `mxfp8` in the name and belong in `diffusion_models/` too. `kitchen` action:"assess" only offers an NVFP4 swap when that sibling is **already listed locally** — it does not guess a URL from the filename. Blackwell (SM ≥ 10.0) is the GPU that can run NVFP4 / MXFP8 compute.
+
 **Conventions**
 - HF "resolve" URLs download directly: `https://huggingface.co/<repo>/resolve/main/<path>`
 - 🔒 = gated repo — needs `HUGGINGFACE_TOKEN` (accept the license on the HF page first)
@@ -118,5 +120,5 @@ handles auth:
 
 ## Sources
 
-- **Official:** Hugging Face resolve-URL convention https://huggingface.co/<repo>/resolve/main/<path>
+- **Official:** Hugging Face resolve-URL convention https://huggingface.co/<repo>/resolve/main/<path>; kitchen NVFP4/MXFP8 hardware gates in ComfyUI `comfy/model_management.py` and quant metadata in `comfy/quant_ops.py`.
 - **Empirical:** the curated list and Civitai notes are ours, not a vendor catalog.

@@ -1,6 +1,6 @@
 # Tool-reach benchmark
 
-100 realistic user requests against the consolidated **37-tool** surface, to answer the
+101 realistic user requests against the consolidated **38-tool** surface, to answer the
 question the 0.50.0 consolidation raises: *folding 154 tools into 37 makes the list
 easier to hold in a context window — but can an agent still reach the RIGHT one?*
 
@@ -16,7 +16,7 @@ instead — its presence is the interesting signal, not a scoring detail.
 
 ## Coverage (checked, not asserted)
 
-- 100 rows; **every one of the 37 tools is exercised at least once** (no blind spots);
+- 101 rows; **every one of the 38 tools is exercised at least once** (no blind spots);
 - every `expect` value exists in the live `TOOL_NAMES` — the corpus cannot silently rot
   against a rename, because the check fails loudly;
 - 11 rows carry an `alt`; 7 are explicitly flagged AMBIGUOUS or CONTROL.
@@ -28,10 +28,10 @@ node benchmarks/run-arm.mjs --base http://127.0.0.1:11434/v1 --model qwen3:4b
 node benchmarks/run-arm.mjs --base https://api.moonshot.ai/v1 --model kimi-k2 --key $KIMI_KEY
 ```
 
-Any OpenAI-compatible `/chat/completions` endpoint. The model sees the 37 tool names and
+Any OpenAI-compatible `/chat/completions` endpoint. The model sees the 38 tool names and
 the request — never `expect`, `alt` or `why`.
 
-**It is not run automatically, and that is deliberate.** A hosted arm is 100 billable
+**It is not run automatically, and that is deliberate.** A hosted arm is 101 billable
 calls; a local arm puts a model resident on the GPU, which on a single-GPU box competes
 with ComfyUI for VRAM (the orchestrator already pauses Ollama during renders for exactly
 that reason). Both are decisions for whoever owns the machine and the budget.
@@ -45,7 +45,7 @@ Read the printed misses, not the rate.
 ### Method notes
 
 
-Give a model ONLY the 37 tool names + descriptions and each `request`, ask which single
+Give a model ONLY the 38 tool names + descriptions and each `request`, ask which single
 tool it would call first, and compare to `expect`. Treat a hit on `alt` as a partial,
 not a miss — those rows are ambiguous **by construction** and are there to measure the
 ambiguity, not the model.
@@ -106,7 +106,7 @@ one GPU and turns a two-minute run into a timeout. Run them one at a time.
 ## What the ambiguity map already shows
 
 Three gaps surfaced while building the corpus. None is a consolidation regression — each
-is a request users make that the 37-tool surface has no clean home for:
+is a request users make that the 38-tool surface has no clean home for:
 
 1. **No error/log retrieval.** *"Show the last error from the server"* (#86), *"my image
    came out black"* (#77). An agent's best move is `get_history`, which is not what was
@@ -117,7 +117,7 @@ is a request users make that the 37-tool surface has no clean home for:
 3. **Capability discovery.** *"What can you do?"* (#100) has no answer in the surface —
    `list_packs` is the nearest and is about packs, not capabilities.
 
-Separately, **live-canvas editing is deliberately absent from these 37** (#75, #76):
+Separately, **live-canvas editing is deliberately absent from these 38** (#75, #76):
 adding a node or setting a widget on the open canvas is a `panel_*` tool. That is by
 design, but it means an agent holding only the core surface cannot edit a graph, and the
 descriptions do not say so — a caller reaching for `create_workflow` to "change the seed

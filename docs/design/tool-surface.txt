@@ -193,3 +193,4 @@ enable_custom_node
 uninstall_custom_node
 runpod
 node_pack
+kitchen
