@@ -10,6 +10,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **`panel_show_media` refuses a kind a stale panel cannot paint (#2017).** A
+  pre-#710 panel has no audio painter: everything that is not video is drawn
+  with `<img>`, so a `.wav` (as a /view ref today, or as `kind:"audio"` once
+  the allowlist lands) becomes a broken-image card that still reports success.
+  The tool now asserts the panel can render the kind BEFORE dispatch. A hello
+  `show_media_kinds` list is the authority when present; otherwise a parseable
+  advertised version below panel 0.11.43 (the first release that shipped #710)
+  is proof. Missing, inherited, or unparseable versions fail open — same
+  tri-state as the command gate — so a current panel that omitted the field is
+  never told to update. Image and video skip the check. The refusal names the
+  advertised version and the upgrade, and tells the user to hard-refresh; a
+  restart alone leaves cached JS running.
 - **Restart does not report graph tools ready on a transient panel reconnect (#2067).**
   `panel_restart_comfyui` accepted the first fresh original-tab hello as
   `graph_tools_ready:true`. That socket can drop a moment later, so the next

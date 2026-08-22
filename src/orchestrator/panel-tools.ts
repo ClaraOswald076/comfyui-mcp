@@ -66,12 +66,14 @@ import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { parse as parseYaml } from "yaml";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { UiBridge, PanelVersionReading } from "../services/ui-bridge.js";
+import type { UiBridge, PanelVersionReading, UnsupportedShowMediaItem } from "../services/ui-bridge.js";
 import {
   requiredPanelVersion,
   SEMVER_RE,
   LATE_ASK_TTL_MS,
   tabIncarnationSlot,
+  SHOW_MEDIA_KIND_MIN_PANEL_VERSION,
+  showMediaItemsPanelCannotPaint,
 } from "../services/ui-bridge.js";
 import { compareSemver } from "../services/self-update.js";
 import { describeInstallPanelAction } from "../services/panel-recovery.js";
@@ -4706,6 +4708,61 @@ function tabAdvertisedPanelVersion(ctx: PanelToolCtx): string | undefined {
   }
   const v = reading?.version;
   return typeof v === "string" && SEMVER_RE.test(v.trim()) ? v.trim() : undefined;
+}
+
+function tabPanelVersionReading(ctx: PanelToolCtx): PanelVersionReading {
+  const fn = ctx.bridge.advertisedPanelVersion;
+  if (typeof fn !== "function") return {};
+  try {
+    return fn.call(ctx.bridge, ctx.tabId) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+function tabAdvertisedShowMediaKinds(ctx: PanelToolCtx): readonly string[] | undefined {
+  const fn = ctx.bridge.tabShowMediaKinds;
+  if (typeof fn !== "function") return undefined;
+  try {
+    return fn.call(ctx.bridge, ctx.tabId);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * #2017 — refuse a kind this panel is proven unable to paint, rather than send
+ * an item that becomes a broken-image card and reports success.
+ *
+ * Names the advertised version (when we have one) and the upgrade; a restart
+ * alone leaves cached JS running, so the hard-refresh is part of the remedy.
+ */
+function formatShowMediaKindUnsupported(blocked: readonly UnsupportedShowMediaItem[]): string {
+  const kinds = [...new Set(blocked.map((b) => b.kind))];
+  const kindList = kinds.map((k) => `"${k}"`).join(", ");
+  const needed =
+    blocked.find((b) => b.needed)?.needed ??
+    kinds.map((k) => SHOW_MEDIA_KIND_MIN_PANEL_VERSION[k]).find((v) => typeof v === "string");
+  const version = blocked.find((b) => b.version)?.version;
+  const items = blocked.map((b) => `  - ${b.filename} (${b.kind})`).join("\n");
+  const update = describeInstallPanelAction(
+    "update",
+    "update the ComfyUI-MCP panel via ComfyUI Manager",
+  );
+  const floor = needed ? ` to ≥${needed}` : " to a build that can paint it";
+  const detected = version ? ` This tab announced panel ${version}.` : "";
+  const why = blocked.some((b) => b.reason === "not_in_hello")
+    ? `The panel advertised the kinds it can paint and ${kindList} ${kinds.length === 1 ? "is" : "are"} not among them.`
+    : `kind ${kindList} ${kinds.length === 1 ? "is" : "are"} only understood by panels from #710 onward` +
+      (needed ? ` (first shipped in ${needed})` : "") +
+      ".";
+  return (
+    `This panel cannot paint ${kindList}.${detected} ${why} ` +
+    `Sending ${blocked.length === 1 ? "it" : "them"} would show a broken-image card and report success.\n` +
+    `Items not sent:\n${items}\n` +
+    `${update}${floor}, then HARD-REFRESH the browser tab (Ctrl+Shift+R, or Cmd+Shift+R on macOS); ` +
+    `a restart alone leaves the tab running cached old JS.`
+  );
 }
 
 /**
@@ -19516,6 +19573,21 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
               });
             }
           }
+        }
+
+        // #2017 — do not send a painter kind this panel is proven unable to
+        // render. A pre-#710 panel paints `audio` as `<img>` and reports
+        // success; refusing with the version and the upgrade is strictly better
+        // than a broken-image card. Fail-OPEN when the version is unknown or
+        // inherited (same tri-state as the #392 command gate) so a current
+        // panel that omitted the field is never told to update. Image/video
+        // skip the check entirely.
+        const blocked = showMediaItemsPanelCannotPaint(resolved, {
+          reading: tabPanelVersionReading(ctx),
+          advertisedKinds: tabAdvertisedShowMediaKinds(ctx),
+        });
+        if (blocked.length > 0) {
+          return fail(formatShowMediaKindUnsupported(blocked));
         }
 
         // #2010 — the reply below is the CLIENT's, and one of the two clients
