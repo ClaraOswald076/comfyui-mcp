@@ -19195,6 +19195,13 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           ".m4v": "video/x-m4v",
           ".avi": "video/x-msvideo",
         };
+        // #2011 — family classification for the /view probe only. The path
+        // gate below still refuses audio; a /view ref is already forwarded
+        // unclassified, and without this set `take.wav` serving `image/png`
+        // is silently blessed. Keys match upload_image action:"audio" /
+        // image-management AUDIO_MIME — the orchestrator's own audio set,
+        // not the panel renderer's (which also lists .opus/.oga).
+        const AUDIO_EXTS = new Set([".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"]);
         const MAX_BYTES = 20 * 1024 * 1024; // 20 MB
 
         const resolved: Array<Record<string, unknown>> = [];
@@ -19457,11 +19464,42 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
               const mime = resp.headers.get("content-type") ?? "";
               if (!resp.ok) {
                 probe.nonMedia.push({ filename: ref.filename, detail: `HTTP ${resp.status}` });
-              } else if (!mime.startsWith("image/") && !mime.startsWith("video/")) {
-                probe.nonMedia.push({
-                  filename: ref.filename,
-                  detail: `content-type "${mime || "unset"}"`,
-                });
+              } else {
+                // #2011 — this probe exists to predict a BROKEN card, and the
+                // panel picks its painter from the filename, never the body.
+                // "Is it media" is the wrong question: take.wav serving
+                // audio/wav is a false alarm, take.wav serving image/png is a
+                // silent broken card, and widening the old test to accept
+                // audio/* blesses plate.png serving audio/wav. Compare
+                // families. An unclassifiable name accepts any media body
+                // (the panel gives it a link card, not a broken one). Uses
+                // this handler's own extension sets, so an exotic-but-real
+                // image (.bmp, .avif) is not accused.
+                const refExt = extname(ref.filename).toLowerCase();
+                const expected = IMAGE_EXTS.has(refExt)
+                  ? "image"
+                  : VIDEO_EXTS.has(refExt)
+                    ? "video"
+                    : AUDIO_EXTS.has(refExt)
+                      ? "audio"
+                      : null;
+                const isMediaBody =
+                  mime.startsWith("image/") ||
+                  mime.startsWith("video/") ||
+                  mime.startsWith("audio/");
+                if (!isMediaBody) {
+                  probe.nonMedia.push({
+                    filename: ref.filename,
+                    detail: `content-type "${mime || "unset"}"`,
+                  });
+                } else if (expected && !mime.startsWith(`${expected}/`)) {
+                  probe.nonMedia.push({
+                    filename: ref.filename,
+                    detail:
+                      `content-type "${mime}" but the filename says ${expected} — the panel picks its ` +
+                      `painter from the NAME, so this card renders broken`,
+                  });
+                }
               }
             } catch {
               // An unreachable /view from HERE says nothing reliable about the
