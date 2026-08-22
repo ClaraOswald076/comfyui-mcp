@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.48] - 2026-08-21
+
 ### Fixed
 
 - **Bridge port 9180 collides with Logitech G HUB — default is now 9199 (#2030).**
@@ -23,6 +25,14 @@ All notable changes to this project are documented here. This project adheres to
   moved. 9180-era pairing on 9182 still answers. The orchestrator advertises
   `ws://127.0.0.1:<bound-port>` on `advertise_bridge` so the panel can follow
   (companion: [comfyui-mcp-panel#1596](https://github.com/artokun/comfyui-mcp-panel/issues/1596)).
+
+### MCP
+
+#### Fixed
+- target tunnels at the bound host (#2023) (#2036)
+- recover subgraph widget write scope (#2037)
+- default the panel bridge to 9199 and never kill a foreign holder (#2034)
+
 
 ## [0.52.47] - 2026-08-21
 
