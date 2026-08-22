@@ -26,6 +26,15 @@ import { advertisedPublicOrigin } from "./services/advertised-origin.js";
 import { banner, labelRows, numberedSteps } from "./i18n/terminal-layout.js";
 import { STDIO_HANDSHAKE_INSTRUCTIONS } from "./handshake-instructions.js";
 
+/** A RunPod proxy can only reach a listener exposed beyond loopback. */
+function advertisedOriginForBind(host: string, port: number): string | undefined {
+  const normalized = host.trim().toLowerCase();
+  if (normalized === "127.0.0.1" || normalized === "::1" || normalized === "localhost") {
+    return undefined;
+  }
+  return advertisedPublicOrigin(port);
+}
+
 /**
  * Fire-and-forget: ensure the ComfyUI sidebar panel is installed (install-if-
  * missing) on MCP load. LOCAL-only, hard-timed-out, and never throws — it must
@@ -292,7 +301,7 @@ async function openTunnelAndAnnounce(
     publicUrl = tunnel.url;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    const advertised = advertisedPublicOrigin(port);
+    const advertised = advertisedOriginForBind(host, port);
     const fallback = advertised
       ? `${advertised}/mcp`
       : host === "0.0.0.0" || host === "::"
@@ -616,7 +625,7 @@ async function main() {
       allowUnauthenticated: cli.allowUnauthenticated,
       createServer: () => createConfiguredServer(cli.toolMode),
     });
-    const advertised = advertisedPublicOrigin(cli.port);
+    const advertised = advertisedOriginForBind(cli.host, cli.port);
     const runningOrigin = advertised
       ? advertised
       : cli.host === "0.0.0.0" || cli.host === "::"
