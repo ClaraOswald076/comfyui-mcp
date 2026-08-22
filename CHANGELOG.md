@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.60] - 2026-08-22
+
+### MCP
+
+#### Fixed
+- a stale panel is refused instead of painting audio as a broken image (#2042)
+
+
 ## [0.52.59] - 2026-08-22
 
 ### Fixed
