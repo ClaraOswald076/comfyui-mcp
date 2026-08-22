@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.57] - 2026-08-22
+
+### MCP
+
+#### Fixed
+- an unroutable show_media names who it is queued for, not whoever hellos next (#2041)
+
+
 ## [0.52.56] - 2026-08-22
 
 ### Fixed
