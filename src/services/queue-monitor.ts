@@ -96,6 +96,11 @@ export interface StallReport {
    *  queued, or a very recent self-queue) — a deliberate batch, not a foreign or
    *  stuck job. The backlog warning is suppressed in that case (#559). */
   selfAttributed: boolean;
+  /** True when a VISIBLE in-flight prompt id is not one this session queued.
+   *  Extra queueRemaining with no such id is stale accounting, not proof of
+   *  foreign work — the turn note must not claim "this session didn't queue"
+   *  unless this is true (#559 recurrence). */
+  foreignVisible: boolean;
   runningPromptId: string | null;
   currentNode: string | null;
   /** running + pending, from ComfyUI's own queue_remaining. */
@@ -383,6 +388,15 @@ class QueueMonitorImpl {
     return "unknown";
   }
 
+  /** Prompt ids the monitor can currently SEE (running + poll-derived pending).
+   *  Distinct from queueRemaining, which status frames can leave stale/high. */
+  private inFlightPromptIds(): string[] {
+    const ids: string[] = [];
+    if (this.state.runningPromptId) ids.push(this.state.runningPromptId);
+    ids.push(...this.state.pendingPromptIds);
+    return ids;
+  }
+
   /** True when the ENTIRE in-flight queue is attributable to this session — i.e.
    *  every visible prompt (the running one plus every pending one) is an id we
    *  queued. That is the only safe basis for suppressing the backlog warning: a
@@ -394,11 +408,16 @@ class QueueMonitorImpl {
    *  to match against (the panel reply never carried a prompt_id) OR nothing is yet
    *  identifiable do we fall back to the coarse "did we self-queue very recently"
    *  heuristic — so a recent self-queue can NOT mask a job whose id we can see is
-   *  not ours. */
+   *  not ours.
+   *
+   *  Extra queueRemaining beyond the visible ids is NOT treated as foreign. Status
+   *  frames can leave that counter high after the poll has already listed every
+   *  real job (the #559 recurrence: one self-owned running prompt, pending empty,
+   *  queueRemaining=2). After the 10-minute window the 1 Hz poll has had hundreds
+   *  of chances to name a real extra job; if it hasn't, the extra slot is stale
+   *  accounting. The duplicate fence still uses the strict proven form. */
   private isSelfAttributed(): boolean {
-    const inFlight: string[] = [];
-    if (this.state.runningPromptId) inFlight.push(this.state.runningPromptId);
-    inFlight.push(...this.state.pendingPromptIds);
+    const inFlight = this.inFlightPromptIds();
     const recentSelfQueue =
       this.lastSelfQueueTs != null && Date.now() - this.lastSelfQueueTs < SELF_QUEUE_WINDOW_MS;
 
@@ -406,20 +425,20 @@ class QueueMonitorImpl {
       // We receive a prompt id for every job we queue, so any VISIBLE in-flight id
       // that isn't one of ours is definitively a foreign job → not our batch.
       if (inFlight.some((id) => !this.selfQueuedIds.has(id))) return false;
-      // Every VISIBLE in-flight job is ours. The pending ids are poll-derived and can
-      // lag a rapid burst of queues, so queueRemaining (updated live by status frames)
-      // may exceed what we've captured. If the poll has fully accounted for the depth,
-      // the whole queue is provably ours; if some items aren't captured yet, only
-      // treat them as ours when we self-queued recently (the reported case — queuing a
-      // batch faster than the 1 Hz poll). A stale unseen item with NO recent self-queue
-      // is treated as possibly-foreign so the warning still fires.
-      const depth = Math.max(inFlight.length, Math.max(0, this.state.queueRemaining));
-      if (inFlight.length >= depth) return true;
-      return recentSelfQueue;
+      // Every VISIBLE in-flight job is ours. Rapid bursts can leave pending ids
+      // lagging queueRemaining; a long self-owned render can leave queueRemaining
+      // stale-high after the timestamp window. Neither is a foreign job.
+      return true;
     }
     // No ids to match against (the panel never surfaced one) or nothing identifiable
     // in flight yet → fall back to the coarse recent-self-queue timestamp.
     return recentSelfQueue;
+  }
+
+  /** True when at least one visible in-flight prompt id is not one we queued.
+   *  Empty visibility (depth from status frames only) is unproven, not foreign. */
+  private isForeignVisible(): boolean {
+    return this.inFlightPromptIds().some((id) => !this.selfQueuedIds.has(id));
   }
 
   /** The STRICT form of isSelfAttributed, for the panel_run duplicate fence
@@ -436,9 +455,7 @@ class QueueMonitorImpl {
    *  refused with the allow_duplicate override named — a false refusal with an
    *  actionable remedy, never a silent duplicate. */
   private isSelfAttributedProven(): boolean {
-    const inFlight: string[] = [];
-    if (this.state.runningPromptId) inFlight.push(this.state.runningPromptId);
-    inFlight.push(...this.state.pendingPromptIds);
+    const inFlight = this.inFlightPromptIds();
     if (this.selfQueuedIds.size === 0 || inFlight.length === 0) return false;
     if (inFlight.some((id) => !this.selfQueuedIds.has(id))) return false;
     const depth = Math.max(inFlight.length, Math.max(0, this.state.queueRemaining));
@@ -930,6 +947,7 @@ class QueueMonitorImpl {
       stalled,
       backlog: queueDepth > 1,
       selfAttributed: this.isSelfAttributed(),
+      foreignVisible: this.isForeignVisible(),
       runningPromptId: this.state.runningPromptId,
       currentNode: this.state.currentNode,
       queueDepth,

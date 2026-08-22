@@ -123,14 +123,26 @@ describe("self-attribution of the in-flight queue (#559)", () => {
     expect(QueueMonitor.snapshot().selfAttributed).toBe(true);
   });
 
-  it("incomplete accounting with NO recent self-queue → NOT ours (an unseen item may be foreign)", () => {
-    QueueMonitor.markSelfQueued("p-mine");
-    priv.lastSelfQueueTs = Date.now() - 11 * 60 * 1000; // aged past the window
-    priv.state.runningPromptId = "p-mine"; // the one job we can see is ours…
+  it("stale extra depth with every VISIBLE id ours is still ours, even after the window (#559 recurrence)", () => {
+    // Reporter: a long self-queued render was in selfQueuedIds; queueRemaining=2
+    // from a status frame while /queue showed that one prompt running and nothing
+    // pending. Once lastSelfQueueTs aged past the window, the old incomplete-
+    // accounting path classified it as non-self and the turn note claimed this
+    // session did not queue the work. Extra depth without a visible foreign id
+    // is stale accounting, not a foreign job.
+    const id = "a248c804-1111-2222-3333-444444444444";
+    QueueMonitor.markSelfQueued(id);
+    priv.lastSelfQueueTs = Date.now() - 11 * 60 * 1000;
+    priv.state.runningPromptId = id;
     priv.state.pendingPromptIds = [];
-    priv.state.queueRemaining = 3; // …but 2 more are in flight, unaccounted
+    priv.state.queueRemaining = 2;
 
-    expect(QueueMonitor.snapshot().selfAttributed).toBe(false);
+    expect(QueueMonitor.snapshot().selfAttributed).toBe(true);
+    const rep = QueueMonitor.report(STALL_MS);
+    expect(rep.selfAttributed).toBe(true);
+    expect(rep.foreignVisible).toBe(false);
+    // The duplicate fence stays strict: extra depth is still not PROVEN.
+    expect(QueueMonitor.snapshot().selfAttributedProven).toBe(false);
   });
 
   it("attribution expires after the window (a stale self-queue no longer covers a new foreign job)", () => {

@@ -239,7 +239,8 @@ import { dedupeAudioRefs, splitAudioAttachments } from "./audio-attachment.js";
 import { startPanelConsoleHttpServer, type PanelConsoleHttpServer } from "./panel-console-http.js";
 import type { AgentBackend } from "./agent-backend.js";
 import { readComfyuiCrashLog, formatCrashNote } from "../services/crash-log.js";
-import { QueueMonitor, type StallReport } from "../services/queue-monitor.js";
+import { QueueMonitor } from "../services/queue-monitor.js";
+import { formatQueueNote } from "./queue-note.js";
 import {
   RunCompletions,
   describe as describeCorrelation,
@@ -542,36 +543,6 @@ function stallThresholdMs(): number {
   if (liveStallSeconds != null) return liveStallSeconds * 1000;
   const s = Number(process.env.COMFYUI_MCP_STALL_S);
   return Number.isFinite(s) && s > 0 ? Math.round(s * 1000) : 180000;
-}
-
-/** Build a one-line agent note from a stall/backlog report, or null when the
- *  queue is healthy. Stall takes priority over a plain backlog. */
-function formatQueueNote(rep: StallReport): string | null {
-  if (rep.stalled) {
-    const secs = Math.round(rep.stalledForMs / 1000);
-    return (
-      `⚠️ The current ComfyUI render appears STALLED: ` +
-      `${rep.currentNode ? `node ${rep.currentNode} ` : ""}${rep.progress ? `(progress ${rep.progress}) ` : ""}` +
-      `on prompt ${rep.runningPromptId ?? "?"} has not advanced for ~${secs}s. ComfyUI only checks interrupts ` +
-      `BETWEEN steps, so a stuck step can ignore a cancel. If it's wedged: call queue (action:"cancel") with ` +
-      `clear_pending:true; if it reports the job still wedged, restart_comfyui / panel_restart_comfyui. ` +
-      `Do NOT queue another run on top.`
-    );
-  }
-  // A plain backlog (depth > 1) is NOT evidence of a wedge — deliberately queuing
-  // a batch is a normal workflow. Suppress the note entirely when the in-flight
-  // work is this session's own recent jobs, and when it isn't, report it NEUTRALLY
-  // (no false "you likely queued behind a stuck job" diagnosis, no destructive
-  // clear_pending as the headline). A genuinely stalled job is handled above (#559).
-  if (rep.backlog && !rep.selfAttributed) {
-    const pending = Math.max(0, rep.queueDepth - 1);
-    return (
-      `ℹ️ ComfyUI queue: ${rep.queueDepth} tasks in flight (1 running + ${pending} pending) that this session ` +
-      `didn't queue. This is only a problem if the running one is stuck — inspect with queue (action:"list"). ` +
-      `queue (action:"cancel_queued") drops a single pending item; queue (action:"cancel") with clear_pending:true resets everything.`
-    );
-  }
-  return null;
 }
 
 /**
