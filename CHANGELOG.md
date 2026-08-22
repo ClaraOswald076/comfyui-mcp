@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.53] - 2026-08-21
+
+### MCP
+
+#### Fixed
+- a boot that starts listening during the reconnect wait is reported server_ready (#2054)
+
+
 ## [0.52.52] - 2026-08-21
 
 ### Fixed
