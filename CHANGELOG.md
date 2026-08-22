@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.61] - 2026-08-22
+
 ### Fixed
 
 - **`panel_set_widget` no longer paints a verified write as a degraded schema probe (#2075).**
@@ -16,6 +18,12 @@ All notable changes to this project are documented here. This project adheres to
   silence is known; adding a node records a live map and unlatches that skip, so
   the next write re-probes. A verified last-observed success against an unchanged
   backend is now returned as a clean write.
+
+### MCP
+
+#### Fixed
+- a verified widget write is no longer reported as a degraded schema probe (#2077)
+
 
 ## [0.52.60] - 2026-08-22
 
