@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.59] - 2026-08-22
+
 ### Fixed
 
 - **Restart does not report graph tools ready on a transient panel reconnect (#2067).**
@@ -19,6 +21,14 @@ All notable changes to this project are documented here. This project adheres to
 
 #### Fixed
 - restart waits for a stable panel reconnect before graph tools are ready (#2067)
+
+### MCP
+
+#### Fixed
+- panel_get_errors answers during concurrent panel reads (#2073)
+- resolve_missing reports unavailable custom-node LoRA combos (#2071)
+- restart waits for a stable panel reconnect before graph tools are ready (#2072)
+
 
 ## [0.52.58] - 2026-08-22
 
