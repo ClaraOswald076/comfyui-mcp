@@ -61,6 +61,10 @@ function makeCtx(opts: {
   tabReturns: boolean;
   /** Omit the pre-restart identity, i.e. nothing was ever watched. */
   noBaseline?: boolean;
+  /** Wall-clock time the reconnect wait actually takes. Zero/omitted returns at once. */
+  tabDelayMs?: number;
+  /** Fires synchronously when the reconnect wait is entered, before the delay. */
+  onTabWait?: () => void;
 }): { ctx: PanelToolCtx; reconnectCalls: ReconnectCall[] } {
   const reconnectCalls: ReconnectCall[] = [];
   const bridge = {
@@ -88,6 +92,8 @@ function makeCtx(opts: {
       budgetMs?: number,
     ) => {
       reconnectCalls.push({ before, budgetMs });
+      opts.onTabWait?.();
+      if (opts.tabDelayMs) await new Promise((r) => setTimeout(r, opts.tabDelayMs));
       return opts.tabReturns;
     },
     tabCanMutateGraph: () => true,
@@ -311,5 +317,81 @@ describe("#1996 WIRING: the bound readiness deadline goes through the reserve", 
     // The exact pre-fix shape on the headless path. Its behavioural coverage lives in
     // panel-restart-legacy-fallback.test.ts; this catches a re-introduction anywhere.
     expect(/const tabBack = recovery\.ready\s*\n?\s*\?/.test(src())).toBe(false);
+  });
+
+  it("BOTH restart paths continue /system_stats during the tab wait (r2)", () => {
+    // A helper-only suite survives either call site going back to a bare
+    // `await ctx.awaitPostRestartReachable(…)` after observeRecovery has already
+    // returned — which type-checks, still watches the tab, and restores the
+    // 0.52.51 recurrence (server listening during that wait, reported unready).
+    expect((src().match(/awaitTabWhileContinuingRecovery\(\{/g) ?? []).length).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1996 r2 — the 0.52.51 recurrence. After #1997 the reconnect wait ran on an
+// unconfirmed boot, but /system_stats was not consulted during it. A server that
+// started listening in that reserved window was reported server_ready:false
+// (`recovered_ms:184461`, saw_down:true) and then panel_graph_outline succeeded.
+// ---------------------------------------------------------------------------
+describe("#1996 r2: a boot that starts listening during the reconnect wait is reported server_ready", () => {
+  it("REPRODUCTION: down for the dedicated budget, then healthy during the tab wait", async () => {
+    let listening = false;
+    __panelToolsTestHooks.setHealthProbe(async () => (listening ? "healthy" : "down"));
+    const { ctx, reconnectCalls } = makeCtx({
+      tabReturns: false,
+      tabDelayMs: 50,
+      onTabWait: () => {
+        listening = true;
+      },
+    });
+
+    const out = parse(await rebootHandler()({ force: false }, ctx));
+
+    expect(reconnectCalls.length).toBe(1);
+    // THE DEFECT: pre-fix this is false — observation had already returned, and
+    // a fresh observer would also ignore a lone healthy (no new down).
+    expect(out.server_ready).toBe(true);
+    expect(out.confirmed_cycle).toBe(true);
+    expect(out.via).toBe("observed-cycle");
+    expect(out.saw_down).toBe(true);
+    // A tab that did not re-hello still withholds graph tools. The boot is what
+    // this recurrence misreported; the reconnect observation stays honest.
+    expect(out.panel_tab_reconnected).toBe(false);
+    expect(out.ready).toBe(false);
+    expect(out.graph_tools_ready).toBe(false);
+  });
+
+  it("that same window, with a tab that DOES re-register, is graph-tool ready", async () => {
+    let listening = false;
+    __panelToolsTestHooks.setHealthProbe(async () => (listening ? "healthy" : "down"));
+    const { ctx } = makeCtx({
+      tabReturns: true,
+      tabDelayMs: 50,
+      onTabWait: () => {
+        listening = true;
+      },
+    });
+
+    const out = parse(await rebootHandler()({ force: false }, ctx));
+
+    expect(out.server_ready).toBe(true);
+    expect(out.panel_tab_reconnected).toBe(true);
+    expect(out.ready).toBe(true);
+    expect(out.graph_tools_ready).toBe(true);
+  });
+
+  it("a server that STAYS down through the tab wait is still an honest refusal", async () => {
+    // Continuation must not invent a cycle. The probe never answers; the extra
+    // window is just more of the same observation.
+    const { ctx } = makeCtx({ tabReturns: true, tabDelayMs: 40 });
+
+    const out = parse(await rebootHandler()({ force: false }, ctx));
+
+    expect(out.server_ready).toBe(false);
+    expect(out.confirmed_cycle).toBe(false);
+    expect(out.ready).toBe(false);
+    expect(out.panel_tab_reconnected).toBe(true);
+    expect(String(out.note)).toMatch(/has not become healthy within/);
   });
 });
