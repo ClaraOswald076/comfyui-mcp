@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.52] - 2026-08-21
+
 ### Fixed
 
 - **`node_pack` scaffolds into the custom_nodes directory the running ComfyUI
@@ -16,6 +18,15 @@ All notable changes to this project are documented here. This project adheres to
   Authoring (scaffold / write / read / patch / git / verify / publish-by-name)
   now shares one scan-root resolver: `--base-directory` when the runtime reports
   one (Desktop, #1770), else the live checkout.
+
+### MCP
+
+#### Fixed
+- report settled clear_vram readings honestly
+- scaffold node packs into ComfyUI scanned roots
+- make RunPod tunnel and origin advertisements reachable
+- keep panel schema readiness honest after object_info timeouts
+
 
 ## [0.52.51] - 2026-08-21
 
