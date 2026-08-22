@@ -337,7 +337,12 @@ describe("UiBridge (mailbox — offline render delivery)", () => {
       { cmd: "show_media", items: [{ filename: "a.png" }] },
       { tabId: "phone-stable-1" },
     );
-    expect(res).toMatchObject({ ok: true, mailboxed: true });
+    expect(res).toMatchObject({
+      ok: true,
+      mailboxed: true,
+      queued_for: "phone-stable-1",
+      recipient_known: true,
+    });
 
     // An INTERACTIVE command to an offline tab still rejects (not mailboxable).
     await expect(
@@ -393,6 +398,145 @@ describe("UiBridge (mailbox — offline render delivery)", () => {
     await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "nobody")).toBe(true));
     expect(got.find((m) => m.type === "mailbox_flush")).toBeUndefined();
     phone.close();
+  });
+
+  it("#2013 a scope-keyed mailbox names NO recipient — queued_for is null", async () => {
+    // Kills: returning the old `{ok:true, mailboxed:true}` with no recipient
+    // fields, which is how "queued for whoever connects next" read as delivered.
+    const res = await bridge.send(
+      { cmd: "show_media", items: [{ filename: "a.png" }] },
+      { tabId: SHARED_SESSION_SCOPE },
+    );
+    expect(res).toMatchObject({
+      ok: true,
+      mailboxed: true,
+      queued_for: null,
+      recipient_known: false,
+    });
+  });
+
+  it("#2013 a canvas-produced scope box is NOT handed to a phone that hellos first", async () => {
+    // The reported "whoever connects next" path: a desktop was the last client,
+    // it left, show_media could not route, and a phone hellos first. Pre-fix
+    // the phone collected the box. Now the flush declines a kind mismatch and
+    // the desktop reconnect is who actually gets it.
+    const desk = await connectPanel("wf:desk.json", "desk");
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:desk.json")).toBe(true));
+    desk.close();
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:desk.json")).toBe(false));
+
+    const queued = await bridge.send(
+      { cmd: "show_media", items: [{ filename: "plate.png" }] },
+      { tabId: SHARED_SESSION_SCOPE },
+    );
+    expect(queued).toMatchObject({ mailboxed: true, recipient_known: false });
+
+    const phoneGot: Array<Record<string, unknown>> = [];
+    const phone = await connectPanel();
+    phone.on("message", (buf) => phoneGot.push(JSON.parse(buf.toString())));
+    phone.send(JSON.stringify({ type: "hello", tab_id: "phone-1", title: "mobile", headless: true }));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "phone-1")).toBe(true));
+    expect(phoneGot.find((m) => m.cmd === "show_media")).toBeUndefined();
+    expect(phoneGot.find((m) => m.type === "mailbox_flush")).toBeUndefined();
+
+    const deskGot: Array<Record<string, unknown>> = [];
+    const desk2 = await connectPanel();
+    desk2.on("message", (buf) => deskGot.push(JSON.parse(buf.toString())));
+    desk2.send(JSON.stringify({ type: "hello", tab_id: "wf:desk.json", title: "desk" }));
+    await waitFor(() => {
+      expect(deskGot.find((m) => m.cmd === "show_media")).toMatchObject({
+        mailbox: true,
+        items: [{ filename: "plate.png" }],
+      });
+    });
+    phone.close();
+    desk2.close();
+  });
+
+  it("#2013 a phone-produced scope box is NOT handed to a desktop that hellos first", async () => {
+    const phone = await connectHeadless("phone-was");
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "phone-was")).toBe(true));
+    phone.close();
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "phone-was")).toBe(false));
+
+    await bridge.send(
+      { cmd: "show_media", items: [{ filename: "from-phone.png" }] },
+      { tabId: SHARED_SESSION_SCOPE },
+    );
+
+    const deskGot: Array<Record<string, unknown>> = [];
+    const desk = await connectPanel();
+    desk.on("message", (buf) => deskGot.push(JSON.parse(buf.toString())));
+    desk.send(JSON.stringify({ type: "hello", tab_id: "wf:later.json", title: "desk" }));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:later.json")).toBe(true));
+    expect(deskGot.find((m) => m.cmd === "show_media")).toBeUndefined();
+
+    const phoneGot: Array<Record<string, unknown>> = [];
+    const phone2 = await connectPanel();
+    phone2.on("message", (buf) => phoneGot.push(JSON.parse(buf.toString())));
+    phone2.send(
+      JSON.stringify({ type: "hello", tab_id: "phone-was", title: "mobile", headless: true }),
+    );
+    await waitFor(() => {
+      expect(phoneGot.find((m) => m.cmd === "show_media")).toMatchObject({ mailbox: true });
+    });
+    desk.close();
+    phone2.close();
+  });
+
+  it("#2013 an unknown-recipient scope box still flushes to the first hello (phone-away images)", async () => {
+    // Never-seen conversation: no last-disconnected kind, so the original
+    // mailbox purpose stands — a finished render is not lost just because
+    // nobody has helloed this process yet.
+    const queued = await bridge.send(
+      { cmd: "show_media", items: [{ filename: "away.png" }] },
+      { tabId: SHARED_SESSION_SCOPE },
+    );
+    expect(queued).toMatchObject({ mailboxed: true, recipient_known: false });
+
+    const got: Array<Record<string, unknown>> = [];
+    const phone = await connectPanel();
+    phone.on("message", (buf) => got.push(JSON.parse(buf.toString())));
+    phone.send(JSON.stringify({ type: "hello", tab_id: "phone-away", title: "mobile", headless: true }));
+    await waitFor(() => {
+      expect(got.find((m) => m.cmd === "show_media")).toMatchObject({ mailbox: true });
+    });
+    phone.close();
+  });
+
+  it("#2013 panel_show_media through the real handler surfaces a scope mailbox as queued-not-delivered", async () => {
+    // Drives the shipped tool, not a stubbed ctx.call: no tab connected, the
+    // session is orchestrator-scoped, the item is a real tiny PNG so nothing
+    // talks to ComfyUI. Kills: treating `{ok:true, mailboxed:true}` as a
+    // presentation, or describing a scope box as waiting for a named tab.
+    const dir = mkdtempSync(join(tmpdir(), "cmcp-2013-"));
+    tempRoots.push(dir);
+    const png = join(dir, "plate.png");
+    writeFileSync(
+      png,
+      Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+        "base64",
+      ),
+    );
+    const ctx = makePanelToolCtx(bridge, SHARED_SESSION_SCOPE, new WorkflowTargetStore());
+    const def = buildPanelToolDefs().find((d) => d.name === "panel_show_media");
+    if (!def) throw new Error("panel_show_media not found");
+    const res = (await def.handler({ items: [{ source: { path: png } }] }, ctx)) as {
+      isError?: boolean;
+      content: Array<{ type: string; text?: string }>;
+    };
+    expect(res.isError).toBeFalsy();
+    const doc = JSON.parse(res.content[0].text!) as Record<string, unknown>;
+    expect(doc.unaccounted_because).toBe("mailboxed");
+    expect(doc.recipient_known).toBe(false);
+    expect(doc.queued_for).toBeNull();
+    expect(doc.presented_confirmed).toBeNull();
+    expect(doc.shown).toBeUndefined();
+    const text = res.content.map((c) => c.text ?? "").join("\n");
+    expect(text).toMatch(/QUEUED, not delivered/);
+    expect(text).toMatch(/whichever client connects next/);
+    expect(text).not.toMatch(/waiting for tab /);
   });
 });
 

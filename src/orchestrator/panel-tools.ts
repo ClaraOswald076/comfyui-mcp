@@ -3948,6 +3948,15 @@ function annotateShowMediaAck(
              *  "partial_accounting" or "mailboxed". Structured so a caller can
              *  branch on it without reading the prose. */
             unaccounted_because: verdict.reason,
+            /** #2013 — only on a mailbox receipt. A concrete tab id is a known
+             *  recipient; `null` means the box is scope-keyed (whoever hellos
+             *  next). Structured so a caller does not have to parse the prose. */
+            ...(verdict.reason === "mailboxed"
+              ? {
+                  queued_for: verdict.queuedFor ?? null,
+                  recipient_known: verdict.queuedFor != null,
+                }
+              : {}),
             /** EVERY dispatched item, even under partial accounting: a reply
              *  that covers 1 of 2 does not say WHICH, so none can be settled. */
             unaccounted: dispatched.map((d) => ({ filename: d.filename, kind: d.kind })),

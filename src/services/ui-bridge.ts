@@ -1729,10 +1729,19 @@ export class UiBridge {
   /** Per-tab "mailbox" of undeliverable render deliveries (show_media), buffered
    *  while a client is OFFLINE and flushed on reconnect — so a finished render is
    *  never lost when the mobile app is backgrounded/killed mid-render. Keyed by a
-   *  STABLE tab id (the phone persists one). In-memory: survives disconnect ⇄
-   *  reconnect within an orchestrator run, not a full orchestrator restart.
-   *  Bounded per tab + TTL'd. */
-  private readonly mailbox = new Map<string, Array<{ cmd: BridgeCommand; ts: number }>>();
+   *  STABLE tab id (the phone persists one) OR a scope address (no tab was
+   *  routable). In-memory: survives disconnect ⇄ reconnect within an orchestrator
+   *  run, not a full orchestrator restart. Bounded per tab + TTL'd.
+   *
+   *  #2013 — `expectHeadless` is the kind of client the entry was produced for
+   *  (`true` phone/remote, `false` canvas, omitted when unknown). A scope-keyed
+   *  box used to flush to the first hello, which is how "could not route" became
+   *  "queued for whoever connects next". The flush now declines a mismatched
+   *  recipient and keeps the box for a matching reconnect. */
+  private readonly mailbox = new Map<
+    string,
+    Array<{ cmd: BridgeCommand; ts: number; expectHeadless?: boolean }>
+  >();
   private static readonly MAILBOX_MAX = 30;
   private static readonly MAILBOX_TTL_MS = 24 * 60 * 60 * 1000;
   /** Tab ids whose most recent connected socket was headless. Retained across a
@@ -3023,6 +3032,10 @@ export class UiBridge {
         if (this.conns.get(tabId)?.headless === true) {
           this.lastHeadlessDisconnectAt = performance.now();
         }
+        // #2013 — remember the kind that just left so a subsequent scope-keyed
+        // mailbox (zero live tabs) is tagged for that client, not for "whoever
+        // hellos next".
+        this.lastDisconnectedHeadless = this.conns.get(tabId)?.headless === true;
         this.conns.delete(tabId);
         if (this.lastActiveTabId === tabId) this.setLastActiveTab(null);
         // The mirrored desktop tab is gone — detach its viewers so their input
@@ -3765,6 +3778,12 @@ export class UiBridge {
    * has never seen a phone can never defer.
    */
   private lastHeadlessDisconnectAt: number | undefined;
+  /** Kind of the most recently departed PRIMARY tab (`true` headless, `false`
+   *  canvas). #2013 uses this when a scope-keyed mailbox is stored with ZERO
+   *  live tabs — the last client to leave is who the conversation was talking
+   *  to, and the flush declines a hello of the other kind. Undefined until a
+   *  primary has actually disconnected this process. */
+  private lastDisconnectedHeadless: boolean | undefined;
 
   /** Test seam: place the recency clock in the past without sleeping. Takes a
    *  `performance.now()`-based reading, matching the field. */
@@ -4346,18 +4365,74 @@ export class UiBridge {
   }
 
   /** Deliveries worth mailboxing when the target is offline (a finished render),
-   *  vs. interactive canvas ops that should just fail. */
+   *  vs. interactive canvas ops that should just fail.
+   *
+   *  #2013 — this is the ONE command that does not reject when `resolveTarget`
+   *  throws. Every other command surfaces `dispatched:false`. Callers that
+   *  reason "unroutable ⇒ not delivered" are wrong here: the frame is buffered
+   *  and the receipt is `{ok:true, mailboxed:true, …}`. */
   private static isMailboxable(cmd: BridgeCommand): boolean {
     return cmd.cmd === "show_media";
   }
 
+  /**
+   * #2013 — kind of client this mailbox entry is for. `true` = headless
+   * (phone/remote), `false` = canvas, `undefined` = unknown (never seen, or a
+   * scope address whose last client we cannot name). The flush declines a live
+   * client that does not match, rather than delivering blind.
+   */
+  private intendedMailboxKind(tabId: string): boolean | undefined {
+    if (!isScopeAddress(tabId)) {
+      if (this.conns.get(tabId)?.headless === true || this.headlessSeen.has(tabId)) return true;
+      if (this.conns.has(tabId) || this.seenTabs.has(tabId)) return false;
+      return undefined;
+    }
+    // Scope address: nobody is named. Prefer a UNIQUE live kind, else the kind
+    // that just left (zero tabs), else unknown — never a guess about who will
+    // hello.
+    let liveHeadless = false;
+    let liveCanvas = false;
+    for (const c of this.conns.values()) {
+      if (c.headless) liveHeadless = true;
+      else liveCanvas = true;
+    }
+    if (liveHeadless && !liveCanvas) return true;
+    if (liveCanvas && !liveHeadless) return false;
+    if (this.conns.size === 0) return this.lastDisconnectedHeadless;
+    return undefined;
+  }
+
+  /** #2013 — the receipt a mailboxed send returns. A concrete tab is a known
+   *  recipient (flushMailbox uses `conns.get(tabId)`). A scope address is not:
+   *  the box sits under the conversation key and used to drain to the first
+   *  matching hello. `queued_for: null` / `recipient_known: false` is how
+   *  "queued for whoever connects next" stops reading as a delivery. */
+  private mailboxReceipt(tabId: string): {
+    ok: true;
+    mailboxed: true;
+    queued_for: string | null;
+    recipient_known: boolean;
+  } {
+    const recipientKnown = !isScopeAddress(tabId);
+    return {
+      ok: true,
+      mailboxed: true,
+      queued_for: recipientKnown ? tabId : null,
+      recipient_known: recipientKnown,
+    };
+  }
+
   private storeMailbox(tabId: string, cmd: BridgeCommand): void {
     const box = this.mailbox.get(tabId) ?? [];
-    box.push({ cmd, ts: Date.now() });
+    const expectHeadless = this.intendedMailboxKind(tabId);
+    box.push(
+      expectHeadless === undefined ? { cmd, ts: Date.now() } : { cmd, ts: Date.now(), expectHeadless },
+    );
     while (box.length > UiBridge.MAILBOX_MAX) box.shift();
     this.mailbox.set(tabId, box);
     logger.info(
-      `[ui-bridge] mailboxed "${cmd.cmd}" for offline tab ${tabId.slice(0, 8)} (${box.length} queued)`,
+      `[ui-bridge] mailboxed "${cmd.cmd}" for offline tab ${tabId.slice(0, 8)} (${box.length} queued` +
+        `${expectHeadless === undefined ? ", recipient unknown" : expectHeadless ? ", for headless" : ", for canvas"})`,
     );
   }
 
@@ -4431,7 +4506,13 @@ export class UiBridge {
 
   /** Deliver any buffered render frames to a tab that just (re)connected, plus a
    *  `mailbox_flush` summary so the client can notify "N renders finished while
-   *  you were away". Expired items (past TTL) are dropped. */
+   *  you were away". Expired items (past TTL) are dropped.
+   *
+   *  #2013 — a box tagged for one kind of client is NOT handed to the other.
+   *  Declined entries stay queued for a matching reconnect rather than
+   *  disappearing into the first hello (the scope-keyed "whoever connects next"
+   *  path). Untagged entries (unknown recipient) still flush, which is the
+   *  original "phone was away, here is your render" behaviour. */
   private flushMailbox(tabId: string, deliverTo?: Conn): void {
     const box = this.mailbox.get(tabId);
     if (!box || box.length === 0) return;
@@ -4440,24 +4521,39 @@ export class UiBridge {
     // itself never owns a conn.
     const conn = deliverTo ?? this.conns.get(tabId);
     if (!conn) return;
-    this.mailbox.delete(tabId);
     const now = Date.now();
-    const fresh = box.filter((m) => now - m.ts <= UiBridge.MAILBOX_TTL_MS);
-    for (const m of fresh) {
+    const kept: typeof box = [];
+    let delivered = 0;
+    let declined = 0;
+    for (const m of box) {
+      if (now - m.ts > UiBridge.MAILBOX_TTL_MS) continue;
+      if (m.expectHeadless !== undefined && conn.headless !== m.expectHeadless) {
+        kept.push(m);
+        declined += 1;
+        continue;
+      }
       try {
         conn.sock.send(JSON.stringify({ rid: randomUUID(), ...m.cmd, mailbox: true }));
+        delivered += 1;
       } catch {
-        // socket raced closed; drop
+        // socket raced closed; drop this one like the pre-#2013 flush
       }
     }
-    if (fresh.length > 0) {
+    if (kept.length > 0) this.mailbox.set(tabId, kept);
+    else this.mailbox.delete(tabId);
+    if (delivered > 0) {
       try {
-        conn.sock.send(JSON.stringify({ type: "mailbox_flush", count: fresh.length }));
+        conn.sock.send(JSON.stringify({ type: "mailbox_flush", count: delivered }));
       } catch {
         /* best-effort */
       }
       logger.info(
-        `[ui-bridge] flushed ${fresh.length} mailboxed frame(s) to reconnected tab ${tabId.slice(0, 8)}`,
+        `[ui-bridge] flushed ${delivered} mailboxed frame(s) to reconnected tab ${tabId.slice(0, 8)}` +
+          (declined > 0 ? ` (${declined} held for a matching client)` : ""),
+      );
+    } else if (declined > 0) {
+      logger.info(
+        `[ui-bridge] held ${declined} mailboxed frame(s) past tab ${tabId.slice(0, 8)} — kind mismatch`,
       );
     }
   }
@@ -4492,7 +4588,7 @@ export class UiBridge {
         // failing, so the agent's "here's your image" isn't lost while the phone is away.
         if (opts.tabId && UiBridge.isMailboxable(cmd)) {
           this.storeMailbox(opts.tabId, cmd);
-          return { ok: true, mailboxed: true };
+          return this.mailboxReceipt(opts.tabId);
         }
         // resolveTarget threw BEFORE any socket write — no tab could be routed to (no
         // connected tab / ambiguous / multiple / not reachable), so nothing was
@@ -4901,7 +4997,7 @@ export class UiBridge {
     if (conn.sock.readyState !== WebSocket.OPEN) {
       if (opts.tabId && UiBridge.isMailboxable(cmd)) {
         this.storeMailbox(opts.tabId, cmd);
-        return Promise.resolve({ ok: true, mailboxed: true });
+        return Promise.resolve(this.mailboxReceipt(opts.tabId));
       }
       // The resolved socket is not OPEN — the command cannot be written, so nothing is
       // dispatched. Typed dispatched:false, same as the resolveTarget refusal above.

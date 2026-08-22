@@ -867,6 +867,10 @@ export type ShowMediaAckVerdict = {
    *  null when it does not. A COUNT, never an identity — a reply covering 1 of
    *  2 items does not say WHICH one, so nothing downstream can name it. */
   covered: number | null;
+  /** #2013 — concrete tab id the mailbox named, when the recipient is knowable.
+   *  `null` when the box is scope-keyed (whoever hellos next). Present only
+   *  for reason `"mailboxed"`. */
+  queuedFor?: string | null;
 };
 
 /**
@@ -903,7 +907,11 @@ export function readShowMediaAck(reply: unknown, dispatchedCount: number): ShowM
   // #2013 — buffered rather than refused. Checked BEFORE the shape test so a
   // mailbox receipt that happened to carry counts could not be read as an
   // account of a presentation no client has had the chance to make.
-  if (r.mailboxed === true) return { accounted: false, reason: "mailboxed", covered: null };
+  if (r.mailboxed === true) {
+    const queuedFor =
+      typeof r.queued_for === "string" && r.queued_for.length > 0 ? r.queued_for : null;
+    return { accounted: false, reason: "mailboxed", covered: null, queuedFor };
+  }
   const count = r.count;
   const painted = r.painted;
   const unrenderable = r.unrenderable;
@@ -972,9 +980,20 @@ export function unaccountedShowMediaNote(
     // #2013 — `show_media` is the ONE command the bridge buffers instead of
     // refusing when it cannot route. No client has seen this at all yet, which
     // is a weaker fact than "a client took it and said nothing about it".
-    what =
-      `${one ? "It was" : "They were"} QUEUED, not delivered: no client has this yet. It will be handed ` +
-      `to whichever client connects next, and nothing here says that client can present it.`;
+    // A concrete tab is a known recipient; a scope-keyed box is not — saying
+    // "whichever client connects next" of a named tab would be a lie in the
+    // other direction.
+    if (verdict.queuedFor) {
+      const short =
+        verdict.queuedFor.length > 12 ? `${verdict.queuedFor.slice(0, 8)}…` : verdict.queuedFor;
+      what =
+        `${one ? "It was" : "They were"} QUEUED, not delivered: no client has this yet. ` +
+        `It is waiting for tab ${short} to reconnect, and nothing here says that client can present it.`;
+    } else {
+      what =
+        `${one ? "It was" : "They were"} QUEUED, not delivered: no client has this yet. It will be handed ` +
+        `to whichever client connects next, and nothing here says that client can present it.`;
+    }
   } else if (verdict.reason === "partial_accounting") {
     // A count is not an identity: a reply about 1 of 2 items does not say WHICH
     // one, so every item is listed and none can be marked settled.
