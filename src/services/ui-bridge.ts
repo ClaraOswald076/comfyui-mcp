@@ -107,6 +107,14 @@ type SendCtx = {
    *  with no established workflow identity (old panel / relay) → no client-side fence. */
   workflowUuid?: string;
   onDispatchedRid?: (rid: string) => void;
+  /**
+   * #2069 — command name of a sibling on the same tab that answered WHILE this
+   * one was still waiting. A timeout that observed that must not claim the tab
+   * may be backgrounded or frozen: the reporter's concurrent query/outline/
+   * screenshot replies proved the tab was alive, and only graph_get_errors
+   * missed its correlation slot.
+   */
+  siblingReply?: string;
 };
 
 type Pending = {
@@ -1437,6 +1445,31 @@ function mutatedButUnacked(ctx: SendCtx): string {
 }
 
 /**
+ * #2069 — the clause after "within N ms". A sibling reply during the wait is
+ * proof the tab is servicing the socket, so "backgrounded or frozen" is a
+ * false diagnosis (the reporter's concurrent graph reads completed).
+ */
+function replyTimeoutSuffix(ctx: SendCtx): string {
+  if (ctx.siblingReply) {
+    return (
+      ` — the tab is not frozen: it answered "${ctx.siblingReply}" while this command was still waiting. ` +
+      `Retry "${ctx.command.cmd}" on its own; concurrent graph reads on the same tab can leave this command unanswered`
+    );
+  }
+  return ` — the ComfyUI tab may be backgrounded or frozen${mutatedButUnacked(ctx)}`;
+}
+
+function noReplyTimeoutMessage(tabId: string, ctx: SendCtx): string {
+  return `Panel tab ${tabId} did not reply to "${ctx.command.cmd}" within ${ctx.timeoutMs} ms${replyTimeoutSuffix(ctx)}`;
+}
+
+/** Graph commands share one frontend handler/main thread per tab. Concurrent
+ *  frames can leave graph_get_errors unanswered (#2069). */
+function usesGraphCommandLane(cmd: string): boolean {
+  return cmd.startsWith("graph_");
+}
+
+/**
  * A mutation the panel acknowledged AFTER its reply timeout (#694, #1175).
  *
  * `result` is the panel's own reply body, present only when it was retained (see
@@ -1765,6 +1798,14 @@ export class UiBridge {
   private missedFrames = new Map<string, Record<string, unknown>[]>();
   private static readonly MAX_MISSED_FRAMES = 100;
   private pending = new Map<string, Pending>();
+  /**
+   * #2069 — per-tab chain of `graph_*` dispatches. The panel's WS listener is
+   * async-per-message, so concurrent graph frames share the main thread and the
+   * /object_info coalescer; graph_get_errors is the one that then misses its
+   * reply window while query/outline/screenshot succeed. Timeout clocks start
+   * at dispatch (after the predecessor settles), not at enqueue.
+   */
+  private graphLane = new Map<string, Promise<unknown>>();
   /** ask_user card sends (rid → {ask_id, ts}): lets a reply that validates AFTER
    *  the reply timer fired (dropped from `pending`) still be buffered for the
    *  caller, instead of being discarded as a "late reply for a timed-out command"
@@ -2885,6 +2926,7 @@ export class UiBridge {
           // an unrelated tab reusing the id can never be granted the veto.
           const served = this.liveConnForTab(p.ctx.tabId, sock);
           served?.provenSupportedCmds.add(p.cmd);
+          this.noteSiblingSuccess(p.ctx, rid);
           p.resolve(msg.result);
         } else {
           // #1529 — carry the panel's STRUCTURED refusal onto the error.
@@ -5005,37 +5047,90 @@ export class UiBridge {
         markDispatched(new Error(`Panel tab ${conn.tabId.slice(0, 8)} is not open`), false),
       );
     }
-    return new Promise((resolve, reject) => {
-      const ctx: SendCtx = {
-        resolve,
-        reject,
-        command: cmd,
-        timeoutMs,
-        // Canonical id of the resolved connection (NOT the caller's possibly-prefix
-        // or migration-alias tabId) — the key the reconnect hello will use, so a
-        // parked read is found and resumed.
-        tabId: conn.tabId,
-        mutating: !UiBridge.READONLY_CMDS.has(cmd.cmd),
-        deadline: Date.now() + timeoutMs,
-        // #570 — graph ops resolve from the CALLER'S intended tab (opts.tabId), NOT
-        // the canonical conn.tabId: after a same-socket switch the two differ, and
-        // we must stamp the workflow the command was ISSUED FOR (so the panel, now
-        // showing a different one, declines it) — never the workflow it happens to
-        // have landed on. #884: for the SHARED SCOPE the orchestrator's resolver
-        // answers with the current TURN's issue-time workflow — same rule,
-        // conversation-level.
-        //
-        // #1815 — Manager / recovery / navigation commands do not act on that
-        // workflow. They take the routed tab's advertised identity so a stale
-        // conversation stamp cannot refuse a search, an install, a reboot, or the
-        // workflow_list the documented rebind needs.
-        workflowUuid:
-          this.resolveTabWorkflowUuid?.(commandStampAddress(cmd, opts.tabId, conn.tabId)) ??
-          undefined,
-        onDispatchedRid: opts.onDispatchedRid,
-      };
-      this.dispatch(conn, ctx);
+    const launch = (): Promise<unknown> => {
+      // Re-resolve after a graph-lane wait: the tab may have migrated while a
+      // predecessor occupied the lane. Gates above already ran against `conn`.
+      let live: Conn;
+      try {
+        live = this.resolveTarget(opts.tabId);
+      } catch (err) {
+        return Promise.reject(
+          markDispatched(err instanceof Error ? err : new Error(String(err)), false),
+        );
+      }
+      if (live.sock.readyState !== WebSocket.OPEN) {
+        if (opts.tabId && UiBridge.isMailboxable(cmd)) {
+          this.storeMailbox(opts.tabId, cmd);
+          return Promise.resolve(this.mailboxReceipt(opts.tabId));
+        }
+        return Promise.reject(
+          markDispatched(new Error(`Panel tab ${live.tabId.slice(0, 8)} is not open`), false),
+        );
+      }
+      return new Promise((resolve, reject) => {
+        const ctx: SendCtx = {
+          resolve,
+          reject,
+          command: cmd,
+          timeoutMs,
+          // Canonical id of the resolved connection (NOT the caller's possibly-prefix
+          // or migration-alias tabId) — the key the reconnect hello will use, so a
+          // parked read is found and resumed.
+          tabId: live.tabId,
+          mutating: !UiBridge.READONLY_CMDS.has(cmd.cmd),
+          // Timeout starts at DISPATCH, not enqueue: waiting for a sibling graph
+          // read cannot itself produce the reporter's 30 s false timeout (#2069).
+          deadline: Date.now() + timeoutMs,
+          // #570 — graph ops resolve from the CALLER'S intended tab (opts.tabId), NOT
+          // the canonical conn.tabId: after a same-socket switch the two differ, and
+          // we must stamp the workflow the command was ISSUED FOR (so the panel, now
+          // showing a different one, declines it) — never the workflow it happens to
+          // have landed on. #884: for the SHARED SCOPE the orchestrator's resolver
+          // answers with the current TURN's issue-time workflow — same rule,
+          // conversation-level.
+          //
+          // #1815 — Manager / recovery / navigation commands do not act on that
+          // workflow. They take the routed tab's advertised identity so a stale
+          // conversation stamp cannot refuse a search, an install, a reboot, or the
+          // workflow_list the documented rebind needs.
+          workflowUuid:
+            this.resolveTabWorkflowUuid?.(commandStampAddress(cmd, opts.tabId, live.tabId)) ??
+            undefined,
+          onDispatchedRid: opts.onDispatchedRid,
+        };
+        this.dispatch(live, ctx);
+      });
+    };
+    if (usesGraphCommandLane(cmd.cmd)) {
+      return this.enqueueGraphLane(conn.tabId, launch);
+    }
+    return launch();
+  }
+
+  /** Serialize `graph_*` dispatches per tab so concurrent reads cannot occupy
+   *  the panel at once (#2069). Failures still release the lane. */
+  private enqueueGraphLane<T>(tabId: string, run: () => Promise<T>): Promise<T> {
+    const prev = this.graphLane.get(tabId) ?? Promise.resolve();
+    const next = prev.then(run, run);
+    const tail: Promise<unknown> = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.graphLane.set(tabId, tail);
+    void tail.then(() => {
+      if (this.graphLane.get(tabId) === tail) this.graphLane.delete(tabId);
     });
+    return next;
+  }
+
+  /** Record that `ctx`'s command answered, so any still-waiting sibling on the
+   *  same tab can refuse the frozen-tab diagnosis (#2069). */
+  private noteSiblingSuccess(ctx: SendCtx, exceptRid: string): void {
+    for (const [rid, p] of this.pending) {
+      if (rid === exceptRid) continue;
+      if (p.ctx.tabId !== ctx.tabId) continue;
+      p.ctx.siblingReply ??= ctx.command.cmd;
+    }
   }
 
   /** Write one attempt of a command to a live socket and arm its reply timer.
@@ -5048,13 +5143,7 @@ export class UiBridge {
     // deadline — clamp the reply timeout to the time remaining.
     const remaining = ctx.deadline - Date.now();
     if (remaining <= 0) {
-      ctx.reject(
-        markReplyTimeout(
-          new Error(
-            `Panel tab ${conn.tabId} did not reply to "${cmd.cmd}" within ${ctx.timeoutMs} ms — the ComfyUI tab may be backgrounded or frozen${mutatedButUnacked(ctx)}`,
-          ),
-        ),
-      );
+      ctx.reject(markReplyTimeout(new Error(noReplyTimeoutMessage(conn.tabId, ctx))));
       return;
     }
     const replyTimeoutMs = Math.min(ctx.timeoutMs, remaining);
@@ -5138,12 +5227,7 @@ export class UiBridge {
       // id CONTAINING SPACES (`wf:workflows/Untitled 2026-08-04.json`) still matches.
       ctx.reject(
         markReplyTimeout(
-          markDispatched(
-            new Error(
-              `Panel tab ${conn.tabId} did not reply to "${cmd.cmd}" within ${ctx.timeoutMs} ms — the ComfyUI tab may be backgrounded or frozen${mutatedButUnacked(ctx)}`,
-            ),
-            true,
-          ),
+          markDispatched(new Error(noReplyTimeoutMessage(conn.tabId, ctx)), true),
         ),
       );
     }, replyTimeoutMs);
