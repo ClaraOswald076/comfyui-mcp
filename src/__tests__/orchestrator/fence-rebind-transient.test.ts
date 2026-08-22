@@ -19,10 +19,11 @@
 // asserted here: the transient window is absorbed, AND a reply that stays
 // contradictory is still refused no matter how many times it is re-read.
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   buildPanelToolDefs,
   makePanelToolCtx,
+  __panelToolsTestHooks,
   type PanelToolCtx,
   type ToolResult,
 } from "../../orchestrator/panel-tools.js";
@@ -174,6 +175,9 @@ describe("mode:'current' absorbs the post-restart reconciliation window (#1292)"
     expect(stamp).toBe(STALE);
     expect(res.isError).toBe(true);
     expect(text).toMatch(/UNCONFIRMED/);
+    // #2059 — UNCONFIRMED keeps the short 3-step budget; the longer missing-active
+    // wait must not leak onto this path or this recovery gets slower for nothing.
+    expect(listCalls, "1 initial + 3 short rechecks").toBe(4);
   });
 
   it("STOPS PRESCRIBING the retry it just performed", async () => {
@@ -242,5 +246,109 @@ describe("mode:'current' absorbs the post-restart reconciliation window (#1292)"
     expect(listCalls, "one read — there is nothing to wait for").toBe(1);
     expect(text).toMatch(/must be UPDATED/);
     expect(text).not.toMatch(/ALREADY TRIED/);
+  });
+});
+
+/**
+ * #2059 — after panel_restart_comfyui the sidebar can hello and answer
+ * workflow_list with NO top-level `active` record. The ordinary 3-step / ~2.9s
+ * window (1 initial + 3 rechecks = 4 reads) exhausted and left the session
+ * fenced to the previous instance. Rechecks for that reason now run longer,
+ * and a reconnect that replaces the tab mid-wait restarts the budget for the
+ * newly connected tab.
+ */
+function noActive(): Record<string, unknown> {
+  return {
+    workflows: [{ path: "workflows/a.json", routing_key: "wf:workflows/a.json", active: true }],
+    active_confirmed: true,
+  };
+}
+
+describe("mode:'current' waits for a missing active-workflow record after restart (#2059)", () => {
+  afterEach(() => {
+    __panelToolsTestHooks.setFenceMissingActiveRecheckSteps(null);
+    __panelToolsTestHooks.setFenceCorroborationRecheckSteps(null);
+  });
+
+  it("RECOVERS when the active record appears after the old 4-read window — the reported case", async () => {
+    // Four replies with no `active` is exactly what the 2.9s budget used to
+    // exhaust. The fifth is the record the frontend publishes once restore
+    // finishes. Shrunk so the suite does not wait the real extra seconds.
+    __panelToolsTestHooks.setFenceMissingActiveRecheckSteps([5, 5, 5, 5]);
+    listReplies = [noActive(), noActive(), noActive(), noActive(), settled(LIVE)];
+
+    const { res, text } = await setCurrent();
+
+    expect(stamp, "the live canvas's identity was adopted").toBe(LIVE);
+    expect(res.isError).toBeFalsy();
+    expect(text).toMatch(/"graph_binding": "bound"/);
+    expect(listCalls, "four misses, then the fifth read that carries active").toBe(5);
+  });
+
+  it("STILL REFUSES a permanently missing active record after the longer wait", async () => {
+    __panelToolsTestHooks.setFenceMissingActiveRecheckSteps([5, 5, 5, 5]);
+    listReplies = [noActive()];
+
+    const { res, text } = await setCurrent();
+
+    expect(stamp).toBe(STALE);
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/no active-workflow record/);
+    expect(text).toMatch(/ALREADY TRIED: the panel was re-read 5 times/);
+    expect(listCalls).toBe(5);
+  });
+
+  it("restarts the wait when a newly connected tab replaces the socket mid-retry", async () => {
+    // Three rechecks — the ORIGINAL budget. Without tab-keying, the 4th read
+    // (new tab, still no active) would exhaust it and never see the 5th.
+    __panelToolsTestHooks.setFenceMissingActiveRecheckSteps([5, 5, 5]);
+
+    const OLD = "wf:workflows/old.json";
+    const NEW = "wf:workflows/a.json";
+    let liveTab = OLD;
+    let generation = 1;
+
+    const tabBridge = {
+      send: async (cmd: Record<string, unknown>) => {
+        if (cmd.cmd === "workflow_list") {
+          const n = listCalls;
+          listCalls += 1;
+          if (n === 2) {
+            // After the 3rd reply the old socket is gone; the next call's
+            // ensureReachable rebinds onto the newly connected tab.
+            liveTab = NEW;
+            generation = 2;
+          }
+          if (liveTab === NEW && n >= 4) return settled(LIVE);
+          return noActive();
+        }
+        return { ok: true };
+      },
+      push: () => 1,
+      canReach: (id: string) => id === liveTab,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: liveTab, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => liveTab,
+      tabConnectionIdentity: () => ({ generation, tabSessionId: "browser-tab-a" }),
+      refreshWorkflowUuid: (_tabId: string, uuid: string) => {
+        stamp = uuid;
+        return true;
+      },
+      workflowUuidFor: () => ({ known: true, uuid: stamp }),
+      tabCanMutateGraph: () => true,
+      tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
+    } as unknown as PanelToolCtx["bridge"];
+
+    const ctx = makePanelToolCtx(tabBridge, OLD, new WorkflowTargetStore());
+    const def = buildPanelToolDefs().find((d) => d.name === "panel_set_workflow_target");
+    if (!def) throw new Error("panel_set_workflow_target is not registered");
+    const res: ToolResult = await def.handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(ctx.tabId, "session rebound onto the newly connected tab").toBe(NEW);
+    expect(stamp, "the new tab's live identity was adopted").toBe(LIVE);
+    expect(res.isError).toBeFalsy();
+    expect(text).toMatch(/"graph_binding": "bound"/);
+    expect(listCalls, "old tab exhausted the original budget; new tab got its own wait").toBe(5);
   });
 });

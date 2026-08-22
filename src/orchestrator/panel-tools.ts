@@ -1111,6 +1111,13 @@ export const __panelToolsTestHooks = {
   setReconnectWaitTiming(timing: { budgetMs: number; intervalMs: number } | null): void {
     reconnectWaitTimingOverride = timing;
   },
+  /** Shrink the #1292 / #2059 corroboration rechecks so tests don't wait ~2.9s / ~9.4s. */
+  setFenceCorroborationRecheckSteps(steps: readonly number[] | null): void {
+    fenceCorroborationRecheckStepsOverride = steps;
+  },
+  setFenceMissingActiveRecheckSteps(steps: readonly number[] | null): void {
+    fenceMissingActiveRecheckStepsOverride = steps;
+  },
   /** The reconnect wait the tools actually use (env/default, or the test override). */
   getReconnectWaitTiming(): { budgetMs: number; intervalMs: number } {
     return reconnectWaitTiming();
@@ -7271,7 +7278,7 @@ function corroborateActiveForFence(
    *  confirm the canvas" apart from "the canvas is a different one". A caller
    *  whose preserved fence equals this uuid is not broken, and telling them their
    *  graph tools will keep failing sends them to a hard refresh for nothing. */
-  | { ok: false; why: string; settles: boolean; seenUuid?: string } {
+  | { ok: false; why: string; settles: boolean; seenUuid?: string; missingActive?: true } {
   const active = parsed.active;
   // Read once, up front, so every failure branch below can report it. Undefined
   // whenever the record is missing, unreadable, or carries no usable uuid.
@@ -7282,7 +7289,16 @@ function corroborateActiveForFence(
   if (!active || typeof active !== "object") {
     // SETTLES: mid-restore the frontend genuinely has no active workflow yet —
     // that is #1184's finding in this reply's terms, and it is the window here.
-    return { ok: false, seenUuid, why: "the reply carried no active-workflow record", settles: true };
+    // #2059 — this is also the post-restart shape: the tab has hellod and will
+    // answer workflow_list, but the canvas has not published an active record.
+    // Rechecks for this reason use a longer, tab-keyed budget (see below).
+    return {
+      ok: false,
+      seenUuid,
+      why: "the reply carried no active-workflow record",
+      settles: true,
+      missingActive: true,
+    };
   }
   // #514: the panel says so itself when its active record is not confirmed. An
   // explicit `false` is the panel telling us the value is untrustworthy — never
@@ -7549,6 +7565,15 @@ WHY THIS READ WAS NEEDED AT ALL: this session's panel is ${v.version}, and a ` +
  * process reconnecting. The reporter's five seconds is an upper bound with a
  * human in it, not a measurement of the settle.
  *
+ * #2059 is the exception, and it is a different window. After `panel_restart_comfyui`
+ * the tab can hello and answer `workflow_list` while the frontend still has no
+ * active-workflow record at all — not UNCONFIRMED, absent. Four reads over 2.9s
+ * were not enough; the session stayed fenced to the previous instance. Rechecks
+ * for that one reason use `FENCE_MISSING_ACTIVE_RECHECK_STEPS_MS`, and the wait
+ * is keyed to the tab that answered (a reconnect that replaces the socket mid-
+ * wait restarts the budget for the new tab rather than spending the old tab's
+ * leftover milliseconds).
+ *
  * WHY ONLY `uncorroborated`: the sibling failure `no_uuid` means the installed
  * panel exposes no workflow identity at all. Rechecking a build that will never
  * answer differently just makes the same error slower — the distinction the
@@ -7560,6 +7585,34 @@ WHY THIS READ WAS NEEDED AT ALL: this session's panel is ${v.version}, and a ` +
  * happening here.
  */
 const FENCE_CORROBORATION_RECHECK_STEPS_MS = [400, 900, 1600] as const;
+/**
+ * #2059 — extra rechecks when the reply carries no active-workflow record.
+ *
+ * The first three steps match the ordinary reconciliation window so a record
+ * that appears on the second read costs the same as UNCONFIRMED. The two extra
+ * steps cover a post-restart frontend that hellos (and will answer) before it
+ * has restored an active canvas. Still far shorter than the 35s reconnect wait:
+ * the socket is already up; this is only workspace restore.
+ */
+const FENCE_MISSING_ACTIVE_RECHECK_STEPS_MS = [400, 900, 1600, 2500, 4000] as const;
+
+let fenceCorroborationRecheckStepsOverride: readonly number[] | null = null;
+let fenceMissingActiveRecheckStepsOverride: readonly number[] | null = null;
+
+function fenceCorroborationRecheckSteps(): readonly number[] {
+  return fenceCorroborationRecheckStepsOverride ?? FENCE_CORROBORATION_RECHECK_STEPS_MS;
+}
+
+function fenceMissingActiveRecheckSteps(): readonly number[] {
+  return fenceMissingActiveRecheckStepsOverride ?? FENCE_MISSING_ACTIVE_RECHECK_STEPS_MS;
+}
+
+function recheckStepsFor(
+  c: ReturnType<typeof corroborateActiveForFence>,
+): readonly number[] {
+  if (c.ok || !c.settles) return [];
+  return c.missingActive ? fenceMissingActiveRecheckSteps() : fenceCorroborationRecheckSteps();
+}
 
 /**
  * #1478 — NAME THE CAUSE OF A MISMATCH THE LOAD MAY HAVE CREATED.
@@ -7664,6 +7717,11 @@ async function rebindWorkflowFence(
     return { corroborated: corroborateActiveForFence(parsed) };
   };
 
+  const tabKeyOf = (): string => {
+    const gen = ctx.panelConnectionIdentity?.()?.generation;
+    return `${ctx.tabId}:${typeof gen === "number" ? String(gen) : ""}`;
+  };
+
   const first = await readAndCorroborate();
   if ("done" in first) return first.done;
   let corroborated = first.corroborated;
@@ -7675,14 +7733,30 @@ async function rebindWorkflowFence(
   // sharing no comparable identity field — will say exactly the same thing 2.9s
   // later, so retrying it just makes the identical error slower. That is the same
   // reasoning that keeps `no_uuid` out of this loop, applied one level down.
-  for (const waitMs of FENCE_CORROBORATION_RECHECK_STEPS_MS) {
-    if (corroborated.ok || !corroborated.settles) break;
+  //
+  // #2059 — the wait is keyed to the tab that answered. After a restart the
+  // socket that first replies may be replaced by a newly connected tab mid-loop;
+  // leftover milliseconds from the old tab are not a wait the new tab was given.
+  // A missing active-workflow record also uses a longer schedule: the frontend
+  // can hello (and answer) before it has restored an active canvas.
+  let keyedTab = tabKeyOf();
+  let steps = recheckStepsFor(corroborated);
+  let stepIndex = 0;
+  while (!corroborated.ok && corroborated.settles && stepIndex < steps.length) {
+    const waitMs = steps[stepIndex] ?? 0;
     await sleep(waitMs);
     waitedMs += waitMs;
+    stepIndex++;
     attempts++;
     const next = await readAndCorroborate();
     if ("done" in next) return next.done;
     corroborated = next.corroborated;
+    const nowTab = tabKeyOf();
+    if (nowTab !== keyedTab) {
+      keyedTab = nowTab;
+      steps = recheckStepsFor(corroborated);
+      stepIndex = 0;
+    }
   }
   if (!corroborated.ok) {
     return {
