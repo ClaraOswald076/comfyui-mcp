@@ -357,6 +357,63 @@ describe("TurnOriginTracker — inherited origins for tab-less turns (gate 3, P1
     expect(warnings.join("\n")).not.toMatch(/FAILS CLOSED/);
   });
 
+  // panel#1209 recurrence on mcp 0.52.51 / panel 0.15.32: panel_new_workflow
+  // (same-socket replacement, NEW instance uuid) → successful
+  // panel_set_workflow_target({mode:"current"}) → a later download_done
+  // continuation stamped graph commands with workflow A's frozen uuid.
+  // panel_get_errors failed closed; rebinding repaired that turn; the next
+  // completion repeated it.
+  //
+  // uuidOfTab is the production seam (index.ts: tabCommandWorkflowUuid.get) —
+  // hello and refreshWorkflowUuid write the live instance there. Inheritance
+  // must read THAT, not lastOrigin.uuid frozen at the previous user turn.
+  it("a download_done turn after a same-socket replacement stamps the LIVE canvas uuid, not the frozen previous instance (panel#1209)", async () => {
+    const { tracker, tabBackends, tabUuids, tabAliases } = makeTracker();
+    tabBackends.set("tab-a", "claude");
+    tabUuids.set("tab-a", "uuid-a");
+    tracker.recordForMid("m-user", "uuid-a", "tab-a");
+    tracker.onSeen(KEY, "m-user");
+    await flushMicrotasks();
+    tracker.turnEnded(KEY);
+
+    // Same socket, new workflow instance (panel_new_workflow / in-place load).
+    // Hello + mode:"current" refresh write the new uuid under the live id.
+    tabAliases.set("tab-a", "tab-b");
+    tabBackends.delete("tab-a");
+    tabBackends.set("tab-b", "claude");
+    tabUuids.set("tab-b", "uuid-b");
+    tracker.setStamp(KEY, "uuid-b");
+
+    const mid = tracker.mintInheritedOrigin();
+    tracker.onSeen(KEY, mid);
+    await flushMicrotasks();
+
+    expect(tracker.pinOf(KEY)).toBe("tab-a");
+    expect(tracker.stampOf(KEY)).toBe("uuid-b");
+    expect(tracker.resolvedPinOf(KEY)).toBe("tab-a");
+  });
+
+  it("a download_done turn after an in-place uuid remint (same tab id) also takes the live stamp (panel#1209)", async () => {
+    const { tracker, tabBackends, tabUuids } = makeTracker();
+    tabBackends.set("tab-a", "claude");
+    tabUuids.set("tab-a", "uuid-a");
+    tracker.recordForMid("m-user", "uuid-a", "tab-a");
+    tracker.onSeen(KEY, "m-user");
+    await flushMicrotasks();
+    tracker.turnEnded(KEY);
+
+    // loadGraphData reminted the instance under the same handle; the poll
+    // re-hello / mode:"current" published the new uuid onto this tab id.
+    tabUuids.set("tab-a", "uuid-b");
+
+    const mid = tracker.mintInheritedOrigin();
+    tracker.onSeen(KEY, mid);
+    await flushMicrotasks();
+
+    expect(tracker.pinOf(KEY)).toBe("tab-a");
+    expect(tracker.stampOf(KEY)).toBe("uuid-b");
+  });
+
   it("inheritance after a migration still refuses when the tab genuinely changed hands (panel#1292 keeps gate 3 closed)", async () => {
     // Same shape as above, but the migrated surface is now on ANOTHER backend.
     // Routing through the alias must not become a way to adopt it.
