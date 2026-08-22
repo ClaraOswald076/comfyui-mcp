@@ -4229,7 +4229,13 @@ async function annotateAddNodeRefusal(
   // #2007 — a schema-budget refusal is evidence that schema-guarded edits cannot
   // obtain /object_info, even when the backend socket is up. Remember it so the
   // next panel_graph_outline does not keep advertising mutations_ready:true.
-  trackSchemaToolResult(res, ctx);
+  // Frontend-only nodes are deliberately accepted without consulting /object_info;
+  // their success therefore cannot clear a refusal observed on a backend node.
+  trackSchemaToolResult(
+    res,
+    ctx,
+    !(typeof classType === "string" && PANEL_ADD_NODE_FRONTEND_ONLY_TYPES.has(classType)),
+  );
   return withFrontendOnlyPanelSkewNote(
     withLoraManagerAutocompleteNote(await withLiveSocketProducerNote(res, classType, ctx)),
     classType,
@@ -4444,7 +4450,12 @@ export function __resetPanelSchemaReadinessForTest(): void {
   panelSchemaBlockedTabs.clear();
 }
 
-function trackSchemaToolResult(res: ToolResult, ctx: PanelToolCtx): ToolResult {
+function trackSchemaToolResult(
+  res: ToolResult,
+  ctx: PanelToolCtx,
+  schemaGuarded = true,
+): ToolResult {
+  if (!schemaGuarded) return res;
   const key = panelSchemaKey(ctx);
   if (!res.isError) markPanelSchemaReady(key);
   else if (isObjectInfoBudgetRefusal(res)) markPanelSchemaBlocked(key);

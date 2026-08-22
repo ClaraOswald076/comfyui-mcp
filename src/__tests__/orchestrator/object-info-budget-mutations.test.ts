@@ -366,6 +366,29 @@ describe("panel_graph_outline does not keep advertising mutations_ready after a 
     expect(parseJson(await outline.handler({} as never, ctx)).mutations_ready).toBe(true);
   });
 
+  it("a frontend-only add does not prove backend schema readiness", async () => {
+    const { b } = bridge(async (cmd) => {
+      if (cmd.cmd === "graph_outline") return outlineOk;
+      if (cmd.cmd === "graph_add_node" && cmd.class_type === "LoadImage") {
+        throw new Error(ADD_UNAVAILABLE);
+      }
+      if (cmd.cmd === "graph_add_node" && cmd.class_type === "MarkdownNote") {
+        return { ok: true, node_id: 30, type: "MarkdownNote" };
+      }
+      return { ok: true };
+    });
+    const ctx = makePanelToolCtx(b, TAB, new WorkflowTargetStore());
+    const defs = buildPanelToolDefs();
+    const add = defs.find((d) => d.name === "panel_add_node");
+    const outline = defs.find((d) => d.name === "panel_graph_outline");
+    if (!add || !outline) throw new Error("tools missing");
+
+    await add.handler({ class_type: "LoadImage" } as never, ctx);
+    await add.handler({ class_type: "MarkdownNote" } as never, ctx);
+
+    expect(parseJson(await outline.handler({} as never, ctx)).mutations_ready).toBe(false);
+  });
+
   it("keys readiness to the live tab, not a stable scope route", async () => {
     const scope = "orchestrator::test";
     let liveTab = "panel-a";
