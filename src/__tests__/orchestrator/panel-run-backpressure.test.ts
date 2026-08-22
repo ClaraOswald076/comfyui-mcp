@@ -111,6 +111,26 @@ describe("panel_run backpressure note (#559)", () => {
     expect(qm.selfQueuedIds.has("p-batch-2")).toBe(true);
   });
 
+  it("a long self-owned render with stale extra depth is still YOUR own, not 'didn't queue' (#559 recurrence)", async () => {
+    // queueRemaining=2 while the only visible id is the one this session queued;
+    // the timestamp has aged past the 10-minute window. The old incomplete-
+    // accounting path called that foreign and recommended clear_pending.
+    QueueMonitor.markSelfQueued("p-long");
+    qm.lastSelfQueueTs = Date.now() - 11 * 60 * 1000;
+    qm.state.runningPromptId = "p-long";
+    qm.state.pendingPromptIds = [];
+    qm.state.queueRemaining = 2;
+
+    const ctx = makeCtx({ queued: true, prompt_id: "p-next" });
+    const res = await defByName("panel_run").handler({ allow_duplicate: true }, ctx);
+    const text = firstText(res);
+
+    expect(res.isError).not.toBe(true);
+    expect(text).toContain("your own");
+    expect(text).not.toContain("didn't queue");
+    expect(text).not.toContain("[QUEUE WARNING]");
+  });
+
   it("an unaccounted-for job running ahead → REFUSED before dispatch, running prompt named (#862)", async () => {
     // The reconnect-duplicate case: the self-queue ledger is in-memory, so after
     // an orchestrator restart the agent's OWN still-running render reads as
