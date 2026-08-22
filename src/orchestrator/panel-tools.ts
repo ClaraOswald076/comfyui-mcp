@@ -142,6 +142,67 @@ import {
   kitchenProactiveHint,
 } from "../services/kitchen.js";
 
+/**
+ * #2012 — the KIND of client a frame addressed at `ctx.tabId` will reach RIGHT NOW.
+ *
+ * `ctx.tabId` is an ADDRESS, not a destination. It may be a scope address
+ * (`orchestrator`, `orchestrator::<backend>`), an 8-char prefix, a same-socket
+ * migration alias, or a real tab that `ensureReachable` is about to rebind.
+ * Asking `isHeadless` about the address itself is a lookup miss on every one
+ * of those except a concrete live id — `conns` / `headlessSeen` never hold a
+ * scope address — and the miss answers `false`. Meanwhile `resolveTarget`'s
+ * scope branch ends "…else the most recent headless one". Two sites in one PR
+ * made that exact mistake; this helper exists so the next per-client decision
+ * cannot re-derive it wrongly.
+ *
+ * Built on `bridge.liveTabIdFor` (`resolveTarget` with the throw swallowed):
+ * scope / prefix / alias → the concrete tab. When nothing is live, a CONCRETE
+ * address still names the mailbox recipient for `show_media` (#2013 is the
+ * one buffered command), so sticky `isHeadless` on that id is then precisely
+ * right. A scope address names nobody — that is `unroutable`, not "not
+ * headless". Callers must treat `unroutable` as an unknown destination.
+ *
+ * Phrase a gate as a POSITIVE requirement on the kind ("allow only a proven
+ * headless destination", "allow only a proven interactive destination"), never
+ * as `kind !== "headless"`. The negative form silently allows every case the
+ * lookup cannot answer, which is exactly how both sites failed.
+ *
+ * Call this at the decision, not at the top of a handler. `ctx.tabId` is held
+ * live on the ctx so a rebind can re-point the session; a boolean captured
+ * before an await is about a tab the frame may no longer go to.
+ */
+export type ClientKind =
+  | { kind: "headless"; tabId: string }
+  | { kind: "interactive"; tabId: string }
+  | { kind: "unroutable" };
+
+export function resolveClientKind(ctx: PanelToolCtx): ClientKind {
+  const b = ctx.bridge as
+    | {
+        liveTabIdFor?: (id: string) => string | undefined;
+        isHeadless?: (id: string) => boolean;
+      }
+    | undefined;
+  const routed =
+    typeof b?.liveTabIdFor === "function" ? b.liveTabIdFor(ctx.tabId) : undefined;
+  // A live resolution wins. When nothing resolves: a CONCRETE id still names
+  // the mailbox recipient; a SCOPE address names nobody.
+  // `isScopeAddress` is typed `id is string`; its false branch would otherwise
+  // narrow a `string` tabId to `never` before `.length` is read (tsc TS2339).
+  const address = ctx.tabId;
+  const destination =
+    typeof routed === "string" && routed.length > 0
+      ? routed
+      : typeof address === "string" && address.length > 0 && !isScopeAddress(address)
+        ? address
+        : undefined;
+  if (destination == null) return { kind: "unroutable" };
+  if (typeof b?.isHeadless === "function" && b.isHeadless(destination)) {
+    return { kind: "headless", tabId: destination };
+  }
+  return { kind: "interactive", tabId: destination };
+}
+
 /** #884 — journal TICKETS (run completions #468, ask answers #486) must be
  *  keyed by the REAL tab a run/card was routed to: the panel reports back under
  *  that tab id, and a ticket keyed by the shared scope address a tool ctx is
@@ -1077,6 +1138,10 @@ export const __panelToolsTestHooks = {
    *  it fails even where the handler suite does not reach. The handler CALL SITE
    *  is covered separately (deleting the wiring must also fail a named test). */
   annotateShowMediaAck,
+  /** #2012 — the destination-kind helper. Handler call sites are covered
+   *  separately (reverting `panel_show_media` to `isHeadless` on the address
+   *  must also fail a named test). */
+  resolveClientKind,
   /** Direct access to the #742 decline recheck loop so its hard-deadline
    *  guarantee (codex gate r2) can be unit-tested with a custom deadline. */
   probeDeclineRecovery,
@@ -19364,8 +19429,14 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
             // bytes HERE and inline them as a data URL. Best-effort: any failure
             // (fetch error, non-media, too big) falls back to forwarding the ref,
             // which the client renders as a caption card.
+            //
+            // #2012 — judge the DESTINATION, not the address. `ctx.tabId` may be
+            // a scope / prefix / alias; `isHeadless` on the address is a lookup
+            // miss that answers false and a phone gets a /view URL it cannot
+            // fetch. Positive requirement: inline only a proven headless
+            // destination.
             let inlined = false;
-            if (ctx.bridge.isHeadless(ctx.tabId)) {
+            if (resolveClientKind(ctx).kind === "headless") {
               try {
                 const base = (process.env.COMFYUI_URL ?? "http://127.0.0.1:8188").replace(/\/+$/, "");
                 const qs = new URLSearchParams({ filename: src.filename, type: src.type ?? "output" });

@@ -6,6 +6,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### Fixed
+
+- **`panel_show_media` inlines a `/view` ref for the tab the frame will actually
+  reach, not for the address the session holds (#2012).** `ctx.tabId` may be a
+  scope (`orchestrator`, `orchestrator::<backend>`), an 8-char prefix, or a
+  migration alias, and `isHeadless(ctx.tabId)` is a lookup miss on every one of
+  those — `conns` is keyed by tab id — answering `false` while the frame lands
+  on a phone. The phone then gets a ComfyUI `/view` URL it cannot fetch. The
+  decision now goes through `resolveClientKind`, which asks `liveTabIdFor` where
+  the frame will land and only inlines for a proven headless destination. An
+  unroutable scope address is its own kind, not a synonym for "not a phone"
+  (`show_media` is the one buffered command; see #2013). A concrete tab that is
+  merely offline is still judged by sticky `isHeadless` — that id names the
+  mailbox recipient.
+
 ## [0.52.55] - 2026-08-22
 
 ### Fixed
@@ -30,7 +45,6 @@ All notable changes to this project are documented here. This project adheres to
 - restore graph binding after restart when the active workflow record arrives late (#2062)
 - download tray no longer announces FAILED while status still shows the transfer streaming (#2061)
 - a long self-queued render is no longer called foreign backlog (#2060)
-
 
 ## [0.52.54] - 2026-08-22
 
