@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.54] - 2026-08-22
+
+### MCP
+
+#### Fixed
+- stamp a download continuation with the live canvas, not the previous workflow (#2056)
+
+
 ## [0.52.53] - 2026-08-21
 
 ### MCP
