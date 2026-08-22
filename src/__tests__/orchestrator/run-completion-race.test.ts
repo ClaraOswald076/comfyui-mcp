@@ -281,7 +281,7 @@ describe("WIRING: panel_run stamps the dispatch time before dispatching (#1327)"
     const { readFile } = await import("node:fs/promises");
     const src = await readFile(new URL("../../orchestrator/panel-tools.ts", import.meta.url), "utf-8");
 
-    const stamp = src.indexOf("const runDispatchedAt = Date.now();");
+    const stamp = src.indexOf("let runDispatchedAt = Date.now();");
     const call = src.indexOf("let res = await ctx.call(runCmd", stamp);
     expect(stamp).toBeGreaterThan(-1);
     expect(call).toBeGreaterThan(stamp); // stamped first

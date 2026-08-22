@@ -49,6 +49,7 @@ function makeWatchdog(
   const delivered: Array<{ payload: CompletionPayload; ticket: RunTicket }> = [];
   const wd = createRunCompletionWatchdog({
     awaiting: (id) => RunCompletions.awaitingCompletion(id),
+    knownTicket: (id) => RunCompletions.ticketFor(id),
     deliver: (payload, ticket) => {
       delivered.push({ payload, ticket });
       RunCompletions.record(ticket.tabId, payload, {
@@ -107,6 +108,62 @@ describe("#1789: a completion the panel never reported is filled in from ComfyUI
     expect(wd.armedCount()).toBe(0);
   });
 
+  it("#2021 holds a fast-render completion until panel_run opens its ticket", async () => {
+    const clock = { t: 1_500_000 };
+    const { wd, delivered } = makeWatchdog(clock);
+
+    // QueueMonitor drained the completion before graph_run's reply reached
+    // panel_run. There is no ticket at the instant observe() sees it.
+    wd.observe([{ promptId: PID, status: "success" }]);
+    expect(wd.armedCount()).toBe(1);
+    expect(delivered).toHaveLength(0);
+
+    expect(RunCompletions.openRun(PID, { tabId: TAB, conversation: CONV })).toBe(true);
+    clock.t += DEFAULT_SYNTHESIS_GRACE_MS;
+    await wd.tick();
+
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0].payload.prompt_id).toBe(PID);
+    expect(delivered[0].ticket.promptId).toBe(PID);
+  });
+
+  it("#2021 promotes a fast-render arm so a completion burst cannot evict it", async () => {
+    const clock = { t: 1_600_000 };
+    const { wd, delivered } = makeWatchdog(clock);
+    wd.observe([{ promptId: PID, status: "success" }]);
+    expect(RunCompletions.openRun(PID, { tabId: TAB, conversation: CONV })).toBe(true);
+    wd.markTicketed([PID]);
+
+    for (let i = 0; i < 300; i++) {
+      wd.observe([{ promptId: `burst-${i}`, status: "success" }]);
+    }
+    clock.t += DEFAULT_SYNTHESIS_GRACE_MS;
+    await wd.tick();
+
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0].payload.prompt_id).toBe(PID);
+  });
+
+  it("#2021 refuses an unknown arm observed before a reused prompt dispatch", async () => {
+    const clock = { t: 1_700_000 };
+    const { wd, delivered } = makeWatchdog(clock);
+    wd.observe([{ promptId: PID, status: "success" }]);
+    clock.t += 100;
+    expect(
+      RunCompletions.openRun(PID, {
+        tabId: TAB,
+        conversation: CONV,
+        dispatchedAt: clock.t,
+      }),
+    ).toBe(true);
+    wd.markTicketed([PID]);
+    clock.t += DEFAULT_SYNTHESIS_GRACE_MS;
+    await wd.tick();
+
+    expect(delivered).toHaveLength(0);
+    expect(RunCompletions.awaitingCompletion(PID)).toBeTruthy();
+  });
+
   it("the synthesised completion is CORRELATED as the run the agent queued, and reaches an agent", () => {
     const clock = { t: 2_000_000 };
     const { wd } = makeWatchdog(clock);
@@ -147,15 +204,16 @@ describe("#1789: a completion the panel never reported is filled in from ComfyUI
     expect(RunCompletions.outstanding(TAB)[0].payload.images).toHaveLength(1);
   });
 
-  it("stays silent for a run this session never queued (a render the USER started)", () => {
+  it("stays silent for a run this session never queued (a render the USER started)", async () => {
     const clock = { t: 4_000_000 };
     const { wd, delivered } = makeWatchdog(clock);
-    // No openRun at all — there is no promise to keep, and waking the agent for
-    // a foreign render is the failure #889/#559 already paid for.
+    // No openRun at all — hold the observation briefly in case it is the
+    // #2021 dispatch/reply race, but never wake the agent for a foreign render.
     wd.observe([{ promptId: "p-foreign", status: "success" }]);
-    expect(wd.armedCount()).toBe(0);
+    expect(wd.armedCount()).toBe(1);
     clock.t += DEFAULT_SYNTHESIS_GRACE_MS + 1;
-    wd.tick();
+    await wd.tick();
+    expect(wd.armedCount()).toBe(0);
     expect(delivered).toHaveLength(0);
   });
 

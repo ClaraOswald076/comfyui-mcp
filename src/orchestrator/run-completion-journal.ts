@@ -122,6 +122,9 @@ export interface RunTicket {
    */
   conversation?: string;
   queuedAt: number;
+  /** Timestamp captured immediately before panel dispatch. The watchdog uses
+   * this to reject an unknown completion observed before this run existed. */
+  dispatchedAt?: number;
   toNodeId?: number;
   /**
    * Generation of THIS ticket. Bumped whenever the id is opened again (a fresh
@@ -708,6 +711,8 @@ export class RunCompletionJournalImpl {
       if (meta.conversation !== undefined) existing.conversation = meta.conversation;
       else delete existing.conversation;
       existing.queuedAt = Date.now();
+      if (typeof meta.dispatchedAt === "number") existing.dispatchedAt = meta.dispatchedAt;
+      else delete existing.dispatchedAt;
       existing.seq = ++this.ticketSeq; // a NEW generation of this id
       // The id no longer identifies ONE run. Every completion for it from here
       // on is unattributable (see RunTicket.reused) — reported UNDETERMINED, and
@@ -738,6 +743,7 @@ export class RunCompletionJournalImpl {
       ...(meta.conversation !== undefined ? { conversation: meta.conversation } : {}),
       seq,
       queuedAt: Date.now(),
+      ...(typeof meta.dispatchedAt === "number" ? { dispatchedAt: meta.dispatchedAt } : {}),
       ...(typeof meta.toNodeId === "number" ? { toNodeId: meta.toNodeId } : {}),
       settled: false,
       ...(hasHistory ? { reused: true } : {}),

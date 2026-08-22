@@ -2022,7 +2022,13 @@ export async function runPanelOrchestrator(): Promise<void> {
   {
     const panelMcpPort = Number(process.env.COMFYUI_MCP_PANEL_MCP_PORT) || ports.panelMcp;
     try {
-      panelMcpHttp = await startPanelMcpHttpServer(bridge, panelMcpPort, "127.0.0.1", workflowTargets);
+      panelMcpHttp = await startPanelMcpHttpServer(
+        bridge,
+        panelMcpPort,
+        "127.0.0.1",
+        workflowTargets,
+        (promptIds) => runCompletionWatchdog?.markTicketed(promptIds),
+      );
     } catch (err) {
       logger.error(
         `[panel-orchestrator] could not start the panel HTTP MCP on :${panelMcpPort} — codex/gemini tabs will lack live-graph tools: ${err instanceof Error ? err.message : String(err)}`,
@@ -2444,7 +2450,12 @@ export async function runPanelOrchestrator(): Promise<void> {
     // one issue-time stamp).
     makePanelServer: (key) =>
       backendOf(key) === "claude"
-        ? createPanelMcpServer(bridge, key, workflowTargets)
+        ? createPanelMcpServer(
+            bridge,
+            key,
+            workflowTargets,
+            (promptIds) => runCompletionWatchdog?.markTicketed(promptIds),
+          )
         : undefined,
     mcpServers: buildMcpServers(),
     // Per-KEY factory — spawns must reflect live state (the Blind gate) and
@@ -6301,10 +6312,13 @@ export async function runPanelOrchestrator(): Promise<void> {
   // observation went only to the `queue_status` UI broadcast. This watchdog is
   // the join: an observed completion whose panel_run ticket is still unanswered
   // after the grace is synthesised into the SAME journal the real frame uses.
+  // A fast completion may precede the ticket itself, so the watchdog also holds
+  // unknown ids briefly and re-checks them after panel_run's reply can arrive.
   // See run-completion-watchdog.ts for why it waits, and why the panel's frame
   // still wins whenever it is coming.
   const wd = createRunCompletionWatchdog({
     awaiting: (promptId) => RunCompletions.awaitingCompletion(promptId),
+    knownTicket: (promptId) => RunCompletions.ticketFor(promptId),
     resolveOutputs: (promptId) => resolveHistoryCompletionImages(promptId),
     lookupStatus: (promptId) => resolveHistoryCompletionStatus(promptId),
     deliver: (payload, ticket) => {

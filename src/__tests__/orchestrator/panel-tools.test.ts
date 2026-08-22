@@ -6642,6 +6642,41 @@ describe("panel-tools: panel_run scoped-run stamp-race retry (#772)", () => {
       }
     });
 
+    it("refreshes the watchdog dispatch fence for the scoped retry (#2021)", async () => {
+      __panelToolsTestHooks.setRetrySettleMs(0);
+      const promptId = "p-2021-retry-fence";
+      let dispatches = 0;
+      let retryStarted = false;
+      const now = vi.spyOn(Date, "now").mockImplementation(() => (retryStarted ? 2000 : 1000));
+      const ctx: PanelToolCtx = {
+        call: async (cmd) => {
+          if (cmd.cmd !== "graph_run") return { content: [{ type: "text", text: "{}" }] };
+          dispatches += 1;
+          if (dispatches === 1) {
+            // The first refusal is the certified-not-queued boundary. Any arm
+            // observed after this point must not be accepted by the retry ticket.
+            retryStarted = true;
+            return { content: [{ type: "text", text: JSON.stringify({ error: RACE }) }] };
+          }
+          return {
+            content: [{ type: "text", text: JSON.stringify({ queued: true, prompt_id: promptId }) }],
+          };
+        },
+        confirm: async () => "yes" as const,
+        bridge: {} as unknown as PanelToolCtx["bridge"],
+        tabId: "test-tab",
+      };
+      try {
+        const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+        expect(res.isError).toBeFalsy();
+        expect(dispatches).toBe(2);
+        expect(RunCompletions.ticketFor(promptId)?.dispatchedAt).toBe(2000);
+      } finally {
+        now.mockRestore();
+        __panelToolsTestHooks.setRetrySettleMs(0);
+      }
+    });
+
     it("still re-issues EXACTLY once when the pause does not save it", async () => {
       const { ctx, runs } = runCtx([{ error: RACE }, { error: RACE }]);
       const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
