@@ -43,7 +43,7 @@ export function runpodDeployLink(): string {
   return `https://console.runpod.io/deploy?template=${RUNPOD_TEMPLATE_ID}&ref=${RUNPOD_REF_CODE}`;
 }
 
-/** The public HTTPS URL RunPod proxies a pod's HTTP port at. For ComfyUI (8188)
+/** The public HTTPS URL RunPod proxies a pod's HTTP port at. For ComfyUI (3000)
  *  this is the URL to point comfyui-mcp at. Only reachable while the pod RUNS and
  *  the port is exposed as an HTTP port on the pod/template. */
 export function runpodProxyUrl(podId: string, port: number = RUNPOD_COMFYUI_PORT): string {

@@ -33,7 +33,7 @@
     "connect_step_click_connect": "در پنل روی «اتصال» بزنید (منوی اتصال در پنل Agent).",
     "connect_step_open_comfyui": "آن ComfyUI را در مرورگرتان باز کنید: {url}",
     "connect_title": "پل عامل محلی در حال راه‌اندازی است",
-    "connect_url_invalid": "نشانی ComfyUI نامعتبری به `connect` داده شد: ‏\"{url}\" ‏({reason}). یک نشانی کامل http(s) بدهید، مثلاً https://abcd-8188.proxy.runpod.net یا http://127.0.0.1:8188 .",
+    "connect_url_invalid": "نشانی ComfyUI نامعتبری به `connect` داده شد: ‏\"{url}\" ‏({reason}). یک نشانی کامل http(s) بدهید، مثلاً https://abcd-3000.proxy.runpod.net یا http://127.0.0.1:8188 .",
     "help_active": "(فعلی: {locale})",
     "help_allow_unauth": "اجازهٔ ‎/mcp باز روی میزبانی غیر از loopback",
     "help_comfyui_url": "هدف‌گیری یک ComfyUI مشخص (از جمله دوردست)",

@@ -60,6 +60,7 @@ import {
 import { unclassifiedOwnership, type ListenerOwnership } from "../services/listener-ownership.js";
 import { judgeHelloRetarget, canonComfyuiTargetUrl } from "../services/hello-retarget.js";
 import { startQuickTunnel } from "../services/tunnel.js";
+import { advertisedWebSocketOrigin } from "../services/advertised-origin.js";
 import { detectInstallMode } from "../services/self-update.js";
 import { performPanelSync, reassessPanelAfterSyncFailure } from "../services/panel-sync.js";
 import { resolveBlindTabGate } from "./blind-tab-gate.js";
@@ -1070,13 +1071,19 @@ export async function runPanelOrchestrator(): Promise<void> {
       bridgeHost === "0.0.0.0" || bridgeHost === "::"
         ? (firstLanIPv4() ?? "<this-machine-ip>")
         : bridgeHost;
+    const publicBridgeOrigin = advertisedWebSocketOrigin(lockPort);
+    const bridgeUrl = publicBridgeOrigin
+      ? `${publicBridgeOrigin}/?token=${bridgeToken}`
+      : `ws://${displayHost}:${lockPort}/?token=${bridgeToken}`;
     process.stderr.write(
       [
         "",
         "════════════════════════════════════════════════════════════════════",
-        " ComfyUI MCP — panel bridge exposed on the LAN (token-gated)",
+        publicBridgeOrigin
+          ? " ComfyUI MCP — panel bridge exposed on a public origin (token-gated)"
+          : " ComfyUI MCP — panel bridge exposed on the LAN (token-gated)",
         "════════════════════════════════════════════════════════════════════",
-        ` Bridge URL : ws://${displayHost}:${lockPort}/?token=${bridgeToken}`,
+        ` Bridge URL : ${bridgeUrl}`,
         "",
         " In the panel: Settings → Advanced → Bridge URL → paste the URL above,",
         " then click Connect. Anyone with this URL can drive the agent — treat",
@@ -1124,7 +1131,10 @@ export async function runPanelOrchestrator(): Promise<void> {
     try {
       await ensurePairListener();
       const ip = firstLanIPv4();
-      const pairUrl = `ws://${ip ?? "<this-machine-ip>"}:${pairPort}/?token=${envPairToken}`;
+      const publicPairOrigin = advertisedWebSocketOrigin(pairPort);
+      const pairUrl = publicPairOrigin
+        ? `${publicPairOrigin}/?token=${envPairToken}`
+        : `ws://${ip ?? "<this-machine-ip>"}:${pairPort}/?token=${envPairToken}`;
       process.stderr.write(
         [
           "",
@@ -1296,6 +1306,23 @@ export async function runPanelOrchestrator(): Promise<void> {
   // effort: on failure the (token-gated) bridge stays up and we log an actionable
   // fix. Held for re-advertise on retarget + teardown on shutdown.
   let secureBridge: SecureBridge | null = null;
+  const printSecureBridgeUrl = (wssUrl: string): void => {
+    process.stderr.write(
+      [
+        "",
+        "════════════════════════════════════════════════════════════════════",
+        " ComfyUI MCP — secure panel bridge ready (token-gated)",
+        "════════════════════════════════════════════════════════════════════",
+        ` Bridge URL : ${wssUrl}`,
+        "",
+        " In the panel: Settings → Advanced → Bridge URL → paste the URL above,",
+        " then click Connect. Anyone with this URL can drive the agent — treat",
+        " it like a password.",
+        "════════════════════════════════════════════════════════════════════",
+        "",
+      ].join("\n") + "\n",
+    );
+  };
   if (wantSecureBridge && bridgeToken) {
     try {
       secureBridge = await setupSecureBridge({
@@ -1305,6 +1332,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         bridge,
         localUrl: localBridgeUrl(lockPort),
       });
+      printSecureBridgeUrl(secureBridge.wssUrl);
     } catch (err) {
       logger.error(
         `[panel-orchestrator] secure bridge (cloudflared) failed: ${err instanceof Error ? err.message : String(err)}. ` +
@@ -4797,12 +4825,15 @@ export async function runPanelOrchestrator(): Promise<void> {
           url = u.toString();
         } else {
           const ip = firstLanIPv4();
-          if (!ip) {
+          const publicPairOrigin = advertisedWebSocketOrigin(pairPort);
+          if (!ip && !publicPairOrigin) {
             throw new Error(
               "No LAN network found — connect this machine to wifi/ethernet, or use the Internet (tunnel) option.",
             );
           }
-          url = `ws://${ip}:${pairPort}/?token=${token}`;
+          url = publicPairOrigin
+            ? `${publicPairOrigin}/?token=${token}`
+            : `ws://${ip}:${pairPort}/?token=${token}`;
         }
         // #875 — say at pair time whether this URL survives a restart. The
         // self-restarter is on by default and rotates the token (always, unless
@@ -6574,6 +6605,7 @@ export async function runPanelOrchestrator(): Promise<void> {
             // left (codex finding: the post-await guard alone couldn't stop it).
             shouldAdvertise: (t) => comfyuiUrl === t && isRemoteHttpsUrl(t),
           });
+          printSecureBridgeUrl(secureBridge.wssUrl);
         } catch (err) {
           logger.error(
             `[panel-orchestrator] secure bridge (cloudflared) failed: ${err instanceof Error ? err.message : String(err)}. ` +

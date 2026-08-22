@@ -161,9 +161,9 @@ describe("parseCliArgs", () => {
   });
 
   it("`connect <url>` implies panelOrchestrator and captures comfyuiUrl", () => {
-    const o = parseCliArgs([...base, "connect", "https://abcd-8188.proxy.runpod.net"], {});
+    const o = parseCliArgs([...base, "connect", "https://abcd-3000.proxy.runpod.net"], {});
     expect(o.panelOrchestrator).toBe(true);
-    expect(o.comfyuiUrl).toBe("https://abcd-8188.proxy.runpod.net");
+    expect(o.comfyuiUrl).toBe("https://abcd-3000.proxy.runpod.net");
     expect(o.transport).toBe("stdio");
   });
 
@@ -230,7 +230,7 @@ describe("exportExplicitToolMode (#667)", () => {
 
 describe("validateConnectUrl", () => {
   it("accepts a full http(s) URL (returns null)", () => {
-    expect(validateConnectUrl("https://abcd-8188.proxy.runpod.net")).toBeNull();
+    expect(validateConnectUrl("https://abcd-3000.proxy.runpod.net")).toBeNull();
     expect(validateConnectUrl("http://127.0.0.1:8188")).toBeNull();
     expect(validateConnectUrl("https://comfy.example.com/comfyapi")).toBeNull();
   });

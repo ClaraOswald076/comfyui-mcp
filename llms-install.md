@@ -62,6 +62,27 @@ author workflows, manage models and custom nodes, and control the server.
 }
 ```
 
+**RunPod:** expose the image's HTTP port **3000** (nginx proxies ComfyUI on
+the pod's internal port 3001), then use the RunPod proxy URL:
+
+```json
+{
+  "mcpServers": {
+    "comfyui": {
+      "command": "npx",
+      "args": ["-y", "comfyui-mcp", "--comfyui-url", "https://<pod-id>-3000.proxy.runpod.net"]
+    }
+  }
+}
+```
+
+If `comfyui-mcp` itself runs inside the pod, set `RUNPOD_POD_ID` (the image
+normally provides it) so local detection uses ComfyUI's internal port 3001.
+For a pod-hosted bridge or phone pairing listener, expose that listener's port
+too; the startup banner will print the corresponding `wss://<pod-id>-<port>`
+URL instead of an unreachable container IP. `COMFYUI_MCP_PUBLIC_URL` is an
+explicit public-origin override for other reverse proxies.
+
 **Comfy Cloud:**
 
 ```json
@@ -89,6 +110,8 @@ panel).
 Set in the `env` block above. None are required for the local-default flow.
 
 - `COMFYUI_HOST` / `COMFYUI_PORT` — override host/port (defaults: auto-detect)
+- `COMFYUI_MCP_PUBLIC_URL` — public origin to print for MCP, bridge, and pairing
+  URLs when the host is behind a reverse proxy
 - `COMFYUI_PATH` — explicit ComfyUI data/base path (also the checkout for a
   conventional install; auto-detected on Mac / Linux / Windows when unset)
 - `COMFYUI_CODE_PATH` — optional checkout path for split installs whose

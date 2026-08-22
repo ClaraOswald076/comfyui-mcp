@@ -22,8 +22,25 @@ import { adoptOrphanedDownloadJobs } from "./services/download-jobs.js";
 import { checkAndSelfUpdate } from "./services/self-update.js";
 import { tr } from "./i18n/index.js";
 import { resolveBridgePort } from "./services/bridge-ports.js";
+import {
+  advertisedPublicOrigin,
+  configuredPublicOrigin,
+} from "./services/advertised-origin.js";
 import { banner, labelRows, numberedSteps } from "./i18n/terminal-layout.js";
 import { STDIO_HANDSHAKE_INSTRUCTIONS } from "./handshake-instructions.js";
+
+/** A RunPod proxy can only reach a listener exposed beyond loopback. */
+function advertisedOriginForBind(host: string, port: number): string | undefined {
+  // An explicit public URL is the operator's reverse-proxy declaration; it is
+  // valid precisely when the local listener is intentionally loopback-bound.
+  const configured = configuredPublicOrigin();
+  if (configured) return configured;
+  const normalized = host.trim().toLowerCase();
+  if (normalized === "127.0.0.1" || normalized === "::1" || normalized === "localhost") {
+    return undefined;
+  }
+  return advertisedPublicOrigin(port);
+}
 
 /**
  * Fire-and-forget: ensure the ComfyUI sidebar panel is installed (install-if-
@@ -291,11 +308,17 @@ async function openTunnelAndAnnounce(
     publicUrl = tunnel.url;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    const advertised = advertisedOriginForBind(host, port);
+    const fallback = advertised
+      ? `${advertised}/mcp`
+      : host === "0.0.0.0" || host === "::"
+        ? `http://<this-machine-address>:${port}/mcp`
+        : `http://${host}:${port}/mcp`;
     logger.error(
       `[tunnel] could not start cloudflared: ${message}\n` +
         `  Install it, then re-run with --tunnel:\n` +
         `    npm install -g cloudflared      # or: brew install cloudflared / winget install cloudflare.cloudflared\n` +
-        `  The local server is still running at http://${host}:${port}/mcp (token auth active).`,
+        `  The local server is still running at ${fallback} (token auth active).`,
     );
     return;
   }
@@ -531,7 +554,7 @@ async function main() {
       // --insecure-bridge → plain loopback ws://. Informational only here.
       const secureBridge = !cli.insecureBridge && isRemoteHttpsPod(cli.comfyuiUrl);
       const bridgeValue = secureBridge
-        ? tr("cli.connect_bridge_secure", "wss:// secure Cloudflare tunnel (auto — nothing to copy)")
+        ? tr("cli.connect_bridge_secure", "wss:// secure Cloudflare tunnel (auto — URL is printed when ready)")
         : `ws://127.0.0.1:${bridgePort}`;
       // Every string below that NAMES A PANEL CONTROL keeps its English fallback exactly as
       // the panel renders it in English today, and says so in its key. The panel's own labels
@@ -568,7 +591,7 @@ async function main() {
                     tr("cli.connect_label_secure", "Secure"),
                     tr(
                       "cli.connect_secure_note",
-                      "the pod's HTTPS panel connects automatically over an\nencrypted tunnel — no URL to paste, works in any browser.",
+                      "the pod's HTTPS panel connects automatically over an\nencrypted tunnel — the URL is printed when ready.",
                     ),
                   ],
                 ] as const)
@@ -609,7 +632,13 @@ async function main() {
       allowUnauthenticated: cli.allowUnauthenticated,
       createServer: () => createConfiguredServer(cli.toolMode),
     });
-    logger.info(`ComfyUI MCP server running on http://${cli.host}:${cli.port}/mcp`);
+    const advertised = advertisedOriginForBind(cli.host, cli.port);
+    const runningOrigin = advertised
+      ? advertised
+      : cli.host === "0.0.0.0" || cli.host === "::"
+        ? `http://<bind-address>:${cli.port}`
+        : `http://${cli.host}:${cli.port}`;
+    logger.info(`ComfyUI MCP server running on ${runningOrigin}/mcp`);
     if (token) {
       logger.info(
         `HTTP MCP auth ENABLED — send 'Authorization: Bearer <token>' or 'X-API-Key: <token>'.`,

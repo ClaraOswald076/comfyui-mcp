@@ -191,7 +191,7 @@ can still run the agent on **your** machine and drive that remote ComfyUI — no
 agent login on the box, nothing to install or configure remotely:
 
 ```bash
-npx -y comfyui-mcp@latest connect https://abcd1234-8188.proxy.runpod.net
+npx -y comfyui-mcp@latest connect https://abcd1234-3000.proxy.runpod.net
 ```
 
 This is sugar for `--panel-orchestrator` with `COMFYUI_URL` set from the URL: the

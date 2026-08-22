@@ -119,9 +119,9 @@ describe("config mode detection", () => {
   });
 
   it("getInstanceSlug() keeps dots/hyphens for a RunPod-style https host", async () => {
-    process.env.COMFYUI_URL = "https://abcd-8188.proxy.runpod.net";
+    process.env.COMFYUI_URL = "https://abcd-3000.proxy.runpod.net";
     const mod = await import("../config.js");
-    expect(mod.getInstanceSlug()).toBe("abcd-8188.proxy.runpod.net_443");
+    expect(mod.getInstanceSlug()).toBe("abcd-3000.proxy.runpod.net_443");
   });
 
   it("getInstanceSlug() is 'comfy-cloud' in cloud mode", async () => {

@@ -9,8 +9,8 @@ vi.mock("../../services/runpod-client.js", () => ({
   stopPod: (...a: unknown[]) => stopPodMock(...a),
   beatDeadman: (...a: unknown[]) => beatMock(...a),
   comfyuiPortExposed: (pod: { runtime?: { ports?: Array<{ privatePort: number; type: string }> } }) =>
-    (pod.runtime?.ports ?? []).some((p) => p.privatePort === 8188 && p.type === "http"),
-  runpodProxyUrl: (id: string) => `https://${id}-8188.proxy.runpod.net`,
+    (pod.runtime?.ports ?? []).some((p) => p.privatePort === 3000 && p.type === "http"),
+  runpodProxyUrl: (id: string) => `https://${id}-3000.proxy.runpod.net`,
 }));
 
 import { createRunpodWatcher, type RunpodStatusFrame } from "../../services/runpod-watch.js";
@@ -23,7 +23,7 @@ const runningPod = (over: Record<string, unknown> = {}) => ({
   machine: { gpuDisplayName: "RTX 4090" },
   runtime: {
     uptimeInSeconds: 60,
-    ports: [{ privatePort: 8188, type: "http", ip: "1", isIpPublic: true, publicPort: 8188 }],
+    ports: [{ privatePort: 3000, type: "http", ip: "1", isIpPublic: true, publicPort: 3000 }],
     gpus: [{ id: "g", gpuUtilPercent: 5, memoryUtilPercent: 10 }],
   },
   ...over,
@@ -51,7 +51,7 @@ describe("runpod-watch — status broadcast", () => {
     const f = frames[0];
     expect(f.pod_id).toBe("pod1");
     expect(f.status).toBe("RUNNING");
-    expect(f.comfyui_url).toBe("https://pod1-8188.proxy.runpod.net");
+    expect(f.comfyui_url).toBe("https://pod1-3000.proxy.runpod.net");
     // second identical poll shouldn't add a frame
     const before = frames.length;
     await w.poll();

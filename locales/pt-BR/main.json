@@ -33,7 +33,7 @@
     "connect_step_click_connect": "Clique em Conectar no painel (o menu Conectar do painel Agent).",
     "connect_step_open_comfyui": "Abra esse ComfyUI no seu navegador: {url}",
     "connect_title": "iniciando a ponte do agente local",
-    "connect_url_invalid": "URL do ComfyUI inválida passada para `connect`: \"{url}\" ({reason}). Informe uma URL http(s) completa, por exemplo https://abcd-8188.proxy.runpod.net ou http://127.0.0.1:8188.",
+    "connect_url_invalid": "URL do ComfyUI inválida passada para `connect`: \"{url}\" ({reason}). Informe uma URL http(s) completa, por exemplo https://abcd-3000.proxy.runpod.net ou http://127.0.0.1:8188.",
     "help_active": "(ativo: {locale})",
     "help_allow_unauth": "permitir um /mcp ABERTO em um host que não seja loopback",
     "help_comfyui_url": "apontar para um ComfyUI específico (inclusive remoto)",

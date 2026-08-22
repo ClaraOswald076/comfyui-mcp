@@ -33,7 +33,7 @@
     "connect_step_click_connect": "Нажмите «Подключиться» в панели (меню подключения в панели Agent).",
     "connect_step_open_comfyui": "Откройте этот ComfyUI в браузере: {url}",
     "connect_title": "запускается локальный мост агента",
-    "connect_url_invalid": "В `connect` передан некорректный URL ComfyUI: \"{url}\" ({reason}). Укажите полный http(s) URL, например https://abcd-8188.proxy.runpod.net или http://127.0.0.1:8188.",
+    "connect_url_invalid": "В `connect` передан некорректный URL ComfyUI: \"{url}\" ({reason}). Укажите полный http(s) URL, например https://abcd-3000.proxy.runpod.net или http://127.0.0.1:8188.",
     "help_active": "(сейчас: {locale})",
     "help_allow_unauth": "разрешить ОТКРЫТЫЙ /mcp на нелокальном хосте",
     "help_comfyui_url": "указать конкретный (в том числе удалённый) ComfyUI",
