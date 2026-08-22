@@ -204,8 +204,36 @@ describe("sessions are orchestrator-scoped, never workflow-scoped (#884)", () =>
     // A cancelled queued message's origin dies with it.
     expect(src).toContain("turnOrigins.cancelMid(mid);");
     // The panel MCP servers bind the backend-QUALIFIED scope address so the
-    // per-conversation stamp is recoverable from the caller id.
-    expect(src).toContain("createPanelMcpServer(bridge, key, workflowTargets)");
+    // per-conversation stamp is recoverable from the caller id. Keep these
+    // assertions structural: the production calls are intentionally multiline,
+    // and the callback is the join that promotes a fast completion arm when
+    // panel_run opens its journal ticket (#2021).
+    expect(src).toMatch(
+      /createPanelMcpServer\(\s*bridge,\s*key,\s*workflowTargets,\s*\(promptIds\)\s*=>\s*runCompletionWatchdog\?\.markTicketed\(promptIds\),\s*\)/s,
+    );
+    expect(src).toMatch(
+      /startPanelMcpHttpServer\(\s*bridge,\s*panelMcpPort,\s*"127\.0\.0\.1",\s*workflowTargets,\s*\(promptIds\)\s*=>\s*runCompletionWatchdog\?\.markTicketed\(promptIds\),\s*\)/s,
+    );
+    expect(src.match(/runCompletionWatchdog\?\.markTicketed\(promptIds\)/g) ?? []).toHaveLength(2);
+
+    const panelHttpSrc = readFileSync(
+      new URL("../../orchestrator/panel-mcp-http.ts", import.meta.url),
+      "utf8",
+    );
+    expect(panelHttpSrc).toMatch(
+      /registerPanelTools\(\s*server,\s*makePanelToolCtx\(\s*bridge,\s*tabId,\s*workflowTargets,\s*onRunTicketOpened\s*\)\s*\)/s,
+    );
+
+    const panelToolsSrc = readFileSync(
+      new URL("../../orchestrator/panel-tools.ts", import.meta.url),
+      "utf8",
+    );
+    expect(panelToolsSrc).toMatch(
+      /const ctx = makePanelToolCtx\(bridge, tabId, workflowTargets, onRunTicketOpened\);/s,
+    );
+    expect(panelToolsSrc).toMatch(
+      /if \(ticketedPromptIds\.length\) ctx\.onRunTicketOpened\?\.\(ticketedPromptIds\);/s,
+    );
     expect(src).toContain("makeHttpBackendMcpServers(key)");
   });
 

@@ -14352,7 +14352,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // instant belongs to this run: the id did not exist before this call created
         // it. Without the timestamp the journal has no way to tell the agent's own
         // 0.1s render from a stranger's, and reported it as UNDETERMINED.
-        const runDispatchedAt = Date.now();
+        let runDispatchedAt = Date.now();
         // #1175 — the rid of the dispatch we are about to make, so an unanswered
         // one can be reconciled against the panel's late acknowledgement. Rebound
         // by the re-issue below, deliberately: the entry that matters is always
@@ -14416,6 +14416,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             // nothing more. A graph still moving after it (a user actively editing)
             // races again and is SURFACED, never re-raced.
             await sleep(retrySettleMs());
+            // The retry is a new dispatch boundary. A watchdog arm observed after the
+            // first certified refusal but before this re-issue belongs to neither
+            // attempt; keep the ticket fence at the dispatch that actually minted its
+            // prompt id rather than allowing that stale arm to be synthesized (#2021).
+            runDispatchedAt = Date.now();
             res = await ctx.call(runCmd, 20000, observeRunRid);
             // #1175 — the re-issue can miss its window exactly as the first
             // dispatch can, and this is the one whose outcome is genuinely open
