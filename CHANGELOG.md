@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.50] - 2026-08-21
+
+### MCP
+
+#### Fixed
+- first code-mode call survives a stale WinGet Node host path (#2046)
+
+
 ## [0.52.49] - 2026-08-21
 
 ### MCP
