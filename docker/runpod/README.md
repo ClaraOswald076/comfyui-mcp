@@ -30,7 +30,7 @@ just `mkdir -p` the data dirs and launches ComfyUI (~**30-60s** ComfyUI init).
    npx -y comfyui-mcp@latest connect https://<pod-id>-3000.proxy.runpod.net
    ```
 4. Open the pod's ComfyUI, open the **Agent Panel** sidebar, enable the
-   external-orchestrator toggle, hit **Connect**, and drive the graph in natural
+   hit **Connect**, and drive the graph in natural
    language.
 
 The agent's brain (the **panel orchestrator**) runs **locally on your machine**
@@ -617,7 +617,7 @@ page is served over `https://`, `connect` automatically opens a secure, token-ga
 the pod's panel that URL — so the HTTPS page reaches your local agent with **no
 browser prompt, in any browser** (a secure page can't open a plain `ws://` socket
 to your box). Then open the pod's ComfyUI, open the **Agent Panel**, enable the
-**external-orchestrator** toggle, and click **Connect**. (Add **`--insecure-bridge`**
+click **Connect**. (Add **`--insecure-bridge`**
 to force the plain `ws://127.0.0.1:9199` loopback instead — e.g. when you reach the
 pod via an SSH port-forward.)
 

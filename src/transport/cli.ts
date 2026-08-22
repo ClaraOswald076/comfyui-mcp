@@ -292,7 +292,7 @@ export function validateConnectUrl(url: string): string | null {
     return tr(
       "cli.connect_url_invalid",
       'Invalid ComfyUI URL passed to `connect`: "{url}" ({reason}). ' +
-        "Pass a full http(s) URL, e.g. https://abcd-8188.proxy.runpod.net or http://127.0.0.1:8188.",
+        "Pass a full http(s) URL, e.g. https://abcd-3000.proxy.runpod.net or http://127.0.0.1:8188.",
       { url, reason },
     );
   }

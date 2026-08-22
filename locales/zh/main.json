@@ -33,7 +33,7 @@
     "connect_step_click_connect": "在面板中点击“连接”（Agent 面板的连接下拉菜单）。",
     "connect_step_open_comfyui": "在浏览器中打开该 ComfyUI：{url}",
     "connect_title": "正在启动本地智能体桥接",
-    "connect_url_invalid": "传给 `connect` 的 ComfyUI URL 无效：\"{url}\"（{reason}）。请传入完整的 http(s) URL，例如 https://abcd-8188.proxy.runpod.net 或 http://127.0.0.1:8188 。",
+    "connect_url_invalid": "传给 `connect` 的 ComfyUI URL 无效：\"{url}\"（{reason}）。请传入完整的 http(s) URL，例如 https://abcd-3000.proxy.runpod.net 或 http://127.0.0.1:8188 。",
     "help_active": "(当前：{locale})",
     "help_allow_unauth": "允许在非回环主机上开放 /mcp",
     "help_comfyui_url": "指定某个（可以是远程的）ComfyUI",

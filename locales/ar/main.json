@@ -33,7 +33,7 @@
     "connect_step_click_connect": "اضغط «اتصال» في اللوحة (قائمة الاتصال المنسدلة في لوحة Agent).",
     "connect_step_open_comfyui": "افتح ComfyUI ذاك في متصفحك: {url}",
     "connect_title": "جارٍ تشغيل جسر الوكيل المحلي",
-    "connect_url_invalid": "تم تمرير رابط ComfyUI غير صالح إلى `connect`: ‏\"{url}\" ‏({reason}). مرّر رابط http(s) كاملًا، مثل https://abcd-8188.proxy.runpod.net أو http://127.0.0.1:8188 .",
+    "connect_url_invalid": "تم تمرير رابط ComfyUI غير صالح إلى `connect`: ‏\"{url}\" ‏({reason}). مرّر رابط http(s) كاملًا، مثل https://abcd-3000.proxy.runpod.net أو http://127.0.0.1:8188 .",
     "help_active": "(الحالي: {locale})",
     "help_allow_unauth": "السماح بـ ‎/mcp مفتوح على مضيف ليس loopback",
     "help_comfyui_url": "استهداف نسخة ComfyUI بعينها (بما فيها البعيدة)",

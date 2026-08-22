@@ -33,7 +33,7 @@
     "connect_step_click_connect": "パネルで「接続」を押してください（Agent パネルの接続ドロップダウン）。",
     "connect_step_open_comfyui": "その ComfyUI をブラウザーで開く: {url}",
     "connect_title": "ローカルのエージェントブリッジを起動しています",
-    "connect_url_invalid": "`connect` に不正な ComfyUI URL が渡されました: \"{url}\"（{reason}）。https://abcd-8188.proxy.runpod.net や http://127.0.0.1:8188 のような完全な http(s) URL を指定してください。",
+    "connect_url_invalid": "`connect` に不正な ComfyUI URL が渡されました: \"{url}\"（{reason}）。https://abcd-3000.proxy.runpod.net や http://127.0.0.1:8188 のような完全な http(s) URL を指定してください。",
     "help_active": "(現在: {locale})",
     "help_allow_unauth": "ループバック以外のホストで /mcp を公開する",
     "help_comfyui_url": "特定の（リモートを含む）ComfyUI を指定",

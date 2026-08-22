@@ -8,6 +8,7 @@ import { normalizeInstallPathEnv } from "./utils/install-path-env.js";
 import { parseComfyUIUrl, type ComfyUITarget } from "./transport/comfyui-url.js";
 import { resetManagerApiCache } from "./services/manager-api-cache.js";
 import { comfyuiEnvFilePath, freshSecretValue, loadEnvFileIntoProcess } from "./env-file.js";
+import { localComfyuiPort } from "./services/advertised-origin.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -407,7 +408,7 @@ export function detectLocalComfyUIPath(): string | undefined {
  * Returns the first port that responds, or the default if none found.
  */
 async function detectComfyUIPort(host: string): Promise<number> {
-  const ports = [8188, 8000];
+  const ports = [...new Set([localComfyuiPort(), 8188, 8000])];
 
   for (const port of ports) {
     try {
@@ -428,9 +429,9 @@ async function detectComfyUIPort(host: string): Promise<number> {
   }
 
   console.error(
-    `[comfyui-mcp] ComfyUI not detected on ports ${ports.join(", ")}. Defaulting to 8188.`,
+    `[comfyui-mcp] ComfyUI not detected on ports ${ports.join(", ")}. Defaulting to ${ports[0]}.`,
   );
-  return 8188;
+  return ports[0];
 }
 
 /**
@@ -759,7 +760,7 @@ if (!bootLocalTarget && !isRunpodProxyHost(bootComfyui.host) && process.env.COMF
  *  back to the loopback default only when nothing non-pod is known (#269:
  *  forcing 127.0.0.1 broke rigs whose local ComfyUI lives on another LAN host). */
 export function getLocalComfyuiUrl(): string {
-  return lastNonPodTarget ?? "http://127.0.0.1:8188";
+  return lastNonPodTarget ?? `http://127.0.0.1:${localComfyuiPort()}`;
 }
 
 /**
