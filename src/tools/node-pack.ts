@@ -5,7 +5,7 @@ import {
   publishCustomNode,
 } from "../services/node-authoring.js";
 import { verifyCustomNode } from "../services/node-verify.js";
-import { resolveCustomNodesScanBaseLive } from "../services/workspace-env.js";
+import { resolveCustomNodesScanBaseLiveStrict } from "../services/workspace-env.js";
 import {
   listNodePackFiles,
   readNodeFile,
@@ -311,7 +311,7 @@ export function registerNodePackTools(server: McpServer): void {
                 // has no --base-directory (the data workspace is not scanned
                 // unless the flag said so), else configuration.
                 undefined,
-                await resolveCustomNodesScanBaseLive(),
+                await resolveCustomNodesScanBaseLiveStrict(),
               ),
             );
           case "verify":
@@ -324,7 +324,7 @@ export function registerNodePackTools(server: McpServer): void {
                 // reads the pack's __init__.py from the directory the runtime
                 // actually scans, so authoring and verification cannot target
                 // different roots.
-                resolvedBase: await resolveCustomNodesScanBaseLive(),
+                resolvedBase: await resolveCustomNodesScanBaseLiveStrict(),
               }),
             );
           case "publish":
@@ -337,7 +337,7 @@ export function registerNodePackTools(server: McpServer): void {
                 undefined,
                 args.path && args.path.trim()
                   ? undefined
-                  : await resolveCustomNodesScanBaseLive(),
+                  : await resolveCustomNodesScanBaseLiveStrict(),
               ),
             );
           case "list_files":
@@ -349,7 +349,7 @@ export function registerNodePackTools(server: McpServer): void {
                   maxEntries: args.max_entries,
                 },
                 undefined,
-                await resolveCustomNodesScanBaseLive(),
+                await resolveCustomNodesScanBaseLiveStrict(),
               ),
             );
           case "read":
@@ -362,7 +362,7 @@ export function registerNodePackTools(server: McpServer): void {
                   maxChars: args.max_chars,
                 },
                 undefined,
-                await resolveCustomNodesScanBaseLive(),
+                await resolveCustomNodesScanBaseLiveStrict(),
               ),
             );
           case "search":
@@ -376,7 +376,7 @@ export function registerNodePackTools(server: McpServer): void {
                   caseSensitive: args.case_sensitive,
                 },
                 undefined,
-                await resolveCustomNodesScanBaseLive(),
+                await resolveCustomNodesScanBaseLiveStrict(),
               ),
             );
           case "write":
@@ -389,7 +389,7 @@ export function registerNodePackTools(server: McpServer): void {
                   createDirs: args.create_dirs,
                 },
                 undefined,
-                await resolveCustomNodesScanBaseLive(),
+                await resolveCustomNodesScanBaseLiveStrict(),
               ),
             );
           case "patch":
@@ -397,7 +397,7 @@ export function registerNodePackTools(server: McpServer): void {
               applyNodePatch(
                 required(args.patch, "patch", "patch", "the unified diff to apply under custom_nodes/"),
                 undefined,
-                await resolveCustomNodesScanBaseLive(),
+                await resolveCustomNodesScanBaseLiveStrict(),
               ),
             );
           case "git":
@@ -419,7 +419,7 @@ export function registerNodePackTools(server: McpServer): void {
                   maxChars: args.max_chars,
                 },
                 undefined,
-                await resolveCustomNodesScanBaseLive(),
+                await resolveCustomNodesScanBaseLiveStrict(),
               ),
             );
           default: {

@@ -43,7 +43,7 @@ vi.mock("../../services/node-verify.js", () => ({
 // before dispatching to the sync authoring services; seam it so no test
 // depends on real config or a reachable server.
 vi.mock("../../services/workspace-env.js", () => ({
-  resolveCustomNodesScanBaseLive: (...a: unknown[]) =>
+  resolveCustomNodesScanBaseLiveStrict: (...a: unknown[]) =>
     mocks.resolveCustomNodesScanBaseLive(...a),
 }));
 
@@ -416,6 +416,25 @@ describe("node_pack adopts the trusted live workspace (#1653)", () => {
       undefined,
       "/live/ComfyUI",
     );
+  });
+
+  it('does not let a fail-closed scan-root refusal fall back to COMFYUI_PATH', async () => {
+    mocks.resolveCustomNodesScanBaseLive.mockRejectedValueOnce(
+      new ValidationError(
+        'The connected ComfyUI declares --base-directory "C:/missing" but that directory is currently unavailable. Refusing to use COMFYUI_PATH or the main.py checkout because custom_nodes would be written where this runtime does not scan.',
+      ),
+    );
+
+    const result = await handler()({
+      action: "scaffold",
+      name: "my-pack",
+      display_name: "My Pack",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(text(result)).toMatch(/currently unavailable/);
+    expect(text(result)).toMatch(/does not scan/);
+    expect(mocks.scaffoldCustomNode).not.toHaveBeenCalled();
   });
 
   it('action:"publish" by name resolves the live base; an explicit path never probes it', async () => {

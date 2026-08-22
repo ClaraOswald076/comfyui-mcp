@@ -105,6 +105,7 @@ import {
   resolveEffectiveComfyUIBase,
   resolveEffectiveComfyUIBaseLive,
   resolveCustomNodesScanBaseLive,
+  resolveCustomNodesScanBaseLiveStrict,
   resolveEffectiveComfyUICodeBase,
   resolveEffectiveComfyUICodeBaseLive,
   resolveLocalWorkspaceBase,
@@ -1974,6 +1975,9 @@ describe("resolveCustomNodesScanBaseLive (#2031 — scan path, not data workspac
       });
 
       expect(await resolveCustomNodesScanBaseLive()).toBeUndefined();
+      await expect(resolveCustomNodesScanBaseLiveStrict()).rejects.toThrow(
+        /currently unavailable.*custom_nodes would be written where this runtime does not scan/i,
+      );
     } finally {
       await rm(root, { recursive: true, force: true });
     }
