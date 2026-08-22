@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.56] - 2026-08-22
+
 ### Fixed
 
 - **`panel_show_media` inlines a `/view` ref for the tab the frame will actually
@@ -20,6 +22,12 @@ All notable changes to this project are documented here. This project adheres to
   (`show_media` is the one buffered command; see #2013). A concrete tab that is
   merely offline is still judged by sticky `isHeadless` — that id names the
   mailbox recipient.
+
+### MCP
+
+#### Fixed
+- panel_show_media inlines /view refs for a phone reached via a scope address (#2039)
+
 
 ## [0.52.55] - 2026-08-22
 
