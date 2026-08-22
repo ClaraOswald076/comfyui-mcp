@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.55] - 2026-08-22
+
 ### Fixed
 
 - **`panel_show_media`'s `/view` probe now asks whether the served family matches the filename (#2011).**
@@ -17,6 +19,18 @@ All notable changes to this project are documented here. This project adheres to
   image-or-video test to accept `audio/*` would have swapped the false alarm
   for a false clearance of `plate.png` serving `audio/wav`. The probe now
   compares families.
+
+### MCP
+
+#### Added
+- kitchen and panel_kitchen report what this GPU can run (#2029)
+
+#### Fixed
+- the /view probe flags a filename/body family mismatch, not a non-media body (#2038)
+- restore graph binding after restart when the active workflow record arrives late (#2062)
+- download tray no longer announces FAILED while status still shows the transfer streaming (#2061)
+- a long self-queued render is no longer called foreign backlog (#2060)
+
 
 ## [0.52.54] - 2026-08-22
 
