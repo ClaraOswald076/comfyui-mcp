@@ -166,6 +166,26 @@ export class TurnOriginTracker {
     return this.deps.liveTabOf ? (this.deps.liveTabOf(tab) ?? tab) : tab;
   }
 
+  /**
+   * Stamp an origin-less turn with the LIVE uuid of the tab it inherits.
+   *
+   * lastOrigin keeps the TAB the conversation last agreed on (never "whatever
+   * is active"). The canvas under that tab can still be replaced in place —
+   * panel_new_workflow, a load into the open tab, ComfyUI restoring at startup —
+   * and hello / panel_set_workflow_target({mode:"current"}) write the new
+   * instance onto uuidOfTab. Reusing the uuid frozen when the origin was
+   * established stamps the continuation for the PREVIOUS instance while the
+   * canvas already reports the new one (panel#1209: download_done after a
+   * successful mode:"current" rebind kept workflow A's fence).
+   *
+   * Missing live evidence falls back to the frozen uuid: an unread stamp is not
+   * proof the inherited one is wrong, and an absent stamp refuses harder (#1331).
+   */
+  private inheritedStampOf(last: { tab: string; uuid: string | undefined }): string | undefined {
+    const live = this.deps.uuidOfTab(this.routedTabOf(last.tab));
+    return typeof live === "string" && live ? live : last.uuid;
+  }
+
   /** Record a message's issue-time origin, keyed by its mid, to be applied at
    *  dequeue. Captures the tab's backend NOW so the application can verify the
    *  tab still belongs to the same conversation then. `injected` marks an
@@ -376,10 +396,10 @@ export class TurnOriginTracker {
           // "whatever tab is active" (confirming gate 2, P0). The inherited tab
           // must STILL belong to this conversation's backend (confirming gate
           // 3, P0); no established/valid origin at all → refuse. A follow-up
-          // mutation stays honest: it is stamped with the inherited origin's
-          // issue-time uuid, so the panel fence (and the dispatch-time
-          // stamp-target agreement gate, #1656) refuse it loudly if the routed
-          // canvas is not the one the stamp names.
+          // mutation stays honest: it is stamped with the LIVE uuid of that
+          // inherited tab at THIS turn's start (panel#1209), so the panel fence
+          // (and the dispatch-time stamp-target agreement gate, #1656) refuse
+          // it loudly if the routed canvas is not the one the stamp names.
           //
           // Ownership is judged on the tab the inherited origin ROUTES to
           // today (routedTabOf), NOT on the id it was recorded under — the
@@ -402,7 +422,7 @@ export class TurnOriginTracker {
           // resolves nowhere still falls back to its raw id and fails closed.
           const last = this.lastOriginByKey.get(key);
           if (last && this.deps.backendForTab(this.routedTabOf(last.tab)) === this.deps.backendOfKey(key)) {
-            this.lastTurnUuidByKey.set(key, last.uuid);
+            this.lastTurnUuidByKey.set(key, this.inheritedStampOf(last));
             this.turnTargetTabByKey.set(key, last.tab);
             if (closed.routes.size > 1) {
               this.deps.warn(
