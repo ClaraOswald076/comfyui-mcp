@@ -1181,7 +1181,9 @@ export const __panelToolsTestHooks = {
     retrySettleMsOverride = ms;
   },
   /** Inject fast reconnect-wait timing so #400/#402 tests don't wait the real ~35s. */
-  setReconnectWaitTiming(timing: { budgetMs: number; intervalMs: number } | null): void {
+  setReconnectWaitTiming(
+    timing: { budgetMs: number; intervalMs: number; stableMs?: number } | null,
+  ): void {
     reconnectWaitTimingOverride = timing;
   },
   /** Shrink the #1292 / #2059 corroboration rechecks so tests don't wait ~2.9s / ~9.4s. */
@@ -1192,7 +1194,7 @@ export const __panelToolsTestHooks = {
     fenceMissingActiveRecheckStepsOverride = steps;
   },
   /** The reconnect wait the tools actually use (env/default, or the test override). */
-  getReconnectWaitTiming(): { budgetMs: number; intervalMs: number } {
+  getReconnectWaitTiming(): { budgetMs: number; intervalMs: number; stableMs?: number } {
     return reconnectWaitTiming();
   },
   /** Shrink the #1175 late-acknowledgement grace so a reconcile test doesn't wait 10s. */
@@ -1742,6 +1744,12 @@ interface ReconnectWaitTiming {
   budgetMs: number;
   /** Interval between canReach polls. */
   intervalMs: number;
+  /**
+   * How long a fresh original-tab hello must remain before we call it durable.
+   * A restart that returns at the first newer generation reports graph tools
+   * ready while that socket can still drop (#2067).
+   */
+  stableMs?: number;
 }
 let reconnectWaitTimingOverride: ReconnectWaitTiming | null = null;
 /** Bounded wait for a browser tab to (re)connect after a full ComfyUI restart or a
@@ -1757,6 +1765,8 @@ const RECONNECT_WAIT_MAX_MS = 60_000;
  *  healthy (panel#654): `panel_graph_outline` reported Connected: none and only a
  *  hard refresh restored the tab. 35s covers those recoveries; the 60s ceiling stays. */
 const RECONNECT_WAIT_DEFAULT_S = 35;
+/** Fresh original-tab hello must persist this long before graph tools are ready (#2067). */
+const POST_RESTART_RECONNECT_STABLE_MS = 2000;
 function reconnectWaitTiming(): ReconnectWaitTiming {
   if (reconnectWaitTimingOverride) return reconnectWaitTimingOverride;
   return {
@@ -10424,6 +10434,9 @@ export interface PanelToolCtx {
    * browser-tab session that received the restart dispatch. This is distinct
    * from awaitReachable: an old tab can still be reachable while ComfyUI is
    * rebooting, and a different browser tab can reuse the same saved-workflow id.
+   * A first newer generation is not enough: the identity must remain present
+   * for a short stability window so a transient hello is not reported as
+   * durable graph-tool readiness (#2067).
    */
   awaitPostRestartReachable?: (
     before: { generation: number; tabSessionId: string } | undefined,
@@ -10612,6 +10625,11 @@ export function makePanelToolCtx(
   // fresh hello can keep the same tab/socket id or arrive under a new one; in the
   // latter case only rebind after the old target is gone, preserving strict
   // multi-tab routing and never guessing away from a still-live pre-restart tab.
+  //
+  // #2067 — the first newer generation is not durable. A ComfyUI restart can
+  // hello, then drop the socket a moment later; returning true there reports
+  // graph_tools_ready while the next graph call sees Connected: none. The same
+  // identity must still be present after a short stability window.
   const awaitPostRestartReachable = async (
     before: { generation: number; tabSessionId: string } | undefined,
     budgetMs?: number,
@@ -10624,6 +10642,7 @@ export function makePanelToolCtx(
     const timing = reconnectWaitTiming();
     const budget = Math.max(0, budgetMs != null ? Math.min(budgetMs, timing.budgetMs) : timing.budgetMs);
     const deadline = Date.now() + budget;
+    const stableMs = Math.max(0, timing.stableMs ?? POST_RESTART_RECONNECT_STABLE_MS);
     const isOriginalTabReconnected = (): boolean => {
       const current = panelConnectionIdentity();
       return (
@@ -10632,14 +10651,21 @@ export function makePanelToolCtx(
         current.tabSessionId === before.tabSessionId
       );
     };
+    const originalTabStayedReconnected = async (): Promise<boolean> => {
+      if (!isOriginalTabReconnected()) return false;
+      const left = deadline - Date.now();
+      if (left <= 0) return false;
+      await sleep(Math.min(stableMs, left));
+      return isOriginalTabReconnected();
+    };
     for (;;) {
-      if (isOriginalTabReconnected()) return true;
+      if (await originalTabStayedReconnected()) return true;
       // A new tab id cannot resolve through the retired binding. Once that binding is
       // actually gone, the existing conservative rebind can follow the sole new tab.
       if (!bridge.canReach(ctx.tabId)) {
         const interactive = interactiveTabIds() ?? [];
         if (interactive.length > 0) ensureReachable();
-        if (isOriginalTabReconnected()) return true;
+        if (await originalTabStayedReconnected()) return true;
       }
       const left = deadline - Date.now();
       if (left <= 0) return false;

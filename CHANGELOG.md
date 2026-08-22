@@ -6,6 +6,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### Fixed
+
+- **Restart does not report graph tools ready on a transient panel reconnect (#2067).**
+  `panel_restart_comfyui` accepted the first fresh original-tab hello as
+  `graph_tools_ready:true`. That socket can drop a moment later, so the next
+  `panel_get_errors` failed with Connected: none. The reconnect wait now
+  requires the new identity to remain present for a short stability window
+  (same check after conservative rebind) before it reports the tab durable.
+
+### MCP
+
+#### Fixed
+- restart waits for a stable panel reconnect before graph tools are ready (#2067)
+
 ## [0.52.58] - 2026-08-22
 
 ### Fixed
