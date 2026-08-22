@@ -87,7 +87,9 @@ import {
 import { unrecognizedKeysError } from "./unrecognized-keys.js";
 import {
   addressedNodeMatchesPersistRemedy,
+  parseAmbiguousPromotedWidgetRefusal,
   parseContradictoryPromotedWidgetRefusal,
+  parseSubgraphScopeRefusal,
   parseUnpromotedControlPersistRemedy,
   resolveInnerPromotedTarget,
   type UnpromotedControlPersistRemedy,
@@ -4663,6 +4665,84 @@ async function persistUnpromotedControlAfterGenerate(
   return rewriteToolResultJson(
     res,
     pinnedControlPayload(payload, remedy, exits.failed ? exits.note : undefined),
+  );
+}
+
+type PromotedWidgetCandidate = {
+  slot: number;
+  name: string;
+  label: string | null;
+};
+
+function promotedWidgetCandidates(
+  payload: Record<string, unknown> | null,
+  nodeId: string,
+  requestedWidget: string,
+): PromotedWidgetCandidate[] {
+  if (!payload || !Array.isArray(payload.nodes)) return [];
+  const node = payload.nodes.find((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+    return String((entry as Record<string, unknown>).id) === nodeId;
+  });
+  if (!node || typeof node !== "object" || Array.isArray(node)) return [];
+  const inputs = (node as Record<string, unknown>).inputs;
+  if (!Array.isArray(inputs)) return [];
+
+  const wanted = requestedWidget.toLowerCase();
+  const candidates: PromotedWidgetCandidate[] = [];
+  for (let index = 0; index < inputs.length; index += 1) {
+    const input = inputs[index];
+    if (!input || typeof input !== "object" || Array.isArray(input)) continue;
+    const record = input as Record<string, unknown>;
+    const name = typeof record.name === "string" ? record.name : null;
+    if (!name) continue;
+    const label = typeof record.label === "string" ? record.label : null;
+    if (name.toLowerCase() !== wanted && label?.toLowerCase() !== wanted) continue;
+    const rawSlot = record.slot;
+    const slot = typeof rawSlot === "number" && Number.isSafeInteger(rawSlot) ? rawSlot : index;
+    candidates.push({ slot, name, label });
+  }
+  return candidates;
+}
+
+async function explainAmbiguousPromotedWidgetRefusal(
+  first: ToolResult,
+  args: Record<string, unknown>,
+  ctx: PanelToolCtx,
+): Promise<ToolResult> {
+  const refusal = parseAmbiguousPromotedWidgetRefusal(
+    textOfToolResult(first),
+    String(args.widget),
+    args.node_id as string | number,
+  );
+  if (!refusal || String(refusal.nodeId) !== String(args.node_id)) return first;
+
+  const detail = await ctx.call(
+    { cmd: "graph_query", ids: [args.node_id], fields: "detail", limit: 1 },
+    8000,
+  );
+  const candidates = promotedWidgetCandidates(
+    parseToolResultJson(detail),
+    refusal.nodeId,
+    refusal.widget,
+  );
+  const listed = candidates.length
+    ? candidates
+        .map(
+          (candidate) =>
+            `{slot:${candidate.slot}, name:${JSON.stringify(candidate.name)}, ` +
+            `label:${JSON.stringify(candidate.label)}}`,
+        )
+        .join("; ")
+    : "unavailable (the node detail query did not expose promoted input names)";
+  return appendToolResultText(
+    first,
+    `\n\n(The panel found ${refusal.matches} promoted inputs matching "${refusal.widget}". ` +
+      `The write was refused and no second write was attempted. Candidate ` +
+      `{slot,name,label} triples: ${listed}. ` +
+      `Use an unambiguous promoted input name if one is available; the MCP layer ` +
+      `cannot safely choose between a name and a label.)` +
+      (detail.isError ? ` Detail query FAILED: ${textOfToolResult(detail)}` : ""),
   );
 }
 
@@ -13776,6 +13856,68 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // leaving "cannot verify the node type" as "the type is missing".
         if (isObjectInfoStarvationRefusal(first)) {
           return appendToolResultText(first, objectInfoStarvationNote());
+        }
+
+        // #2015 — a panel pre-executor can reject an inner node because the
+        // tab has fallen back to the root graph even though the caller already
+        // entered that subgraph. The refusal contains the authoritative
+        // panel_enter_subgraph route. Reassert that route once, then retry the
+        // exact write; never infer an owner from an arbitrary node id.
+        const scopeRefusal = parseSubgraphScopeRefusal(
+          textOfToolResult(first),
+          args.node_id as string | number,
+        );
+        if (scopeRefusal) {
+          const entered: string[] = [];
+          for (const ownerNodeId of scopeRefusal.enterPath) {
+            const step = await ctx.call(
+              { cmd: "graph_enter_subgraph", node_id: ownerNodeId },
+              15000,
+            );
+            if (step.isError) {
+              const exits = await exitSubgraphLevels(ctx, entered.length);
+              return appendToolResultText(
+                first,
+                `\n\n(The panel said node ${scopeRefusal.nodeId} was outside the current ` +
+                  `subgraph. Re-entering panel_enter_subgraph(node_id=${ownerNodeId}) ` +
+                  `FAILED: ${textOfToolResult(step)}${exits.failed ? ` ${exits.note}` : ""}. ` +
+                  `The write was not retried.)`,
+              );
+            }
+            entered.push(ownerNodeId);
+          }
+
+          const retried = await write(args.node_id, args.widget as string);
+          if (!retried.isError) {
+            const persisted = await persistUnpromotedControlAfterGenerate(
+              retried,
+              ctx,
+              args.node_id,
+            );
+            return appendToolResultText(
+              persisted,
+              `\n\n(The panel reported node ${scopeRefusal.nodeId} outside the current ` +
+                `graph, so its own panel_enter_subgraph route was re-entered and the ` +
+                `write was retried once. The tab remains in that entered scope.)`,
+            );
+          }
+          return appendToolResultText(
+            retried,
+            `\n\n(The panel_enter_subgraph route was re-entered, but the exact write ` +
+              `still failed on its one allowed retry: ${textOfToolResult(retried)})`,
+          );
+        }
+
+        // #2015 — the panel's name/label ambiguity is a correctness refusal.
+        // Query detail only to expose the candidates; guessing a slot or
+        // writing an inner node would risk changing a different promoted rail.
+        const ambiguous = parseAmbiguousPromotedWidgetRefusal(
+          textOfToolResult(first),
+          args.widget as string,
+          args.node_id as string | number,
+        );
+        if (ambiguous && String(ambiguous.nodeId) === String(args.node_id)) {
+          return explainAmbiguousPromotedWidgetRefusal(first, args, ctx);
         }
 
         // #1655 — the panel listed this widget as promoted while refusing it as

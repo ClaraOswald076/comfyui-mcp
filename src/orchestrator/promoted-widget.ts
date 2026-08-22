@@ -28,8 +28,25 @@ export type InnerPromotedTarget = {
   widget: string;
 };
 
+export type AmbiguousPromotedWidgetRefusal = {
+  nodeId: string;
+  widget: string;
+  matches: number;
+};
+
+export type SubgraphScopeRefusal = {
+  nodeId: string;
+  enterPath: string[];
+};
+
 const CONTRADICTORY_RE =
   /Cannot set widget on subgraph node (\S+): "([^"]+)" is not a promoted widget on this subgraph \(promoted: ([^)]+)\)/i;
+
+const AMBIGUOUS_RE =
+  /(?:panel_set_widget refused "([^"]+)" on node (\S+)[\s\S]*?)?promoted widget "([^"]+)" is ambiguous\s*[—-]\s*(\d+)\s+promoted inputs? match/i;
+
+const SCOPED_NODE_RE = /No node with id (\S+) in the current graph[\s\S]*?lives INSIDE a subgraph/i;
+const ENTER_PATH_RE = /panel_enter_subgraph\((?:node_id=)?\s*([^)]+)\)/gi;
 
 /** Exact name first; a unique case-insensitive hit is accepted so a listed
  *  `width` still matches a caller who sent `Width`. Several CI hits refuse. */
@@ -37,6 +54,58 @@ export function matchListedName(wanted: string, listed: readonly string[]): stri
   if (listed.includes(wanted)) return wanted;
   const ci = listed.filter((n) => n.toLowerCase() === wanted.toLowerCase());
   return ci.length === 1 ? ci[0] : null;
+}
+
+/**
+ * Parse the panel's promoted-name/label ambiguity refusal. This is deliberately
+ * diagnostic-only: the refusal proves that a blind second write could target the
+ * wrong promoted rail, so callers must not turn the count into a guessed target.
+ */
+export function parseAmbiguousPromotedWidgetRefusal(
+  text: string,
+  requestedWidget?: string,
+  requestedNodeId?: number | string,
+): AmbiguousPromotedWidgetRefusal | null {
+  const m = AMBIGUOUS_RE.exec(text);
+  if (!m) return null;
+  const widget = m[3] ?? m[1];
+  if (!widget) return null;
+  if (requestedWidget != null && requestedWidget.toLowerCase() !== widget.toLowerCase()) {
+    return null;
+  }
+  const nodeId = m[2] ?? (requestedNodeId == null ? undefined : String(requestedNodeId));
+  if (!nodeId) return null;
+  const matches = Number(m[4]);
+  if (!Number.isSafeInteger(matches) || matches < 2) return null;
+  return { nodeId: nodeId.replace(/[,:]$/, ""), widget, matches };
+}
+
+/**
+ * Parse the panel's pre-executor scope diagnosis. The enter path is taken only
+ * from the panel's own `panel_enter_subgraph(...)` remedy, never inferred from a
+ * node id or from a generic missing-node error.
+ */
+export function parseSubgraphScopeRefusal(
+  text: string,
+  requestedNodeId?: number | string,
+): SubgraphScopeRefusal | null {
+  const missing = SCOPED_NODE_RE.exec(text);
+  if (!missing) return null;
+  const nodeId = missing[1].replace(/[,:]$/, "");
+  if (
+    requestedNodeId != null &&
+    String(requestedNodeId).replace(/[,:]$/, "") !== nodeId
+  ) {
+    return null;
+  }
+
+  const enterPath: string[] = [];
+  ENTER_PATH_RE.lastIndex = 0;
+  for (let m = ENTER_PATH_RE.exec(text); m; m = ENTER_PATH_RE.exec(text)) {
+    const id = m[1].trim().replace(/[,:]$/, "");
+    if (id) enterPath.push(id);
+  }
+  return enterPath.length > 0 ? { nodeId, enterPath } : null;
 }
 
 function parseListed(raw: string): string[] {
