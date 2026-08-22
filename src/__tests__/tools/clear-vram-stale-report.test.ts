@@ -206,4 +206,17 @@ describe("clear_vram post-unload VRAM (#2050)", () => {
     expect(textOf(res)).toContain("VRAM cleared successfully (models unloaded, memory freed).");
     expect(textOf(res)).not.toContain("Current VRAM:");
   });
+
+  it("omits a stale first sample when a later stats read fails", async () => {
+    mocks.comfyApiFetch.mockResolvedValue(freeOk());
+    mocks.getSystemStats
+      .mockResolvedValueOnce(STALE)
+      .mockRejectedValue(new Error("ETIMEDOUT"));
+
+    const res = await runClear({ unload_models: true, free_memory: true });
+
+    expect(textOf(res)).toContain("VRAM cleared successfully (models unloaded, memory freed).");
+    expect(textOf(res)).not.toContain("Current VRAM:");
+    expect(textOf(res)).not.toContain(STALE_LINE);
+  });
 });

@@ -52,7 +52,10 @@ async function readSettledSystemStats(): Promise<SystemStats | null> {
     try {
       current = await getSystemStats();
     } catch {
-      return last;
+      // A prior sample is not a valid substitute for the current one: /free may
+      // have released memory between the two reads, so returning `last` would
+      // print a known-stale VRAM figure as if it were current.
+      return null;
     }
 
     const sig = vramSignature(current);
