@@ -86,6 +86,18 @@ import {
 } from "./node-id.js";
 import { unrecognizedKeysError } from "./unrecognized-keys.js";
 import {
+  FIND_NODES_DEFAULT_FIELDS,
+  FIND_NODES_FIELDS,
+  type FindNodesFields,
+  GROUP_ID_MESSAGE,
+  GROUP_ID_PATTERN,
+  normalizeGroupId,
+  normalizeShowMediaItem,
+  normalizeTodoItemKeys,
+  pickAlias,
+  projectFindNodesPayload,
+} from "./panel-arg-aliases.js";
+import {
   addressedNodeMatchesPersistRemedy,
   parseAmbiguousPromotedWidgetRefusal,
   parseContradictoryPromotedWidgetRefusal,
@@ -12562,7 +12574,12 @@ export interface PanelToolDef {
  *     verbatim; a `.safeParse()` probe against the returned tool definition confirmed
  *     an unrecognized key is rejected with `Unrecognized key: "..."`.
  */
-function strictPanelSchema(shape: z.ZodRawShape) {
+/** Exported for #1968's tests: an alias is a SCHEMA-layer fix, and every failure
+ *  in that report was a validation error the handler never saw. A test that calls
+ *  `def.handler` directly proves nothing about it — it has to parse through the
+ *  very validator both transports install, or it is asserting on a code path the
+ *  caller cannot reach. */
+export function strictPanelSchema(shape: z.ZodRawShape) {
   return z.object(shape, { error: unrecognizedKeysError(shape) }).strict();
 }
 
@@ -12625,6 +12642,135 @@ const nodeId = () =>
       error: unionErrorFor(NODE_ID_MESSAGE),
     })
     .transform(normalizeNodeId);
+
+/**
+ * #1968 — a GROUP id, in either spelling, normalized to the number the wire takes.
+ *
+ * The same #845 round trip nodeId() fixed, one surface over: `panel_query_graph`
+ * prints a groups[] entry and the group tools took `z.number().int()`, so pasting
+ * the id back failed whenever the reader had rendered it as a string. Coercion
+ * here is not cosmetic — the panel's `resolveGroup` compares with a strict `===`
+ * against `group.id` and its index fallback is guarded by
+ * `typeof groupId === "number"`, so a string on the wire misses a group that
+ * exists and reports "No group with id …" about the one the caller is looking at.
+ *
+ * The union carries an explicit `error` for the #1889 reason: without it zod
+ * renders a failed union as the bare words "Invalid input" and buries the real
+ * message in a nested `errors` array no agent-facing renderer prints.
+ */
+const groupId = () =>
+  z
+    .union([z.number().int(), z.string().regex(GROUP_ID_PATTERN, GROUP_ID_MESSAGE)], {
+      error: unionErrorFor(GROUP_ID_MESSAGE),
+    })
+    .transform(normalizeGroupId);
+
+/**
+ * #1968 — resolve a group tool's `group_id` / `group` pair to one id.
+ *
+ * `group` is the alias because it is the first guess and the guess was well
+ * founded: `panel_subgraph_group` — the group tool a caller most recently used —
+ * takes `group`, and `panel_create_group` REPLIES with `group.id`, so "the group"
+ * is what the surface itself calls it. Refusing that spelling with a raw
+ * `unrecognized_keys: ["group"]` beside a separate `expected number, received
+ * undefined` at `group_id` puts both halves of the answer in front of the caller
+ * and makes them join it.
+ */
+function resolveGroupIdArg(
+  tool: string,
+  args: Record<string, unknown>,
+): { ok: true; value: number } | { ok: false; error: string } {
+  return pickAlias<number>(
+    tool,
+    { name: "group_id", value: args.group_id as number | undefined },
+    { name: "group", value: args.group as number | undefined },
+  );
+}
+
+/**
+ * #1968 — apply `panel_find_nodes`' `fields` projection to the panel's reply.
+ *
+ * Done HERE and not on the wire on purpose. The panel's `graph_find_nodes` takes
+ * eleven named parameters and `fields` is not one of them, so a forwarded
+ * projection would be dropped on arrival and the tool would advertise a bound
+ * nothing enforced. The payload it returns is structured (`matches: [...]` of
+ * whole node summaries), so the orchestrator can do the whole job itself — and
+ * every panel build old and new gets the projection, rather than only those
+ * shipped after this change.
+ *
+ * Runs AFTER withTruncationHints so the `truncated` / `truncation_hint` pair is
+ * computed against the real match count. Projecting first would leave the hint
+ * describing a payload that no longer exists, and under `fields:'ids'` there
+ * would be no rows left for `replyCount` to count.
+ *
+ * FAILS OPEN, silently and deliberately. An unparseable reply, an error reply, or
+ * a payload whose `matches` is not an array is returned untouched, and — this is
+ * the load-bearing half — the `fields` marker is NOT stamped on it. A reply that
+ * announces a projection it did not receive is the "schema says ACCEPT, not DO"
+ * defect wearing the evidence of a fix, and an agent reading `fields:"compact"`
+ * on a full-detail payload has been told something false about its own context.
+ */
+function projectFindNodesReply(res: ToolResult, requested: unknown): ToolResult {
+  const fields: FindNodesFields =
+    typeof requested === "string" && (FIND_NODES_FIELDS as readonly string[]).includes(requested)
+      ? (requested as FindNodesFields)
+      : FIND_NODES_DEFAULT_FIELDS;
+
+  const payload = parseToolResultJson(res);
+  if (!payload) return res;
+  const projected = projectFindNodesPayload(payload, fields);
+  if (!projected) return res;
+  const idx = res.content.findIndex((c) => c.type === "text");
+  if (idx < 0) return res;
+  return {
+    ...res,
+    content: res.content.map((c, i) =>
+      i === idx && c.type === "text" ? { ...c, text: JSON.stringify(projected, null, 2) } : c,
+    ),
+  };
+}
+
+/**
+ * #1968 — one checklist schema, shared by `items` and its alias `todos`.
+ *
+ * `text` is OPTIONAL here and required by `normalizeTodoItemKeys` in the handler,
+ * because `content` is the other accepted spelling and zod cannot express "one of
+ * these two". Optional-in-the-shape is not optional-in-effect: an item with
+ * NEITHER key is refused by name, so the alias widens which spelling lands
+ * without quietly making a step description skippable.
+ */
+const todoChecklist = () =>
+  z.array(
+    z.object({
+      text: z.string().optional().describe("Short step description (a few words)."),
+      // #1968 — `content` is what the analogous built-in TODO surface calls it,
+      // so it is the first guess. It is accepted, and `text` stays canonical.
+      content: z.string().optional().describe("Alias for text."),
+      // #1018 — accept the synonyms agents actually produce (in_progress,
+      // completed, …) and normalize them in the handler. The DESCRIPTION
+      // still teaches only the canonical trio: one vocabulary to learn,
+      // and no round trip lost to a rejected first call over a spelling
+      // whose intent was never in doubt.
+      status: z
+        .enum(TODO_STATUS_INPUTS as [string, ...string[]])
+        .optional()
+        .describe("Step state (default 'pending'). Mark the one you're on 'active'."),
+    }),
+  );
+
+/** The shared schema pair every group tool takes, so the three cannot drift into
+ *  disagreeing about which spellings they accept (#1968). Both are optional in
+ *  the SHAPE and exactly one is required by `resolveGroupIdArg` — a cross-field
+ *  rule a flat ZodRawShape cannot express, handled the same way
+ *  `validatePanelEditNodeArgs` handles node_id/node_ids. */
+const GROUP_ID_ARGS = {
+  group_id: groupId()
+    .optional()
+    .describe("Group id from panel_query_graph's groups[] / panel_create_group."),
+  group: groupId()
+    .optional()
+    .describe("Alias for group_id — the same id under the name panel_subgraph_group takes and panel_create_group returns."),
+};
 
 /**
  * #1497 — the ONE node-id argument #845 never reached: panel_run's `to_node_id`.
@@ -13152,7 +13298,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_find_nodes",
-      "SEARCH the live canvas for nodes matching a term you supply — the right way to PINPOINT a node (a specific loader, sampler, save, switch) in a LARGE graph. Supply a free-text `query` and/or targeted filters; with nothing specific in mind, read the whole graph with panel_graph_outline instead. This searches the LIVE graph ON THE CANVAS — NOT the installable node registry (that's panel_search_nodes). It scans the graph in the canvas's own node order and STOPS once it has `limit` matches (default 40, max 200) — so a capped result is neither exhaustive nor a count of all matches: the result's count field is what was returned, total is the graph's node count, and truncated:true means the scan REACHED the cap — on current panels that proves more matches exist, on older panel builds it can also fire on an exactly-`limit` result that dropped nothing, so read it as 'may be incomplete'. Either way the result carries a truncation_hint naming the fix (raise `limit`, up to 200, or add a filter) — retry, do not conclude the node isn't there. Give a free-text `query` (matched case-insensitively across node type, title, description, widget NAMES, widget VALUES, and input/output port names+types — a node hits if ANY of those contain it) and/or targeted filters: type, title, input, output, widget (name), widget_value (contents), is_output, is_subgraph, mode. Targeted filters are ANDed together; the free `query` ORs across fields. Each match is the SAME rich summary as panel_query_graph's detail rows (id, type, title, widgets, inputs WITH their connected_from sources, outputs, mode, is_output, …) PLUS the node's description and a `matched_on` list saying WHY it matched. Read-only. Examples — the video loader: {query:'tiktok'} or {type:'LoadVideo'} or {input:'video'}; every output node: {is_output:true}; the node whose widget holds a file: {widget_value:'.png'}; a bypassed switch: {type:'Switch', mode:'bypass'}.",
+      "SEARCH the live canvas for nodes matching a term you supply — the right way to PINPOINT a node (a specific loader, sampler, save, switch) in a LARGE graph. Supply a free-text `query` and/or targeted filters; with nothing specific in mind, read the whole graph with panel_graph_outline instead. This searches the LIVE graph ON THE CANVAS — NOT the installable node registry (that's panel_search_nodes). It scans the graph in the canvas's own node order and STOPS once it has `limit` matches (default 40, max 200) — so a capped result is neither exhaustive nor a count of all matches: the result's count field is what was returned, total is the graph's node count, and truncated:true means the scan REACHED the cap — on current panels that proves more matches exist, on older panel builds it can also fire on an exactly-`limit` result that dropped nothing, so read it as 'may be incomplete'. Either way the result carries a truncation_hint naming the fix (raise `limit`, up to 200, or add a filter) — retry, do not conclude the node isn't there. Give a free-text `query` (matched case-insensitively across node type, title, description, widget NAMES, widget VALUES, and input/output port names+types — a node hits if ANY of those contain it) and/or targeted filters: type, title, input, output, widget (name), widget_value (contents), is_output, is_subgraph, mode. Targeted filters are ANDed together; the free `query` ORs across fields. `fields` sets how much comes back per match, exactly as it does on panel_query_graph: 'compact' (THE DEFAULT) gives id, type, title, mode, is_output, is_subgraph and a `matched_on` list saying WHY the node matched — enough to pinpoint a node and decide what to read next, and cheap enough that searching a big graph cannot flood your context; 'ids' gives bare ids; 'detail' gives the SAME rich summary as panel_query_graph's detail rows (widgets, inputs WITH their connected_from sources, outputs) PLUS the node's description. So a match with no `widgets` key means you asked for compact, NOT that the node has no widgets — re-run with fields:'detail', or read one node with panel_query_graph({ids:[id], fields:'detail'}). Every projected reply echoes the `fields` it applied. Read-only. Examples — the video loader: {query:'tiktok'} or {type:'LoadVideo'} or {input:'video'}; every output node: {is_output:true}; the node whose widget holds a file: {widget_value:'.png'}; a bypassed switch: {type:'Switch', mode:'bypass'}.",
       {
         query: z
           .string()
@@ -13199,24 +13345,35 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .describe(
             `Max matches to return (default ${FIND_NODES_DEFAULT_LIMIT}, max ${FIND_NODES_LIMIT_CEILING}). The scan STOPS once this many match, so a capped result is not a complete match set.`,
           ),
+        // #1968 — the same three names, with the same meanings, as
+        // panel_query_graph's `fields`. This tool had no verbosity control at
+        // all while its sibling defaulted to compact, so a SEARCH — the cheap
+        // orienting call — was the most expensive read on the surface.
+        fields: z
+          .enum(FIND_NODES_FIELDS as unknown as [string, ...string[]])
+          .optional()
+          .describe(
+            `Projection: 'compact' (default) keeps id/type/title/mode/is_output/is_subgraph and the matched_on reasons; 'ids' returns bare ids; 'detail' is the full node summary with every widget, socket and the node description. The reply echoes the projection it applied.`,
+          ),
       },
       async (args: A, ctx) =>
-        withTruncationHints(
-          await ctx.call({
-            cmd: "graph_find_nodes",
-            query: args.query,
-            type: args.type,
-            title: args.title,
-            input: args.input,
-            output: args.output,
-            widget: args.widget,
-            widget_value: args.widget_value,
-            is_output: args.is_output,
-            is_subgraph: args.is_subgraph,
-            mode: args.mode,
-            limit: args.limit,
-          }),
-          [
+        projectFindNodesReply(
+          withTruncationHints(
+            await ctx.call({
+              cmd: "graph_find_nodes",
+              query: args.query,
+              type: args.type,
+              title: args.title,
+              input: args.input,
+              output: args.output,
+              widget: args.widget,
+              widget_value: args.widget_value,
+              is_output: args.is_output,
+              is_subgraph: args.is_subgraph,
+              mode: args.mode,
+              limit: args.limit,
+            }),
+            [
             {
               flag: "truncated",
               key: "truncation_hint",
@@ -13242,7 +13399,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 );
               },
             },
-          ],
+            ],
+          ),
+          args.fields,
         ),
     ),
     def(
@@ -15281,22 +15440,21 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "panel_set_todo",
       "Show/update a live TODO checklist in the panel's footer tray — a running view of your plan that the user watches as you work a multi-step task. Pass the FULL ordered list each call (it replaces the tray); update each step's status as you progress (pending → active → done). Pass an empty array to clear it. Use for genuinely multi-step work (3+ steps); skip it for quick one-shot replies. Mark exactly one step 'active' at a time.",
       {
-        items: z
-          .array(
-            z.object({
-              text: z.string().describe("Short step description (a few words)."),
-              // #1018 — accept the synonyms agents actually produce (in_progress,
-              // completed, …) and normalize them in the handler. The DESCRIPTION
-              // still teaches only the canonical trio: one vocabulary to learn,
-              // and no round trip lost to a rejected first call over a spelling
-              // whose intent was never in doubt.
-              status: z
-                .enum(TODO_STATUS_INPUTS as [string, ...string[]])
-                .optional()
-                .describe("Step state (default 'pending'). Mark the one you're on 'active'."),
-            }),
-          )
+        // Optional in the SHAPE, required by `pickAlias` in the handler: exactly
+        // one of items/todos must be present, which a flat ZodRawShape cannot
+        // say. Leaving `items` required here would have made the alias dead —
+        // `{todos:[…]}` alone would still fail, on the canonical key.
+        items: todoChecklist()
+          .optional()
           .describe("The full ordered checklist (replaces the current one). Empty array clears the tray."),
+        // #1968 — `todos` is the first guess ("todo" is in the tool's own name)
+        // and it cost the reporter a round trip, then a SECOND one when the
+        // retry tripped `content` vs `text`. Same trade as #1018's status
+        // synonyms: the alias exists so a first call lands; `items` stays the
+        // one spelling the description teaches.
+        todos: todoChecklist()
+          .optional()
+          .describe("Alias for items — the same ordered checklist."),
       },
       // #322: a 5s ack deadline false-timed-out a responsive session whose tab was
       // momentarily backgrounded. set_todo is a non-destructive, idempotent full-
@@ -15310,7 +15468,18 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // #1018 — canonicalize ONCE, here, before anything reads the list. The
         // panel, recordTodo's snapshot (#977) and the completion-directive logic
         // all keep seeing only pending/active/done.
-        const items = normalizeTodoItems(args.items as Array<{ text?: unknown; status?: unknown }>);
+        // #1968 — resolve items/todos and text/content BEFORE #1018's status pass,
+        // so everything downstream (the panel, recordTodo's snapshot, the
+        // completion-directive logic) sees exactly one canonical shape.
+        const list = pickAlias<Array<Record<string, unknown>>>(
+          "panel_set_todo",
+          { name: "items", value: args.items as Array<Record<string, unknown>> | undefined },
+          { name: "todos", value: args.todos as Array<Record<string, unknown>> | undefined },
+        );
+        if (!list.ok) return fail(list.error);
+        const keyed = normalizeTodoItemKeys(list.value);
+        if (!keyed.ok) return fail(keyed.error);
+        const items = normalizeTodoItems(keyed.value as Array<{ text?: unknown; status?: unknown }>);
         const redirect = desktopCanvasRedirect(ctx, "panel_set_todo");
         if (redirect?.error) return fail(redirect.error);
         if (redirect?.tabId) {
@@ -16532,7 +16701,22 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
     ),
     def(
       "panel_create_subgraph",
-      "Group the given nodes into a SUBGRAPH (ComfyUI 'Convert to Subgraph') on the user's canvas — collapses them into one subgraph node. Returns the new subgraph node id. Undoable with Ctrl+Z. To wrap an existing GROUP, prefer panel_subgraph_group (you don't have to list the node_ids yourself).",
+      "Group the given nodes into a SUBGRAPH (ComfyUI 'Convert to Subgraph') on the user's canvas — collapses them into one subgraph node. Returns the new subgraph node id; rename it with panel_edit_node({node_id, title}). Undoable with Ctrl+Z. To wrap an existing GROUP, prefer panel_subgraph_group (you don't have to list the node_ids yourself).",
+      // #1968 asked for a `title` here, and the argument for it is good: the
+      // sibling panel_create_group takes one, and the node gets a name either
+      // way. It is NOT built, on purpose — see the note in the issue thread.
+      //
+      // The panel's graph_create_subgraph destructures only `{ node_ids }`, so
+      // honouring a title means a SECOND command (graph_set_title) against the id
+      // the first returned. That is a new capability rather than a rejected-valid-
+      // call fix, which the feature freeze parks; and it carries a window this
+      // side cannot close — each dispatch is stamped with ctx.workflowUuid
+      // resolved AT DISPATCH, so a workflow switch between the two commands would
+      // let the rename land on whatever node holds that id on the NEW canvas.
+      //
+      // The rest of #1968 is aliasing keys that already meant something, which
+      // adds no capability and is why it ships here. Naming a subgraph is one
+      // extra call away and always was.
       { node_ids: z.array(nodeId()).describe("Node ids to group into a subgraph.") },
       async (args: A, ctx) => ctx.call({ cmd: "graph_create_subgraph", node_ids: args.node_ids }, 15000),
     ),
@@ -16649,20 +16833,23 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
     ),
     def(
       "panel_move_group",
-      "Move a group box to a new top-left [x, y] on the user's open graph. By default the nodes inside the group move with it (like dragging the group header); pass move_nodes:false to move only the box. Group id comes from panel_query_graph (the `groups` array on every result) or panel_create_group. Undoable.",
+      "Move a group box to a new top-left [x, y] on the user's open graph. By default the nodes inside the group move with it (like dragging the group header); pass move_nodes:false to move only the box. Group id comes from panel_query_graph (the `groups` array on every result) or panel_create_group, as `group_id` or `group`. Undoable.",
       {
-        group_id: z.number().int().describe("Group id from panel_query_graph's groups[] / panel_create_group."),
+        ...GROUP_ID_ARGS,
         pos: xy().describe("New top-left [x, y] (two numbers)."),
         move_nodes: z.boolean().optional().describe("Move the contained nodes too (default true)."),
       },
-      async (args: A, ctx) =>
-        ctx.call({ cmd: "graph_move_group", group_id: args.group_id, pos: args.pos, move_nodes: args.move_nodes }),
+      async (args: A, ctx) => {
+        const id = resolveGroupIdArg("panel_move_group", args);
+        if (!id.ok) return fail(id.error);
+        return ctx.call({ cmd: "graph_move_group", group_id: id.value, pos: args.pos, move_nodes: args.move_nodes });
+      },
     ),
     def(
       "panel_edit_group",
-      "Edit a group box: its title, color, font_size, and/or bounds [x, y, width, height]. Only the fields you pass are changed. Undoable.",
+      "Edit a group box: its title, color, font_size, and/or bounds [x, y, width, height]. Only the fields you pass are changed. Identify it with `group_id` or `group`. Undoable.",
       {
-        group_id: z.number().int().describe("Group id from panel_query_graph's groups[] / panel_create_group."),
+        ...GROUP_ID_ARGS,
         title: z.string().optional().describe("New label."),
         color: z.string().optional().describe("New box/header color, e.g. '#3f789e'."),
         font_size: z.number().optional().describe("New title font size."),
@@ -16670,24 +16857,31 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           .optional()
           .describe("Resize/reposition the box: [x, y, width, height] (four numbers)."),
       },
-      async (args: A, ctx) =>
-        ctx.call(
+      async (args: A, ctx) => {
+        const id = resolveGroupIdArg("panel_edit_group", args);
+        if (!id.ok) return fail(id.error);
+        return ctx.call(
           {
             cmd: "graph_edit_group",
-            group_id: args.group_id,
+            group_id: id.value,
             title: args.title,
             color: args.color,
             font_size: args.font_size,
             bounds: args.bounds,
           },
           15000,
-        ),
+        );
+      },
     ),
     def(
       "panel_remove_group",
-      "Remove a group box from the user's open graph. The nodes inside the group are NOT deleted — only the box. Undoable.",
-      { group_id: z.number().int().describe("Group id from panel_query_graph's groups[] / panel_create_group.") },
-      async (args: A, ctx) => ctx.call({ cmd: "graph_remove_group", group_id: args.group_id }, 15000),
+      "Remove a group box from the user's open graph. The nodes inside the group are NOT deleted — only the box. Pass the id as `group_id` (or `group` — the same argument under either name). Undoable.",
+      { ...GROUP_ID_ARGS },
+      async (args: A, ctx) => {
+        const id = resolveGroupIdArg("panel_remove_group", args);
+        if (!id.ok) return fail(id.error);
+        return ctx.call({ cmd: "graph_remove_group", group_id: id.value }, 15000);
+      },
     ),
     def(
       "panel_set_node_title",
@@ -18524,32 +18718,63 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         items: z
           .array(
             z.object({
-              source: z.union([
-                // Absolute file path on the orchestrator host
-                z.object({
-                  path: z.string().min(1),
-                  stage: z
-                    .boolean()
-                    .optional()
-                    .describe(
-                      "OPT-IN for a file over the 20 MB inline cap that is NOT under any directory ComfyUI serves: the orchestrator COPIES it into <output>/_panel_staged (a real disk write — caps 512 MB per file, 2 GB total staged; the copy persists until someone deletes it) and displays the copy by reference. Ignored for files already servable or small enough to inline.",
-                    ),
-                }),
-                // ComfyUI /view ref
-                z.object({
-                  filename: z.string().min(1),
-                  subfolder: z.string().optional(),
-                  type: z.string().optional(),
-                }),
-              ]),
+              // #1968 — OPTIONAL in the shape, required by normalizeShowMediaItem
+              // in the handler, which accepts the FLAT spelling below as an
+              // equivalent. The tool's own prose says "pass the output ref
+              // {filename, subfolder, type}" and that is exactly what the
+              // reporter passed — one level too shallow. A doc that describes the
+              // payload and a schema that wants it wrapped is a defect in the
+              // pair, not in the caller.
+              source: z
+                .union([
+                  // Absolute file path on the orchestrator host
+                  z.object({
+                    path: z.string().min(1),
+                    stage: z
+                      .boolean()
+                      .optional()
+                      .describe(
+                        "OPT-IN for a file over the 20 MB inline cap that is NOT under any directory ComfyUI serves: the orchestrator COPIES it into <output>/_panel_staged (a real disk write — caps 512 MB per file, 2 GB total staged; the copy persists until someone deletes it) and displays the copy by reference. Ignored for files already servable or small enough to inline.",
+                      ),
+                  }),
+                  // ComfyUI /view ref
+                  z.object({
+                    filename: z.string().min(1),
+                    subfolder: z.string().optional(),
+                    type: z.string().optional(),
+                  }),
+                ])
+                .optional(),
+              // The same two members, FLAT on the item — the shape the tool
+              // description already tells callers to send. Wrapped into `source`
+              // by normalizeShowMediaItem before anything reads it, so the rest of
+              // this handler still sees exactly one shape.
+              filename: z.string().min(1).optional().describe("ComfyUI output ref, flat: accepted in place of source.{filename}."),
+              subfolder: z.string().optional().describe("Goes with a flat filename."),
+              type: z.string().optional().describe("Goes with a flat filename (e.g. 'output', 'temp')."),
+              path: z.string().min(1).optional().describe("Absolute disk path, flat: accepted in place of source.{path}."),
+              stage: z.boolean().optional().describe("Goes with a flat path — see source.stage."),
               caption: z.string().optional(),
+              // #1968 — accepted because a caller who guessed it once will guess
+              // it again. `caption` stays canonical; it has been the key since
+              // v0.19.0 and was never named `label`.
+              label: z.string().optional().describe("Alias for caption."),
             }),
           )
           .min(1)
           .max(8),
       },
       async (args: A, ctx) => {
-        const items = args.items as Array<{
+        // #1968 — flatten the accepted aliases into the canonical item shape ONCE,
+        // before any of the resolution below runs. Everything downstream keeps
+        // seeing `{source, caption}` and nothing else had to learn the new keys.
+        const normalized: Array<Record<string, unknown>> = [];
+        for (const [i, raw] of (args.items as Array<Record<string, unknown>>).entries()) {
+          const item = normalizeShowMediaItem(raw, i);
+          if (!item.ok) return fail(item.error);
+          normalized.push(item.value);
+        }
+        const items = normalized as Array<{
           source:
             | { path: string; stage?: boolean }
             | { filename: string; subfolder?: string; type?: string };
