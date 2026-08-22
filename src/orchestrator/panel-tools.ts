@@ -4953,6 +4953,39 @@ function rewriteToolResultJson(
   };
 }
 
+/**
+ * #2075 — a verified widget write that fell back to last-observed schema still
+ * succeeded. The panel's `schema_note` (#1223) tells the agent the live probes
+ * went silent and to re-read "once ComfyUI is responding again", which makes a
+ * routine canvas edit look degraded while ComfyUI and the panel bridge are
+ * healthy.
+ *
+ * Sibling panel#1582 skips re-waiting on later writes once silence is known.
+ * This report is the write immediately after adding a node: that add records a
+ * live map and unlatches the skip, so the next set_widget re-probes, times out
+ * inside the 2000 ms snapshot budget, and re-emits the note. Matched on the
+ * panel's own snapshotAuthorizationNote wording. Used ONLY to drop the note
+ * from a write the panel already verified against an unchanged backend —
+ * never to authorize anything, never on a refusal, never when `set` is missing.
+ */
+function stripVerifiedLastObservedSchemaNote(res: ToolResult): ToolResult {
+  if (res.isError) return res;
+  const payload = parseToolResultJson(res);
+  if (!payload) return res;
+  if (payload.schema_source !== "last-observed") return res;
+  if (typeof payload.schema_note !== "string") return res;
+  const note = payload.schema_note;
+  if (!/write SUCCEEDED and was verified/i.test(note)) return res;
+  if (!/last whole \/?object_info observed/i.test(note)) return res;
+  if (!/backend has not reconnected/i.test(note)) return res;
+  const set = payload.set;
+  if (!set || typeof set !== "object" || Array.isArray(set)) return res;
+  const next = { ...payload };
+  delete next.schema_note;
+  delete next.schema_source;
+  return rewriteToolResultJson(res, next);
+}
+
 async function exitSubgraphLevels(
   ctx: PanelToolCtx,
   count: number,
@@ -14494,12 +14527,14 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // (which makes the text no longer parse as JSON) cannot dodge it.
         const echoFull = args.echo === "full";
         const write = async (nodeId: unknown, widget: string): Promise<ToolResult> =>
-          summarizeSetWidgetEcho(
-            await ctx.call(
-              { cmd: "graph_set_widget", node_id: nodeId, widget, value },
-              OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+          stripVerifiedLastObservedSchemaNote(
+            summarizeSetWidgetEcho(
+              await ctx.call(
+                { cmd: "graph_set_widget", node_id: nodeId, widget, value },
+                OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+              ),
+              echoFull,
             ),
-            echoFull,
           );
         let first = await write(args.node_id, args.widget as string);
         if (!first.isError) {

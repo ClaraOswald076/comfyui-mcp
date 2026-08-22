@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### Fixed
+
+- **`panel_set_widget` no longer paints a verified write as a degraded schema probe (#2075).**
+  After adding a node, both live schema routes (`api.getNodeDefs()` 1000 ms,
+  `GET /object_info` 500 ms) time out inside the panel's 2000 ms snapshot budget
+  and the write still lands from last-observed schema, with `schema_note` #1223
+  telling the agent ComfyUI went quiet. Sibling panel#1582 skips re-waiting once
+  silence is known; adding a node records a live map and unlatches that skip, so
+  the next write re-probes. A verified last-observed success against an unchanged
+  backend is now returned as a clean write.
+
 ## [0.52.60] - 2026-08-22
 
 ### MCP
