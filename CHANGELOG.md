@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.58] - 2026-08-22
+
 ### Fixed
 
 - **Codex `panel_*` tools reappear after `panel_restart_comfyui` / a mid-session MCP drop (#1524).**
@@ -25,6 +27,12 @@ All notable changes to this project are documented here. This project adheres to
 
 #### Fixed
 - Codex panel_* tools reappear after panel_restart_comfyui (#1524)
+
+### MCP
+
+#### Fixed
+- panel_* tools reappear after panel_restart_comfyui (#2066)
+
 
 ## [0.52.57] - 2026-08-22
 
