@@ -98,3 +98,4 @@
 {"id":98,"request":"Is my RunPod still running?","expect":"runpod"}
 {"id":99,"request":"Install a pack from this git URL","expect":"install_custom_node"}
 {"id":100,"request":"What can you do?","expect":"list_packs","alt":[],"why":"CONTROL: no good answer — capability discovery has no tool"}
+{"id":101,"request":"Is comfy-kitchen present on this GPU, and where is this workflow leaving kitchen speed on the table?","expect":"kitchen"}
