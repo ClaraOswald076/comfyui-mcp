@@ -2,9 +2,78 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { getSystemStats, comfyApiFetch } from "../comfyui/client.js";
+import type { SystemStats } from "../comfyui/types.js";
 import { ComfyUIError, errorToToolResult } from "../utils/errors.js";
 import { bodyPrefixOf, describeStatus } from "../comfyui/json-guard.js";
 import { logger } from "../utils/logger.js";
+
+/** Poll interval between /system_stats reads after /free (#2050). */
+export const CLEAR_VRAM_SETTLE_INTERVAL_MS = 250;
+/** Do not treat an unchanged first reading as settled — CUDA may not have started releasing yet. */
+export const CLEAR_VRAM_SETTLE_MIN_MS = 1_000;
+/** Hard cap so a card that never plateaus still returns a number. */
+export const CLEAR_VRAM_SETTLE_TIMEOUT_MS = 5_000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** The counters `clear_vram` prints — device 0's VRAM + torch pool. */
+function vramSignature(stats: SystemStats): string {
+  const gpu = stats.devices?.[0];
+  if (!gpu) return "";
+  return `${gpu.vram_free}:${gpu.torch_vram_free}`;
+}
+
+function formatVramStats(stats: SystemStats): string {
+  const gpu = stats.devices?.[0];
+  if (!gpu) return "";
+  const vramFreeMB = (gpu.vram_free / 1024 / 1024).toFixed(0);
+  const vramTotalMB = (gpu.vram_total / 1024 / 1024).toFixed(0);
+  const torchFreeMB = (gpu.torch_vram_free / 1024 / 1024).toFixed(0);
+  const torchTotalMB = (gpu.torch_vram_total / 1024 / 1024).toFixed(0);
+  return `\n\nCurrent VRAM: ${vramFreeMB}/${vramTotalMB} MB free | Torch: ${torchFreeMB}/${torchTotalMB} MB free`;
+}
+
+/**
+ * /free answers when ComfyUI drops model refs; CUDA/driver release can lag.
+ * Poll until the displayed counters stop changing (or we hit the cap) so the
+ * printed value matches a follow-up get_system_stats (action:"stats") (#2050).
+ */
+async function readSettledSystemStats(): Promise<SystemStats | null> {
+  const started = Date.now();
+  const deadline = started + CLEAR_VRAM_SETTLE_TIMEOUT_MS;
+  let last: SystemStats | null = null;
+  let lastSig: string | null = null;
+  let sawChange = false;
+
+  for (;;) {
+    let current: SystemStats;
+    try {
+      current = await getSystemStats();
+    } catch {
+      return last;
+    }
+
+    const sig = vramSignature(current);
+    const elapsed = Date.now() - started;
+    if (lastSig !== null && sig !== lastSig) sawChange = true;
+    const stable = lastSig !== null && sig === lastSig;
+    last = current;
+    lastSig = sig;
+
+    if (stable && (sawChange || elapsed >= CLEAR_VRAM_SETTLE_MIN_MS)) {
+      return current;
+    }
+    if (elapsed >= CLEAR_VRAM_SETTLE_TIMEOUT_MS) {
+      return current;
+    }
+
+    const wait = Math.min(CLEAR_VRAM_SETTLE_INTERVAL_MS, Math.max(0, deadline - Date.now()));
+    if (wait <= 0) return current;
+    await sleep(wait);
+  }
+}
 
 export function registerMemoryManagementTools(server: McpServer): void {
   server.tool(
@@ -54,18 +123,11 @@ export function registerMemoryManagementTools(server: McpServer): void {
           };
         }
 
-        // Get updated stats
+        // Get updated stats — after CUDA release settles, not the first post-/free sample.
         let statsText = "";
         try {
-          const stats = await getSystemStats();
-          const gpu = stats.devices?.[0];
-          if (gpu) {
-            const vramFreeMB = (gpu.vram_free / 1024 / 1024).toFixed(0);
-            const vramTotalMB = (gpu.vram_total / 1024 / 1024).toFixed(0);
-            const torchFreeMB = (gpu.torch_vram_free / 1024 / 1024).toFixed(0);
-            const torchTotalMB = (gpu.torch_vram_total / 1024 / 1024).toFixed(0);
-            statsText = `\n\nCurrent VRAM: ${vramFreeMB}/${vramTotalMB} MB free | Torch: ${torchFreeMB}/${torchTotalMB} MB free`;
-          }
+          const stats = await readSettledSystemStats();
+          if (stats) statsText = formatVramStats(stats);
         } catch {
           // Best effort
         }
