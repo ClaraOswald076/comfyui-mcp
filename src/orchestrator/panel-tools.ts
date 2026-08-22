@@ -67,7 +67,12 @@ import { parse as parseYaml } from "yaml";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { UiBridge, PanelVersionReading } from "../services/ui-bridge.js";
-import { requiredPanelVersion, SEMVER_RE, LATE_ASK_TTL_MS } from "../services/ui-bridge.js";
+import {
+  requiredPanelVersion,
+  SEMVER_RE,
+  LATE_ASK_TTL_MS,
+  tabIncarnationSlot,
+} from "../services/ui-bridge.js";
 import { compareSemver } from "../services/self-update.js";
 import { describeInstallPanelAction } from "../services/panel-recovery.js";
 import {
@@ -3893,7 +3898,7 @@ function queueNeverSawATask(reply: Record<string, unknown> | null): boolean {
  */
 function panelIncarnation(ctx: PanelToolCtx, tabId: string): string | undefined {
   const b = ctx.bridge as { tabIncarnation?: (t: string) => string | undefined };
-  return typeof b.tabIncarnation === "function" ? b.tabIncarnation(tabId) : undefined;
+  return typeof b?.tabIncarnation === "function" ? b.tabIncarnation(tabId) : undefined;
 }
 
 async function settleDroppedEnqueue(
@@ -4416,12 +4421,22 @@ function isObjectInfoBudgetRefusal(res: ToolResult): boolean {
  */
 const panelSchemaBlockedTabs = new Set<string>();
 
-function markPanelSchemaBlocked(tabId: string): void {
-  if (tabId) panelSchemaBlockedTabs.add(tabId);
+/**
+ * Scope addresses (wf:...) are stable workflow routes, not browser tabs. The
+ * panel that currently owns one can change while the tool session remains
+ * alive, so schema readiness must follow the live tab plus its incarnation.
+ */
+function panelSchemaKey(ctx: PanelToolCtx): string {
+  const tabId = journalTabFor(ctx);
+  return tabIncarnationSlot(tabId, panelIncarnation(ctx, tabId));
 }
 
-function markPanelSchemaReady(tabId: string): void {
-  if (tabId) panelSchemaBlockedTabs.delete(tabId);
+function markPanelSchemaBlocked(key: string): void {
+  if (key) panelSchemaBlockedTabs.add(key);
+}
+
+function markPanelSchemaReady(key: string): void {
+  if (key) panelSchemaBlockedTabs.delete(key);
 }
 
 /** Test seam: schema readiness is process-wide, so each file that mutates it resets. */
@@ -4430,8 +4445,9 @@ export function __resetPanelSchemaReadinessForTest(): void {
 }
 
 function trackSchemaToolResult(res: ToolResult, ctx: PanelToolCtx): ToolResult {
-  if (!res.isError) markPanelSchemaReady(ctx.tabId);
-  else if (isObjectInfoBudgetRefusal(res)) markPanelSchemaBlocked(ctx.tabId);
+  const key = panelSchemaKey(ctx);
+  if (!res.isError) markPanelSchemaReady(key);
+  else if (isObjectInfoBudgetRefusal(res)) markPanelSchemaBlocked(key);
   return res;
 }
 
@@ -4467,7 +4483,7 @@ function withSchemaMutationReadiness(res: ToolResult, ctx: PanelToolCtx): ToolRe
   const payload = parseToolResultJson(res);
   if (!payload) return res;
   if (payload.mutations_ready !== true) return res;
-  if (!panelSchemaBlockedTabs.has(ctx.tabId)) return res;
+  if (!panelSchemaBlockedTabs.has(panelSchemaKey(ctx))) return res;
   payload.mutations_ready = false;
   payload.schema_ready = false;
   payload.schema_ready_note =
@@ -14156,13 +14172,14 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           );
         let first = await write(args.node_id, args.widget as string);
         if (!first.isError) {
-          markPanelSchemaReady(ctx.tabId);
+          markPanelSchemaReady(panelSchemaKey(ctx));
           return persistUnpromotedControlAfterGenerate(first, ctx, args.node_id);
         }
         // #2004 — both whole-schema routes timed out. The panel refused BEFORE
         // mutating, so this is not outcome-unknown. Name the timeout rather than
         // leaving "cannot verify the node type" as "the type is missing".
         if (isObjectInfoStarvationRefusal(first)) {
+          markPanelSchemaBlocked(panelSchemaKey(ctx));
           return appendToolResultText(first, objectInfoStarvationNote());
         }
 
@@ -14231,10 +14248,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         if (isObjectInfoBudgetRefusal(first)) {
           // #2007 — same schema-budget refusal as panel_add_node, same
           // before-write fail-closed, same "do not refresh_nodes" recovery.
-          markPanelSchemaBlocked(ctx.tabId);
+          markPanelSchemaBlocked(panelSchemaKey(ctx));
           const retried = await write(args.node_id, args.widget as string);
           if (!retried.isError) {
-            markPanelSchemaReady(ctx.tabId);
+            markPanelSchemaReady(panelSchemaKey(ctx));
             return persistUnpromotedControlAfterGenerate(retried, ctx, args.node_id);
           }
           first = isObjectInfoBudgetRefusal(retried)
@@ -15087,15 +15104,15 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           "failed refresh can make the next panel_set_widget worse. Wait, then retry " +
           "the widget write rather than refreshing again.";
         if (isObjectInfoBudgetRefusal(res)) {
-          markPanelSchemaBlocked(ctx.tabId);
+          markPanelSchemaBlocked(panelSchemaKey(ctx));
           return appendReplyNote(res, refreshSchemaNote);
         }
         const payload = parseToolResultJson(res);
         if (payload && payload.refreshed === false && payload.reason === "object_info_fetch_failed") {
-          markPanelSchemaBlocked(ctx.tabId);
+          markPanelSchemaBlocked(panelSchemaKey(ctx));
           return appendReplyNote(res, refreshSchemaNote);
         }
-        if (!res.isError) markPanelSchemaReady(ctx.tabId);
+        if (payload?.refreshed === true) markPanelSchemaReady(panelSchemaKey(ctx));
         return res;
       },
     ),

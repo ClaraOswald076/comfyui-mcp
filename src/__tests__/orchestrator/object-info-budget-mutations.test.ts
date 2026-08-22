@@ -38,6 +38,14 @@ const SET_WIDGET_BUDGET =
   `api.getNodeDefs() exceeded 10000ms share; GET /object_info exceeded 5000ms share; ` +
   `no whole schema observed.`;
 
+const SET_WIDGET_STARVATION =
+  `Cannot set widget on node 12 ("OpenAICompatibleLLM"): cannot verify the node type against the ` +
+  `ComfyUI backend — no usable /object_info schema was obtained. Tried 2 routes: ` +
+  `api.getNodeDefs() did not answer within its 10000ms share of the 20000ms budget; ` +
+  `GET /object_info did not answer within its 5000ms share of the 20000ms budget. ` +
+  `Refusing to write rather than trust a possibly-stale node cache (#458). ` +
+  `Reconnect ComfyUI and retry.`;
+
 const STALE_SCHEMA =
   `"LoadImage" required input "image" was added or retyped since this page loaded its node ` +
   `schema, so creating it now would build the OLD shape. Call panel_refresh_nodes and retry.`;
@@ -216,6 +224,36 @@ describe("panel_set_widget retries a schema-budget refusal (#2007)", () => {
     expect(text).toMatch(/already retried ONCE/);
     expect(text).toMatch(/Do NOT call panel_refresh_nodes/);
   });
+
+  it("records a starvation refusal so the next outline does not advertise readiness", async () => {
+    const { b } = bridge(async (cmd) => {
+      if (cmd.cmd === "graph_set_widget") throw new Error(SET_WIDGET_STARVATION);
+      if (cmd.cmd === "graph_outline") {
+        return {
+          outline: "12 OpenAICompatibleLLM",
+          node_count: 1,
+          backend_socket: "up",
+          mutations_ready: true,
+        };
+      }
+      return { ok: true };
+    });
+    const ctx = makePanelToolCtx(b, TAB, new WorkflowTargetStore());
+    const defs = buildPanelToolDefs();
+    const setWidget = defs.find((d) => d.name === "panel_set_widget");
+    const outline = defs.find((d) => d.name === "panel_graph_outline");
+    if (!setWidget || !outline) throw new Error("tools missing");
+
+    const refused = await setWidget.handler(
+      { node_id: 12, widget: "system_prompt", value: "hello" } as never,
+      ctx,
+    );
+    expect(refused.isError).toBe(true);
+    expect(textOf(refused)).toMatch(/refresh TIMEOUT, not a missing node/i);
+
+    const next = parseJson(await outline.handler({} as never, ctx));
+    expect(next.mutations_ready).toBe(false);
+  });
 });
 
 describe("panel_refresh_nodes names a timed-out whole-schema fetch (#2007)", () => {
@@ -231,6 +269,28 @@ describe("panel_refresh_nodes names a timed-out whole-schema fetch (#2007)", () 
     expect(text).toContain("object_info_fetch_failed");
     expect(text).toMatch(/CLEARS the last-known schema/i);
     expect(text).toMatch(/not down/i);
+  });
+
+  it("does not clear a blocked connection on a non-authoritative register failure", async () => {
+    const { b } = bridge(async (cmd) => {
+      if (cmd.cmd === "graph_add_node") throw new Error(ADD_UNAVAILABLE);
+      if (cmd.cmd === "refresh_nodes") return { refreshed: false, reason: "register_failed" };
+      if (cmd.cmd === "graph_outline") {
+        return { outline: "12 LoadImage", node_count: 1, backend_socket: "up", mutations_ready: true };
+      }
+      return { ok: true };
+    });
+    const ctx = makePanelToolCtx(b, TAB, new WorkflowTargetStore());
+    const defs = buildPanelToolDefs();
+    const add = defs.find((d) => d.name === "panel_add_node");
+    const refresh = defs.find((d) => d.name === "panel_refresh_nodes");
+    const outline = defs.find((d) => d.name === "panel_graph_outline");
+    if (!add || !refresh || !outline) throw new Error("tools missing");
+
+    await add.handler({ class_type: "LoadImage" } as never, ctx);
+    await refresh.handler({} as never, ctx);
+
+    expect(parseJson(await outline.handler({} as never, ctx)).mutations_ready).toBe(false);
   });
 });
 
@@ -304,5 +364,39 @@ describe("panel_graph_outline does not keep advertising mutations_ready after a 
     const okAdd = await add.handler({ class_type: "LoadImage" } as never, ctx);
     expect(okAdd.isError).toBeFalsy();
     expect(parseJson(await outline.handler({} as never, ctx)).mutations_ready).toBe(true);
+  });
+
+  it("keys readiness to the live tab, not a stable scope route", async () => {
+    const scope = "orchestrator::test";
+    let liveTab = "panel-a";
+    const calls: string[] = [];
+    const b = {
+      send: async (cmd: Record<string, unknown>) => {
+        calls.push(String(cmd.cmd));
+        if (cmd.cmd === "graph_add_node") throw new Error(ADD_UNAVAILABLE);
+        if (cmd.cmd === "graph_outline") return outlineOk;
+        return { ok: true };
+      },
+      push: () => 1,
+      canReach: () => true,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: liveTab, title: liveTab, connected_at: 0 }],
+      resolveSharedTabId: () => liveTab,
+      resolveActiveTabId: () => liveTab,
+      tabIncarnation: (tabId: string) => `${tabId}-incarnation`,
+      tabCanMutateGraph: () => true,
+      tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(b, scope, new WorkflowTargetStore());
+    const defs = buildPanelToolDefs();
+    const add = defs.find((d) => d.name === "panel_add_node");
+    const outline = defs.find((d) => d.name === "panel_graph_outline");
+    if (!add || !outline) throw new Error("tools missing");
+
+    await add.handler({ class_type: "LoadImage" } as never, ctx);
+    liveTab = "panel-b";
+
+    expect(parseJson(await outline.handler({} as never, ctx)).mutations_ready).toBe(true);
+    expect(calls.filter((cmd) => cmd === "graph_add_node")).toHaveLength(2);
   });
 });
