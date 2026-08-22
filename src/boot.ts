@@ -22,12 +22,19 @@ import { adoptOrphanedDownloadJobs } from "./services/download-jobs.js";
 import { checkAndSelfUpdate } from "./services/self-update.js";
 import { tr } from "./i18n/index.js";
 import { resolveBridgePort } from "./services/bridge-ports.js";
-import { advertisedPublicOrigin } from "./services/advertised-origin.js";
+import {
+  advertisedPublicOrigin,
+  configuredPublicOrigin,
+} from "./services/advertised-origin.js";
 import { banner, labelRows, numberedSteps } from "./i18n/terminal-layout.js";
 import { STDIO_HANDSHAKE_INSTRUCTIONS } from "./handshake-instructions.js";
 
 /** A RunPod proxy can only reach a listener exposed beyond loopback. */
 function advertisedOriginForBind(host: string, port: number): string | undefined {
+  // An explicit public URL is the operator's reverse-proxy declaration; it is
+  // valid precisely when the local listener is intentionally loopback-bound.
+  const configured = configuredPublicOrigin();
+  if (configured) return configured;
   const normalized = host.trim().toLowerCase();
   if (normalized === "127.0.0.1" || normalized === "::1" || normalized === "localhost") {
     return undefined;
