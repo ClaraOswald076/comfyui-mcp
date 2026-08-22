@@ -94,7 +94,7 @@ async function ensureBinary(): Promise<void> {
 }
 
 /**
- * Start a Cloudflare quick tunnel that exposes http://localhost:<port> on a
+ * Start a Cloudflare quick tunnel that exposes the local `<host>:<port>` on a
  * public HTTPS URL. Resolves once the `url` event fires; rejects if the
  * cloudflared process errors or exits before becoming ready.
  *
@@ -112,7 +112,17 @@ export async function startQuickTunnel(
   await ensureBinary();
   const { Tunnel } = await loadCloudflared();
 
-  const t = Tunnel.quick(`http://${host}:${port}`, {
+  // A wildcard is a bind address, not a useful origin for cloudflared. In
+  // particular, `localhost` can resolve to IPv6 while a 0.0.0.0 server is
+  // listening only on IPv4, so always route wildcard binds through IPv4
+  // loopback.
+  const originHost =
+    host === "0.0.0.0" || host === "::"
+      ? "127.0.0.1"
+      : host.includes(":") && !host.startsWith("[")
+        ? `[${host}]`
+        : host;
+  const t = Tunnel.quick(`http://${originHost}:${port}`, {
     "--config": getCloudflaredConfigArg(),
     "--edge-ip-version": "4",
   });

@@ -287,7 +287,7 @@ async function openTunnelAndAnnounce(
   logger.info("[tunnel] starting cloudflared quick tunnel…");
   let publicUrl: string;
   try {
-    const tunnel = await startQuickTunnel(port);
+    const tunnel = await startQuickTunnel(port, host);
     publicUrl = tunnel.url;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
