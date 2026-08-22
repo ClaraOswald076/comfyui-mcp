@@ -11,6 +11,7 @@ import { observeLiveServerProcess, resolveLiveInterpreter } from "./live-interpr
 import {
   hasUnresolvableRelativeBaseDirFlag,
   parseBaseDirFromArgv,
+  rawFlagValue,
 } from "./launch-argv.js";
 import { logger } from "../utils/logger.js";
 import { ValidationError } from "../utils/errors.js";
@@ -288,7 +289,8 @@ export async function resolveEffectiveComfyUIBaseLive(): Promise<string | undefi
  * Matches ComfyUI `folder_paths.py`:
  *   1. Live `--base-directory` when it exists on disk (#1715/#1770 Desktop).
  *   2. Else the live `main.py` root (#2031 portable/split without the flag).
- *   3. Fail closed on an unresolvable relative `--base-directory`.
+ *   3. Fail closed when a present `--base-directory` cannot be resolved or is
+ *      currently unavailable on disk.
  *   4. Else the configured data base (offline / unreachable).
  *
  * Remote mode → undefined. Never throws. `node_pack` (scaffold / verify /
@@ -302,7 +304,15 @@ export async function resolveCustomNodesScanBaseLive(): Promise<string | undefin
   if (snapshot.reachable) {
     const baseDir = parseBaseDirFromArgv(snapshot.argv, snapshot.cwd);
     if (baseDir && existsSync(baseDir)) return baseDir;
-    if (hasUnresolvableRelativeBaseDirFlag(snapshot.argv, snapshot.cwd)) {
+    // A present flag is authoritative even when its directory is temporarily
+    // unavailable. Falling through to the main.py checkout here is unsafe:
+    // ComfyUI still scans custom_nodes under the configured base once it is
+    // reachable, so node_pack would scaffold into an invisible tree.
+    const rawBaseDir = rawFlagValue(snapshot.argv, "--base-directory");
+    if (
+      rawBaseDir !== undefined &&
+      (baseDir === undefined || !existsSync(baseDir))
+    ) {
       return undefined;
     }
     // Without --base-directory, folder_paths.base_path is the checkout that

@@ -1960,6 +1960,25 @@ describe("resolveCustomNodesScanBaseLive (#2031 — scan path, not data workspac
     }
   });
 
+  it("fails closed when an absolute --base-directory is currently unavailable", async () => {
+    const root = await tmpDir();
+    try {
+      const code = join(root, "code");
+      await mkdir(join(code, "custom_nodes"), { recursive: true });
+      await writeFile(join(code, "main.py"), "", "utf-8");
+      const unavailable = join(root, "data-not-mounted");
+      mockGetSystemStats.mockResolvedValue({
+        system: {
+          argv: [join(code, "main.py"), "--base-directory", unavailable],
+        },
+      });
+
+      expect(await resolveCustomNodesScanBaseLive()).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("returns undefined in remote mode without probing /system_stats", async () => {
     h.remoteMode.value = true;
     expect(await resolveCustomNodesScanBaseLive()).toBeUndefined();
