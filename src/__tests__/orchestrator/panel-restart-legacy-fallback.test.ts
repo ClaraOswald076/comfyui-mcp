@@ -442,6 +442,32 @@ describe("#1996 an unconfirmed managed restart still watches for the tab", () =>
     expect(out.panel_tab_reconnected).toBe(false);
     expect(out.ready).toBe(false);
   });
+
+  it("#1996 r2: a boot that starts listening during the tab wait is server_ready", async () => {
+    // Same recurrence as the bound path: dedicated observation expires still-down,
+    // then ComfyUI starts listening while we wait for the tab. A fresh observer
+    // would ignore that lone healthy (no new down); continuing the latch certifies.
+    let listening = false;
+    __panelToolsTestHooks.setHealthProbe(async () => (listening ? "healthy" : "down"));
+    const { ctx } = makeCtx(NO_ENDPOINT_REPLY);
+    ctx.awaitPostRestartReachable = async () => {
+      listening = true;
+      await new Promise((r) => setTimeout(r, 50));
+      return false;
+    };
+    ctx.tabCanMutateGraph = () => true;
+
+    const res = (await restartTool().handler({}, ctx)) as ToolResult;
+    const out = JSON.parse(res.content.find((c) => c.type === "text")!.text as string);
+
+    expect(out.server_ready).toBe(true);
+    expect(out.confirmed_cycle).toBe(true);
+    expect(out.via).toBe("observed-cycle");
+    expect(out.saw_down).toBe(true);
+    expect(out.panel_tab_reconnected).toBe(false);
+    expect(out.ready).toBe(false);
+    expect(out.graph_tools_ready).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------

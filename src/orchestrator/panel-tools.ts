@@ -2961,6 +2961,14 @@ interface ObserveRecoveryOpts {
    *  live deadline. Absent → legacy mode (started AFTER the restart's synchronous work;
    *  probe immediately against the fixed `deadline`). */
   gate?: DispatchObservationGate;
+  /**
+   * #1996 r2 — resume the SAME down→up observation after the dedicated readiness
+   * budget expired. A fresh observer would re-latch `sawDown` at false, so a
+   * server that started listening during the reconnect wait (healthy, no new
+   * down) would be ignored as a first-healthy no-op. Carry the latch and the
+   * elapsed clock; do not extend a budget that already certified.
+   */
+  continueFrom?: Pick<PanelReadyResult, "sawDown" | "attempts" | "waited_ms" | "lastStatus">;
 }
 
 /**
@@ -2994,16 +3002,17 @@ async function observeRecovery(
   deadline: number,
   opts: ObserveRecoveryOpts,
 ): Promise<PanelReadyResult> {
-  const start = Date.now();
+  const prior = opts.continueFrom;
+  const start = prior ? Date.now() - prior.waited_ms : Date.now();
   const gate = opts.gate;
   const intervalMs = panelRebootTimingOverride
     ? Math.max(1, timing.intervalMs)
     : Math.max(50, timing.intervalMs);
   const probe = healthProbeOverride ?? probeComfyEndpoint;
   const currentDeadline = () => gate?.deadline ?? deadline;
-  let sawDown = false;
-  let lastStatus: ProbeStatus | undefined;
-  let attempts = 0;
+  let sawDown = prior?.sawDown ?? false;
+  let lastStatus: ProbeStatus | undefined = prior?.lastStatus;
+  let attempts = prior?.attempts ?? 0;
   for (;;) {
     if (gate?.cancelled) break;
     if (currentDeadline() - Date.now() <= 0) break;
@@ -3055,6 +3064,78 @@ async function observeRecovery(
     await sleep(Math.min(intervalMs, left));
   }
   return { ready: false, waited_ms: Date.now() - start, attempts, sawDown, lastStatus };
+}
+
+function startPostRestartTabWait(
+  ctx: PanelToolCtx,
+  preRestartPanelIdentity: { generation: number; tabSessionId: string } | undefined,
+  overallDeadline: number,
+): Promise<boolean> {
+  const budgetMs = Math.max(0, overallDeadline - Date.now());
+  if (ctx.awaitPostRestartReachable) {
+    return ctx.awaitPostRestartReachable(preRestartPanelIdentity, budgetMs);
+  }
+  if (ctx.awaitReachable) return ctx.awaitReachable(budgetMs);
+  return Promise.resolve(true);
+}
+
+/**
+ * #1996 r2 — keep watching /system_stats during the post-restart tab wait.
+ *
+ * The dedicated readiness budget still expires first (so a dead server is not
+ * held until the whole-handler cap). The reconnect wait after it used to look
+ * ONLY at the tab, so a server that started listening in that reserved window
+ * was reported `server_ready:false` while the handler was still running — the
+ * 0.52.51 recurrence (`recovered_ms:184461`, ComfyUI already listening, then
+ * `panel_graph_outline` succeeded). Continue the SAME down→up observation in
+ * parallel; abort it when the tab wait finishes so an instant wait cannot
+ * stretch to `overallDeadline`.
+ *
+ * A later healthy sample still requires the earlier down (carried via
+ * `continueFrom`). A tab coming back still does not certify the boot.
+ */
+async function awaitTabWhileContinuingRecovery(args: {
+  recovery: PanelReadyResult;
+  timing: PanelRebootTiming;
+  healthBase: string;
+  overallDeadline: number;
+  ctx: PanelToolCtx;
+  preRestartPanelIdentity: { generation: number; tabSessionId: string } | undefined;
+}): Promise<{ recovery: PanelReadyResult; tabBack: boolean }> {
+  const tabWait = startPostRestartTabWait(
+    args.ctx,
+    args.preRestartPanelIdentity,
+    args.overallDeadline,
+  );
+  if (args.recovery.ready) {
+    return { recovery: args.recovery, tabBack: await tabWait };
+  }
+  const gate: DispatchObservationGate = {
+    dispatched: true,
+    dispatchedAt: 0,
+    cancelled: false,
+    deadline: args.overallDeadline,
+    waitDispatched: Promise.resolve(),
+  };
+  const extraPromise = observeRecovery(args.timing, args.overallDeadline, {
+    healthBase: args.healthBase,
+    gate,
+    continueFrom: args.recovery,
+  });
+  const tabBack = await tabWait;
+  gate.cancelled = true;
+  const extra = await extraPromise;
+  if (extra.ready) return { recovery: extra, tabBack };
+  return {
+    recovery: {
+      ready: false,
+      waited_ms: extra.waited_ms,
+      attempts: extra.attempts,
+      sawDown: args.recovery.sawDown || extra.sawDown,
+      lastStatus: extra.lastStatus ?? args.recovery.lastStatus,
+    },
+    tabBack,
+  };
 }
 
 // ---- workflow_open verify-after-timeout (#215/#319/#496/#661) --------------
@@ -17875,16 +17956,7 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           }
           // Otherwise (the process WAS stopped/started, or restartComfyUI's own readiness
           // poll merely expired — neither terminal) DEFER to OUR OWN observed DOWN→UP.
-          const recovery = await proofPromise;
-          // #742 r4/r5/r15: the managed restart was observed back — clear THIS
-          // session's record, CLEAR-IF-SAME: only when the session still holds
-          // the token THIS restart stamped (a concurrent dispatch's newer
-          // record survives). restartComfyUI also clears its own process-wide
-          // record on success; this covers only-observer-saw-it recoveries.
-          if (recovery.ready && headlessDispatchToken != null) {
-            clearSessionRestartDispatchIfSame(ctx, headlessDispatchToken);
-          }
-          const observed = recovery.via === "observed-cycle";
+          let recovery = await proofPromise;
           // The headless path restarts ComfyUI out-of-band too. Server recovery alone
           // is not graph-tool readiness: wait for the browser tab to reconnect, then verify
           // the same workflow-stamp capability the bridge requires before it dispatches a
@@ -17895,14 +17967,27 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           // bound one — `recovery.ready ? … : false` — so a managed kill+relaunch whose
           // cold start outran the observation window forfeited the reconnect wait too,
           // and reported a bare `false` for a tab nobody had looked at.
-          const tabBack = ctx.awaitPostRestartReachable
-            ? await ctx.awaitPostRestartReachable(
-                preRestartPanelIdentity,
-                Math.max(0, overallDeadline - Date.now()),
-              )
-            : ctx.awaitReachable
-              ? await ctx.awaitReachable(Math.max(0, overallDeadline - Date.now()))
-              : true;
+          // #1996 r2: the tab wait also continues the health observation, so a boot
+          // that starts listening in this reserved window is not reported unready
+          // while the handler is still running.
+          let tabBack: boolean;
+          ({ recovery, tabBack } = await awaitTabWhileContinuingRecovery({
+            recovery,
+            timing: headlessTiming,
+            healthBase,
+            overallDeadline,
+            ctx,
+            preRestartPanelIdentity,
+          }));
+          // #742 r4/r5/r15: the managed restart was observed back — clear THIS
+          // session's record, CLEAR-IF-SAME: only when the session still holds
+          // the token THIS restart stamped (a concurrent dispatch's newer
+          // record survives). restartComfyUI also clears its own process-wide
+          // record on success; this covers only-observer-saw-it recoveries.
+          if (recovery.ready && headlessDispatchToken != null) {
+            clearSessionRestartDispatchIfSame(ctx, headlessDispatchToken);
+          }
+          const observed = recovery.via === "observed-cycle";
           // #1996: `recovery.ready &&` is LOAD-BEARING now that the wait above runs on
           // both outcomes. Without it a tab that re-registered while the server was still
           // unproven would report ready:true — turning the honest refusal this path
@@ -18730,13 +18815,7 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           overallDeadline,
           reserveMs: reconnectWaitTiming().budgetMs,
         });
-        const recovery = await recoveryPromise!;
-        // #742 r4/r5/r15: the dispatched restart was observed back — clear the
-        // record, CLEAR-IF-SAME: only when the session still holds the token
-        // THIS dispatch stamped (a concurrent dispatch's newer record survives).
-        if (recovery.ready && acceptedDispatchToken != null) {
-          clearSessionRestartDispatchIfSame(ctx, acceptedDispatchToken);
-        }
+        let recovery = await recoveryPromise!;
         // #400/#709: ComfyUI is healthy, but the panel's browser tab re-registers its own
         // socket a moment later. The old socket can still be reachable after dispatch, so
         // the generation waiter below requires a fresh hello before reporting readiness.
@@ -18755,14 +18834,24 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // it honestly could not give AND the reconnect wait it could have given, which is
         // the only thing on this path that calls `ensureReachable()` to heal the session
         // binding onto the returning tab. An unconfirmed boot now still gets watched.
-        const tabBack = ctx.awaitPostRestartReachable
-          ? await ctx.awaitPostRestartReachable(
-              preRestartPanelIdentity,
-              Math.max(0, overallDeadline - Date.now()),
-            )
-          : ctx.awaitReachable
-            ? await ctx.awaitReachable(Math.max(0, overallDeadline - Date.now()))
-            : true;
+        // #1996 r2: the wait also continues /system_stats, so a boot that starts
+        // listening in this reserved window is not reported unready while we are
+        // still inside the handler.
+        let tabBack: boolean;
+        ({ recovery, tabBack } = await awaitTabWhileContinuingRecovery({
+          recovery,
+          timing,
+          healthBase,
+          overallDeadline,
+          ctx,
+          preRestartPanelIdentity,
+        }));
+        // #742 r4/r5/r15: the dispatched restart was observed back — clear the
+        // record, CLEAR-IF-SAME: only when the session still holds the token
+        // THIS dispatch stamped (a concurrent dispatch's newer record survives).
+        if (recovery.ready && acceptedDispatchToken != null) {
+          clearSessionRestartDispatchIfSame(ctx, acceptedDispatchToken);
+        }
         if (!recovery.ready) {
           const waited = Math.round(recovery.waited_ms / 1000);
           // #1996: the refusal itself is NOT the defect and is left exactly as it was.
