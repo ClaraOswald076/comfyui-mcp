@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.63] - 2026-08-22
+
+### MCP
+
+#### Fixed
+- a save that persisted is no longer reported as outcome unknown (#2080)
+
+
 ## [0.52.62] - 2026-08-22
 
 ### MCP
