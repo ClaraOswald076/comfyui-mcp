@@ -6,6 +6,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.49] - 2026-08-21
+
+### MCP
+
+#### Fixed
+- refresh retry completion fence
+- retain and fence fast completion arms
+- retain fast render completions before ticketing
+- keep audit completion on rebound route
+- require workflow identity for completion
+- refuse opaque root graph completion
+
+
 ## [0.52.48] - 2026-08-21
 
 ### Fixed
