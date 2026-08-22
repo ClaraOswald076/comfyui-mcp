@@ -6,12 +6,22 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("../../comfyui/client.js", () => ({
-  getObjectInfo: async () => ({
+const objectInfo = vi.hoisted(() => ({
+  current: {
     CheckpointLoaderSimple: {
       input: { required: { ckpt_name: [["already-have.safetensors"], {}] } },
     },
-  }),
+  } as Record<string, unknown>,
+}));
+
+const DEFAULT_OBJECT_INFO = {
+  CheckpointLoaderSimple: {
+    input: { required: { ckpt_name: [["already-have.safetensors"], {}] } },
+  },
+};
+
+vi.mock("../../comfyui/client.js", () => ({
+  getObjectInfo: async () => objectInfo.current,
   getSystemStats: async () => ({ devices: [{ vram_total: 16 * 1024 ** 3 }] }),
 }));
 
@@ -52,6 +62,7 @@ const WORKFLOW = {
 beforeEach(() => {
   providers.civitaiDown = true;
   providers.hfDown = true;
+  objectInfo.current = structuredClone(DEFAULT_OBJECT_INFO);
 });
 
 describe('action:"resolve_missing" never calls a failed lookup an empty one', () => {
@@ -78,5 +89,56 @@ describe('action:"resolve_missing" never calls a failed lookup an empty one', ()
     const text = res.content[0]!.text as string;
     expect(text).toMatch(/No candidates found on CivitAI or HuggingFace/);
     expect(text).not.toMatch(/lookup FAILED/);
+  });
+});
+
+// #2068 — download_model action:"resolve_missing" must surface custom-node
+// LoRA combo values that /object_info does not list, the same way
+// panel_get_errors reports unavailable_widget_values. ComfyUI 0.33 publishes
+// those slots as V3 ["COMBO", {options}], which the V1-only parser skipped.
+describe('action:"resolve_missing" reports unavailable custom-node LoRA combos', () => {
+  it("DonutLoRAStack lora_name_N absent from a V3 COMBO list is missing, not healthy", async () => {
+    const wanted = [
+      "krea2/general-purpose/realism_engine_krea2_v1.safetensors",
+      "krea2/Krea2-realism-V2.safetensors",
+      "krea2/general-purpose/Krea2_HMNSFW_AIO.safetensors",
+      "krea2/Krea2_NSFW_Aesthetics_V1.safetensors",
+    ];
+    const installed = ["None", "already-have.safetensors"];
+    const v3 = (options: string[]) => ["COMBO", { options }];
+    objectInfo.current = {
+      DonutLoRAStack: {
+        input: {
+          required: {
+            lora_name_1: v3(installed),
+            lora_name_2: v3(installed),
+            lora_name_3: v3(installed),
+          },
+        },
+      },
+    };
+    const workflow = {
+      "10": {
+        class_type: "DonutLoRAStack",
+        inputs: { lora_name_1: wanted[0], lora_name_2: wanted[1], lora_name_3: "None" },
+      },
+      "11": {
+        class_type: "DonutLoRAStack",
+        inputs: { lora_name_1: wanted[2], lora_name_2: wanted[3], lora_name_3: "None" },
+      },
+    };
+
+    providers.civitaiDown = false;
+    providers.hfDown = false;
+    const res = await captureHandler()({ workflow });
+    const text = res.content[0]!.text as string;
+
+    expect(text).not.toMatch(/No missing models/);
+    expect(text).toMatch(new RegExp(`${wanted.length} missing model`));
+    for (const file of wanted) {
+      expect(text).toContain(file);
+    }
+    expect(text).toMatch(/DonutLoRAStack · lora_name_/);
+    expect(text).toMatch(/models\/loras\//);
   });
 });

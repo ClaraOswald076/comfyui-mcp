@@ -44,6 +44,15 @@ const DIR_BY_WIDGET: Record<string, string> = {
   ipadapter_file: "ipadapter",
 };
 
+/** DonutLoRAStack / LoRA Stacker V2 / similar: `lora_name_1`, `lora_name_2`, … */
+const NUMBERED_LORA_WIDGET = /^lora_name_\d+$/i;
+
+function directoryForWidget(widget: string): string | undefined {
+  if (Object.prototype.hasOwnProperty.call(DIR_BY_WIDGET, widget)) return DIR_BY_WIDGET[widget];
+  if (NUMBERED_LORA_WIDGET.test(widget)) return DIR_BY_WIDGET.lora_name;
+  return undefined;
+}
+
 export type Precision = "fp32" | "fp16" | "bf16" | "fp8" | "gguf" | "nf4" | "unknown";
 
 export interface MissingModel {
@@ -173,12 +182,33 @@ interface ApiNode {
   inputs?: Record<string, unknown>;
 }
 
-/** The combo option list for an input spec, or null when it isn't a combo. */
+/**
+ * The option list for an input spec, in either schema form, or null when this
+ * pass has no authority over it.
+ *
+ * ComfyUI serialises a V1 combo as `[[...allowed], {cfg}]` and a V3 one as
+ * `["COMBO", {options: [...], ...}]` (`add_to_dict_v1` writes
+ * `(io_type, as_dict())`). Both are the live inventory `panel_get_errors`
+ * already reads. The V1-only parser skipped every V3 custom-node combo — so
+ * DonutLoRAStack `lora_name_N` values absent from /object_info were reported
+ * as "No missing models" (#2068). A MULTISELECT combo is refused: its stored
+ * value is a selection of several options, so membership in the list is the
+ * wrong question.
+ */
 function comboOptions(spec: unknown): string[] | null {
   if (!Array.isArray(spec) || spec.length === 0) return null;
-  const first = spec[0];
-  if (!Array.isArray(first)) return null;
-  return first.filter((o): o is string => typeof o === "string");
+  const cfg =
+    spec[1] && typeof spec[1] === "object" && !Array.isArray(spec[1])
+      ? (spec[1] as Record<string, unknown>)
+      : null;
+  if (cfg?.multiselect) return null;
+  const type = spec[0];
+  if (Array.isArray(type)) return type.filter((v): v is string => typeof v === "string");
+  if (typeof type !== "string" || !/COMBO/i.test(type) || /DYNAMIC/i.test(type)) return null;
+  const opts = cfg?.options;
+  if (!Array.isArray(opts)) return null;
+  const strings = opts.filter((v): v is string => typeof v === "string");
+  return strings.length === opts.length ? strings : null;
 }
 
 /**
@@ -231,7 +261,7 @@ export function findMissingModels(
         node_type: classType,
         widget,
         name: value,
-        directory: DIR_BY_WIDGET[widget],
+        directory: directoryForWidget(widget),
       });
     }
   }
