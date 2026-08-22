@@ -37,7 +37,7 @@ function budgetExhaustedReply(opts?: { extraUnchecked?: number }): Record<string
   }));
   const unchecked = [...extras, ...execution];
   return {
-    viewing: { kind: "root", workflow: "wan.json" },
+    viewing: { kind: "root", workflow: "wan.json", workflow_uuid: "workflow-a" },
     node_count: 37 + extra,
     errored_count: 0,
     nodes: [],
@@ -75,14 +75,13 @@ function detailText(
 
 async function runGetErrors(
   replies: (cmd: Record<string, unknown>) => Record<string, unknown>,
+  opts: { rebindAfterPrimary?: string } = {},
 ): Promise<{ payload: Record<string, unknown>; cmds: string[]; keys: string[] }> {
   const def = buildPanelToolDefs().find((d) => d.name === "panel_get_errors");
   if (!def) throw new Error("panel_get_errors is not registered");
   const cmds: string[] = [];
   let primaryViewing: unknown;
-  const res = (await def.handler(
-    {},
-    {
+  const ctx = {
       call: async (cmd: Record<string, unknown>) => {
         cmds.push(String(cmd.cmd));
         const reply = replies(cmd);
@@ -92,13 +91,16 @@ async function runGetErrors(
         // completion path; mismatch tests provide an explicit different one.
         const withViewing =
           cmd.cmd === "graph_query" && !Object.hasOwn(reply, "viewing")
-            ? { viewing: primaryViewing ?? { kind: "root" }, ...reply }
+            ? { viewing: primaryViewing ?? { kind: "root", workflow_uuid: "workflow-a" }, ...reply }
             : reply;
+        if (cmd.cmd === "graph_get_errors" && opts.rebindAfterPrimary) {
+          ctx.tabId = opts.rebindAfterPrimary;
+        }
         return { content: [{ type: "text" as const, text: JSON.stringify(withViewing, null, 2) }] };
       },
       tabId: "test-tab",
-    } as unknown as PanelToolCtx,
-  )) as ToolResult;
+    } as unknown as PanelToolCtx;
+  const res = (await def.handler({}, ctx)) as ToolResult;
   const text = res.content.find((c) => c.type === "text")?.text;
   if (typeof text !== "string") throw new Error("panel_get_errors returned no text");
   const payload = JSON.parse(text) as Record<string, unknown>;
@@ -165,6 +167,27 @@ describe("panel_get_errors leftover call-budget audit (#1973)", () => {
     expect(payload.unavailable_widget_values).toBeUndefined();
   });
 
+  it("keeps the completion pass on the live route after a primary reconnect rebind", async () => {
+    const panel = budgetExhaustedReply({ extraUnchecked: 0 });
+    const { payload } = await runGetErrors((cmd) => {
+      if (cmd.cmd === "graph_get_errors") return panel;
+      if (cmd.cmd === "graph_query") {
+        return {
+          matched: EXECUTION_NODES.length,
+          shown: EXECUTION_NODES.length,
+          text: detailText(EXECUTION_NODES),
+        };
+      }
+      if (cmd.cmd === "graph_get_object_info") {
+        return { ok: true, object_info: objectInfoFor(EXECUTION_NODES) };
+      }
+      return { ok: false };
+    }, { rebindAfterPrimary: "reconnected-tab" });
+
+    expect(payload.audit_complete).toBe(true);
+    expect(payload.unchecked_nodes).toBeUndefined();
+  });
+
   it("reports a combo miss on an execution node the budget skip had hidden", async () => {
     const panel = budgetExhaustedReply({ extraUnchecked: 0 });
     const save = EXECUTION_NODES.find((n) => n.type === "SaveVideo")!;
@@ -227,7 +250,7 @@ describe("panel_get_errors leftover call-budget audit (#1973)", () => {
       if (cmd.cmd === "graph_get_errors") return panel;
       if (cmd.cmd === "graph_query") {
         return {
-          viewing: { kind: "root", workflow: "different-workflow.json" },
+          viewing: { kind: "root", workflow: "different-workflow.json", workflow_uuid: "workflow-b" },
           matched: EXECUTION_NODES.length,
           shown: EXECUTION_NODES.length,
           text: detailText(EXECUTION_NODES),
@@ -283,6 +306,38 @@ describe("panel_get_errors leftover call-budget audit (#1973)", () => {
     expect(payload.unavailable_widget_values).toBeUndefined();
     expect((payload.unchecked_nodes as Array<Record<string, unknown>>).some((e) => String(e.id) === "5")).toBe(true);
   });
+
+  it("does not complete an opaque root scope after a same-tab workflow switch", async () => {
+    const panel = {
+      ...budgetExhaustedReply({ extraUnchecked: 0 }),
+      viewing: { scope: "root" },
+      unchecked_nodes: [{ id: 5, type: "Loader", reason: BUDGET_REASON }],
+    };
+    const { payload } = await runGetErrors((cmd) => {
+      if (cmd.cmd === "graph_get_errors") return panel;
+      if (cmd.cmd === "graph_query") {
+        return {
+          viewing: { scope: "root" },
+          matched: 1,
+          shown: 1,
+          text: JSON.stringify({ id: 5, type: "Loader", widgets: { asset: "present.safetensors" } }),
+        };
+      }
+      if (cmd.cmd === "graph_get_object_info") {
+        return {
+          ok: true,
+          object_info: {
+            Loader: { input: { required: { asset: [["present.safetensors"], {}] } } },
+          },
+        };
+      }
+      return { ok: false };
+    });
+
+    expect(payload.audit_complete).toBe(false);
+    expect(payload.unchecked_count).toBe(1);
+    expect(payload.unavailable_widget_values).toBeUndefined();
+  });
 });
 
 // #1973 follow-up — the first cut of this fix judged completeness from the
@@ -296,7 +351,7 @@ describe("panel_get_errors completeness parity with the panel's scanner (#1973)"
   const UNENUM = "not checked: this value names a file below the input root";
   function probeCapReply(): Record<string, unknown> {
     return {
-      viewing: { kind: "root", workflow: "wan.json" },
+      viewing: { kind: "root", workflow: "wan.json", workflow_uuid: "workflow-a" },
       node_count: 77,
       errored_count: 0,
       nodes: [],
@@ -500,7 +555,7 @@ describe("the clean note may survive only where the PANEL would have called it c
   // A payload whose ONLY abstention is retryable, so the completion pass retires it
   // and the audit finishes — the one path where the panel's note can be re-emitted.
   const completable = (extra: Record<string, unknown>) => ({
-    viewing: { kind: "root" },
+    viewing: { kind: "root", workflow: "wan.json", workflow_uuid: "workflow-a" },
     node_count: 12,
     errored_count: 0,
     nodes: [],

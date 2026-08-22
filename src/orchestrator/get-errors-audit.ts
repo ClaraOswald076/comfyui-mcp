@@ -520,12 +520,17 @@ function sameViewingIdentity(
   const a = viewingIdentity(primary);
   const b = viewingIdentity(followUp);
   if (!a || !b) return false;
-  // A UUID/path identity cannot be downgraded to a coincidentally equal root
-  // scope. If either side publishes one, both must publish the same value.
-  for (const key of ["workflow_uuid", "workflow"]) {
-    if (key in a || key in b) {
-      if (!(key in a) || !(key in b) || !Object.is(a[key], b[key])) return false;
-    }
+  // Scope and owner/title are not workflow-instance identity. A tab can switch
+  // from root workflow A to root workflow B, or from subgraph A to a same-shaped
+  // subgraph B, without changing the tab id. The panel's graph replies publish
+  // the root workflow_uuid for this purpose; without it, never retire A's
+  // leftovers from an opaque follow-up read.
+  if (typeof a.workflow_uuid !== "string" || typeof b.workflow_uuid !== "string") return false;
+  if (!Object.is(a.workflow_uuid, b.workflow_uuid)) return false;
+  // A path is useful corroboration when both replies publish one, but it cannot
+  // replace the per-instance UUID: the same saved path may be reopened in place.
+  if ("workflow" in a || "workflow" in b) {
+    if (!("workflow" in a) || !("workflow" in b) || !Object.is(a.workflow, b.workflow)) return false;
   }
   const shared = Object.keys(a).filter((key) => key in b);
   return shared.length > 0 && shared.every((key) => Object.is(a[key], b[key]));

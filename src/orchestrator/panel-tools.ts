@@ -14689,8 +14689,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       // the file-probe cap and a failed /object_info lookup produce the same
       // false-clean payload with no flag at all. See get-errors-audit.ts.
       async (_args, ctx) => {
-        const primaryTabId = ctx.tabId;
         const primary = await ctx.call({ cmd: "graph_get_errors" }, OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS);
+        // ctx.call may self-heal a reconnect by rebinding the session while the
+        // primary read is in flight. Capture the route that actually produced
+        // this payload, not the stale id from before the retry.
+        const primaryTabId = ctx.tabId;
         return withTruncationHints(
           await completeGetErrorsAudit(
             ctx,
