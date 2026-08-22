@@ -39,7 +39,7 @@
 
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createRequire } from "node:module";
-import { promises as fsp } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, promises as fsp } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
@@ -89,7 +89,10 @@ const CODEX_HOST_SPAWN_RETRY_MS =
   Number.isFinite(configuredHostSpawnRetryMs) && configuredHostSpawnRetryMs >= 0
     ? configuredHostSpawnRetryMs
     : 150;
-const CODEX_HOST_SPAWN_RETRIES = 1;
+// Two attempts: a stale WinGet path (os error 3) can be followed immediately
+// by a sharing-violation (os error 32) while the replacement image is copied
+// or scanned (#2045). A single retry died on that second failure.
+const CODEX_HOST_SPAWN_RETRIES = 2;
 
 async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
   let timer: NodeJS.Timeout | undefined;
@@ -656,6 +659,167 @@ export function isWindowsCodeModeHostSharingViolation(message: string): boolean 
 }
 
 /**
+ * #2045 — Windows ERROR_PATH_NOT_FOUND (os error 3) when WinGet deletes a
+ * versioned Node package dir (`node-vX.Y.Z-win-x64\\...`) out from under a live
+ * app-server. Distinct from os error 2 (file not found in an existing dir),
+ * which stays terminal (#1929).
+ */
+export function isWindowsCodeModeHostPathNotFound(message: string): boolean {
+  if (!message) return false;
+  const m = message.toLowerCase();
+  const isHost = m.includes("code-mode host") || m.includes("codex-code-mode-host");
+  if (!isHost) return false;
+  if (/\bos error 2\b/.test(m)) return false;
+  return (
+    /\bos error 3\b/.test(m) ||
+    m.includes("cannot find the path specified") ||
+    m.includes("chemin d'acces specifie est introuvable") ||
+    m.includes("chemin d'accès spécifié est introuvable") ||
+    m.includes("no puede encontrar la ruta")
+  );
+}
+
+export function isWindowsCodeModeHostSpawnRetryable(message: string): boolean {
+  return isWindowsCodeModeHostSharingViolation(message) || isWindowsCodeModeHostPathNotFound(message);
+}
+
+const CODEX_PLATFORM_PACKAGE: Record<string, { pkg: string; triple: string }> = {
+  "win32-x64": { pkg: "@openai/codex-win32-x64", triple: "x86_64-pc-windows-msvc" },
+  "win32-arm64": { pkg: "@openai/codex-win32-arm64", triple: "aarch64-pc-windows-msvc" },
+  "darwin-x64": { pkg: "@openai/codex-darwin-x64", triple: "x86_64-apple-darwin" },
+  "darwin-arm64": { pkg: "@openai/codex-darwin-arm64", triple: "aarch64-apple-darwin" },
+  "linux-x64": { pkg: "@openai/codex-linux-x64", triple: "x86_64-unknown-linux-musl" },
+  "linux-arm64": { pkg: "@openai/codex-linux-arm64", triple: "aarch64-unknown-linux-musl" },
+};
+
+function vendorHostName(platform: NodeJS.Platform | string = process.platform): string {
+  return platform === "win32" ? "codex-code-mode-host.exe" : "codex-code-mode-host";
+}
+
+function vendorExeName(platform: NodeJS.Platform | string = process.platform): string {
+  return platform === "win32" ? "codex.exe" : "codex";
+}
+
+function platformOfHostPath(hostPath: string): NodeJS.Platform | string {
+  return hostPath.toLowerCase().endsWith(".exe") ? "win32" : process.platform;
+}
+
+/** WinGet's versioned Node dir and nvm-windows layouts vanish on an update. */
+export function isVolatileCodexPackagePath(p: string): boolean {
+  const n = p.replace(/\\/g, "/").toLowerCase();
+  return (
+    n.includes("/winget/packages/") ||
+    /\/node-v\d+\.\d+\.\d+-win/.test(n) ||
+    /\/nvm\/v?\d/.test(n) ||
+    n.includes("/.nvm/")
+  );
+}
+
+export function codeModeHostPathFromError(message: string): string | null {
+  const m = message.match(/code-mode host\s+(.+?):\s/i);
+  const p = m?.[1]?.trim();
+  return p || null;
+}
+
+export function resolveCodexCodeModeHostPath(
+  opts: {
+    resolve?: (id: string) => string;
+    existsSync?: (p: string) => boolean;
+    platform?: NodeJS.Platform;
+    arch?: string;
+  } = {},
+): string | null {
+  const platform = opts.platform ?? process.platform;
+  const arch = opts.arch ?? process.arch;
+  const spec = CODEX_PLATFORM_PACKAGE[`${platform}-${arch}`];
+  if (!spec) return null;
+  const exists = opts.existsSync ?? existsSync;
+  const resolve = opts.resolve ?? ((id: string) => createRequire(import.meta.url).resolve(id));
+  try {
+    const pkgJson = resolve(`${spec.pkg}/package.json`);
+    const host = path.join(path.dirname(pkgJson), "vendor", spec.triple, "bin", vendorHostName(platform));
+    return exists(host) ? host : null;
+  } catch {
+    return null;
+  }
+}
+
+export function stableCodexVendorDir(home = os.homedir()): string {
+  const override = process.env.COMFYUI_MCP_CODEX_VENDOR_DIR?.trim();
+  return override || path.join(home, ".comfyui-mcp", "codex-vendor");
+}
+
+/**
+ * Copy the vendor `codex` + `codex-code-mode-host` pair out of a volatile
+ * WinGet/nvm package dir into a stable location. If the source is already gone
+ * or the dest is locked (os error 32), keep a usable dest copy.
+ */
+export function ensureStableCodexVendor(
+  srcHost: string,
+  opts: {
+    destDir?: string;
+    existsSync?: (p: string) => boolean;
+    mkdirSync?: (p: string, options?: { recursive: boolean }) => void;
+    copyFileSync?: (src: string, dest: string) => void;
+  } = {},
+): string | null {
+  const exists = opts.existsSync ?? existsSync;
+  const mkdir = opts.mkdirSync ?? mkdirSync;
+  const copy = opts.copyFileSync ?? copyFileSync;
+  const destDir = opts.destDir ?? stableCodexVendorDir();
+  const plat = platformOfHostPath(srcHost);
+  const destHost = path.join(destDir, vendorHostName(plat));
+  const destExe = path.join(destDir, vendorExeName(plat));
+  const srcExe = path.join(path.dirname(srcHost), vendorExeName(plat));
+  const destUsable = exists(destHost) && exists(destExe);
+  if (!exists(srcHost) || !exists(srcExe)) return destUsable ? destHost : null;
+  try {
+    mkdir(destDir, { recursive: true });
+    copy(srcExe, destExe);
+    copy(srcHost, destHost);
+    return exists(destHost) && exists(destExe) ? destHost : destUsable ? destHost : null;
+  } catch {
+    return destUsable ? destHost : null;
+  }
+}
+
+export function resolveCodexLaunchBin(
+  opts: {
+    resolveJs?: () => string | null;
+    resolveHost?: () => string | null;
+    existsSync?: (p: string) => boolean;
+    ensureStable?: (srcHost: string) => string | null;
+  } = {},
+): string {
+  const exists = opts.existsSync ?? existsSync;
+  const host = (opts.resolveHost ?? (() => resolveCodexCodeModeHostPath({ existsSync: exists })))();
+  if (host && isVolatileCodexPackagePath(host)) {
+    const ensure = opts.ensureStable ?? ((src: string) => ensureStableCodexVendor(src));
+    const stableHost = ensure(host);
+    if (stableHost) {
+      const exe = path.join(path.dirname(stableHost), vendorExeName(platformOfHostPath(stableHost)));
+      if (exists(exe)) return exe;
+    }
+  }
+  try {
+    const js =
+      opts.resolveJs?.() ??
+      (() => {
+        const require = createRequire(import.meta.url);
+        const pkgPath = require.resolve("@openai/codex/package.json");
+        const pkg = require("@openai/codex/package.json") as { bin?: Record<string, string> | string };
+        const binRel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.codex;
+        if (!binRel) return null;
+        return path.join(pkgPath.replace(/[\\/]package\.json$/, ""), binRel.replace(/^\.[\\/]/, ""));
+      })();
+    if (js && exists(js)) return js;
+  } catch {
+    // bundled package not installed — fall through to PATH.
+  }
+  return "codex";
+}
+
+/**
  * The Codex app-server adapter. One instance per PanelAgent; it holds the live
  * app-server client + current thread/turn ids and re-opens on each `run()`.
  */
@@ -743,28 +907,22 @@ export class CodexBackend implements AgentBackend {
   }
 
   /**
-   * Resolve the codex binary: prefer the bundled `@openai/codex` launcher (via
-   * require.resolve of its package bin) so no separate install is needed; fall
-   * back to a `codex` on PATH. Throws a clear message if neither is available.
+   * Resolve the codex binary: prefer a stable copy of the vendor exe when the
+   * active package lives under a WinGet/nvm versioned dir (#2045), else the
+   * bundled `@openai/codex` launcher, else a `codex` on PATH. A cached path
+   * that no longer exists is dropped so the next spawn cannot keep a stale
+   * WinGet Node folder.
    */
   private resolveBin(): string {
-    if (this.bin) return this.bin;
-    try {
-      const require = createRequire(import.meta.url);
-      // The package exposes bin/codex.js; resolve its package.json then derive the
-      // bin path relative to the package dir (works regardless of OS separators).
-      const pkgPath = require.resolve("@openai/codex/package.json");
-      const pkg = require("@openai/codex/package.json") as { bin?: Record<string, string> | string };
-      const binRel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.codex;
-      if (binRel) {
-        const sep = pkgPath.includes("\\") ? "\\" : "/";
-        const pkgDir = pkgPath.replace(/[\\/]package\.json$/, "");
-        this.bin = `${pkgDir}${sep}${binRel.replace(/^\.[\\/]/, "")}`;
+    if (this.bin && this.bin !== "codex") {
+      if (!existsSync(this.bin)) this.bin = null;
+      else if (!/\.(c|m)?js$/i.test(this.bin)) {
+        const host = path.join(path.dirname(this.bin), vendorHostName(platformOfHostPath(this.bin)));
+        if (!existsSync(host)) this.bin = null;
       }
-    } catch {
-      // bundled package not installed — fall through to PATH.
     }
-    if (!this.bin) this.bin = "codex"; // PATH fallback (a `codex` on PATH)
+    if (this.bin) return this.bin;
+    this.bin = resolveCodexLaunchBin();
     return this.bin;
   }
 
@@ -1033,11 +1191,15 @@ export class CodexBackend implements AgentBackend {
     // signal — every raw app-server notification for the active turn re-arms
     // PanelAgent's idle watchdog so a long, quiet generation doesn't falsely trip.
     let turnSeq = 0;
+    let liveClient = client;
     for await (const turn of opts.channel) {
-      yield* stampTurn(this.runTurn(client, turn, opts.onActivity), ++turnSeq);
-      // A timed-out interrupt detaches this client. End the old run before it can
-      // consume another queued turn; PanelAgent will start a fresh app-server.
-      if (this.client !== client) return;
+      // A timed-out interrupt nulls this.client — stop draining so PanelAgent
+      // can start a fresh app-server. A stale-host recycle (#2045) replaces
+      // the client in place; keep going on the replacement.
+      if (!this.client) return;
+      liveClient = this.client;
+      yield* stampTurn(this.runTurn(liveClient, turn, opts.onActivity), ++turnSeq);
+      if (!this.client) return;
     }
   }
 
@@ -1052,6 +1214,7 @@ export class CodexBackend implements AgentBackend {
     onActivity?: () => void,
   ): AsyncGenerator<AgentEvent> {
     const threadId = this.threadId!;
+    let liveClient = client;
     // Event queue bridging the push-based notification handler to this pull-based
     // async generator. The handler enqueues normalized AgentEvents; we drain.
     const queue: AgentEvent[] = [];
@@ -1187,15 +1350,37 @@ export class CodexBackend implements AgentBackend {
     // Assigned after turn input is built — the retry timer only fires after a
     // turn/start has already run, so this is never invoked while still a no-op.
     let issueTurnStart: () => void = () => {};
+    let handler: (msg: RpcMessage) => void = () => {};
+    let hostRecycleInFlight = false;
+    const watchExit = (watched: AppServerClient) => {
+      void watched.exitPromise.then(() => {
+        if (done) return;
+        if (watched !== liveClient) return;
+        // Closing the old app-server is the point of a stale-host recycle;
+        // its exit must not finish the replacement turn (#2045).
+        if (hostRecycleInFlight) return;
+        emitTerminalError(
+          watched.exitError ? msgOf(watched.exitError) : "codex app-server connection closed.",
+        );
+      });
+    };
 
     const tryRetryCodeModeHostSpawn = (message: string): boolean => {
       if (interrupted || finishedResult || retryPending) return false;
       if (hostSpawnRetries >= CODEX_HOST_SPAWN_RETRIES) return false;
-      if (!isWindowsCodeModeHostSharingViolation(message)) return false;
+      if (!isWindowsCodeModeHostSpawnRetryable(message)) return false;
       hostSpawnRetries += 1;
       retryPending = true;
+      const reportedHost = codeModeHostPathFromError(message);
+      const recycle =
+        isWindowsCodeModeHostPathNotFound(message) &&
+        typeof this.bin === "string" &&
+        this.bin !== "codex" &&
+        (!reportedHost || !existsSync(reportedHost) || isVolatileCodexPackagePath(reportedHost));
       logger.warn(
-        `[codex-backend] code-mode host spawn hit a Windows sharing violation; retrying once after ${CODEX_HOST_SPAWN_RETRY_MS}ms (#1929)`,
+        recycle
+          ? `[codex-backend] code-mode host spawn hit a stale path; recycling the app-server then retrying after ${CODEX_HOST_SPAWN_RETRY_MS}ms (#2045)`
+          : `[codex-backend] code-mode host spawn failed; retrying after ${CODEX_HOST_SPAWN_RETRY_MS}ms (#1929/#2045)`,
       );
       try {
         onActivity?.();
@@ -1204,13 +1389,60 @@ export class CodexBackend implements AgentBackend {
       }
       retryTimer = setTimeout(() => {
         retryTimer = undefined;
-        if (interrupted || finishedResult || this.disposed) {
-          retryPending = false;
-          return;
-        }
-        turnIdKnown = false;
-        buffered.length = 0;
-        issueTurnStart();
+        void (async () => {
+          if (interrupted || finishedResult || this.disposed) {
+            retryPending = false;
+            return;
+          }
+          if (recycle) {
+            hostRecycleInFlight = true;
+            this.bin = null;
+            if (this.client === liveClient) this.client = null;
+            await this.beginClientClose(liveClient, "stale code-mode host recycle teardown failed");
+            if (interrupted || finishedResult || this.disposed) {
+              hostRecycleInFlight = false;
+              retryPending = false;
+              return;
+            }
+            try {
+              await this.prepare();
+            } catch (err) {
+              hostRecycleInFlight = false;
+              retryPending = false;
+              emitTerminalError(msgOf(err));
+              return;
+            }
+            const next = this.client;
+            if (!next) {
+              hostRecycleInFlight = false;
+              retryPending = false;
+              emitTerminalError("codex app-server not initialized");
+              return;
+            }
+            liveClient = next;
+            hostRecycleInFlight = false;
+            liveClient.notificationHandler = handler;
+            watchExit(liveClient);
+            try {
+              await liveClient.request("thread/resume", {
+                threadId,
+                cwd: this.deps.cwd ?? process.cwd(),
+                model: this.resolveTurnModel(),
+                approvalPolicy: "never",
+                sandbox: this.sandbox,
+              });
+            } catch {
+              // Thread may not survive a process recycle; still retry the turn.
+            }
+            if (interrupted || finishedResult || this.disposed) {
+              retryPending = false;
+              return;
+            }
+          }
+          turnIdKnown = false;
+          buffered.length = 0;
+          issueTurnStart();
+        })();
       }, CODEX_HOST_SPAWN_RETRY_MS);
       retryTimer.unref?.();
       return true;
@@ -1317,8 +1549,8 @@ export class CodexBackend implements AgentBackend {
           const e = (params.error ?? {}) as { message?: string };
           if (params.willRetry === true) break;
           const message = e.message ?? "Codex error";
-          // #1929 — a Windows sharing-violation on the bundled code-mode host is
-          // the same transient the user already proved by retrying the call.
+          // #1929 / #2045 — a Windows sharing-violation or stale WinGet path on
+          // the bundled code-mode host is the same transient /restart recovered.
           if (tryRetryCodeModeHostSpawn(message)) break;
           // A non-retrying `error` ends the turn: emit it AND finish, so a turn that
           // errors out (no following turn/completed) doesn't hang (P0-2). Route it
@@ -1340,8 +1572,8 @@ export class CodexBackend implements AgentBackend {
       }
     };
 
-    const prev = client.notificationHandler;
-    client.notificationHandler = (msg: RpcMessage) => {
+    const prev = liveClient.notificationHandler;
+    handler = (msg: RpcMessage) => {
       // Until the turnId is known, buffer everything — we can't yet tell which
       // turn a notification belongs to, so we can't yet decide whether it counts
       // as liveness either. Replayed (and bumped) after turn/start resolves, so
@@ -1357,6 +1589,7 @@ export class CodexBackend implements AgentBackend {
       }
       apply(msg);
     };
+    liveClient.notificationHandler = handler;
 
     // Watch for the app-server child dying mid-turn: reject/finish the turn so the
     // local drain below is woken instead of waiting forever (P0-2). Crucially this
@@ -1364,14 +1597,9 @@ export class CodexBackend implements AgentBackend {
     // turn/start is still pending leaves the turn with a terminal `result` — the
     // turn-start .catch() running first (rejecting the pending request) no longer
     // lets this watcher finish() without a result and hang the gate (P0-B).
-    void client.exitPromise.then(() => {
-      if (done) return;
-      // emitTerminalError is a no-op if a result already fired, so it's safe to
-      // call alongside the turn-start .catch() (which may run first when the child
-      // dies while turn/start is pending) — it guarantees the turn still ends with
-      // exactly one terminal result and never hangs the gate (P0-B).
-      emitTerminalError(client.exitError ? msgOf(client.exitError) : "codex app-server connection closed.");
-    });
+    // A stale-host recycle (#2045) replaces liveClient; the old child's exit
+    // must not finish the replacement turn.
+    watchExit(liveClient);
 
     // FIRST-TURN PERSONA: the app-server has no thread-level instructions field,
     // so the panel system prompt is prepended to the first turn's input as a
@@ -1439,7 +1667,7 @@ export class CodexBackend implements AgentBackend {
     issueTurnStart = () => {
       // turn/start delivers the user text plus any resolved image input items.
       const turnModel = this.resolveTurnModel();
-      client
+      liveClient
         .request<{ turn?: { id?: string } }>("turn/start", {
           threadId,
           input: turnInput,
@@ -1525,7 +1753,9 @@ export class CodexBackend implements AgentBackend {
       if (this.abortActiveTurn === abortActiveTurn) this.abortActiveTurn = null;
       // Restore the prior handler ONLY if it's still ours (close() may have nulled
       // it during shutdown — don't resurrect a stale handler onto a dead client).
-      if (client.notificationHandler && !client.exitError) client.notificationHandler = prev ?? null;
+      if (liveClient.notificationHandler && !liveClient.exitError) {
+        liveClient.notificationHandler = prev ?? null;
+      }
       this.turnId = null;
       // #1152 — the app-server does NOT necessarily read a localImage at
       // turn/start, which is what this used to assume ("the bytes were read at
