@@ -5,7 +5,7 @@ import {
   publishCustomNode,
 } from "../services/node-authoring.js";
 import { verifyCustomNode } from "../services/node-verify.js";
-import { resolveEffectiveComfyUIBaseLive } from "../services/workspace-env.js";
+import { resolveCustomNodesScanBaseLiveStrict } from "../services/workspace-env.js";
 import {
   listNodePackFiles,
   readNodeFile,
@@ -40,12 +40,13 @@ const jsonResult = (result: unknown) => ({
  * They are one work-domain by construction: they are the author loop, in order —
  * scaffold → write/patch → verify → git → publish — with read/list/search as the
  * orientation steps between them. Every one is LOCAL-ONLY, and every
- * FILE-TOUCHING one is jailed to custom_nodes/ under the resolved local install
- * base: the running server's own --base-directory when it reports one (#1715 —
- * that is the root the runtime actually scans custom_nodes/ from, and on
- * ComfyUI Desktop it is NOT the code install root), else COMFYUI_PATH, else the
- * saved default workspace, else the running local server's own install root
- * (#1653). The single
+ * FILE-TOUCHING one is jailed to custom_nodes/ under the directory ComfyUI
+ * actually scans: the running server's own --base-directory when it reports one
+ * (#1715 — on ComfyUI Desktop that is NOT the code install root), else the live
+ * main.py checkout on a split install that has no --base-directory (#2031 — the
+ * data workspace is not scanned unless the flag said so), else COMFYUI_PATH,
+ * else the saved default workspace, else the running local server's own install
+ * root (#1653). The single
  * exception is action:"publish" with an explicit `path`, which the retired tool
  * accepted as an absolute pack directory anywhere on the machine (deliberately —
  * publishing is a local filesystem + comfy-cli operation independent of which
@@ -90,8 +91,8 @@ const jsonResult = (result: unknown) => ({
 export function registerNodePackTools(server: McpServer): void {
   server.tool(
     "node_pack",
-    "Author, edit, test and publish YOUR OWN ComfyUI custom-node pack under <COMFYUI_PATH>/custom_nodes/. LOCAL-ONLY: it acts on the local filesystem and is meaningless for a remote --comfyui-url target. Every file-touching action (list_files, read, search, write, patch, git) is jailed to custom_nodes/ under the resolved local base — the running server's own --base-directory when it reports one (that is where the runtime actually scans custom_nodes/ from; on ComfyUI Desktop it is NOT the code install root), else COMFYUI_PATH, else the saved default workspace, else the running LOCAL server's own install root; the one exception is action:\"publish\", which also accepts an explicit `path` to a pack directory ANYWHERE on this machine and therefore works without COMFYUI_PATH. To INSTALL or update someone else's pack use install_custom_node instead. Driven by the `action` parameter:\n" +
-      '- action:"scaffold" — Generate a new pack from a template into the local ComfyUI\'s custom_nodes/<name>/ (the install base resolves from the running server\'s --base-directory when it reports one, else COMFYUI_PATH, else the saved default workspace, else the running LOCAL server this session is connected to — the same workspace install_comfyui action:"environment" reports). Writes pyproject.toml (with the [tool.comfy] PublisherId/DisplayName/Icon table the Comfy Registry requires), __init__.py exporting NODE_CLASS_MAPPINGS / NODE_DISPLAY_NAME_MAPPINGS, and src/nodes.py containing a runnable sample node (INPUT_TYPES/RETURN_TYPES/FUNCTION/CATEGORY), plus .comfyignore and .gitignore. Optionally emits a web/js frontend stub (wiring WEB_DIRECTORY) and a GitHub Actions publish workflow (with_ci). This is the FIRST step of the author loop: scaffold here, then restart_comfyui to load it, test it, and finally action:"publish". Names must be a safe lowercase slug and cannot escape custom_nodes/; an existing non-empty directory is left untouched unless overwrite is true. Requires `name` and `display_name`.\n' +
+    "Author, edit, test and publish YOUR OWN ComfyUI custom-node pack under the custom_nodes/ directory the running ComfyUI actually scans. LOCAL-ONLY: it acts on the local filesystem and is meaningless for a remote --comfyui-url target. Every file-touching action (list_files, read, search, write, patch, git) is jailed to custom_nodes/ under the directory the running ComfyUI actually scans — the server's own --base-directory when it reports one (on ComfyUI Desktop that is NOT the code install root), else the live main.py checkout on a split install that has no --base-directory (the data workspace is not scanned unless the flag said so), else COMFYUI_PATH, else the saved default workspace, else the running LOCAL server's own install root; the one exception is action:\"publish\", which also accepts an explicit `path` to a pack directory ANYWHERE on this machine and therefore works without COMFYUI_PATH. To INSTALL or update someone else's pack use install_custom_node instead. Driven by the `action` parameter:\n" +
+      '- action:"scaffold" — Generate a new pack from a template into the local ComfyUI\'s scanned custom_nodes/<name>/ (the install base resolves from the running server\'s --base-directory when it reports one, else the live main.py checkout on a split install, else COMFYUI_PATH, else the saved default workspace, else the running LOCAL server this session is connected to). Writes pyproject.toml (with the [tool.comfy] PublisherId/DisplayName/Icon table the Comfy Registry requires), __init__.py exporting NODE_CLASS_MAPPINGS / NODE_DISPLAY_NAME_MAPPINGS, and src/nodes.py containing a runnable sample node (INPUT_TYPES/RETURN_TYPES/FUNCTION/CATEGORY), plus .comfyignore and .gitignore. Optionally emits a web/js frontend stub (wiring WEB_DIRECTORY) and a GitHub Actions publish workflow (with_ci). This is the FIRST step of the author loop: scaffold here, then restart_comfyui to load it, test it, and finally action:"publish". Names must be a safe lowercase slug and cannot escape custom_nodes/; an existing non-empty directory is left untouched unless overwrite is true. Requires `name` and `display_name`.\n' +
       '- action:"verify" — Test that a pack actually LOADS in ComfyUI — the middle step of the author loop. Restarts the local ComfyUI and waits for it to become ready, then checks that the pack\'s node class_types appear in /object_info. A node that fails to import (a missing dependency or a syntax error) simply never registers, so any missing class_types pinpoint a broken pack. Provide `class_types` explicitly, or a pack `name` whose __init__.py declares NODE_CLASS_MAPPINGS (the keys are inferred). Needs a managed local ComfyUI. Set restart:false to check the already-running server without restarting it.\n' +
       '- action:"publish" — Publish a local pack to the public Comfy Registry (registry.comfy.org) by running `comfy node publish` inside the pack directory. First validates the pack\'s pyproject.toml has the required [project].name, [project].version and [tool.comfy].PublisherId (refusing the scaffold placeholder), then publishes using the API key from the REGISTRY_ACCESS_TOKEN environment variable (passed to comfy-cli via the environment, never via logged arguments). This is the LAST step of the author loop and an IRREVERSIBLE, EXTERNAL action: it creates/updates a PUBLIC registry version that this tool cannot undo. Requires comfy-cli installed and REGISTRY_ACCESS_TOKEN set. Give `name` (a folder under custom_nodes/) or `path` (an explicit pack directory).\n' +
       '- action:"list_files" — List the files in one installed pack under custom_nodes/<pack>/ (read-only). Skips .git/, __pycache__/ and node_modules/. Use this to orient before action:"read" / action:"search" when diagnosing or editing a pack you found via bisect or install_custom_node (action:"fix"). Requires `pack`.\n' +
@@ -303,17 +304,14 @@ export function registerNodePackTools(server: McpServer): void {
                   withCi: args.with_ci,
                   overwrite: args.overwrite,
                 },
-                // Deps stay default; the THIRD argument is the live-aware local
-                // base (#1653/#1715): the running LOCAL server's own
-                // --base-directory when it reports one (the root the runtime
-                // actually scans custom_nodes/ from — on Desktop NOT the code
-                // install root), else configuration, else the server's own
-                // install root — the trusted workspace install_comfyui
-                // (action:"environment") already reports — is where the pack
-                // belongs, and refusing as "no local install" was a
-                // contradiction of that same session.
+                // Deps stay default; the THIRD argument is the directory
+                // ComfyUI actually scans custom_nodes/ from (#1653/#1715/#2031):
+                // --base-directory when reported (Desktop: NOT the code install
+                // root), else the live main.py checkout on a split install that
+                // has no --base-directory (the data workspace is not scanned
+                // unless the flag said so), else configuration.
                 undefined,
-                await resolveEffectiveComfyUIBaseLive(),
+                await resolveCustomNodesScanBaseLiveStrict(),
               ),
             );
           case "verify":
@@ -322,11 +320,11 @@ export function registerNodePackTools(server: McpServer): void {
                 name: args.name,
                 classTypes: args.class_types,
                 restart: args.restart,
-                // The SAME live-aware root scaffold wrote to (#1715): verify reads
-                // the pack's __init__.py from the runtime's own --base-directory
-                // when one is reported, so authoring and verification cannot
-                // target different roots.
-                resolvedBase: await resolveEffectiveComfyUIBaseLive(),
+                // The SAME scan root scaffold wrote to (#1715/#2031): verify
+                // reads the pack's __init__.py from the directory the runtime
+                // actually scans, so authoring and verification cannot target
+                // different roots.
+                resolvedBase: await resolveCustomNodesScanBaseLiveStrict(),
               }),
             );
           case "publish":
@@ -339,7 +337,7 @@ export function registerNodePackTools(server: McpServer): void {
                 undefined,
                 args.path && args.path.trim()
                   ? undefined
-                  : await resolveEffectiveComfyUIBaseLive(),
+                  : await resolveCustomNodesScanBaseLiveStrict(),
               ),
             );
           case "list_files":
@@ -351,7 +349,7 @@ export function registerNodePackTools(server: McpServer): void {
                   maxEntries: args.max_entries,
                 },
                 undefined,
-                await resolveEffectiveComfyUIBaseLive(),
+                await resolveCustomNodesScanBaseLiveStrict(),
               ),
             );
           case "read":
@@ -364,7 +362,7 @@ export function registerNodePackTools(server: McpServer): void {
                   maxChars: args.max_chars,
                 },
                 undefined,
-                await resolveEffectiveComfyUIBaseLive(),
+                await resolveCustomNodesScanBaseLiveStrict(),
               ),
             );
           case "search":
@@ -378,7 +376,7 @@ export function registerNodePackTools(server: McpServer): void {
                   caseSensitive: args.case_sensitive,
                 },
                 undefined,
-                await resolveEffectiveComfyUIBaseLive(),
+                await resolveCustomNodesScanBaseLiveStrict(),
               ),
             );
           case "write":
@@ -391,7 +389,7 @@ export function registerNodePackTools(server: McpServer): void {
                   createDirs: args.create_dirs,
                 },
                 undefined,
-                await resolveEffectiveComfyUIBaseLive(),
+                await resolveCustomNodesScanBaseLiveStrict(),
               ),
             );
           case "patch":
@@ -399,7 +397,7 @@ export function registerNodePackTools(server: McpServer): void {
               applyNodePatch(
                 required(args.patch, "patch", "patch", "the unified diff to apply under custom_nodes/"),
                 undefined,
-                await resolveEffectiveComfyUIBaseLive(),
+                await resolveCustomNodesScanBaseLiveStrict(),
               ),
             );
           case "git":
@@ -421,7 +419,7 @@ export function registerNodePackTools(server: McpServer): void {
                   maxChars: args.max_chars,
                 },
                 undefined,
-                await resolveEffectiveComfyUIBaseLive(),
+                await resolveCustomNodesScanBaseLiveStrict(),
               ),
             );
           default: {

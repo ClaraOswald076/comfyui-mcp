@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### Fixed
+
+- **`node_pack` scaffolds into the custom_nodes directory the running ComfyUI
+  actually scans on a split install (#2031).** Without `--base-directory`,
+  `folder_paths` loads packs from the `main.py` checkout, not from the data
+  workspace `COMFYUI_PATH` / `workspace_path` names. Scaffold was writing under
+  the workspace; after restart the class was missing from `/object_info`.
+  Authoring (scaffold / write / read / patch / git / verify / publish-by-name)
+  now shares one scan-root resolver: `--base-directory` when the runtime reports
+  one (Desktop, #1770), else the live checkout.
+
 ## [0.52.51] - 2026-08-21
 
 ### MCP
@@ -61,7 +72,6 @@ All notable changes to this project are documented here. This project adheres to
 - target tunnels at the bound host (#2023) (#2036)
 - recover subgraph widget write scope (#2037)
 - default the panel bridge to 9199 and never kill a foreign holder (#2034)
-
 
 ## [0.52.47] - 2026-08-21
 

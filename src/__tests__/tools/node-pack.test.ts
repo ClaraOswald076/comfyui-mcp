@@ -27,7 +27,7 @@ const mocks = vi.hoisted(() => ({
   writeNodeFile: vi.fn(),
   applyNodePatch: vi.fn(),
   nodePackGit: vi.fn(),
-  resolveEffectiveComfyUIBaseLive: vi.fn(),
+  resolveCustomNodesScanBaseLive: vi.fn(),
 }));
 
 vi.mock("../../services/node-authoring.js", () => ({
@@ -43,8 +43,8 @@ vi.mock("../../services/node-verify.js", () => ({
 // before dispatching to the sync authoring services; seam it so no test
 // depends on real config or a reachable server.
 vi.mock("../../services/workspace-env.js", () => ({
-  resolveEffectiveComfyUIBaseLive: (...a: unknown[]) =>
-    mocks.resolveEffectiveComfyUIBaseLive(...a),
+  resolveCustomNodesScanBaseLiveStrict: (...a: unknown[]) =>
+    mocks.resolveCustomNodesScanBaseLive(...a),
 }));
 
 vi.mock("../../services/node-dev.js", () => ({
@@ -120,7 +120,7 @@ beforeEach(() => {
   mocks.verifyCustomNode.mockResolvedValue({ ok: true });
   // Default: no local base resolvable — the service's own refusal is what a
   // caller must see then.
-  mocks.resolveEffectiveComfyUIBaseLive.mockResolvedValue(undefined);
+  mocks.resolveCustomNodesScanBaseLive.mockResolvedValue(undefined);
 });
 
 describe("node_pack registration", () => {
@@ -409,7 +409,7 @@ describe("node_pack adopts the trusted live workspace (#1653)", () => {
     // detected the trusted local workspace, but neither COMFYUI_PATH nor a
     // default workspace is set. The handler must hand that running server's
     // root to scaffold instead of letting it refuse as "no local install".
-    mocks.resolveEffectiveComfyUIBaseLive.mockResolvedValueOnce("/live/ComfyUI");
+    mocks.resolveCustomNodesScanBaseLive.mockResolvedValueOnce("/live/ComfyUI");
     await handler()({ action: "scaffold", name: "my-pack", display_name: "My Pack" });
     expect(mocks.scaffoldCustomNode).toHaveBeenCalledWith(
       expect.objectContaining({ name: "my-pack" }),
@@ -418,8 +418,27 @@ describe("node_pack adopts the trusted live workspace (#1653)", () => {
     );
   });
 
+  it('does not let a fail-closed scan-root refusal fall back to COMFYUI_PATH', async () => {
+    mocks.resolveCustomNodesScanBaseLive.mockRejectedValueOnce(
+      new ValidationError(
+        'The connected ComfyUI declares --base-directory "C:/missing" but that directory is currently unavailable. Refusing to use COMFYUI_PATH or the main.py checkout because custom_nodes would be written where this runtime does not scan.',
+      ),
+    );
+
+    const result = await handler()({
+      action: "scaffold",
+      name: "my-pack",
+      display_name: "My Pack",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(text(result)).toMatch(/currently unavailable/);
+    expect(text(result)).toMatch(/does not scan/);
+    expect(mocks.scaffoldCustomNode).not.toHaveBeenCalled();
+  });
+
   it('action:"publish" by name resolves the live base; an explicit path never probes it', async () => {
-    mocks.resolveEffectiveComfyUIBaseLive.mockResolvedValue("/live/ComfyUI");
+    mocks.resolveCustomNodesScanBaseLive.mockResolvedValue("/live/ComfyUI");
     await handler()({ action: "publish", name: "my-pack" });
     expect(mocks.publishCustomNode).toHaveBeenCalledWith(
       { name: "my-pack", path: undefined },
@@ -427,11 +446,11 @@ describe("node_pack adopts the trusted live workspace (#1653)", () => {
       "/live/ComfyUI",
     );
 
-    mocks.resolveEffectiveComfyUIBaseLive.mockClear();
+    mocks.resolveCustomNodesScanBaseLive.mockClear();
     await handler()({ action: "publish", path: "/abs/packs/my-pack" });
     // An explicit path is a self-contained local target (and stays legal in
     // remote mode) — resolving a live base for it would be a wasted probe.
-    expect(mocks.resolveEffectiveComfyUIBaseLive).not.toHaveBeenCalled();
+    expect(mocks.resolveCustomNodesScanBaseLive).not.toHaveBeenCalled();
     expect(mocks.publishCustomNode).toHaveBeenCalledWith(
       { name: undefined, path: "/abs/packs/my-pack" },
       undefined,
@@ -439,12 +458,12 @@ describe("node_pack adopts the trusted live workspace (#1653)", () => {
     );
   });
 
-  it('threads the SAME live-resolved base to verify and every file-touching action (#1715)', async () => {
-    // The Desktop split-root failure: scaffold wrote under the code install
-    // root while the runtime loaded from its --base-directory. Authoring AND
-    // verification must share one resolution, so every action receives the
-    // resolver's answer — here the runtime-reported base directory.
-    mocks.resolveEffectiveComfyUIBaseLive.mockResolvedValue("/live/base-dir");
+  it('threads the SAME live-resolved base to verify and every file-touching action (#1715/#2031)', async () => {
+    // Authoring AND verification must share one scan-root resolution, so every
+    // action receives the resolver's answer — Desktop --base-directory (#1715)
+    // or the live checkout on a split install that has no --base-directory
+    // (#2031). Here a proven scan root, whatever produced it.
+    mocks.resolveCustomNodesScanBaseLive.mockResolvedValue("/live/base-dir");
     await handler()({ action: "verify", name: "MyPack" });
     expect(mocks.verifyCustomNode).toHaveBeenCalledWith(
       expect.objectContaining({ resolvedBase: "/live/base-dir" }),

@@ -28,13 +28,11 @@ export interface VerifyOptions {
   /** Restart ComfyUI before checking (default true). Set false to check the live server as-is. */
   restart?: boolean;
   /**
-   * The caller's ASYNC, live-aware install base (resolveEffectiveComfyUIBaseLive,
-   * #1715). AUTHORITATIVE when given: it already encodes the full precedence —
-   * the running runtime's --base-directory (where it actually scans
-   * custom_nodes/ from) ahead of configuration — so verify reads the pack from
-   * the same root scaffold wrote to, closing the split-root failure where the
-   * pack landed under the code install root while the runtime loaded from its
-   * base directory.
+   * The caller's ASYNC, live-aware scan root (resolveCustomNodesScanBaseLive,
+   * #1715/#2031). AUTHORITATIVE when given: it already encodes the full
+   * precedence — the running runtime's --base-directory when set, else the live
+   * main.py checkout on a split install that has no --base-directory — so
+   * verify reads the pack from the same root scaffold wrote to.
    */
   resolvedBase?: string;
 }

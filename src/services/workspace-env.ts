@@ -11,6 +11,7 @@ import { observeLiveServerProcess, resolveLiveInterpreter } from "./live-interpr
 import {
   hasUnresolvableRelativeBaseDirFlag,
   parseBaseDirFromArgv,
+  rawFlagValue,
 } from "./launch-argv.js";
 import { logger } from "../utils/logger.js";
 import { ValidationError } from "../utils/errors.js";
@@ -271,6 +272,89 @@ export async function resolveEffectiveComfyUIBaseLive(): Promise<string | undefi
     return undefined;
   }
   return configured;
+}
+
+/**
+ * The install base whose `custom_nodes/` the running ComfyUI actually scans.
+ *
+ * `resolveEffectiveComfyUIBaseLive` answers the DATA/base root: `--base-directory`
+ * when present, else `COMFYUI_PATH` / the saved workspace. That is correct for
+ * models and output, and for custom nodes ONLY when `--base-directory` is set —
+ * `folder_paths.py` then points `custom_nodes` at `<base-directory>/custom_nodes`.
+ * Without the flag, `folder_paths.base_path` is the `main.py` directory, so a
+ * split install's data workspace is NOT scanned (#2031: `node_pack` scaffolded
+ * into `workspace_path/custom_nodes`; the class never appeared in `/object_info`;
+ * copying the same pack to `code_path/custom_nodes` loaded it).
+ *
+ * Matches ComfyUI `folder_paths.py`:
+ *   1. Live `--base-directory` when it exists on disk (#1715/#1770 Desktop).
+ *   2. Else the live `main.py` root (#2031 portable/split without the flag).
+ *   3. Fail closed when a present `--base-directory` cannot be resolved or is
+ *      currently unavailable on disk.
+ *   4. Else the configured data base (offline / unreachable).
+ *
+ * Remote mode → undefined. Never throws. `node_pack` (scaffold / verify /
+ * write / read / patch / git / publish-by-name) threads this so authoring and
+ * verification cannot target different roots.
+ */
+interface CustomNodesScanBaseLiveOutcome {
+  base: string | undefined;
+  unavailableBaseDirectory: string | undefined;
+}
+
+async function customNodesScanBaseLiveOutcome(): Promise<CustomNodesScanBaseLiveOutcome> {
+  if (isRemoteMode()) return { base: undefined, unavailableBaseDirectory: undefined };
+
+  const snapshot = await getLiveServerSnapshot();
+  if (snapshot.reachable) {
+    const baseDir = parseBaseDirFromArgv(snapshot.argv, snapshot.cwd);
+    // A present flag is authoritative even when its directory is temporarily
+    // unavailable. Falling through to the main.py checkout here is unsafe:
+    // ComfyUI still scans custom_nodes under the configured base once it is
+    // reachable, so node_pack would scaffold into an invisible tree.
+    const rawBaseDir = rawFlagValue(snapshot.argv, "--base-directory");
+    if (
+      rawBaseDir !== undefined &&
+      (baseDir === undefined || !existsSync(baseDir))
+    ) {
+      return { base: undefined, unavailableBaseDirectory: rawBaseDir };
+    }
+    if (baseDir && existsSync(baseDir)) {
+      return { base: baseDir, unavailableBaseDirectory: undefined };
+    }
+    // Without --base-directory, folder_paths.base_path is the checkout that
+    // holds main.py — NOT COMFYUI_PATH / workspace_path, which may only be
+    // the extra_model_paths data root.
+    const live = resolveLiveServerRoot(snapshot.argv, snapshot.cwd, { remote: false });
+    if (live.root && existsSync(live.root) && hasMainPy(live.root)) {
+      return { base: live.root, unavailableBaseDirectory: undefined };
+    }
+  }
+  return { base: resolveEffectiveComfyUIBase(), unavailableBaseDirectory: undefined };
+}
+
+export async function resolveCustomNodesScanBaseLive(): Promise<string | undefined> {
+  return (await customNodesScanBaseLiveOutcome()).base;
+}
+
+/**
+ * Authoring operations must preserve an explicit unavailable --base-directory
+ * as a refusal. A bare undefined is otherwise a valid "no live evidence"
+ * result, and the synchronous service APIs intentionally use it to fall back
+ * to COMFYUI_PATH. That fallback is unsafe when ComfyUI itself has already
+ * selected a different, currently unavailable scan root.
+ */
+export async function resolveCustomNodesScanBaseLiveStrict(): Promise<string | undefined> {
+  const result = await customNodesScanBaseLiveOutcome();
+  if (result.unavailableBaseDirectory !== undefined) {
+    throw new ValidationError(
+      `The connected ComfyUI declares --base-directory "${result.unavailableBaseDirectory}" ` +
+        "but that directory is currently unavailable. Refusing to use COMFYUI_PATH or " +
+        "the main.py checkout because custom_nodes would be written where this runtime " +
+        "does not scan. Make the base directory reachable and retry.",
+    );
+  }
+  return result.base;
 }
 
 // ---------------------------------------------------------------------------

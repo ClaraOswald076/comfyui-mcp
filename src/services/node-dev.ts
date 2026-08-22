@@ -312,11 +312,11 @@ export function customNodesRoot(resolvedBase?: string): string {
   // mode or when no local install is known — then we refuse with a clear error.
   //
   // `resolvedBase`, when threaded by the node_pack handler, is the ASYNC
-  // live-aware resolution (resolveEffectiveComfyUIBaseLive, #1653/#1715) and is
-  // AUTHORITATIVE: it already encodes the full precedence — the live server's
-  // own --base-directory (where the running runtime actually scans
-  // custom_nodes/ from) ahead of configuration — so configuration is NOT
-  // re-preferred over it here.
+  // live-aware scan-root resolution (resolveCustomNodesScanBaseLive,
+  // #1653/#1715/#2031) and is AUTHORITATIVE: it already encodes the full
+  // precedence — the live server's --base-directory when set, else the live
+  // main.py checkout on a split install that has no --base-directory, ahead
+  // of configuration — so configuration is NOT re-preferred over it here.
   const base = resolvedBase ?? resolveEffectiveComfyUIBase();
   if (!base) {
     throw new NodeDevError(
