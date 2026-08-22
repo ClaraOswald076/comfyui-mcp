@@ -6,7 +6,7 @@
 // sizeSane and schema oracle live in the other repo; these compensations are
 // what this orchestrator can still do for a caller who has not updated the panel.
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import {
   DEFAULT_NODE_BODY_HEIGHT,
@@ -18,6 +18,7 @@ import {
 } from "../../orchestrator/edit-node-uncollapse.js";
 import {
   buildPanelToolDefs,
+  __panelToolsTestHooks,
   type PanelToolCtx,
   type ToolResult,
 } from "../../orchestrator/panel-tools.js";
@@ -67,6 +68,14 @@ const SAVE_TIMEOUT =
   `The save may still complete in the background. The same tab reports modified:true persisted:true. ` +
   `modified:true means the canvas has not been marked clean, so the write has not been acknowledged as landed. ` +
   `Confirm by reading the saved file itself before retrying — a re-issue may write twice.`;
+
+/** #2078 — the panel's own 13s budget wording, already tagging OUTCOME UNKNOWN. */
+const SAVE_TIMEOUT_2078 =
+  `workflow_save did not finish within 13s. The save may still complete in the background. OUTCOME UNKNOWN.`;
+
+const FIRST_SAVE_TIMEOUT_2078 =
+  `workflow_save did not finish within 13s. The active workflow changed from "Untitled Workflow" ` +
+  `to "first-save" while the save was in flight, so which file the hung write targets cannot be determined from here.`;
 
 describe("restored uncollapse size (#2004)", () => {
   it("a stored [228, 0] is not sizeSane and restores keeping the width", () => {
@@ -250,21 +259,36 @@ describe("panel_set_widget names object_info starvation (#2004)", () => {
   });
 });
 
-describe("panel_save_workflow acknowledges a save that landed after the budget (#2004)", () => {
+describe("panel_save_workflow acknowledges a save that landed after the budget (#2004, #2078)", () => {
+  afterEach(() => {
+    __panelToolsTestHooks.setSaveTimeoutSettleGraceMs(null);
+  });
+
   it("THE REPORTED CASE: modified:false persisted:true after the 13s budget is treated as saved", async () => {
     const calls: Forwarded[] = [];
     const ctx: PanelToolCtx = {
-      call: async (cmd) => {
+      call: async (cmd, _timeoutMs, onDispatchedRid) => {
         calls.push(cmd);
-        if (cmd.cmd === "workflow_save") return errorResult(SAVE_TIMEOUT);
+        if (cmd.cmd === "workflow_save") {
+          onDispatchedRid?.("save-rid");
+          return errorResult(SAVE_TIMEOUT);
+        }
         if (cmd.cmd === "workflow_list") {
           return jsonResult({
             active: {
               path: "workflows/graph.json",
+              routing_key: "wf:workflows/graph.json",
               filename: "graph",
               modified: false,
               persisted: true,
             },
+            late_save_receipts: [
+              {
+                rid: "save-rid",
+                cmd: "workflow_save",
+                result: { saved: true, routing_key: "wf:workflows/graph.json" },
+              },
+            ],
           });
         }
         return jsonResult({ ok: true });
@@ -278,20 +302,186 @@ describe("panel_save_workflow acknowledges a save that landed after the budget (
     expect(res.isError).toBeFalsy();
     const text = textOf(res);
     expect(text).toMatch(/"saved": true/);
+    expect(text).toMatch(/"late_ack": true/);
     expect(text).toMatch(/"acknowledged_after_timeout": true/);
-    expect(calls[0]).toMatchObject({ cmd: "workflow_save" });
+    expect(calls.map((c) => c.cmd)).toContain("workflow_save");
     expect(calls.map((c) => c.cmd)).toContain("workflow_list");
+  });
+
+  it("#2078 THE REPORTED CASE: a list that is still dirty, then clean, is saved not unknown", async () => {
+    // The 13s budget fires with modified:true. #2004 listed once, still saw
+    // dirty, and returned OUTCOME UNKNOWN. The caller's next panel_list_workflows
+    // was already modified:false persisted:true. Keep reading for the grace.
+    __panelToolsTestHooks.setSaveTimeoutSettleGraceMs(1500);
+    const calls: Forwarded[] = [];
+    let lists = 0;
+    const ctx: PanelToolCtx = {
+      call: async (cmd, _timeoutMs, onDispatchedRid) => {
+        calls.push(cmd);
+        if (cmd.cmd === "workflow_save") {
+          onDispatchedRid?.("save-rid");
+          return errorResult(SAVE_TIMEOUT_2078);
+        }
+        if (cmd.cmd === "workflow_list") {
+          lists += 1;
+          return jsonResult({
+            active: {
+              path: "workflows/graph.json",
+              routing_key: "wf:workflows/graph.json",
+              filename: "graph",
+              modified: lists === 1,
+              persisted: true,
+            },
+            late_save_receipts: [
+              {
+                rid: "save-rid",
+                cmd: "workflow_save",
+                result: { saved: true, routing_key: "wf:workflows/graph.json" },
+              },
+            ],
+          });
+        }
+        return jsonResult({ ok: true });
+      },
+      confirm: async () => "yes" as const,
+      bridge: {} as PanelToolCtx["bridge"],
+      tabId: "test-tab",
+    };
+
+    const res = await defByName("panel_save_workflow").handler({}, ctx);
+    expect(res.isError).toBeFalsy();
+    const text = textOf(res);
+    expect(text).toMatch(/"saved": true/);
+    expect(text).toMatch(/"late_ack": true/);
+    expect(text).not.toMatch(/OUTCOME UNKNOWN/);
+    expect(lists).toBeGreaterThanOrEqual(2);
+    expect(calls.filter((c) => c.cmd === "workflow_save")).toHaveLength(1);
+  });
+
+  it("a clean different workflow after the timeout does not acknowledge the save", async () => {
+    __panelToolsTestHooks.setSaveTimeoutSettleGraceMs(0);
+    let lists = 0;
+    const ctx: PanelToolCtx = {
+      call: async (cmd) => {
+        if (cmd.cmd === "workflow_save") return errorResult(SAVE_TIMEOUT_2078);
+        if (cmd.cmd === "workflow_list") {
+          lists += 1;
+          return jsonResult({
+            active: {
+              path: "workflows/b.json",
+              routing_key: "wf:workflows/b.json",
+              modified: false,
+              persisted: true,
+            },
+            late_save_receipts: [],
+          });
+        }
+        return jsonResult({ ok: true });
+      },
+      confirm: async () => "yes" as const,
+      bridge: {} as PanelToolCtx["bridge"],
+      tabId: "test-tab",
+    };
+
+    const res = await defByName("panel_save_workflow").handler({}, ctx);
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/OUTCOME UNKNOWN/);
+    expect(lists).toBe(1);
+  });
+
+  it("a first-save successor with the timed-out command's late receipt can be acknowledged", async () => {
+    __panelToolsTestHooks.setSaveTimeoutSettleGraceMs(0);
+    let lists = 0;
+    const ctx: PanelToolCtx = {
+      call: async (cmd, _timeoutMs, onDispatchedRid) => {
+        if (cmd.cmd === "workflow_save") onDispatchedRid?.("save-rid");
+        if (cmd.cmd === "workflow_save") return errorResult(FIRST_SAVE_TIMEOUT_2078);
+        if (cmd.cmd === "workflow_list") {
+          lists += 1;
+          return jsonResult({
+            active: {
+              path: "workflows/first-save.json",
+              filename: "first-save",
+              routing_key: "wf:workflows/first-save.json",
+              modified: false,
+              persisted: true,
+            },
+            late_save_receipts: [
+              {
+                rid: "save-rid",
+                cmd: "workflow_save",
+                result: { saved: true, routing_key: "wf:workflows/first-save.json" },
+              },
+            ],
+          });
+        }
+        return jsonResult({ ok: true });
+      },
+      confirm: async () => "yes" as const,
+      bridge: {} as PanelToolCtx["bridge"],
+      tabId: "test-tab",
+    };
+
+    const res = await defByName("panel_save_workflow").handler({}, ctx);
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toMatch(/"late_ack": true/);
+    expect(lists).toBe(2);
+  });
+
+  it("a first-save timeout cannot acknowledge an unrelated clean successor", async () => {
+    __panelToolsTestHooks.setSaveTimeoutSettleGraceMs(0);
+    let lists = 0;
+    const ctx: PanelToolCtx = {
+      call: async (cmd, _timeoutMs, onDispatchedRid) => {
+        if (cmd.cmd === "workflow_save") onDispatchedRid?.("save-rid");
+        if (cmd.cmd === "workflow_save") return errorResult(FIRST_SAVE_TIMEOUT_2078);
+        if (cmd.cmd === "workflow_list") {
+          lists += 1;
+          return jsonResult({
+            active: {
+              path: "workflows/other.json",
+              filename: "other",
+              routing_key: "wf:workflows/other.json",
+              modified: false,
+              persisted: true,
+            },
+            late_save_receipts: [
+              {
+                rid: "save-rid",
+                cmd: "workflow_save",
+                result: { saved: true, routing_key: "wf:workflows/first-save.json" },
+              },
+            ],
+          });
+        }
+        return jsonResult({ ok: true });
+      },
+      confirm: async () => "yes" as const,
+      bridge: {} as PanelToolCtx["bridge"],
+      tabId: "test-tab",
+    };
+
+    const res = await defByName("panel_save_workflow").handler({}, ctx);
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/OUTCOME UNKNOWN/);
+    expect(lists).toBe(1);
   });
 
   it("modified:true persisted:true at follow-up is still outcome-unknown, not success", async () => {
     // The timeout snapshot itself. Treating persisted:true as proof would have
-    // reported the reporter's still-dirty canvas as saved.
+    // reported the reporter's still-dirty canvas as saved. Grace 0 = one list.
+    __panelToolsTestHooks.setSaveTimeoutSettleGraceMs(0);
     const ctx: PanelToolCtx = {
       call: async (cmd) => {
         if (cmd.cmd === "workflow_save") return errorResult(SAVE_TIMEOUT);
         if (cmd.cmd === "workflow_list") {
           return jsonResult({
-            active: { path: "workflows/graph.json", modified: true, persisted: true },
+            active: {
+              path: "workflows/graph.json",
+              routing_key: "wf:workflows/graph.json",
+              modified: true,
+              persisted: true,
+            },
           });
         }
         return jsonResult({ ok: true });
