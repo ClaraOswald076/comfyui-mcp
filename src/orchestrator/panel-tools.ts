@@ -374,6 +374,8 @@ import {
   restartComfyUI,
   preflightLocalRestart,
   readServingArgv,
+  resolveVerifiedProxyRestartTarget,
+  type VerifiedProxyRestartTarget,
   describeArgvDrift,
   recordRestartDispatch,
   clearRestartDispatch,
@@ -1113,6 +1115,12 @@ export const __panelToolsTestHooks = {
       | null,
   ): void {
     localRestartPreflightOverride = fn;
+  },
+  /** Inject the narrow EZi/CEI proxy proof; null restores the live resolver. */
+  setVerifiedProxyRestartTarget(
+    fn: (() => Promise<VerifiedProxyRestartTarget | undefined>) | null,
+  ): void {
+    verifiedProxyRestartTargetOverride = fn;
   },
   /** Inject a fast #742 decline-probe recheck window so decline-path tests
    *  don't wait the real ~6s. null restores the DECLINE_PROBE_* constants. */
@@ -2964,6 +2972,26 @@ let localRestartPreflightOverride:
       selfRelaunch?: boolean;
     }>)
   | null = null;
+
+let verifiedProxyRestartTargetOverride:
+  | (() => Promise<VerifiedProxyRestartTarget | undefined>)
+  | null = null;
+
+function panelVerifiedProxyRestartTarget(): Promise<VerifiedProxyRestartTarget | undefined> {
+  return (verifiedProxyRestartTargetOverride ?? resolveVerifiedProxyRestartTarget)();
+}
+
+function proxyTargetBindsPanel(
+  ctx: PanelToolCtx,
+  target: VerifiedProxyRestartTarget | undefined,
+): target is VerifiedProxyRestartTarget {
+  return (
+    target != null &&
+    sameHttpBase(getComfyUIBaseUrl(), target.proxyBase) &&
+    ctx.bridge?.tabIsLocal?.(ctx.tabId) === true &&
+    sameHttpBase(ctx.bridge?.tabServerOrigin?.(ctx.tabId), target.proxyBase)
+  );
+}
 
 /** Test injection for the #742 decline-probe recheck window, so tests don't
  *  wait the real ~6s. null → the DECLINE_PROBE_* constants. */
@@ -18557,6 +18585,10 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
               " To restart the server without a panel confirmation card, use restart_comfyui.",
           );
         }
+        // #2118: keep the proxy proof alive across the confirmation/preflight
+        // awaits. The proxy is never treated as a ComfyUI process; it only lets
+        // the tab-scoped Manager request be observed against the immutable backend.
+        let proxyRestartTarget: VerifiedProxyRestartTarget | undefined;
         // #1819: resolve instance identity BEFORE the confirmation card. Asking the
         // user to confirm a restart, then refusing because we cannot tell which
         // ComfyUI this tab fronts, is two contradictory outcomes (timeout vs refuse)
@@ -18572,11 +18604,15 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
             identityHealthBase != null &&
             sameHttpBase(getComfyUIBaseUrl(), identityHealthBase);
           if (!identityBound) {
+            const candidate = await panelVerifiedProxyRestartTarget();
+            if (proxyTargetBindsPanel(ctx, candidate)) {
+              proxyRestartTarget = candidate;
+            }
             const tabStillHere =
               typeof ctx.bridge?.canReach === "function"
                 ? ctx.bridge.canReach(ctx.tabId) === true
                 : true;
-            if (tabStillHere) {
+            if (tabStillHere && proxyRestartTarget == null) {
               return restartRefusedPreservingBinding(
                 ctx,
                 unboundLocalRestartRefusalNote(ctx, identityHealthBase, identityBinding.blocker),
@@ -19208,8 +19244,18 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // "idle" and a restart aborts whatever is running.
         const configuredRestartCommand = config.comfyuiRestartCommand;
         if (configuredRestartCommand && !isRemoteMode() && !isCloudMode()) {
-          const commandHealthBase = captureRebootHealthBase(ctx);
-          if (commandHealthBase != null && sameHttpBase(getComfyUIBaseUrl(), commandHealthBase)) {
+          if (proxyRestartTarget != null) {
+            const refreshedProxy = await panelVerifiedProxyRestartTarget();
+            proxyRestartTarget = proxyTargetBindsPanel(ctx, refreshedProxy)
+              ? refreshedProxy
+              : undefined;
+          }
+          const commandHealthBase =
+            proxyRestartTarget?.backendBase ?? captureRebootHealthBase(ctx);
+          const commandBound =
+            proxyRestartTarget != null ||
+            (commandHealthBase != null && sameHttpBase(getComfyUIBaseUrl(), commandHealthBase));
+          if (commandHealthBase != null && commandBound) {
             if (force !== true) {
               let busyCount: number | null = null;
               try {
@@ -19248,7 +19294,14 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
             // Re-heal and re-verify at the point of action, exactly as the
             // dispatch path below does.
             ctx.ensureReachable?.();
-            const postCheckHealthBase = captureRebootHealthBase(ctx);
+            if (proxyRestartTarget != null) {
+              const postProxy = await panelVerifiedProxyRestartTarget();
+              proxyRestartTarget = proxyTargetBindsPanel(ctx, postProxy)
+                ? postProxy
+                : undefined;
+            }
+            const postCheckHealthBase =
+              proxyRestartTarget?.backendBase ?? captureRebootHealthBase(ctx);
             if (
               postCheckHealthBase == null ||
               !sameHttpBase(commandHealthBase, postCheckHealthBase)
@@ -19333,11 +19386,22 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // can be proven. They keep restart_comfyui, and the note says so. Weighed
         // against #814 — where exactly such a user's server was stopped and never came
         // back — declining is the recoverable side.
+        // Re-resolve after the confirmation await. A proxy proof is an endpoint
+        // identity claim, not a durable permission; a retarget or tab rebind makes
+        // it unusable and returns to the existing refusal path.
+        if (proxyRestartTarget != null) {
+          const refreshedProxy = await panelVerifiedProxyRestartTarget();
+          proxyRestartTarget = proxyTargetBindsPanel(ctx, refreshedProxy)
+            ? refreshedProxy
+            : undefined;
+        }
         const preflightBinding = resolveRebootHealthBinding(ctx);
-        const preflightHealthBase = preflightBinding.base;
+        const preflightHealthBase =
+          proxyRestartTarget?.backendBase ?? preflightBinding.base;
         const preflightBound =
-          preflightHealthBase != null &&
-          sameHttpBase(getComfyUIBaseUrl(), preflightHealthBase);
+          proxyRestartTarget != null ||
+          (preflightHealthBase != null &&
+            sameHttpBase(getComfyUIBaseUrl(), preflightHealthBase));
         // #848: what the instance was OBSERVED running with, taken from the preflight
         // that already had to resolve it. Nothing new is probed before the dispatch —
         // the no-await invariant between the binding capture and the reboot stands.
@@ -19374,7 +19438,9 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           // EVERY retarget — any mutation, including a round trip back to the
           // same base, is caught.
           const preflightTargetGeneration = getComfyuiTargetGeneration();
-          const preflight = await (localRestartPreflightOverride ?? preflightLocalRestart)();
+          const preflight = proxyRestartTarget
+            ? { ok: true, observedArgv: proxyRestartTarget.argv }
+            : await (localRestartPreflightOverride ?? preflightLocalRestart)();
           // #848: keep the observed launch arguments. Recorded here and spent ONLY on
           // the success path far below, where the reboot has been proven to have
           // cycled THIS instance — it never influences any decision above.
@@ -19393,13 +19459,21 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           // re-capture BEFORE trusting the result either way. The guarantee
           // that must hold: a stop/reboot is only ever sent when the preflight
           // validated THE instance the dispatch will cycle.
+          if (proxyRestartTarget) {
+            // The proxy branch performs no local stop/preflight. Its direct
+            // backend proof is rechecked immediately before dispatch below.
+            preflightArgvGeneration = proxyRestartTarget.generation;
+          }
           ctx.ensureReachable?.();
           const postPreflightHealthBase = captureRebootHealthBase(ctx);
           const tabFrontsSameInstance =
-            postPreflightHealthBase != null &&
-            sameHttpBase(preflightHealthBase, postPreflightHealthBase);
+            proxyRestartTarget != null ||
+            (postPreflightHealthBase != null &&
+              sameHttpBase(preflightHealthBase, postPreflightHealthBase));
           const configStable =
-            getComfyuiTargetGeneration() === preflightTargetGeneration;
+            proxyRestartTarget != null
+              ? getComfyuiTargetGeneration() === proxyRestartTarget.generation
+              : getComfyuiTargetGeneration() === preflightTargetGeneration;
           if (!configStable && tabFrontsSameInstance) {
             // r10: the target config moved MID-CHECK, so the preflight result
             // — pass OR fail — cannot vouch for the tab-fronted instance (a
@@ -19478,7 +19552,18 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // this SAME browser tab; a different tab can reuse the same saved-workflow
         // routing id while the original is still reconnecting.
         const preRestartPanelIdentity = ctx.panelConnectionIdentity?.();
-        const healthBase = captureRebootHealthBase(ctx);
+        if (proxyRestartTarget != null) {
+          const dispatchProxy = await panelVerifiedProxyRestartTarget();
+          proxyRestartTarget = proxyTargetBindsPanel(ctx, dispatchProxy)
+            ? dispatchProxy
+            : undefined;
+          if (proxyRestartTarget) {
+            preflightArgv = [...proxyRestartTarget.argv];
+            preflightArgvGeneration = proxyRestartTarget.generation;
+          }
+        }
+        const healthBase =
+          proxyRestartTarget?.backendBase ?? captureRebootHealthBase(ctx);
         // THE BINDING RULE APPLIES AT THE DISPATCH POINT, NOT ONLY BEFORE THE AWAIT.
         //
         // The check above happens before the preflight; a tab or connection rebind
@@ -19492,7 +19577,8 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // Same rule, same exclusions: only a LOCAL target we cannot tie to the
         // instance this server accounts for is refused.
         const dispatchBound =
-          healthBase != null && sameHttpBase(getComfyUIBaseUrl(), healthBase);
+          proxyRestartTarget != null ||
+          (healthBase != null && sameHttpBase(getComfyUIBaseUrl(), healthBase));
         if (!dispatchBound && !isRemoteMode() && !isCloudMode()) {
           return restartRefusedPreservingBinding(
             ctx,
@@ -19698,6 +19784,7 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
             // server replaced at the same URL between the reboot and here. That gap is real
             // and tracked in #871; this gate narrows the window, it does not close it.
             healthBase != null &&
+            proxyRestartTarget == null &&
             sameHttpBase(getComfyUIBaseUrl(), healthBase)
           ) {
             return runHeadlessManagedRestart({
