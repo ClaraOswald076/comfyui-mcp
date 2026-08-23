@@ -133,8 +133,13 @@ beforeEach(() => {
   watcherState.watched = null;
   mockBaseUrl = "http://127.0.0.1:8188";
   setComfyuiTargetMock.mockReturnValue(true);
-  // default probe: ComfyUI answers
-  global.fetch = vi.fn(async () => ({ ok: true, status: 200 })) as unknown as typeof fetch;
+  // default probe: ComfyUI answers with a JSON object
+  global.fetch = vi.fn(async () =>
+    new Response(JSON.stringify({ system: {} }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+  ) as unknown as typeof fetch;
 });
 
 describe("runpod registration", () => {
@@ -439,6 +444,19 @@ describe("runpod actions call the same services with the same arguments", () => 
     expect(setComfyuiTargetMock).not.toHaveBeenCalled();
   });
 
+  it('action:"connect" rejects an HTTP-200 nginx startup page', async () => {
+    getPodMock.mockResolvedValue(runningPod());
+    global.fetch = vi.fn(async () =>
+      new Response("<!doctype html><title>ComfyUI is starting</title>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      }),
+    ) as unknown as typeof fetch;
+    const t = text(await runpod()({ action: "connect", pod_id: "pod123" }));
+    expect(t).toContain("response was not valid JSON");
+    expect(setComfyuiTargetMock).not.toHaveBeenCalled();
+  });
+
   it('action:"deploy_link" returns the referral deploy link', async () => {
     const t = text(await runpod()({ action: "deploy_link" }));
     expect(t).toContain("console.runpod.io/deploy?template=bnqtkvcer3&ref=dkx71w9b");
@@ -510,6 +528,20 @@ describe("runpod_watch actions call the same services with the same arguments", 
     global.fetch = vi.fn(async () => ({ ok: false, status: 502 })) as unknown as typeof fetch;
     const t = text(await runpodWatch()({ action: "troubleshoot", pod_id: "pod123" }));
     expect(t).toContain("did not answer");
+  });
+
+  it('action:"troubleshoot" rejects an HTTP-200 nginx startup page', async () => {
+    getPodMock.mockResolvedValue(runningPod());
+    global.fetch = vi.fn(async () =>
+      new Response("<!doctype html><title>ComfyUI is starting</title>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      }),
+    ) as unknown as typeof fetch;
+    const t = text(await runpodWatch()({ action: "troubleshoot", pod_id: "pod123" }));
+    expect(t).toContain("did not answer");
+    expect(t).not.toContain("The pod is healthy");
+    expect(t).toContain("response was not valid JSON");
   });
 
   it('action:"troubleshoot" reports healthy when ComfyUI answers', async () => {
