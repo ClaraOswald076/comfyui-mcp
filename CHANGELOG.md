@@ -6,6 +6,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.82] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- reject malformed kitchen dictionaries
+- enforce kitchen backend payload boundaries
+- harden kitchen backend log parsing
+- parse dictionary-shaped kitchen backend logs
+
+#### Changed
+- release-0.52.81 (#2160)
+
+
 ## [0.52.81] - 2026-08-23
 
 ### MCP
