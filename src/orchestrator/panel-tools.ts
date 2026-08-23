@@ -5402,9 +5402,32 @@ function parseVerifiedQueriedNodeIdentity(
 
   if (typeof payload.text !== "string") return null;
   const rows: QueriedNodeIdentity[] = [];
-  for (const line of payload.text.split("\n")) {
+  const lines = payload.text.split(/\r?\n/);
+  for (const [index, line] of lines.entries()) {
     const trimmed = line.trim();
     if (!trimmed) continue;
+
+    // The live compact projection always prefixes its rows with this bounded summary.
+    // Keep the grammar narrow so arbitrary prose cannot make an unverified row usable,
+    // while accepting the documented header that older tests and panels may omit.
+    if (
+      index === 0 &&
+      /^\d+ match\(es\) of \d+ in scope \(viewing: \d+ nodes\)(?: · traversal depth≤-?\d+)?$/.test(
+        trimmed,
+      )
+    ) {
+      continue;
+    }
+    // A compact row may be followed by one of the panel's bounded clipping notes or
+    // truncation remedies. They do not identify nodes and are ignored only after a row
+    // has been authenticated below.
+    if (
+      rows.length > 0 &&
+      (/^\(\d+ widget value\(s\) clipped to \d+ chars/.test(trimmed) ||
+        /^… truncated at \d+ of \d+/.test(trimmed))
+    ) {
+      continue;
+    }
 
     if (trimmed.startsWith("#")) {
       const compact = trimmed.match(/^#(\S+)\s+(\S+)(?:\s|$)/);
@@ -5496,6 +5519,13 @@ function isUsablePanelConnectionIdentity(
   );
 }
 
+function samePanelConnectionIdentity(
+  left: { generation: number; tabSessionId: string },
+  right: { generation: number; tabSessionId: string },
+): boolean {
+  return left.generation === right.generation && left.tabSessionId === right.tabSessionId;
+}
+
 /** Refuse the DaSiWa stack widget whose custom UI deterministically overwrites a
  *  graph_set_widget write after acknowledging it. This gate fails closed unless
  *  the probe proves the requested node and remains bound to the same panel tab. */
@@ -5541,10 +5571,7 @@ async function refuseDaSiWaStackWrite(
   if (!isUsablePanelConnectionIdentity(identityAfter)) {
     return daSiWaIdentityRefusal("the panel-tab identity became unavailable after the probe");
   }
-  if (
-    identityAfter.tabSessionId !== identityBefore.tabSessionId ||
-    identityAfter.generation !== identityBefore.generation
-  ) {
+  if (!samePanelConnectionIdentity(identityBefore, identityAfter)) {
     return daSiWaIdentityRefusal("the panel-tab connection changed during the probe");
   }
   if (probe.isError) {
@@ -5563,6 +5590,70 @@ async function refuseDaSiWaStackWrite(
   }
   if (identity.type !== DASIWA_LTX2_LORA_LOADER) return null;
   return daSiWaStackRefusal(identity.type);
+}
+
+/** Recheck the target immediately before a stack_data mutation. The first probe
+ *  prevents the known refusal from dispatching; this final fence catches a tab
+ *  reconnect or node replacement observed between that probe and graph_set_widget. */
+async function verifyDaSiWaStackWriteFence(
+  ctx: PanelToolCtx,
+  nodeId: unknown,
+): Promise<ToolResult | null> {
+  const tabBefore = ctx.tabId;
+  let identityBefore: { generation: number; tabSessionId: string } | undefined;
+  try {
+    identityBefore = ctx.panelConnectionIdentity?.();
+  } catch {
+    return daSiWaIdentityRefusal("the bound browser-tab identity was unreadable before dispatch");
+  }
+  if (!isUsablePanelConnectionIdentity(identityBefore)) {
+    return daSiWaIdentityRefusal("the bound browser-tab identity was unavailable before dispatch");
+  }
+
+  let probe: ToolResult;
+  try {
+    probe = await ctx.call({
+      cmd: "graph_query",
+      ids: [nodeId],
+      fields: "compact",
+      limit: 1,
+    });
+  } catch {
+    return daSiWaIdentityRefusal("the final graph_query fence failed before dispatch");
+  }
+  if (ctx.tabId !== tabBefore) {
+    return daSiWaIdentityRefusal("the final fence was answered by a different panel tab");
+  }
+
+  let identityAfter: { generation: number; tabSessionId: string } | undefined;
+  try {
+    identityAfter = ctx.panelConnectionIdentity?.();
+  } catch {
+    return daSiWaIdentityRefusal("the panel-tab identity became unreadable before dispatch");
+  }
+  if (!isUsablePanelConnectionIdentity(identityAfter)) {
+    return daSiWaIdentityRefusal("the panel-tab identity became unavailable before dispatch");
+  }
+  if (!samePanelConnectionIdentity(identityBefore, identityAfter)) {
+    return daSiWaIdentityRefusal("the panel-tab connection changed before dispatch");
+  }
+  if (probe.isError) {
+    return daSiWaIdentityRefusal("the final graph_query fence returned an error");
+  }
+
+  const identity = parseVerifiedQueriedNodeIdentity(parseToolResultJson(probe));
+  const requestedId = canonicalQueriedNodeId(nodeId);
+  if (!identity || !requestedId) {
+    return daSiWaIdentityRefusal(
+      "the final graph_query fence was malformed, truncated, or did not contain exactly one verifiable row",
+    );
+  }
+  if (identity.id !== requestedId) {
+    return daSiWaIdentityRefusal("the final graph_query fence identified a different node_id");
+  }
+  return identity.type === DASIWA_LTX2_LORA_LOADER
+    ? daSiWaStackRefusal(identity.type)
+    : null;
 }
 
 // ---- #809: turn the panel's silent `truncated: true` booleans into a remedy --------
@@ -14963,6 +15054,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           args.widget as string,
         );
         if (daSiWaBlocked) return daSiWaBlocked;
+        if (args.widget === DASIWA_STACK_WIDGET) {
+          const daSiWaFence = await verifyDaSiWaStackWriteFence(ctx, args.node_id);
+          if (daSiWaFence) return daSiWaFence;
+        }
         // #599: the frontend runs refresh-before-validate here (pulls a fresh
         // /object_info so a just-staged/-downloaded/-installed value is accepted on
         // a single revalidation, #338/#458) — that authoritative fetch can outlast

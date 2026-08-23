@@ -476,6 +476,8 @@ describe("panel-tools: panel_set_widget DaSiWa stack_data (#2107)", () => {
     identityUnavailable?: boolean;
     identityUnavailableAfterProbe?: boolean;
     probeThrows?: boolean;
+    finalTabChange?: boolean;
+    finalQueryReply?: unknown;
   };
 
   async function run(
@@ -489,6 +491,7 @@ describe("panel-tools: panel_set_widget DaSiWa stack_data (#2107)", () => {
       tabSessionId: "browser-tab-a",
     };
     let probeComplete = false;
+    let queryCount = 0;
     const ctx = {
       tabId: "test-tab",
       panelConnectionIdentity: () => {
@@ -500,16 +503,22 @@ describe("panel-tools: panel_set_widget DaSiWa stack_data (#2107)", () => {
       call: async (cmd: Record<string, unknown>) => {
         cmds.push(String(cmd.cmd));
         if (cmd.cmd === "graph_query") {
+          queryCount++;
           if (options.probeThrows) throw new Error("probe unavailable");
-          if (options.tabChange) ctx.tabId = "other-tab";
+          if (options.tabChange || (options.finalTabChange && queryCount === 2)) {
+            ctx.tabId = "other-tab";
+          }
           if (options.sessionChange) {
             identity = { generation: 2, tabSessionId: "browser-tab-b" };
           }
           probeComplete = true;
-          if (typeof queryReply === "object" && queryReply !== null && "isError" in queryReply) {
-            return queryReply as ToolResult;
+          const reply = queryCount === 2 && options.finalQueryReply !== undefined
+            ? options.finalQueryReply
+            : queryReply;
+          if (typeof reply === "object" && reply !== null && "isError" in reply) {
+            return reply as ToolResult;
           }
-          return { content: [{ type: "text" as const, text: JSON.stringify(queryReply, null, 2) }] };
+          return { content: [{ type: "text" as const, text: JSON.stringify(reply, null, 2) }] };
         }
         return {
           content: [
@@ -539,7 +548,10 @@ describe("panel-tools: panel_set_widget DaSiWa stack_data (#2107)", () => {
   }
 
   it("refuses stack_data on DaSiWa_LTX2LoraLoader before graph_set_widget", async () => {
-    const { res, cmds } = await run({ text: '#2571 DaSiWa_LTX2LoraLoader "Lora HIGH" · stack_data=old' });
+    const { res, cmds } = await run({
+      text:
+        '1 match(es) of 1 in scope (viewing: 3 nodes)\n#2571 DaSiWa_LTX2LoraLoader "Lora HIGH" · stack_data=old',
+    });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/cannot set "stack_data" on DaSiWa_LTX2LoraLoader/);
     expect(res.content[0].text).toMatch(/custom multi-row widget/);
@@ -557,12 +569,16 @@ describe("panel-tools: panel_set_widget DaSiWa stack_data (#2107)", () => {
 
   it("does not block stack_data on another node type after exact identity", async () => {
     const { res, cmds } = await run(
-      { text: '#3 OtherLoraLoader "other" · stack_data=old' },
+      {
+        text:
+          '1 match(es) of 1 in scope (viewing: 3 nodes)\n#3 OtherLoraLoader "other" · stack_data=old\n' +
+          '(1 widget value(s) clipped to 60 chars by `fields`:"compact" — read fuller values with `fields`:"detail", which caps values at 2048 chars.)',
+      },
       { node_id: 3, widget: "stack_data", value: "NEW" },
     );
     expect(res.isError).toBeUndefined();
     expect(JSON.parse(res.content[0].text!).set.value).toBe("NEW");
-    expect(cmds).toEqual(["graph_query", "graph_set_widget"]);
+    expect(cmds).toEqual(["graph_query", "graph_query", "graph_set_widget"]);
   });
 
   it("refuses when graph_query returns an error", async () => {
@@ -648,6 +664,28 @@ describe("panel-tools: panel_set_widget DaSiWa stack_data (#2107)", () => {
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/different panel tab/);
     expect(cmds).toEqual(["graph_query"]);
+  });
+
+  it("refuses if the final fence sees the node become DaSiWa", async () => {
+    const { res, cmds } = await run(
+      { text: '1 match(es) of 1 in scope (viewing: 3 nodes)\n#3 OtherLoraLoader · stack_data=old' },
+      { node_id: 3, widget: "stack_data", value: "NEW" },
+      { finalQueryReply: { nodes: [{ id: 3, type: "DaSiWa_LTX2LoraLoader" }] } },
+    );
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/cannot set "stack_data"/);
+    expect(cmds).toEqual(["graph_query", "graph_query"]);
+  });
+
+  it("refuses if the panel tab changes during the final fence", async () => {
+    const { res, cmds } = await run(
+      { text: '1 match(es) of 1 in scope (viewing: 3 nodes)\n#3 OtherLoraLoader · stack_data=old' },
+      { node_id: 3, widget: "stack_data", value: "NEW" },
+      { finalTabChange: true },
+    );
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/final fence.*different panel tab/);
+    expect(cmds).toEqual(["graph_query", "graph_query"]);
   });
 
   it("keeps a different widget writable on the exact DaSiWa node", async () => {
