@@ -5598,7 +5598,7 @@ async function refuseDaSiWaStackWrite(
 async function verifyDaSiWaStackWriteFence(
   ctx: PanelToolCtx,
   nodeId: unknown,
-): Promise<ToolResult | null> {
+): Promise<ToolResult | { expectedNodeType: string } | null> {
   const tabBefore = ctx.tabId;
   let identityBefore: { generation: number; tabSessionId: string } | undefined;
   try {
@@ -5653,7 +5653,7 @@ async function verifyDaSiWaStackWriteFence(
   }
   return identity.type === DASIWA_LTX2_LORA_LOADER
     ? daSiWaStackRefusal(identity.type)
-    : null;
+    : { expectedNodeType: identity.type };
 }
 
 // ---- #809: turn the panel's silent `truncated: true` booleans into a remedy --------
@@ -15054,9 +15054,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           args.widget as string,
         );
         if (daSiWaBlocked) return daSiWaBlocked;
+        let expectedNodeType: string | undefined;
         if (args.widget === DASIWA_STACK_WIDGET) {
           const daSiWaFence = await verifyDaSiWaStackWriteFence(ctx, args.node_id);
-          if (daSiWaFence) return daSiWaFence;
+          if (daSiWaFence && "content" in daSiWaFence) return daSiWaFence;
+          expectedNodeType = daSiWaFence?.expectedNodeType;
         }
         // #599: the frontend runs refresh-before-validate here (pulls a fresh
         // /object_info so a just-staged/-downloaded/-installed value is accepted on
@@ -15074,7 +15076,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           stripVerifiedLastObservedSchemaNote(
             summarizeSetWidgetEcho(
               await ctx.call(
-                { cmd: "graph_set_widget", node_id: nodeId, widget, value },
+                {
+                  cmd: "graph_set_widget",
+                  node_id: nodeId,
+                  widget,
+                  value,
+                  ...(expectedNodeType ? { expected_node_type: expectedNodeType } : {}),
+                },
                 OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
               ),
               echoFull,

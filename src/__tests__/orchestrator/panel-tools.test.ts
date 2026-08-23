@@ -484,8 +484,9 @@ describe("panel-tools: panel_set_widget DaSiWa stack_data (#2107)", () => {
     queryReply: unknown,
     args: Record<string, unknown> = { node_id: 2571, widget: "stack_data", value: "NEW" },
     options: RunOptions = {},
-  ): Promise<{ res: ToolResult; cmds: string[] }> {
+  ): Promise<{ res: ToolResult; cmds: string[]; calls: Record<string, unknown>[] }> {
     const cmds: string[] = [];
+    const calls: Record<string, unknown>[] = [];
     let identity: { generation: number; tabSessionId: string } | undefined = {
       generation: 1,
       tabSessionId: "browser-tab-a",
@@ -502,6 +503,7 @@ describe("panel-tools: panel_set_widget DaSiWa stack_data (#2107)", () => {
       },
       call: async (cmd: Record<string, unknown>) => {
         cmds.push(String(cmd.cmd));
+        calls.push(cmd);
         if (cmd.cmd === "graph_query") {
           queryCount++;
           if (options.probeThrows) throw new Error("probe unavailable");
@@ -544,7 +546,7 @@ describe("panel-tools: panel_set_widget DaSiWa stack_data (#2107)", () => {
       args,
       ctx,
     )) as ToolResult;
-    return { res, cmds };
+    return { res, cmds, calls };
   }
 
   it("refuses stack_data on DaSiWa_LTX2LoraLoader before graph_set_widget", async () => {
@@ -568,7 +570,7 @@ describe("panel-tools: panel_set_widget DaSiWa stack_data (#2107)", () => {
   });
 
   it("does not block stack_data on another node type after exact identity", async () => {
-    const { res, cmds } = await run(
+    const { res, cmds, calls } = await run(
       {
         text:
           '1 match(es) of 1 in scope (viewing: 3 nodes)\n#3 OtherLoraLoader "other" · stack_data=old\n' +
@@ -579,6 +581,10 @@ describe("panel-tools: panel_set_widget DaSiWa stack_data (#2107)", () => {
     expect(res.isError).toBeUndefined();
     expect(JSON.parse(res.content[0].text!).set.value).toBe("NEW");
     expect(cmds).toEqual(["graph_query", "graph_query", "graph_set_widget"]);
+    expect(calls[2]).toMatchObject({
+      cmd: "graph_set_widget",
+      expected_node_type: "OtherLoraLoader",
+    });
   });
 
   it("refuses when graph_query returns an error", async () => {
