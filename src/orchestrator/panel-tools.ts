@@ -7983,6 +7983,7 @@ async function reconcileFailedPanelLoad(
   res: ToolResult,
   ctx: PanelToolCtx,
   data: unknown,
+  graphBefore: unknown,
   tabAtDispatch: string,
   fenceBefore: FenceRead,
   dispatchedRid: string | undefined,
@@ -7992,10 +7993,17 @@ async function reconcileFailedPanelLoad(
   const expectedNodeCount = uiWorkflowNodeCount(data);
   if (
     expectedNodeCount === undefined ||
+    graphBefore == null ||
     fenceBefore.known !== true ||
     typeof fenceBefore.uuid !== "string" ||
     ctx.tabId !== tabAtDispatch
   ) {
+    return loadOutcomeUnknown(res, dispatchedRid);
+  }
+  // A matching post-failure graph is only a causal proof when the pre-dispatch
+  // graph was different. If the requested graph was already present, the reads
+  // cannot tell whether this RID changed anything, so keep the retry token.
+  if (openLiveMatchesDestContent(graphBefore, data)) {
     return loadOutcomeUnknown(res, dispatchedRid);
   }
 
@@ -14612,6 +14620,16 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // Generous timeout — loading a large graph onto the live canvas can take a moment.
           const tabAtDispatch = ctx.tabId;
           const fenceBefore = currentWorkflowFence(ctx);
+          let graphBefore: unknown;
+          if (uiWorkflowNodeCount(data) !== undefined) {
+            try {
+              const before = await ctx.call({ cmd: "graph_serialize" }, 8000);
+              if (!before.isError) graphBefore = parseToolResultJson(before)?.workflow;
+            } catch {
+              // Without a pre-dispatch snapshot, a later matching graph cannot
+              // prove that this request caused the transition.
+            }
+          }
           let dispatchedRid: string | undefined;
           const loaded = await ctx.call(
             { cmd: "graph_load", graph: data },
@@ -14625,6 +14643,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               loaded,
               ctx,
               data,
+              graphBefore,
               tabAtDispatch,
               fenceBefore,
               dispatchedRid,

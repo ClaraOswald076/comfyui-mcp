@@ -36,8 +36,10 @@ function bridgeFor(options: {
   nodeCount?: number;
   workflowUuid?: string;
   nodeTypeMismatch?: boolean;
+  preExistingSame?: boolean;
 } = {}) {
   const sent: string[] = [];
+  let serializeCalls = 0;
   const bridge = {
     send: async (
       cmd: Record<string, unknown>,
@@ -49,9 +51,14 @@ function bridgeFor(options: {
         throw new Error(options.graphLoadError ?? "Failed to fetch");
       }
       if (cmd.cmd === "graph_serialize") {
+        serializeCalls += 1;
         const nodeCount = options.nodeCount ?? UI_GRAPH.nodes.length;
         const nodes = UI_GRAPH.nodes.slice(0, nodeCount).map((node, index) =>
-          options.nodeTypeMismatch && index === 0 ? { ...node, type: "DifferentNode" } : node,
+          serializeCalls > 1 && options.nodeTypeMismatch && index === 0
+            ? { ...node, type: "DifferentNode" }
+            : serializeCalls === 1 && index === 0 && !options.preExistingSame
+              ? { ...node, type: "OldNode" }
+              : node,
         );
         return { workflow: { ...UI_GRAPH, nodes }, node_count: nodeCount };
       }
@@ -100,7 +107,7 @@ describe("panel_load_workflow post-dispatch fetch failure (#2106)", () => {
       workflow_uuid: WORKFLOW_UUID,
       response_error: "Failed to fetch",
     });
-    expect(sent).toEqual(["graph_load", "graph_serialize", "workflow_list"]);
+    expect(sent).toEqual(["graph_serialize", "graph_load", "graph_serialize", "workflow_list"]);
   });
 
   it("keeps an outcome-unknown error when the live node count does not prove the load", async () => {
@@ -111,7 +118,7 @@ describe("panel_load_workflow post-dispatch fetch failure (#2106)", () => {
     expect(text).toContain("Failed to fetch");
     expect(text).toContain("OUTCOME UNKNOWN");
     expect(text).toContain(`retry_of:"${DISPATCHED_RID}"`);
-    expect(sent).toEqual(["graph_load", "graph_serialize"]);
+    expect(sent).toEqual(["graph_serialize", "graph_load", "graph_serialize"]);
   });
 
   it("keeps an outcome-unknown error when the active workflow UUID changed", async () => {
@@ -121,7 +128,7 @@ describe("panel_load_workflow post-dispatch fetch failure (#2106)", () => {
     expect(result.isError).toBe(true);
     expect(text).toContain("OUTCOME UNKNOWN");
     expect(text).toContain(`retry_of:"${DISPATCHED_RID}"`);
-    expect(sent).toEqual(["graph_load", "graph_serialize", "workflow_list"]);
+    expect(sent).toEqual(["graph_serialize", "graph_load", "graph_serialize", "workflow_list"]);
   });
 
   it("does not recover an old graph with the same UUID and node count", async () => {
@@ -131,7 +138,17 @@ describe("panel_load_workflow post-dispatch fetch failure (#2106)", () => {
     expect(result.isError).toBe(true);
     expect(text).toContain("OUTCOME UNKNOWN");
     expect(text).toContain(`retry_of:"${DISPATCHED_RID}"`);
-    expect(sent).toEqual(["graph_load", "graph_serialize"]);
+    expect(sent).toEqual(["graph_serialize", "graph_load", "graph_serialize"]);
+  });
+
+  it("keeps an identical pre-existing graph outcome-unknown because causality is unproven", async () => {
+    const { result, sent } = await load({ preExistingSame: true });
+    const text = textOf(result);
+
+    expect(result.isError).toBe(true);
+    expect(text).toContain("OUTCOME UNKNOWN");
+    expect(text).toContain(`retry_of:"${DISPATCHED_RID}"`);
+    expect(sent).toEqual(["graph_serialize", "graph_load"]);
   });
 
   it("does not reconcile or soften a genuine executor failure", async () => {
@@ -141,7 +158,7 @@ describe("panel_load_workflow post-dispatch fetch failure (#2106)", () => {
     expect(result.isError).toBe(true);
     expect(text).toContain("Unknown node type: MissingNode");
     expect(text).not.toContain("OUTCOME UNKNOWN");
-    expect(sent).toEqual(["graph_load"]);
+    expect(sent).toEqual(["graph_serialize", "graph_load"]);
   });
 
   it("does not call a mutation outcome-unknown when fetch failed before dispatch", async () => {
@@ -151,6 +168,6 @@ describe("panel_load_workflow post-dispatch fetch failure (#2106)", () => {
     expect(result.isError).toBe(true);
     expect(text).toBe("Error: Failed to fetch");
     expect(text).not.toContain("OUTCOME UNKNOWN");
-    expect(sent).toEqual(["graph_load"]);
+    expect(sent).toEqual(["graph_serialize", "graph_load"]);
   });
 });
