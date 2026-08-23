@@ -13733,6 +13733,15 @@ async function resolveGroupMutationTarget(
   const query = await ctx.call({ cmd: "graph_query", fields: "ids", limit: 1 }, 8000);
   if (query.isError) return { ok: false, result: query };
   const payload = parseToolResultJson(query);
+  if (payload?.groups_truncated === true) {
+    return {
+      ok: false,
+      result: fail(
+        `Cannot safely resolve group title "${ref}": the live groups index was truncated, so another matching title may be hidden. ` +
+          "Re-read with panel_graph_outline or use group_id with the exact id.",
+      ),
+    };
+  }
   const groups = payload?.groups;
   if (!Array.isArray(groups)) {
     return {

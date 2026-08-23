@@ -241,6 +241,20 @@ describe("#2108: group titles resolve consistently for edit, move, and remove", 
     expect(h.sent).toHaveLength(1);
     expect(res.content.map((c) => c.text).join(" ")).toContain("clipped");
   });
+
+  it("refuses a title against a truncated group index rather than guessing", async () => {
+    const h = harness({
+      graph_query: {
+        groups_truncated: true,
+        groups: [{ id: 4, title: "Notes" }],
+      },
+    });
+    const res = await callTool("panel_remove_group", { group: "notes" }, h.ctx);
+    expect(res.isError).toBe(true);
+    expect(h.sent).toHaveLength(1);
+    expect(res.content.map((c) => c.text).join(" ")).toContain("truncated");
+    expect(res.content.map((c) => c.text).join(" ")).toContain("hidden");
+  });
 });
 
 // ---------------------------------------------------------------------------
