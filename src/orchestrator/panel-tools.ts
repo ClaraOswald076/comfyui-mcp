@@ -5536,6 +5536,16 @@ async function refuseDaSiWaStackWrite(
 ): Promise<ToolResult | null> {
   if (widget !== DASIWA_STACK_WIDGET) return null;
 
+  try {
+    if (ctx.tabExpectedNodeTypeFenceCapability?.() !== true) {
+      return daSiWaIdentityRefusal(
+        "the bound panel does not advertise the atomic expected-node-type write fence; update the panel and hard-refresh",
+      );
+    }
+  } catch {
+    return daSiWaIdentityRefusal("the panel expected-node-type write fence could not be verified");
+  }
+
   const tabBefore = ctx.tabId;
   let identityBefore: { generation: number; tabSessionId: string } | undefined;
   try {
@@ -5599,6 +5609,16 @@ async function verifyDaSiWaStackWriteFence(
   ctx: PanelToolCtx,
   nodeId: unknown,
 ): Promise<ToolResult | { expectedNodeType: string } | null> {
+  try {
+    if (ctx.tabExpectedNodeTypeFenceCapability?.() !== true) {
+      return daSiWaIdentityRefusal(
+        "the bound panel does not advertise the atomic expected-node-type write fence; update the panel and hard-refresh",
+      );
+    }
+  } catch {
+    return daSiWaIdentityRefusal("the panel expected-node-type write fence could not be verified");
+  }
+
   const tabBefore = ctx.tabId;
   let identityBefore: { generation: number; tabSessionId: string } | undefined;
   try {
@@ -11035,6 +11055,10 @@ export interface PanelToolCtx {
    * Optional only for lightweight legacy test contexts.
    */
   tabCanMutateGraph?: () => boolean;
+  /** Whether the currently bound panel enforces graph_set_widget's optional
+   * expected_node_type at the synchronous mutation boundary. Real contexts
+   * provide this; omitted/false is a fail-closed answer for #2107. */
+  tabExpectedNodeTypeFenceCapability?: () => boolean;
   /**
    * The same question TRI-STATE, for code that must REPORT the answer rather than
    * gate on it. `tabCanMutateGraph` fails closed (an unreadable probe becomes
@@ -12432,6 +12456,8 @@ export function makePanelToolCtx(
   ctx.panelConnectionIdentity = panelConnectionIdentity;
   ctx.awaitPostRestartReachable = awaitPostRestartReachable;
   ctx.tabCanMutateGraph = () => bridge.tabCanMutateGraph(ctx.tabId);
+  ctx.tabExpectedNodeTypeFenceCapability = () =>
+    bridge.tabExpectedNodeTypeFenceCapability(ctx.tabId);
   ctx.tabGraphMutationCapability = () => bridge.tabGraphMutationCapability(ctx.tabId);
   return ctx;
 }

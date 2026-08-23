@@ -501,6 +501,7 @@ describe("panel-tools: panel_set_widget DaSiWa stack_data (#2107)", () => {
         }
         return identity;
       },
+      tabExpectedNodeTypeFenceCapability: () => true,
       call: async (cmd: Record<string, unknown>) => {
         cmds.push(String(cmd.cmd));
         calls.push(cmd);

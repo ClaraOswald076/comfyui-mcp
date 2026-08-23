@@ -211,6 +211,11 @@ interface Conn {
    * its required fresh-backend query yields to the browser, allowing a workflow
    * switch before it writes. Re-read per hello and fail closed if absent. */
   enforcesWorkflowStampAtWrite: boolean;
+  /** True only when THIS hello advertises that the panel validates an optional
+   * expected_node_type at the synchronous graph_set_widget write boundary.
+   * Re-read per hello and fail closed when absent: an older panel would silently
+   * ignore the field and leave the node-replacement fence unenforced. */
+  enforcesExpectedNodeTypeAtWrite: boolean;
   /** True when THIS hello advertises that the panel understands `agent_note` — a frame
    *  delivered to the AGENT ONLY and never rendered as a chat bubble.
    *
@@ -350,6 +355,9 @@ export const BRIDGE_CAPABILITY_MIN_PANEL_VERSION: Readonly<Record<string, string
   // handshake capabilities, not commands, hence this table.
   enforces_workflow_stamp: "0.11.30",
   enforces_workflow_stamp_at_write: "0.11.35",
+  // #2107 — graph_set_widget's optional expected_node_type fence shipped with
+  // the panel-side write-boundary check.
+  enforces_expected_node_type_at_write: "0.15.58",
 };
 
 /**
@@ -2919,6 +2927,8 @@ export class UiBridge {
             (msg as { enforces_workflow_stamp?: unknown }).enforces_workflow_stamp === true,
           enforcesWorkflowStampAtWrite:
             (msg as { enforces_workflow_stamp_at_write?: unknown }).enforces_workflow_stamp_at_write === true,
+          enforcesExpectedNodeTypeAtWrite:
+            (msg as { enforces_expected_node_type_at_write?: unknown }).enforces_expected_node_type_at_write === true,
           // Re-read per hello like the stamps above: a reconnect can be a different build.
           acceptsAgentNotes:
             (msg as { accepts_agent_notes?: unknown }).accepts_agent_notes === true,
@@ -3469,6 +3479,16 @@ export class UiBridge {
     // state to a human should use tabGraphMutationCapability instead — see below.
     const r = this.tabGraphMutationCapability(tabId);
     return r.known ? r.canMutate : false;
+  }
+
+  /** Whether THIS connected panel enforces graph_set_widget's optional
+   * expected-node-type fence at the actual mutation boundary (#2107). */
+  tabExpectedNodeTypeFenceCapability(tabId: string): boolean {
+    try {
+      return this.resolveTarget(tabId).enforcesExpectedNodeTypeAtWrite === true;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -4922,6 +4942,25 @@ export class UiBridge {
       panelVersionProvesUnsupported(cmd.cmd, conn.panelVersion)
     ) {
       return Promise.reject(buildPanelTooOldError(cmd.cmd, connPanelVersionReading(conn)));
+    }
+    // #2107 — an expected_node_type is meaningful only when the receiving panel
+    // checks it immediately before mutating. An old panel silently ignoring this
+    // optional field would reopen the node-replacement race, so never dispatch it
+    // without the matching hello capability.
+    if (
+      cmd.cmd === "graph_set_widget" &&
+      Object.prototype.hasOwnProperty.call(cmd, "expected_node_type") &&
+      !conn.enforcesExpectedNodeTypeAtWrite
+    ) {
+      const refusal = markDispatched(
+        new Error(
+          `graph_set_widget was refused before dispatch because panel tab ${conn.tabId} ` +
+            `does not advertise the atomic expected-node-type write fence. Update the ` +
+            `panel to 0.15.58+ and hard-refresh the browser tab.`,
+        ),
+        false,
+      );
+      return Promise.reject(markCapabilityRefusal(refusal));
     }
     // #570 P0c — FAIL CLOSED for a command that mutates the ACTIVE workflow/canvas (every
     // graph_* mutator, plus path-less workflow_save/save_as/rename/close) when the resolved
