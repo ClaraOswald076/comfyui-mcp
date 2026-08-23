@@ -138,6 +138,8 @@ function makeDeps(opts: {
   noUpstream?: boolean;
   /** Manager API dialect the probe reports ("unproven" -> undefined). Defaults to "legacy". */
   dialect?: "v2" | "v2-batch" | "legacy" | "unproven";
+  /** Result of the two-endpoint queue-availability probe when live counts are unreadable. */
+  managerQueueAvailability?: "available" | "absent" | "unreadable";
   /** Ignored-file collisions the fallback gate reports (default: none). */
   ignoredConflicts?: string[];
   /** When set, the Manager `update` mock throws this — the #771 direct path. */
@@ -218,6 +220,7 @@ function makeDeps(opts: {
       if (seq && i < seq.length) return seq[i];
       return { pending: 0, inProgress: 0, processing: false };
     },
+    probeManagerQueueAvailability: async () => opts.managerQueueAvailability ?? "available",
     gitWorktreeRoot: (dir) => {
       if (opts.gitRootError) throw new Error(opts.gitRootError);
       return opts.gitRoot ?? dir;
@@ -1045,6 +1048,46 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     expect(err).toBeInstanceOf(PanelInstallError);
     expect(String(err?.message ?? err)).not.toMatch(/already at the upstream tip/);
     // The git fallback must NOT fire on a movement state it cannot prove.
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("confirmed Manager absence permits the guarded git fallback", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateThrows: "ComfyUI-Manager queue status returned 404",
+      // The count read is unreadable because Manager is absent; the separate
+      // probe proves that BOTH dialect endpoints returned 404.
+      liveQueue: [undefined, undefined],
+      managerQueueAvailability: "absent",
+      upstreamRev: REV_B,
+      onGitPull: ({ files, revs }) => {
+        files[pyPath] = pyproject(PANEL_REGISTRY_ID, "0.11.35");
+        revs[dir] = REV_B;
+        return "Updating aaaaaaaa..bbbbbbbb\nFast-forward";
+      },
+    });
+    const r = await runPanelAction("update", h.deps);
+    expect(h.updates).toEqual([{ id: PANEL_REGISTRY_ID }]);
+    expect(h.gitPulls).toEqual([dir]);
+    expect(r.installedVersion).toBe("0.11.35");
+  });
+
+  it("an unreadable Manager probe still refuses the git fallback", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateThrows: "ComfyUI-Manager queue status timed out",
+      liveQueue: [undefined],
+      managerQueueAvailability: "unreadable",
+      upstreamRev: REV_B,
+      onGitPull: () => "Updating aaaaaaaa..bbbbbbbb\nFast-forward",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/could not be read at all/);
     expect(h.gitPulls).toEqual([]);
   });
 

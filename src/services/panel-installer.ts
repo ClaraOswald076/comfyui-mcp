@@ -38,7 +38,7 @@ import {
 } from "node:fs";
 import { createHash } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { config, isLocalMode } from "../config.js";
+import { config, getComfyUIBaseUrl, isLocalMode } from "../config.js";
 import { logger } from "../utils/logger.js";
 import { parsePyproject } from "./node-authoring.js";
 import {
@@ -48,6 +48,8 @@ import {
   nonInteractiveGitEnv,
   type NodeOpResult,
   type ManagerTaskHistoryEntry,
+  type ManagerQueueAvailability,
+  probeManagerQueueAvailability as probeManagerQueueAvailabilityOnHost,
 } from "./node-management.js";
 import { getSystemStats } from "../comfyui/client.js";
 import {
@@ -292,6 +294,17 @@ export interface PanelInstallerDeps {
    * the real fetchManagerQueueCounts; tests stub it.
    */
   fetchLiveQueueCounts?: ((base?: string) => Promise<LiveQueueCounts | undefined>) | undefined;
+  /**
+   * Distinguish a confirmed Manager absence from an unreadable queue. `absent`
+   * is returned only when both queue/status dialects answered HTTP 404 on the
+   * same captured ComfyUI base; timeout, malformed, 5xx, auth, and mixed
+   * responses remain `unreadable` and refuse a direct git mutation.
+   */
+  probeManagerQueueAvailability?:
+    | ((base?: string) => Promise<ManagerQueueAvailability>)
+    | undefined;
+  /** Capture the Manager base before an update call that may throw without a result. */
+  managerBase?: (() => string) | undefined;
   /**
    * #1999 — look up ONE Manager task by the exact `ui_id` it was enqueued
    * under. Manager v4 keeps a per-task record (result + a structured
@@ -602,6 +615,7 @@ export function gitIgnoredPullConflicts(dir: string, upstreamRev: string): strin
 
 export const defaultDeps: PanelInstallerDeps = {
   isLocalMode: () => isLocalMode(),
+  managerBase: () => getComfyUIBaseUrl(),
   // #766/#769 — LIVE-FIRST. The panel is not a file the user reads; it is a web
   // extension the RUNNING ComfyUI serves to the browser tab, so the only
   // custom_nodes that can matter is the one belonging to the server we are
@@ -2275,13 +2289,51 @@ async function readLiveQueueCounts(
   }
 }
 
+/** A queue observation that can safely authorize a direct git fallback. */
+type LiveQueueObservation = LiveQueueCounts | { managerAbsent: true };
+
+/**
+ * A missing queue count is normally an unreadable queue and must refuse. The
+ * one safe exception is a probe that saw HTTP 404 from BOTH Manager dialects on
+ * this same base: there is no Manager queue that could be writing the checkout.
+ * Injected test deps without the probe stay fail-closed; production deps carry
+ * the real probe through the default dependency set.
+ */
+async function readLiveQueueObservation(
+  deps: PanelInstallerDeps,
+  base: string | undefined,
+): Promise<LiveQueueObservation | undefined> {
+  const live = await readLiveQueueCounts(deps, base);
+  if (live) return live;
+  try {
+    let availability: ManagerQueueAvailability;
+    if (deps.probeManagerQueueAvailability) {
+      availability = await deps.probeManagerQueueAvailability(base);
+    } else if (isRealDeps(deps)) {
+      availability = await probeManagerQueueAvailabilityOnHost(base);
+    } else {
+      return undefined;
+    }
+    return availability === "absent" ? { managerAbsent: true } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** True only when the probe SUCCEEDED and every live indicator reports clear. */
-function isLiveQueueIdle(c: LiveQueueCounts | undefined): boolean {
-  return !!c && c.pending === 0 && c.inProgress === 0 && c.processing === false;
+function isLiveQueueIdle(c: LiveQueueObservation | undefined): boolean {
+  return (
+    !!c &&
+    ("managerAbsent" in c ||
+      (c.pending === 0 && c.inProgress === 0 && c.processing === false))
+  );
 }
 
 /** Render a live probe for a message — including the "no answer at all" case. */
-function describeLiveQueue(c: LiveQueueCounts | undefined): string {
+function describeLiveQueue(c: LiveQueueObservation | undefined): string {
+  if (c && "managerAbsent" in c) {
+    return `ComfyUI-Manager is confirmed absent (both queue/status endpoints returned HTTP 404)`;
+  }
   return c
     ? `pending=${c.pending}, in_progress=${c.inProgress}, is_processing=${c.processing}`
     : `the live queue could not be read at all`;
@@ -3049,7 +3101,7 @@ async function updateViaGitCheckoutFallback(opts: {
   // Each pre-merge check refuses BEFORE any mutation, so its own failure is
   // free — the guard cannot itself damage the tree it is protecting.
   {
-    const live = await readLiveQueueCounts(deps, managerBase);
+    const live = await readLiveQueueObservation(deps, managerBase);
     if (!isLiveQueueIdle(live)) {
       throw new PanelInstallError(
         `Panel update did NOT apply: ${managerReason}, and the git fallback is ` +
@@ -3256,7 +3308,7 @@ async function updateViaGitCheckoutFallback(opts: {
     );
   }
   {
-    const live = await readLiveQueueCounts(deps, managerBase);
+    const live = await readLiveQueueObservation(deps, managerBase);
     if (!isLiveQueueIdle(live)) {
       throw new PanelInstallError(
         `Could not verify the panel update: the pinned fast-forward ALREADY RAN ` +
@@ -5737,6 +5789,16 @@ async function runPanelActionCore(
     // to propagate when the disk AGREES the pack is absent — then the message
     // is true and there is genuinely nothing to update.
     assertSameTarget("before the ComfyUI-Manager update");
+    // updateCustomNode captures this same base before its first await, but a
+    // Manager-absent failure has no NodeOpResult to carry it back. Capture it
+    // here too so the absence probe cannot silently drift to a different
+    // configured ComfyUI while this operation is in flight.
+    let managerBaseForFailure: string | undefined;
+    try {
+      managerBaseForFailure = deps.managerBase?.();
+    } catch {
+      managerBaseForFailure = undefined;
+    }
     let result: NodeOpResult | undefined;
     let managerFailure: string | undefined;
     try {
@@ -5916,11 +5978,11 @@ async function runPanelActionCore(
           // The Manager errored on its OWN pack list, not on its queue — and
           // an erroring Manager is no less likely to have a task writing to
           // this checkout, so the merge is bracketed here exactly as it is
-          // everywhere else. There is no observed base to pin to on this path
-          // (the call threw before returning one), so the re-probe resolves the
-          // configured Manager; the assertSameTarget checks around the mutation
-          // are what catch a retarget in the meantime.
-          managerBase: undefined,
+          // everywhere else. The base was captured immediately before the
+          // Manager call even though the thrown path has no NodeOpResult to
+          // carry it back; the assertSameTarget checks around the mutation
+          // still catch a local retarget in the meantime.
+          managerBase: managerBaseForFailure,
           // Synthesize the shape the fallback reports around; there is no real
           // Manager result because the Manager call failed.
           result: {
