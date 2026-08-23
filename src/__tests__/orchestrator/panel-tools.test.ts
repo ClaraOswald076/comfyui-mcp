@@ -6853,6 +6853,9 @@ describe("panel-tools: panel_run scoped-run stamp-race retry (#772)", () => {
     "run-to-node scope for node 650 was NOT applied: the workflow graph CHANGED after the run " +
     "was queued - the deferred dispatch would render a modified workflow, not the one that was " +
     "scoped. Nothing was queued - refusing to fall through to a full-graph execution (#556).";
+  const SEED_RACE =
+    "differing entry node 53 seed: 449267357935865\n" +
+    RACE;
 
   /** A ctx whose graph_run replies are scripted per attempt. A reply of
    *  `{__error}` is an isError ToolResult; `{__throw}` makes ctx.call THROW. */
@@ -6901,6 +6904,38 @@ describe("panel-tools: panel_run scoped-run stamp-race retry (#772)", () => {
     expect(runs[1]).toMatchObject({ batch_count: 3 }); // the batch is preserved, not dropped
     expect(runText(res)).not.toMatch(/Exactly one render/i);
     expect(runText(res)).toMatch(/queued once, not twice/);
+  });
+
+  it("allows one bounded extra retry for a repeated seed stamp race (#2120)", async () => {
+    const { ctx, runs } = runCtx([
+      { error: SEED_RACE },
+      { error: SEED_RACE },
+      { queued: true, prompt_id: "p-fixed-seed" },
+    ]);
+    const res = await defByName("panel_run").handler({ to_node_id: 650, batch_count: 2 }, ctx);
+
+    expect(res.isError).toBeFalsy();
+    expect(runs).toHaveLength(3);
+    expect(runs[1]).toMatchObject({ cmd: "graph_run", to_node_id: 650, batch_count: 2 });
+    expect(runs[2]).toMatchObject({ cmd: "graph_run", to_node_id: 650, batch_count: 2 });
+    expect(runText(res)).toMatch(/first 2 dispatches.*certified to have queued NOTHING/i);
+    expect(runText(res)).toMatch(/re-issued 2 times/);
+  });
+
+  it("caps the seed-race recovery at two retries", async () => {
+    const { ctx, runs } = runCtx([
+      { error: SEED_RACE },
+      { error: SEED_RACE },
+      { error: SEED_RACE },
+      { queued: true, prompt_id: "must-not-dispatch" },
+    ]);
+    const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(runs).toHaveLength(3);
+    expect(runText(res)).toMatch(/first 2 dispatches definitely queued nothing/i);
+    expect(runText(res)).toMatch(/dispatch 3/);
+    expect(runText(res)).not.toContain("must-not-dispatch");
   });
 
   // #1050 — the re-issue used to fire in the SAME tick as the refusal, so it
@@ -6985,6 +7020,58 @@ describe("panel-tools: panel_run scoped-run stamp-race retry (#772)", () => {
       expect(text).toMatch(/still changing under the run/);
       // …and the certified fact is unchanged.
       expect(text).toMatch(/first dispatch definitely queued nothing/);
+    });
+
+    it("preserves a transport result from the safe retry and never spends a third attempt", async () => {
+      const transport =
+        'send error to http://127.0.0.1:9198/orchestrator::codex; retry_of:"rid-seed-retry"';
+      const { ctx, runs } = runCtx([
+        { error: SEED_RACE },
+        { __error: transport },
+        { queued: true, prompt_id: "must-not-dispatch" },
+      ]);
+      const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+
+      expect(res.isError).toBe(true);
+      expect(runs).toHaveLength(2);
+      expect(runText(res)).toContain(transport);
+      expect(runText(res)).toMatch(/the first dispatch definitely queued nothing/i);
+      expect(runText(res)).not.toContain("must-not-dispatch");
+    });
+
+    it("keeps the bridge retry token when late-receipt transport fails after the retry answered", async () => {
+      __panelToolsTestHooks.setRunLateAckGraceMs(0);
+      let graphRuns = 0;
+      const bridge = {
+        send: async (
+          cmd: Record<string, unknown>,
+          opts?: { onDispatchedRid?: (rid: string) => void },
+        ) => {
+          if (cmd.cmd !== "graph_run") return {};
+          graphRuns += 1;
+          opts?.onDispatchedRid?.(`rid-${graphRuns}`);
+          if (graphRuns === 1) return { error: SEED_RACE };
+          throw markReplyTimeout(new Error("panel reply transport failed"));
+        },
+        peekLateMutation: () => {
+          throw new Error("late receipt transport failed");
+        },
+        takeLateMutation: () => undefined,
+      } as unknown as PanelToolCtx["bridge"];
+      try {
+        const res = await defByName("panel_run").handler(
+          { to_node_id: 650 },
+          makePanelToolCtx(bridge, "test-tab"),
+        );
+
+        expect(res.isError).toBe(true);
+        expect(graphRuns).toBe(2);
+        expect(runText(res)).toMatch(/retry_of:"rid-2"/);
+        expect(runText(res)).toMatch(/result is preserved/i);
+        expect(runText(res)).toContain("late receipt transport failed");
+      } finally {
+        __panelToolsTestHooks.setRunLateAckGraceMs(null);
+      }
     });
 
     // The pause must not apply to rejections that are NOT the certified race —
@@ -7156,6 +7243,13 @@ describe("panel-tools: panel_run scoped-run stamp-race retry (#772)", () => {
     expect(__panelRunTestHooks.isRetryableRunToNodeStampRace(errored, race)).toBe(false);
     expect(__panelRunTestHooks.isRetryableRunToNodeStampRace(queued, race)).toBe(false);
     expect(__panelRunTestHooks.isRetryableRunToNodeStampRace(unparseable, race)).toBe(false);
+    expect(__panelRunTestHooks.isSeedRunToNodeStampRace(answered, race)).toBe(false);
+    expect(
+      __panelRunTestHooks.isSeedRunToNodeStampRace(
+        { content: [{ type: "text", text: JSON.stringify({ error: SEED_RACE }) }] },
+        { content: [{ type: "text", text: SEED_RACE }] },
+      ),
+    ).toBe(true);
   });
 });
 

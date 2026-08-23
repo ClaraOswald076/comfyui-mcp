@@ -6808,10 +6808,26 @@ function isRetryableRunToNodeStampRace(res: ToolResult, rejection: ToolResult): 
   );
 }
 
+/**
+ * #2120 — an older panel can decorate a fixed seed while it builds the deferred
+ * run prompt. That can make the same scoped run hit the certified stamp race more
+ * than once. The panel still has to identify the changed entry as a seed; this is
+ * deliberately narrower than allowing an arbitrary third dispatch.
+ */
+const MAX_SCOPED_STAMP_RACE_RETRIES = 2;
+
+function isSeedRunToNodeStampRace(res: ToolResult, rejection: ToolResult): boolean {
+  return (
+    isRetryableRunToNodeStampRace(res, rejection) &&
+    /\bdiffering\b[\s\S]{0,160}\bseed\b/i.test(toolResultText(rejection))
+  );
+}
+
 export const __panelRunTestHooks = {
   detectRunRejection,
   formatRunRejection,
   isRetryableRunToNodeStampRace,
+  isSeedRunToNodeStampRace,
   describeDroppedOutputs,
 };
 
@@ -15872,17 +15888,27 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // "you'll be notified automatically" guidance. Only a genuine queue
         // gets the anti-poll note below.
         let rejection = detectRunRejection(res);
-        // #772 — ONE re-issue, and only for the scoped-run stamp race the panel
-        // explicitly certifies as not-queued. Gated on OUR OWN args (this really was a
-        // scoped run) and on the panel having ANSWERED, so an unknown outcome is never
-        // retried. Exactly once: a second race is surfaced, never re-raced.
+        // #772/#2120 — re-issue only the scoped-run stamp race the panel explicitly
+        // certifies as not-queued. Gated on OUR OWN args (this really was a scoped run)
+        // and on the panel having ANSWERED, so an unknown outcome is never retried.
+        // The ordinary race gets one re-issue. A repeated race gets ONE additional
+        // chance only when the panel names a differing seed entry — the fixed-seed
+        // decoration race reported in #2120. Every attempt still passes the panel's
+        // graph-stamp check independently; this is not a bypass or a blind mutation
+        // retry.
         let scopeRebuilt = false;
-        if (
+        let scopeRetryCount = 0;
+        while (
           rejection &&
           typeof args.to_node_id === "number" &&
-          isRetryableRunToNodeStampRace(res, rejection)
+          isRetryableRunToNodeStampRace(res, rejection) &&
+          (scopeRetryCount === 0 ||
+            (scopeRetryCount < MAX_SCOPED_STAMP_RACE_RETRIES &&
+              isSeedRunToNodeStampRace(res, rejection)))
         ) {
           scopeRebuilt = true;
+          scopeRetryCount += 1;
+          let retryResultReceived = false;
           try {
             // #1050 — SETTLE before re-issuing. The panel refuses this race when the
             // graph changed between dispatch and apply, and re-dispatching in the
@@ -15904,6 +15930,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             // prompt id rather than allowing that stale arm to be synthesized (#2021).
             runDispatchedAt = Date.now();
             res = await ctx.call(runCmd, 20000, observeRunRid);
+            retryResultReceived = true;
             // #1175 — the re-issue can miss its window exactly as the first
             // dispatch can, and this is the one whose outcome is genuinely open
             // (the first was CERTIFIED to have queued nothing). Reconcile it on
@@ -15911,18 +15938,43 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             await reconcileRun();
             rejection = detectRunRejection(res);
           } catch (err) {
+            // A bridge/late-receipt failure after ctx.call already returned must not
+            // erase the retry's own result (notably its retry_of token). Preserve it
+            // verbatim and stop: no further dispatch is justified by a failed local
+            // reconciliation step.
+            if (retryResultReceived) {
+              return appendToolResultText(
+                res,
+                `\n\n(Dispatch history: the retry dispatch returned the result above, but local ` +
+                  `late-ack reconciliation failed before this handler could finish ` +
+                  `interpreting it. That result is preserved and no further dispatch was ` +
+                  `made. Do not infer an additional queue entry from the reconciliation ` +
+                  `failure alone. (${err instanceof Error ? err.message : String(err)})`,
+              );
+            }
             // ctx.call settles every panel/transport failure into a ToolResult and does
             // not throw today — but this await is the one point where a throw would
-            // DESTROY evidence we already hold: that the first dispatch was certified
-            // not-queued, and that a second dispatch went out whose outcome is now
-            // unknown. Propagating the raw throw would lose both and invite a third
-            // dispatch. Report what we observed, claim nothing we did not.
+            // DESTROY evidence we already hold: that every prior dispatch was
+            // certified not-queued, and that this dispatch went out whose outcome is
+            // now unknown. Propagating the raw throw would lose both and invite a
+            // blind dispatch. Report what we observed, claim nothing we did not.
+            if (scopeRetryCount === 1) {
+              return fail(
+                `panel_run re-issued the scoped run after the panel's certified run-to-node ` +
+                  `stamp race, and that SECOND dispatch failed before any reply could be read — ` +
+                  `its outcome is UNKNOWN and it may have queued a render. The FIRST dispatch was ` +
+                  `certified by the panel to have queued nothing. Do NOT re-run blindly: check the ` +
+                  `queue (action:"list") or get_history before deciding. (${err instanceof Error ? err.message : String(err)})`,
+              );
+            }
             return fail(
-              `panel_run re-issued the scoped run after the panel's certified run-to-node ` +
-                `stamp race, and that SECOND dispatch failed before any reply could be read — ` +
-                `its outcome is UNKNOWN and it may have queued a render. The FIRST dispatch was ` +
-                `certified by the panel to have queued nothing. Do NOT re-run blindly: check the ` +
-                `queue (action:"list") or get_history before deciding. (${err instanceof Error ? err.message : String(err)})`,
+              `panel_run re-issued the scoped run ${scopeRetryCount} times after the panel ` +
+                `certified each prior run-to-node stamp race as not-queued, and the ` +
+                `dispatch ${scopeRetryCount + 1} failed before any reply could be read — ` +
+                `its outcome is UNKNOWN and it may have queued a render. The first ` +
+                `${scopeRetryCount} dispatches were certified by the panel to have queued ` +
+                `nothing. Do NOT re-run blindly: check the queue (action:"list") or ` +
+                `get_history before deciding. (${err instanceof Error ? err.message : String(err)})`,
             );
           }
         }
@@ -15942,14 +15994,24 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             return lateAckNote ? appendToolResultText(rejection, lateAckNote) : rejection;
           return appendToolResultText(
             rejection,
-            `\n\n(Dispatch history: the first graph_run was refused by the panel's run-to-node ` +
-              `graph-stamp race, which CERTIFIED that nothing was queued, so the scoped run was ` +
-              `re-issued exactly once — after a short pause to let pending graph edits land ` +
-              `(#1050). The failure above is that SECOND dispatch; it was not retried again. ` +
-              `Judge whether anything was queued from that message alone — the first dispatch ` +
-              `definitely queued nothing. Racing AGAIN after the pause means the graph is still ` +
-              `changing under the run: let the canvas settle, then re-run.)` +
-              lateAckNote,
+            scopeRetryCount === 1
+              ? `\n\n(Dispatch history: the first graph_run was refused by the panel's run-to-node ` +
+                `graph-stamp race, which CERTIFIED that nothing was queued, so the scoped run was ` +
+                `re-issued exactly once — after a short pause to let pending graph edits land ` +
+                `(#1050). The failure above is that SECOND dispatch; it was not retried again. ` +
+                `Judge whether anything was queued from that message alone — the first dispatch ` +
+                `definitely queued nothing. Racing AGAIN after the pause means the graph is still ` +
+                `changing under the run: let the canvas settle, then re-run.)` +
+                lateAckNote
+              : `\n\n(Dispatch history: the first ${scopeRetryCount} graph_run dispatches were each ` +
+                `refused by the panel's run-to-node graph-stamp race, and each CERTIFIED ` +
+                `that nothing was queued. The scoped run was re-issued ${scopeRetryCount} ` +
+                `times after short pauses to let pending graph edits land (#1050). The ` +
+                `failure above is dispatch ${scopeRetryCount + 1}; it was not retried again. ` +
+                `Judge whether anything was queued from that message alone — the first ` +
+                `${scopeRetryCount} dispatches definitely queued nothing. Let the canvas ` +
+                `settle, then re-run.)` +
+                lateAckNote,
           );
         }
         // Attribute this genuine queue to ourselves so a later panel_run in the
@@ -16081,22 +16143,29 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // clear_pending remedy that would wipe the user's whole batch (#559). A
         // genuinely stalled render is caught by the turn-start stall notice, which
         // does the staleness gating and keeps the interrupt guidance.
-        // #772 — never report a dispatch history the caller did not see. When the scoped
-        // run only queued on the SECOND dispatch, say so, so the agent does not read the
-        // earlier refusal (if it surfaces in a log) as a separate queued job.
+        // #772/#2120 — never report a dispatch history the caller did not see. Say
+        // exactly which earlier dispatches were certified clean, so the agent does
+        // not read a refusal (if it surfaces in a log) as a separate queued job.
         //
         // It says only what was OBSERVED (codex gate). An earlier draft said "exactly one
         // render was queued" — but `batch_count` is "times to queue", so a successful
         // dispatch can enqueue several, and the panel reports one prompt id, not a count.
-        // The certified fact is about DISPATCHES, not renders: the first queued nothing,
-        // so everything in the queue came from the second. State that and stop.
-        const retryNote = scopeRebuilt
-          ? "\n\n[NOTE] The first dispatch of this scoped run was refused by the panel's run-to-node " +
-            "graph-stamp race (the graph changed between dispatch and apply); the panel certified that " +
-            "nothing was queued, so the scope was rebuilt and re-issued once, and THAT is the run above. " +
-            "The first dispatch contributed NOTHING to the queue, so whatever this run queued was " +
-            "queued once, not twice."
-          : "";
+        // The certified fact is about DISPATCHES, not renders: the prior dispatches
+        // queued nothing, so everything in the queue came from the final dispatch.
+        const retryNote =
+          scopeRetryCount === 0
+            ? ""
+            : scopeRetryCount === 1
+              ? "\n\n[NOTE] The first dispatch of this scoped run was refused by the panel's run-to-node " +
+                "graph-stamp race (the graph changed between dispatch and apply); the panel certified that " +
+                "nothing was queued, so the scope was rebuilt and re-issued once, and THAT is the run above. " +
+                "The first dispatch contributed NOTHING to the queue, so whatever this run queued was " +
+                "queued once, not twice."
+              : `\n\n[NOTE] The first ${scopeRetryCount} dispatches of this scoped run were refused by the ` +
+                `panel's run-to-node graph-stamp race (the graph changed between dispatch and apply), ` +
+                `and each was certified to have queued NOTHING. The scope was rebuilt and re-issued ` +
+                `${scopeRetryCount} times, and THAT is the run above. Whatever this run queued came ` +
+                `from the final dispatch; the earlier dispatches contributed NOTHING to the queue.`;
         let warn = "";
         if (pre.connected && pre.running) {
           const pending = Math.max(0, pre.queueDepth - 1);
