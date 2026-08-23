@@ -5311,6 +5311,9 @@ const ANIMA_REGIONAL_WIRED_PROMPT_INPUT: Record<string, string> = {
   negative_prompt: "negative_prompt_in",
 };
 
+const DASIWA_STACK_WIDGET = "stack_data";
+const DASIWA_LTX2_LORA_LOADER = "DaSiWa_LTX2LoraLoader";
+
 function isAnimaRegionalPromptWidget(widget: string): boolean {
   return ANIMA_REGIONAL_PROMPT_WIDGETS.has(widget);
 }
@@ -5348,6 +5351,110 @@ function parseQueriedNodeType(payload: Record<string, unknown> | null): string |
   return null;
 }
 
+type QueriedNodeIdentity = { id: string; type: string };
+
+function canonicalQueriedNodeId(value: unknown): string | null {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) ? String(value) : null;
+  }
+  if (typeof value !== "string" || !NODE_ID_PATTERN.test(value)) return null;
+  const normalized = normalizeNodeId(value);
+  return typeof normalized === "number" && !Number.isSafeInteger(normalized)
+    ? null
+    : String(normalized);
+}
+
+function parseQueriedNodeIdentityRow(row: unknown): QueriedNodeIdentity | null {
+  if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+  const record = row as Record<string, unknown>;
+  const id = canonicalQueriedNodeId(record.id);
+  if (!id) return null;
+
+  const type = record.type;
+  const classType = record.class_type;
+  if (type !== undefined && typeof type !== "string") return null;
+  if (classType !== undefined && typeof classType !== "string") return null;
+  if (typeof type === "string" && typeof classType === "string" && type !== classType) {
+    return null;
+  }
+  const resolvedType = typeof type === "string" ? type : classType;
+  return resolvedType ? { id, type: resolvedType } : null;
+}
+
+/** Strict identity parser for the DaSiWa refusal gate. Unlike the older type-only
+ * parser above, this accepts exactly one non-truncated row and authenticates its id. */
+function parseVerifiedQueriedNodeIdentity(
+  payload: Record<string, unknown> | null,
+): QueriedNodeIdentity | null {
+  if (!payload) return null;
+  if (
+    Object.prototype.hasOwnProperty.call(payload, "truncated") &&
+    payload.truncated !== false
+  ) {
+    return null;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(payload, "nodes")) {
+    return Array.isArray(payload.nodes) && payload.nodes.length === 1
+      ? parseQueriedNodeIdentityRow(payload.nodes[0])
+      : null;
+  }
+
+  if (typeof payload.text !== "string") return null;
+  const rows: QueriedNodeIdentity[] = [];
+  const lines = payload.text.split(/\r?\n/);
+  for (const [index, line] of lines.entries()) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    // The live compact projection always prefixes its rows with this bounded summary.
+    // Keep the grammar narrow so arbitrary prose cannot make an unverified row usable,
+    // while accepting the documented header that older tests and panels may omit.
+    if (
+      index === 0 &&
+      /^\d+ match\(es\) of \d+ in scope \(viewing: \d+ nodes\)(?: · traversal depth≤-?\d+)?$/.test(
+        trimmed,
+      )
+    ) {
+      continue;
+    }
+    // A compact row may be followed by one of the panel's bounded clipping notes or
+    // truncation remedies. They do not identify nodes and are ignored only after a row
+    // has been authenticated below.
+    if (
+      rows.length > 0 &&
+      (/^\(\d+ widget value\(s\) clipped to \d+ chars/.test(trimmed) ||
+        /^… truncated at \d+ of \d+/.test(trimmed))
+    ) {
+      continue;
+    }
+
+    if (trimmed.startsWith("#")) {
+      const compact = trimmed.match(/^#(\S+)\s+(\S+)(?:\s|$)/);
+      if (!compact) return null;
+      const id = canonicalQueriedNodeId(compact[1]);
+      if (!id) return null;
+      rows.push({ id, type: compact[2] });
+      continue;
+    }
+
+    if (trimmed.startsWith("{")) {
+      let row: unknown;
+      try {
+        row = JSON.parse(trimmed);
+      } catch {
+        return null;
+      }
+      const parsed = parseQueriedNodeIdentityRow(row);
+      if (!parsed) return null;
+      rows.push(parsed);
+      continue;
+    }
+    return null;
+  }
+  return rows.length === 1 ? rows[0] : null;
+}
+
 function animaRegionalPromptRefusal(type: string, widget: string): ToolResult {
   const wired = ANIMA_REGIONAL_WIRED_PROMPT_INPUT[widget];
   const route = wired
@@ -5380,6 +5487,193 @@ async function refuseAnimaRegionalPromptWrite(
   const type = parseQueriedNodeType(parseToolResultJson(probe));
   if (!type || !ANIMA_REGIONAL_CANVAS_TYPES.has(type)) return null;
   return animaRegionalPromptRefusal(type, widget);
+}
+
+function daSiWaStackRefusal(type: string): ToolResult {
+  return fail(
+    `panel_set_widget cannot set "${DASIWA_STACK_WIDGET}" on ${type}. ` +
+      `The node's custom multi-row widget owns the LoRA stack in its internal JS state and ` +
+      `re-serializes that state over widget.value, so the normal graph_set_widget success ` +
+      `echo would be a false success. Edit the stack rows in the node UI instead; do not retry ` +
+      `panel_set_widget for this widget.`,
+  );
+}
+
+function daSiWaIdentityRefusal(reason: string): ToolResult {
+  return fail(
+    `panel_set_widget refused "${DASIWA_STACK_WIDGET}" because the panel probe could not ` +
+      `prove the requested node is the intended ${DASIWA_LTX2_LORA_LOADER} (${reason}). ` +
+      `No graph_set_widget was dispatched. Edit the stack rows in the node UI instead; ` +
+      `do not retry this write until the node identity can be read exactly.`,
+  );
+}
+
+function isUsablePanelConnectionIdentity(
+  identity: { generation: number; tabSessionId: string } | undefined,
+): identity is { generation: number; tabSessionId: string } {
+  return (
+    !!identity &&
+    Number.isSafeInteger(identity.generation) &&
+    typeof identity.tabSessionId === "string" &&
+    identity.tabSessionId.length > 0
+  );
+}
+
+function samePanelConnectionIdentity(
+  left: { generation: number; tabSessionId: string },
+  right: { generation: number; tabSessionId: string },
+): boolean {
+  return left.generation === right.generation && left.tabSessionId === right.tabSessionId;
+}
+
+/** Refuse the DaSiWa stack widget whose custom UI deterministically overwrites a
+ *  graph_set_widget write after acknowledging it. This gate fails closed unless
+ *  the probe proves the requested node and remains bound to the same panel tab. */
+async function refuseDaSiWaStackWrite(
+  ctx: PanelToolCtx,
+  nodeId: unknown,
+  widget: string,
+): Promise<ToolResult | null> {
+  if (widget !== DASIWA_STACK_WIDGET) return null;
+
+  try {
+    if (ctx.tabExpectedNodeTypeFenceCapability?.() !== true) {
+      return daSiWaIdentityRefusal(
+        "the bound panel does not advertise the atomic expected-node-type write fence; update the panel and hard-refresh",
+      );
+    }
+  } catch {
+    return daSiWaIdentityRefusal("the panel expected-node-type write fence could not be verified");
+  }
+
+  const tabBefore = ctx.tabId;
+  let identityBefore: { generation: number; tabSessionId: string } | undefined;
+  try {
+    identityBefore = ctx.panelConnectionIdentity?.();
+  } catch {
+    return daSiWaIdentityRefusal("the bound browser-tab identity was unreadable");
+  }
+  if (!isUsablePanelConnectionIdentity(identityBefore)) {
+    return daSiWaIdentityRefusal("the bound browser-tab identity was unavailable");
+  }
+
+  let probe: ToolResult;
+  try {
+    probe = await ctx.call({
+      cmd: "graph_query",
+      ids: [nodeId],
+      fields: "compact",
+      limit: 1,
+    });
+  } catch {
+    return daSiWaIdentityRefusal("the graph_query probe failed before identity could be verified");
+  }
+
+  if (ctx.tabId !== tabBefore) {
+    return daSiWaIdentityRefusal("the probe was answered by a different panel tab");
+  }
+  let identityAfter: { generation: number; tabSessionId: string } | undefined;
+  try {
+    identityAfter = ctx.panelConnectionIdentity?.();
+  } catch {
+    return daSiWaIdentityRefusal("the panel-tab identity became unreadable after the probe");
+  }
+  if (!isUsablePanelConnectionIdentity(identityAfter)) {
+    return daSiWaIdentityRefusal("the panel-tab identity became unavailable after the probe");
+  }
+  if (!samePanelConnectionIdentity(identityBefore, identityAfter)) {
+    return daSiWaIdentityRefusal("the panel-tab connection changed during the probe");
+  }
+  if (probe.isError) {
+    return daSiWaIdentityRefusal("the graph_query probe returned an error");
+  }
+
+  const identity = parseVerifiedQueriedNodeIdentity(parseToolResultJson(probe));
+  const requestedId = canonicalQueriedNodeId(nodeId);
+  if (!identity || !requestedId) {
+    return daSiWaIdentityRefusal(
+      "the graph_query reply was malformed, truncated, or did not contain exactly one verifiable row",
+    );
+  }
+  if (identity.id !== requestedId) {
+    return daSiWaIdentityRefusal("the graph_query row identified a different node_id");
+  }
+  if (identity.type !== DASIWA_LTX2_LORA_LOADER) return null;
+  return daSiWaStackRefusal(identity.type);
+}
+
+/** Recheck the target immediately before a stack_data mutation. The first probe
+ *  prevents the known refusal from dispatching; this final fence catches a tab
+ *  reconnect or node replacement observed between that probe and graph_set_widget. */
+async function verifyDaSiWaStackWriteFence(
+  ctx: PanelToolCtx,
+  nodeId: unknown,
+): Promise<ToolResult | { expectedNodeType: string } | null> {
+  try {
+    if (ctx.tabExpectedNodeTypeFenceCapability?.() !== true) {
+      return daSiWaIdentityRefusal(
+        "the bound panel does not advertise the atomic expected-node-type write fence; update the panel and hard-refresh",
+      );
+    }
+  } catch {
+    return daSiWaIdentityRefusal("the panel expected-node-type write fence could not be verified");
+  }
+
+  const tabBefore = ctx.tabId;
+  let identityBefore: { generation: number; tabSessionId: string } | undefined;
+  try {
+    identityBefore = ctx.panelConnectionIdentity?.();
+  } catch {
+    return daSiWaIdentityRefusal("the bound browser-tab identity was unreadable before dispatch");
+  }
+  if (!isUsablePanelConnectionIdentity(identityBefore)) {
+    return daSiWaIdentityRefusal("the bound browser-tab identity was unavailable before dispatch");
+  }
+
+  let probe: ToolResult;
+  try {
+    probe = await ctx.call({
+      cmd: "graph_query",
+      ids: [nodeId],
+      fields: "compact",
+      limit: 1,
+    });
+  } catch {
+    return daSiWaIdentityRefusal("the final graph_query fence failed before dispatch");
+  }
+  if (ctx.tabId !== tabBefore) {
+    return daSiWaIdentityRefusal("the final fence was answered by a different panel tab");
+  }
+
+  let identityAfter: { generation: number; tabSessionId: string } | undefined;
+  try {
+    identityAfter = ctx.panelConnectionIdentity?.();
+  } catch {
+    return daSiWaIdentityRefusal("the panel-tab identity became unreadable before dispatch");
+  }
+  if (!isUsablePanelConnectionIdentity(identityAfter)) {
+    return daSiWaIdentityRefusal("the panel-tab identity became unavailable before dispatch");
+  }
+  if (!samePanelConnectionIdentity(identityBefore, identityAfter)) {
+    return daSiWaIdentityRefusal("the panel-tab connection changed before dispatch");
+  }
+  if (probe.isError) {
+    return daSiWaIdentityRefusal("the final graph_query fence returned an error");
+  }
+
+  const identity = parseVerifiedQueriedNodeIdentity(parseToolResultJson(probe));
+  const requestedId = canonicalQueriedNodeId(nodeId);
+  if (!identity || !requestedId) {
+    return daSiWaIdentityRefusal(
+      "the final graph_query fence was malformed, truncated, or did not contain exactly one verifiable row",
+    );
+  }
+  if (identity.id !== requestedId) {
+    return daSiWaIdentityRefusal("the final graph_query fence identified a different node_id");
+  }
+  return identity.type === DASIWA_LTX2_LORA_LOADER
+    ? daSiWaStackRefusal(identity.type)
+    : { expectedNodeType: identity.type };
 }
 
 // ---- #809: turn the panel's silent `truncated: true` booleans into a remedy --------
@@ -10761,6 +11055,10 @@ export interface PanelToolCtx {
    * Optional only for lightweight legacy test contexts.
    */
   tabCanMutateGraph?: () => boolean;
+  /** Whether the currently bound panel enforces graph_set_widget's optional
+   * expected_node_type at the synchronous mutation boundary. Real contexts
+   * provide this; omitted/false is a fail-closed answer for #2107. */
+  tabExpectedNodeTypeFenceCapability?: () => boolean;
   /**
    * The same question TRI-STATE, for code that must REPORT the answer rather than
    * gate on it. `tabCanMutateGraph` fails closed (an unreadable probe becomes
@@ -12158,6 +12456,8 @@ export function makePanelToolCtx(
   ctx.panelConnectionIdentity = panelConnectionIdentity;
   ctx.awaitPostRestartReachable = awaitPostRestartReachable;
   ctx.tabCanMutateGraph = () => bridge.tabCanMutateGraph(ctx.tabId);
+  ctx.tabExpectedNodeTypeFenceCapability = () =>
+    bridge.tabExpectedNodeTypeFenceCapability(ctx.tabId);
   ctx.tabGraphMutationCapability = () => bridge.tabGraphMutationCapability(ctx.tabId);
   return ctx;
 }
@@ -14734,7 +15034,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_set_widget",
-      "Set a widget value on a node in the user's open graph (steps, cfg, seed, ckpt_name, text prompts, …). Returns the previous and new value (a string longer than 1000 chars is echoed as {chars, sha256, preview} so batched calls stay inside the outer tool-result budget — pass `echo: \"full\"` for the verbatim string). Undoable with Ctrl+Z. To CLEAR a text widget to an empty string, pass `clear: true` (some MCP clients drop an empty-string `value` from the serialized payload, so `value: \"\"` may not arrive — `clear: true` always works). For the LTXDirector timeline node (WhatDreamsCost CSGlide), set `timeline_data` with the FULL timeline JSON (segments + global_prompt) to drive its custom timeline UI — this re-syncs the editor and regenerates its derived `local_prompts`/`segment_lengths`/`guide_strength` widgets; setting those derived widgets directly is refused (they are silently reverted). For AnimaRegionalCanvasInline / Krea2RegionalCanvasInline (LC123), quality/scene/red/green/blue/negative prompt writes are refused: the custom textarea and node.properties.animaPrompts overwrite widget.value on APPLY. Drive quality/scene/negative via a PrimitiveStringMultiline wired into quality_prompt_in / scene_prompt_in / negative_prompt_in; red/green/blue have no socket.",
+      "Set a widget value on a node in the user's open graph (steps, cfg, seed, ckpt_name, text prompts, …). Returns the previous and new value (a string longer than 1000 chars is echoed as {chars, sha256, preview} so batched calls stay inside the outer tool-result budget — pass `echo: \"full\"` for the verbatim string). Undoable with Ctrl+Z. To CLEAR a text widget to an empty string, pass `clear: true` (some MCP clients drop an empty-string `value` from the serialized payload, so `value: \"\"` may not arrive — `clear: true` always works). For the LTXDirector timeline node (WhatDreamsCost CSGlide), set `timeline_data` with the FULL timeline JSON (segments + global_prompt) to drive its custom timeline UI — this re-syncs the editor and regenerates its derived `local_prompts`/`segment_lengths`/`guide_strength` widgets; setting those derived widgets directly is refused (they are silently reverted). For AnimaRegionalCanvasInline / Krea2RegionalCanvasInline (LC123), quality/scene/red/green/blue/negative prompt writes are refused: the custom textarea and node.properties.animaPrompts overwrite widget.value on APPLY. Drive quality/scene/negative via a PrimitiveStringMultiline wired into quality_prompt_in / scene_prompt_in / negative_prompt_in; red/green/blue have no socket. DaSiWa_LTX2LoraLoader's `stack_data` write is also refused: its custom multi-row widget reserializes its own JS state over `widget.value`, so the echoed write would be a false success; edit the stack rows in the node UI instead.",
       {
         node_id: nodeId().describe("Node id from panel_graph_outline / panel_query_graph."),
         widget: z.string().describe("Widget name (e.g. 'steps', 'cfg', 'text')."),
@@ -14774,6 +15074,18 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           args.widget as string,
         );
         if (blocked) return blocked;
+        const daSiWaBlocked = await refuseDaSiWaStackWrite(
+          ctx,
+          args.node_id,
+          args.widget as string,
+        );
+        if (daSiWaBlocked) return daSiWaBlocked;
+        let expectedNodeType: string | undefined;
+        if (args.widget === DASIWA_STACK_WIDGET) {
+          const daSiWaFence = await verifyDaSiWaStackWriteFence(ctx, args.node_id);
+          if (daSiWaFence && "content" in daSiWaFence) return daSiWaFence;
+          expectedNodeType = daSiWaFence?.expectedNodeType;
+        }
         // #599: the frontend runs refresh-before-validate here (pulls a fresh
         // /object_info so a just-staged/-downloaded/-installed value is accepted on
         // a single revalidation, #338/#458) — that authoritative fetch can outlast
@@ -14786,11 +15098,27 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // to the raw success reply so a later appendToolResultText disclosure
         // (which makes the text no longer parse as JSON) cannot dodge it.
         const echoFull = args.echo === "full";
-        const write = async (nodeId: unknown, widget: string): Promise<ToolResult> =>
+        const write = async (
+          nodeId: unknown,
+          widget: string,
+          targetExpectedNodeType: string | undefined = expectedNodeType,
+        ): Promise<ToolResult> =>
           stripVerifiedLastObservedSchemaNote(
             summarizeSetWidgetEcho(
               await ctx.call(
-                { cmd: "graph_set_widget", node_id: nodeId, widget, value },
+                {
+                  cmd: "graph_set_widget",
+                  node_id: nodeId,
+                  widget,
+                  value,
+                  // The caller supplies the type proven for THIS addressed node.
+                  // The outer final fence is used for direct/re-mapped writes;
+                  // promoted recovery re-probes its inner node after entering
+                  // and supplies that node's own type.
+                  ...(targetExpectedNodeType
+                    ? { expected_node_type: targetExpectedNodeType }
+                    : {}),
+                },
                 OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
               ),
               echoFull,
@@ -14944,7 +15272,52 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           );
         }
 
-        const written = await write(inner.innerNodeId, inner.widget);
+        let innerExpectedNodeType: string | undefined;
+        if (expectedNodeType !== undefined) {
+          // The inner mapping was discovered before an awaited enter. Re-query
+          // the addressed inner node after entering so the stack_data write gets
+          // its OWN live type fence; carrying the outer wrapper's type would
+          // reject a valid inner node, while omitting a fence would let a same-
+          // type replacement mutate a detached object and report false success.
+          const innerProbe = await ctx.call(
+            { cmd: "graph_query", ids: [inner.innerNodeId], fields: "compact", limit: 1 },
+            OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+          );
+          const innerIdentity = innerProbe.isError
+            ? null
+            : parseVerifiedQueriedNodeIdentity(parseToolResultJson(innerProbe));
+          const expectedInnerId = canonicalQueriedNodeId(inner.innerNodeId);
+          if (!innerIdentity || !expectedInnerId || innerIdentity.id !== expectedInnerId) {
+            const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+            return appendToolResultText(
+              first,
+              `\n\n(The panel listed "${refusal.widget}" as promoted and mapped it to inner node ` +
+                `${inner.innerNodeId}, but the post-enter identity probe did not verify that ` +
+                `exact live node${innerProbe.isError ? `: ${textOfToolResult(innerProbe)}` : "."} ` +
+                `The write was not retried.${
+                  exited.isError
+                    ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}`
+                    : ""
+                })`,
+            );
+          }
+          if (innerIdentity.type === DASIWA_LTX2_LORA_LOADER) {
+            const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+            return appendToolResultText(
+              first,
+              `\n\n(The promoted inner node ${inner.innerNodeId} was identified as ` +
+                `${DASIWA_LTX2_LORA_LOADER}; ${textOfToolResult(daSiWaStackRefusal(innerIdentity.type))} ` +
+                `No inner graph_set_widget was dispatched.${
+                  exited.isError
+                    ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}`
+                    : ""
+                })`,
+            );
+          }
+          innerExpectedNodeType = innerIdentity.type;
+        }
+
+        const written = await write(inner.innerNodeId, inner.widget, innerExpectedNodeType);
         const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
         if (!written.isError) {
           const via =
