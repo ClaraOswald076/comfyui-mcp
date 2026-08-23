@@ -4194,6 +4194,35 @@ function parseToolResultJson(res: ToolResult): Record<string, unknown> | null {
   }
 }
 
+/**
+ * Normalize the panel's graph_query detail reply for graph consumers. Newer
+ * panel executors return matching detail rows as JSON Lines in `text` inside a
+ * wrapper object, while older/current executors may return `{ nodes: [...] }`.
+ * A malformed row is only one bad observation; it must not discard the valid
+ * rows that follow it or make panel_kitchen report a transport failure.
+ */
+function normalizeGraphQueryResult(res: ToolResult): Record<string, unknown> {
+  const parsed = parseToolResultJson(res);
+  if (!parsed) return { nodes: [] };
+  if (Array.isArray(parsed.nodes)) return parsed;
+
+  if (typeof parsed.text !== "string") return { nodes: [] };
+  const nodes: Record<string, unknown>[] = [];
+  for (const line of parsed.text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const row = JSON.parse(trimmed) as unknown;
+      if (row && typeof row === "object" && !Array.isArray(row)) {
+        nodes.push(row as Record<string, unknown>);
+      }
+    } catch {
+      // Ignore one malformed JSON row; other graph_query rows remain usable.
+    }
+  }
+  return { nodes };
+}
+
 function toolResultText(res: ToolResult): string {
   return res?.content?.find((c) => c.type === "text")?.text ?? "workflow_open failed";
 }
@@ -19932,7 +19961,7 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           fields: "detail",
           limit: 200,
         });
-        const graph = parseToolResultJson(query) ?? { nodes: [] };
+        const graph = normalizeGraphQueryResult(query);
         const recs = await assessKitchenGraph(status, graph);
         if (args.action === "assess") {
           const hint = kitchenProactiveHint(status, recs);

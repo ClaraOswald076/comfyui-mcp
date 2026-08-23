@@ -77,6 +77,49 @@ describe("panel_kitchen", () => {
     expect(Array.isArray(body.recommendations)).toBe(true);
   });
 
+  it("assess normalizes text-serialized graph_query rows and skips malformed rows", async () => {
+    resetKitchenHintSession();
+    const bridge = {
+      send: async (cmd: Record<string, unknown>) => {
+        if (cmd.cmd === "graph_query") {
+          return {
+            matched: 1,
+            text: [
+              "not-json",
+              JSON.stringify({
+                id: 12,
+                type: "UNETLoader",
+                widgets: { unet_name: "flux1-dev.safetensors", weight_dtype: "default" },
+              }),
+              JSON.stringify(null),
+              JSON.stringify(["not a row"]),
+            ].join("\n"),
+          };
+        }
+        return {};
+      },
+      push: () => 1,
+      canReach: () => true,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: TAB, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => TAB,
+      tabCanMutateGraph: () => true,
+      tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
+      workflowUuidFor: () => ({ known: false }),
+      refreshWorkflowUuid: () => true,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, TAB, new WorkflowTargetStore());
+    const def = buildPanelToolDefs().find((d) => d.name === "panel_kitchen")!;
+
+    const res = await def.handler({ action: "assess" } as never, ctx);
+
+    expect(res.isError).toBeFalsy();
+    const body = JSON.parse(textOf(res));
+    expect(body.loaders).toHaveLength(1);
+    expect(body.loaders[0].node_id).toBe("12");
+    expect(body.loaders[0].unet_name).toEqual({ status: "known", value: "flux1-dev.safetensors" });
+  });
+
   it("apply of an unknown id names the assess ids rather than guessing", async () => {
     const bridge = {
       send: async (cmd: Record<string, unknown>) => {
