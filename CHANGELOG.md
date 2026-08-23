@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### MCP
+
+#### Fixed
+- `panel_show_media` now accepts audio files through the panel's existing audio card (panel #1572).
+
 ## [0.52.68] - 2026-08-23
 
 _No user-facing changes._
@@ -378,7 +383,6 @@ _No user-facing changes._
   reply about one item can no longer stand in for a two-item call and lose the
   second in silence. A reply whose own numbers contradict each other is reported
   as that, rather than as a short count.
-
 - **Ollama refuses audio unless the model is a verified listener (#1972).** Native
   `/api/chat` carries audio in `message.images[]`. Most models HTTP 400 (fail
   closed). `huihui_ai/gemma-4-abliterated:E4b-qat` accepts the payload and

@@ -19369,7 +19369,7 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
     ),
     def(
       "panel_show_media",
-      "Display one or more images or videos directly in the panel chat. Use this whenever the user asks to SEE or SHOW a file — a disk path you composited/downloaded/generated (absolute path on the orchestrator host) OR a ComfyUI output ref ({ filename, subfolder?, type? }). Items are rendered as media cards in the agent chat area; supply optional captions. Max 8 items per call. A path item OVER the 20 MB inline cap that is not under any directory ComfyUI serves can still be shown by passing stage:true on that item — the orchestrator COPIES it into <output>/_panel_staged (an opt-in, persistent disk write; 512 MB per-file and 2 GB total caps) and displays the copy by reference. NEVER describe an image with emoji or text placeholders — call this tool instead.",
+      "Display one or more images, videos or AUDIO files directly in the panel chat. Use this whenever the user asks to SEE, SHOW, PLAY or HEAR a file — a disk path you composited/downloaded/generated (absolute path on the orchestrator host) OR a ComfyUI output ref ({ filename, subfolder?, type? }). Items are rendered as media cards in the agent chat area — audio gets a real player (.wav/.mp3/.flac/.ogg/.oga/.opus/.m4a/.aac), so a generated TTS or voice take is played back with this tool, not described; supply optional captions. You are never sent the audio yourself and cannot hear it. Max 8 items per call. A path item OVER the 20 MB inline cap that is not under any directory ComfyUI serves can still be shown by passing stage:true on that item — the orchestrator COPIES it into <output>/_panel_staged (an opt-in, persistent disk write; 512 MB per-file and 2 GB total caps) and displays the copy by reference. NEVER describe an image with emoji or text placeholders — call this tool instead.",
       {
         items: z
           .array(
@@ -19471,14 +19471,99 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           ".m4v": "video/x-m4v",
           ".avi": "video/x-msvideo",
         };
-        // #2011 — family classification for the /view probe only. The path
-        // gate below still refuses audio; a /view ref is already forwarded
-        // unclassified, and without this set `take.wav` serving `image/png`
-        // is silently blessed. Keys match upload_image action:"audio" /
-        // image-management AUDIO_MIME — the orchestrator's own audio set,
-        // not the panel renderer's (which also lists .opus/.oga).
-        const AUDIO_EXTS = new Set([".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"]);
+        // #1572 — audio was refused outright ("unsupported file type \".wav\""),
+        // so a TTS/voice-clone session could not play a generated take back to
+        // the user at all. Nothing else was missing: the panel has shipped a
+        // real `<audio controls>` card since #710 (paintAudio, its own
+        // AUDIO_EXTENSIONS allowlist, an "audible" disclosure in the reply, and
+        // media persistence under mkind:"audio"), and composeShowMediaReply
+        // already routes kind:"audio" to it and skips the video storyboard for
+        // it. THIS gate was the only closed door.
+        //
+        // The set is the panel renderer's own AUDIO_EXTENSIONS, verbatim —
+        // the gate's job is to refuse what the card cannot present, so the
+        // card's allowlist is the authoritative answer. It is a superset of
+        // what this codebase already calls audio elsewhere (upload_image
+        // action:"audio" and services/image-management's AUDIO_MIME:
+        // .wav/.mp3/.flac/.ogg/.m4a/.aac) and of what ComfyUI's own save nodes
+        // actually write (comfy_api AudioSaveHelper._FORMATS is
+        // {flac, mp3, opus} and it names the file `…_00001.<format>`, so
+        // SaveAudio/SaveAudioMP3/SaveAudioOpus/SaveAudioAdvanced emit exactly
+        // .flac/.mp3/.opus; .wav is what VHS and the TTS packs write).
+        //
+        // Deliberately NARROWER than the orchestrator's own AUDIO_MIME_BY_EXT
+        // (audio-attachment.ts), which additionally lists webm/weba/wave/m4b/
+        // mpga/mp2: `.webm` is ALREADY in VIDEO_EXTS above and claiming it as
+        // audio here would demote an existing video card, and the rest are not
+        // in the panel's renderer set — admitting them would pass this gate only
+        // to reach a link card, i.e. widen the allowlist without widening what
+        // can be shown.
+        const AUDIO_EXTS = new Set([
+          ".wav",
+          ".mp3",
+          ".flac",
+          ".ogg",
+          ".oga",
+          ".opus",
+          ".m4a",
+          ".aac",
+        ]);
+        // MEASURED in Chromium against real ffmpeg-encoded files served as
+        // `data:` URLs, not derived from a table — the same failure #811 fixed
+        // for video bites harder here, because a data URL's declared type is
+        // the ONLY type the browser gets and a wrong one is refused before any
+        // decoder runs ("MEDIA_ELEMENT_ERROR: Unable to load URL due to content
+        // type"). Two entries would have been wrong if copied from elsewhere in
+        // this codebase:
+        //   - `.opus` → `audio/opus` (what audio-attachment.ts uses, and the
+        //     natural guess) is REFUSED by Chromium; `audio/ogg` decodes. That
+        //     matters because .opus is a core ComfyUI SaveAudio output.
+        //   - `.flac` → `audio/x-flac` is REFUSED; `audio/flac` decodes.
+        const AUDIO_MIME: Record<string, string> = {
+          ".wav": "audio/wav",
+          ".mp3": "audio/mpeg",
+          ".flac": "audio/flac",
+          ".ogg": "audio/ogg",
+          ".oga": "audio/ogg",
+          ".opus": "audio/ogg",
+          ".m4a": "audio/mp4",
+          ".aac": "audio/aac",
+        };
         const MAX_BYTES = 20 * 1024 * 1024; // 20 MB
+
+        // Capability refusal must be a preflight, before the loop can perform
+        // the opt-in stage:true filesystem write. A mixed batch such as a
+        // staged image followed by audio must not leave a persistent copy when
+        // a proven-old panel will refuse the audio item. The same preflight also
+        // keeps local audio out of the known headless clients: they have no
+        // audio painter, and #2018's honest accounting cannot make an absent
+        // player render the item.
+        const panelCompatibility = {
+          reading: tabPanelVersionReading(ctx),
+          advertisedKinds: tabAdvertisedShowMediaKinds(ctx),
+        };
+        const knownAudioItems: Array<Record<string, unknown>> = [];
+        const knownAudioPaths: string[] = [];
+        for (const item of items) {
+          const src = item.source;
+          const filename = "path" in src ? src.path : src.filename;
+          if (AUDIO_EXTS.has(extname(filename).toLowerCase())) {
+            knownAudioItems.push({ kind: "audio", filename });
+            if ("path" in src) knownAudioPaths.push(filename);
+          }
+        }
+        if (knownAudioItems.length > 0) {
+          const blocked = showMediaItemsPanelCannotPaint(knownAudioItems, panelCompatibility);
+          if (blocked.length > 0) {
+            return fail(formatShowMediaKindUnsupported(blocked));
+          }
+          if (knownAudioPaths.length > 0 && resolveClientKind(ctx).kind === "headless") {
+            return fail(
+              "panel_show_media cannot send audio to this headless client: it has no audio player. " +
+                "Use an interactive ComfyUI browser panel tab to play the audio instead.",
+            );
+          }
+        }
 
         const resolved: Array<Record<string, unknown>> = [];
         /** Oversized items that took the /view reference route instead (#648). */
@@ -19529,16 +19614,23 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
             // for the reference route.
             const ext = extname(p).toLowerCase();
             let mime: string;
-            let kind: "image" | "video";
+            let kind: "image" | "video" | "audio";
             if (IMAGE_EXTS.has(ext)) {
               mime = ext === ".jpg" ? "image/jpeg" : "image/" + ext.slice(1);
               kind = "image";
             } else if (VIDEO_EXTS.has(ext)) {
               mime = VIDEO_MIME[ext];
               kind = "video";
+            } else if (AUDIO_EXTS.has(ext)) {
+              mime = AUDIO_MIME[ext];
+              kind = "audio";
             } else {
+              // Still an explicit ALLOWLIST, and still the whole gate: anything
+              // not named in one of the three sets above is refused here, before
+              // its bytes are read. Widening it by three more extensions is not
+              // a licence to sniff or to fall back to a denylist.
               return fail(
-                "unsupported file type \"" + ext + "\" (allowed: " + [...IMAGE_EXTS, ...VIDEO_EXTS].join(", ") + "): " + p,
+                "unsupported file type \"" + ext + "\" (allowed: " + [...IMAGE_EXTS, ...VIDEO_EXTS, ...AUDIO_EXTS].join(", ") + "): " + p,
               );
             }
             if (stat.size > MAX_BYTES) {
@@ -19702,8 +19794,7 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // panel that omitted the field is never told to update. Image/video
         // skip the check entirely.
         const blocked = showMediaItemsPanelCannotPaint(resolved, {
-          reading: tabPanelVersionReading(ctx),
-          advertisedKinds: tabAdvertisedShowMediaKinds(ctx),
+          ...panelCompatibility,
         });
         if (blocked.length > 0) {
           return fail(formatShowMediaKindUnsupported(blocked));
