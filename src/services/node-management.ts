@@ -270,6 +270,26 @@ export function explainManagerForbidden(status: number, body: string): string {
   return "";
 }
 
+/**
+ * A Manager capability probe can be answered by the authentication layer in
+ * front of ComfyUI. Treating a 401/407 as an absent Manager loses the one fact
+ * the caller can act on, especially when the browser is authenticated but the
+ * MCP process is not carrying that browser session.
+ */
+export function explainManagerAuthenticationRequired(status: number): string {
+  if (status !== 401 && status !== 407) return "";
+  const gate = status === 407 ? "proxy authentication layer" : "ComfyUI or an authentication proxy";
+  const credentialHint =
+    "Configure the gateway credentials for this MCP process (COMFYUI_AUTH_TOKEN / " +
+    "COMFYUI_AUTH_HEADER, or the CF-Access client-id/client-secret pair); browser cookies " +
+    "and panel login sessions are not forwarded automatically.";
+  return (
+    ` — the ${gate} rejected the Manager probe with HTTP ${status}. This is an ` +
+    "authentication failure, not evidence that ComfyUI-Manager is missing. " +
+    credentialHint
+  );
+}
+
 async function managerFetch<T>(
   path: string,
   options: ManagerFetchOptions = {},
@@ -298,14 +318,28 @@ async function managerFetch<T>(
   }
 
   if (!res.ok) {
-    if (soft) return undefined;
     // unknown-ok: "" is interpolated into an ERROR MESSAGE and nothing else — the
     // HTTP status is reported either way, so an unreadable body costs detail in the
     // text, never a wrong conclusion. Verified there is no branch on this value.
     const text = await res.text().catch(() => "");
+    if (soft) {
+      // A soft probe may ignore an absent route or a transient server error, but
+      // authentication is actionable evidence. Returning undefined here made
+      // detectManagerApi() fall through to its false "Manager is missing"
+      // conclusion when an authenticated reverse proxy answered 401 (#2085).
+      const auth = explainManagerAuthenticationRequired(res.status);
+      if (auth) {
+        throw new NodeManagementError(
+          `ComfyUI-Manager probe at ${url} was rejected` + auth + managerBodyClause(text),
+          { url, status: res.status, body: text },
+        );
+      }
+      return undefined;
+    }
     throw new NodeManagementError(
       `ComfyUI-Manager API ${res.status} ${res.statusText} for ${path}` +
         explainManagerForbidden(res.status, text) +
+        explainManagerAuthenticationRequired(res.status) +
         // #1397 — SHOW THE BODY. It was already being captured into `details` below
         // and only surfaced for 403, so a task-queue failure reported a bare status
         // line while the serialized exception naming the cause sat one layer down.
