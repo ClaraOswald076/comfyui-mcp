@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.70] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- allow the panel git fallback when ComfyUI-Manager is absent (#2096).
+
+
 ## [0.52.69] - 2026-08-23
 
 ### MCP
