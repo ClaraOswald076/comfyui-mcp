@@ -72,6 +72,7 @@ function bridge(opts: {
   scopeLost?: boolean;
   promotedDetail?: Record<string, unknown>;
   stackDataIdentity?: Record<string, unknown>;
+  stackDataInnerIdentity?: Record<string, unknown> | null;
 }) {
   const calls: Array<Record<string, unknown>> = [];
   let writes = 0;
@@ -111,6 +112,9 @@ function bridge(opts: {
       if (cmd.cmd === "graph_query") {
         graphQueries += 1;
         if (opts.stackDataIdentity && graphQueries <= 2) return opts.stackDataIdentity;
+        if (opts.stackDataIdentity && graphQueries === 3) {
+          return opts.stackDataInnerIdentity ?? { nodes: [{ id: 76, type: "OtherLoraLoader" }] };
+        }
         return (
           opts.promotedDetail ?? {
             nodes: [
@@ -280,12 +284,41 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
       "graph_set_widget",
       "graph_get_subgraph",
       "graph_enter_subgraph",
+      "graph_query",
       "graph_set_widget",
       "graph_exit_subgraph",
     ]);
     expect(calls[2]).toMatchObject({ expected_node_type: "OtherLoraLoader" });
-    expect(calls[5]).not.toHaveProperty("expected_node_type");
+    expect(calls[6]).toMatchObject({ expected_node_type: "OtherLoraLoader" });
     expect(text).toMatch(/inner widget this promotion lists/);
+  });
+
+  it("refuses a promoted inner retry when the post-enter identity is stale", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "stack_data", value: "NEW" },
+      {
+        stackDataIdentity: { nodes: [{ id: 78, type: "OtherLoraLoader" }] },
+        stackDataInnerIdentity: { nodes: [{ id: 99, type: "OtherLoraLoader" }] },
+        subgraph: {
+          subgraph_of: { node_id: 78, title: "OtherLoraLoader" },
+          node_count: 1,
+          nodes: [{ id: 76, type: "OtherLoraLoader", widgets: { stack_data: "old" } }],
+        },
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(calls.map((c) => c.cmd)).toEqual([
+      "graph_query",
+      "graph_query",
+      "graph_set_widget",
+      "graph_get_subgraph",
+      "graph_enter_subgraph",
+      "graph_query",
+      "graph_exit_subgraph",
+    ]);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(1);
+    expect(text).toMatch(/post-enter identity probe did not verify/);
   });
 
   it("reports ambiguous promoted name/label candidates without a second write (#2015)", async () => {

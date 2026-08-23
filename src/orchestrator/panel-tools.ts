@@ -15098,7 +15098,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // to the raw success reply so a later appendToolResultText disclosure
         // (which makes the text no longer parse as JSON) cannot dodge it.
         const echoFull = args.echo === "full";
-        const write = async (nodeId: unknown, widget: string): Promise<ToolResult> =>
+        const write = async (
+          nodeId: unknown,
+          widget: string,
+          targetExpectedNodeType: string | undefined = expectedNodeType,
+        ): Promise<ToolResult> =>
           stripVerifiedLastObservedSchemaNote(
             summarizeSetWidgetEcho(
               await ctx.call(
@@ -15107,14 +15111,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                   node_id: nodeId,
                   widget,
                   value,
-                  // The final identity probe authenticates the ORIGINAL target.
-                  // A promoted-widget recovery can deliberately re-enter a
-                  // different inner node; carrying the outer type into that
-                  // write would make the Panel's direct-target fence reject a
-                  // valid inner mutation. The inner route has its own panel
-                  // target/workflow guards, so omit this outer-only fence there.
-                  ...(expectedNodeType && String(nodeId) === String(args.node_id)
-                    ? { expected_node_type: expectedNodeType }
+                  // The caller supplies the type proven for THIS addressed node.
+                  // The outer final fence is used for direct/re-mapped writes;
+                  // promoted recovery re-probes its inner node after entering
+                  // and supplies that node's own type.
+                  ...(targetExpectedNodeType
+                    ? { expected_node_type: targetExpectedNodeType }
                     : {}),
                 },
                 OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
@@ -15270,7 +15272,39 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           );
         }
 
-        const written = await write(inner.innerNodeId, inner.widget);
+        let innerExpectedNodeType: string | undefined;
+        if (expectedNodeType !== undefined) {
+          // The inner mapping was discovered before an awaited enter. Re-query
+          // the addressed inner node after entering so the stack_data write gets
+          // its OWN live type fence; carrying the outer wrapper's type would
+          // reject a valid inner node, while omitting a fence would let a same-
+          // type replacement mutate a detached object and report false success.
+          const innerProbe = await ctx.call(
+            { cmd: "graph_query", ids: [inner.innerNodeId], fields: "compact", limit: 1 },
+            OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+          );
+          const innerIdentity = innerProbe.isError
+            ? null
+            : parseVerifiedQueriedNodeIdentity(parseToolResultJson(innerProbe));
+          const expectedInnerId = canonicalQueriedNodeId(inner.innerNodeId);
+          if (!innerIdentity || !expectedInnerId || innerIdentity.id !== expectedInnerId) {
+            const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+            return appendToolResultText(
+              first,
+              `\n\n(The panel listed "${refusal.widget}" as promoted and mapped it to inner node ` +
+                `${inner.innerNodeId}, but the post-enter identity probe did not verify that ` +
+                `exact live node${innerProbe.isError ? `: ${textOfToolResult(innerProbe)}` : "."} ` +
+                `The write was not retried.${
+                  exited.isError
+                    ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}`
+                    : ""
+                })`,
+            );
+          }
+          innerExpectedNodeType = innerIdentity.type;
+        }
+
+        const written = await write(inner.innerNodeId, inner.widget, innerExpectedNodeType);
         const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
         if (!written.isError) {
           const via =
