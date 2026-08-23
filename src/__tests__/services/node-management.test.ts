@@ -205,6 +205,8 @@ function stubFetch(opts: {
   queueOpStatus?: number;
   /** Body for `https://api.comfy.org/nodes/:id` (registry-zip empty-pack fallback). */
   registryDetails?: unknown;
+  /** Body for v4 per-task queue history lookups. */
+  managerTaskHistory?: unknown | ((uiId: string) => unknown);
 } = {}) {
   const calls: Call[] = [];
   let statusIdx = 0;
@@ -231,6 +233,14 @@ function stubFetch(opts: {
         const s = statusSeq[Math.min(statusIdx, statusSeq.length - 1)];
         statusIdx++;
         return jsonResponse(s);
+      }
+      if (parsed.pathname === "/v2/manager/queue/history") {
+        const uiId = parsed.searchParams.get("ui_id") ?? "";
+        const h =
+          typeof opts.managerTaskHistory === "function"
+            ? opts.managerTaskHistory(uiId)
+            : opts.managerTaskHistory;
+        return h === undefined ? new Response("", { status: 200 }) : jsonResponse(h);
       }
       // queue ops + start return empty bodies
       if (path.includes("/queue/")) {
@@ -2762,6 +2772,106 @@ describe("node-management service", () => {
       const { params } = taskOf(calls, "install-model");
       expect(params.name).toBe("m.safetensors");
       expect(params.save_path).toBe("default");
+    });
+
+    it.each(["failed", "error"] as const)(
+      "surfaces a v4 per-task install-model %s after queue drain",
+      async (statusStr) => {
+        const secret = "0123456789abcdef0123456789abcdef";
+        const huge =
+          `HTTP 429 Too Many Requests: <html>slow down</html> failed fetching ` +
+          `https://civitai.com/api/download/models/123?token=${secret}&page=2 ` +
+          "x".repeat(1200);
+        const { calls } = stubFetch({
+          managerTaskHistory: (uiId) => ({
+            history: {
+              ui_id: uiId,
+              kind: "install-model",
+              result: huge,
+              status: { status_str: statusStr },
+            },
+          }),
+        });
+
+        const err = await installModelViaManager({
+          name: "bad.safetensors",
+          url: `https://civitai.com/api/download/models/123?token=${secret}`,
+          filename: "bad.safetensors",
+          type: "checkpoints",
+        }).catch((e) => e as Error);
+
+        expect(err).toBeInstanceOf(NodeManagementError);
+        const msg = err.message;
+        expect(msg).toContain(`server-side model download task as ${statusStr}`);
+        expect(msg).toMatch(/HTTP 429 Too Many Requests/);
+        expect(msg).toMatch(/<html>slow down<\/html>/);
+        expect(msg).toContain("token=");
+        expect(msg).toContain("page=2");
+        expect(msg).not.toContain(secret);
+        expect(msg).toMatch(/truncated/);
+        expect(msg.length).toBeLessThan(1200);
+
+        const { body } = taskOf(calls, "install-model");
+        const historyCalls = calls.filter(
+          (c) => new URL(c.url).pathname === "/v2/manager/queue/history",
+        );
+        expect(historyCalls).toHaveLength(1);
+        expect(new URL(historyCalls[0].url).searchParams.get("ui_id")).toBe(body.ui_id);
+
+        const details = JSON.stringify((err as NodeManagementError).details);
+        expect(details).toContain(String(body.ui_id));
+        expect(details).toContain(statusStr);
+        expect(details).toContain("HTTP 429 Too Many Requests");
+        expect(details).not.toContain(secret);
+        expect(details).toMatch(/truncated/);
+        expect(details.length).toBeLessThan(1200);
+      },
+    );
+
+    it("preserves the handoff result when v4 history records success", async () => {
+      const { calls } = stubFetch({
+        managerTaskHistory: (uiId) => ({
+          history: {
+            ui_id: uiId,
+            kind: "install-model",
+            result: "success",
+            status: { status_str: "success" },
+          },
+        }),
+      });
+
+      const res = await installModelViaManager({
+        name: "ok.safetensors",
+        url: "https://example.com/ok.safetensors",
+        filename: "ok.safetensors",
+        type: "checkpoints",
+      });
+
+      expect(res.mechanism).toBe("manager-http");
+      expect(res.message).toMatch(/Dispatched model/);
+      expect(res.message).toMatch(/success is NOT guaranteed/);
+      expect(
+        calls.some((c) => new URL(c.url).pathname === "/v2/manager/queue/history"),
+      ).toBe(true);
+    });
+
+    it("preserves the handoff result when history is unavailable or unknown", async () => {
+      const { calls } = stubFetch({
+        managerTaskHistory: { history: {} },
+      });
+
+      const res = await installModelViaManager({
+        name: "unknown.safetensors",
+        url: "https://example.com/unknown.safetensors",
+        filename: "unknown.safetensors",
+        type: "checkpoints",
+      });
+
+      expect(res.mechanism).toBe("manager-http");
+      expect(res.message).toMatch(/Dispatched model/);
+      expect(
+        calls.some((c) => new URL(c.url).pathname === "/v2/manager/queue/history"),
+      ).toBe(true);
     });
   });
 
