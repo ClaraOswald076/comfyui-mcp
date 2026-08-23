@@ -107,6 +107,21 @@ describe("parseKitchenLog", () => {
     expect(parsed.backends.eager).toEqual({ available: false, raw });
   });
 
+  it.each([
+    ["a nested available property", "{'nested': {'available': True}}"],
+    ["trailing garbage", "{'available': True} garbage"],
+  ])("rejects %s as a backend dictionary", (_caseName, raw) => {
+    const parsed = parseKitchenLog(`Found comfy_kitchen backend eager: ${raw}`);
+
+    expect(parsed.backends.eager).toEqual({ available: false, raw });
+  });
+
+  it("preserves the legacy cached availability status", () => {
+    const parsed = parseKitchenLog("Found comfy_kitchen backend eager: available (cached)");
+
+    expect(parsed.backends.eager).toEqual({ available: true, raw: "available (cached)" });
+  });
+
   it("does not treat a missing attention line as a no", () => {
     const parsed = parseKitchenLog("comfy-kitchen version: 0.2.10");
     expect(parsed.ckAttentionLog.status).toBe("unknown");

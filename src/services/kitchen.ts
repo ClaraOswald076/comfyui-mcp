@@ -225,6 +225,93 @@ export function logTextFromPayload(data: unknown): string {
   }
 }
 
+function matchingClose(open: string, close: string): boolean {
+  return (open === "{" && close === "}") || (open === "[" && close === "]") || (open === "(" && close === ")");
+}
+
+function splitTopLevelDictionary(raw: string): string[] | undefined {
+  const text = raw.trim();
+  if (text.length < 2 || text[0] !== "{" || text[text.length - 1] !== "}") return undefined;
+
+  const members: string[] = [];
+  const stack: string[] = [];
+  let quote: "'" | '"' | undefined;
+  let escaped = false;
+  let start = 1;
+
+  for (let i = 1; i < text.length - 1; i++) {
+    const ch = text[i]!;
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === quote) quote = undefined;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+    } else if (ch === "{" || ch === "[" || ch === "(") {
+      stack.push(ch);
+    } else if (ch === "}" || ch === "]" || ch === ")") {
+      const open = stack.pop();
+      if (!open || !matchingClose(open, ch)) return undefined;
+    } else if (ch === "," && stack.length === 0) {
+      const member = text.slice(start, i).trim();
+      if (member) members.push(member);
+      start = i + 1;
+    }
+  }
+
+  if (quote || stack.length > 0) return undefined;
+  const last = text.slice(start, -1).trim();
+  if (last) members.push(last);
+  return members;
+}
+
+function topLevelColon(member: string): number {
+  const stack: string[] = [];
+  let quote: "'" | '"' | undefined;
+  let escaped = false;
+  for (let i = 0; i < member.length; i++) {
+    const ch = member[i]!;
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === quote) quote = undefined;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+    } else if (ch === "{" || ch === "[" || ch === "(") {
+      stack.push(ch);
+    } else if (ch === "}" || ch === "]" || ch === ")") {
+      const open = stack.pop();
+      if (!open || !matchingClose(open, ch)) return -1;
+    } else if (ch === ":" && stack.length === 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function parseKitchenDictionaryAvailable(raw: string): boolean | undefined {
+  const members = splitTopLevelDictionary(raw);
+  if (!members) return undefined;
+
+  let available: boolean | undefined;
+  for (const member of members) {
+    const colon = topLevelColon(member);
+    if (colon < 0) return undefined;
+    const key = member.slice(0, colon).trim();
+    if (!/^(?:"available"|'available'|available)$/i.test(key)) continue;
+
+    const value = member.slice(colon + 1).trim();
+    if (!/^true$/i.test(value) && !/^false$/i.test(value)) return undefined;
+    if (available !== undefined) return undefined;
+    available = /^true$/i.test(value);
+  }
+  return available;
+}
+
 export function parseKitchenLog(text: string): KitchenLogParse {
   const versionMatch = text.match(/comfy-kitchen version:\s*(\S+)/i);
   const backends: KitchenLogParse["backends"] = {};
@@ -233,12 +320,10 @@ export function parseKitchenLog(text: string): KitchenLogParse {
     const name = m[1]!.toLowerCase();
     if ((KITCHEN_BACKENDS as readonly string[]).includes(name)) {
       const raw = m[2]!.trim();
-      const field = /(?:\{|,)\s*(?:"available"|'available'|available)\s*:\s*(true|false)(?=\s*(?:,|}))/i.exec(
-        raw,
-      );
-      const available = field
-        ? field[1]!.toLowerCase() === "true"
-        : /^(?:available|enabled|ok|loaded|true|ready)$/i.test(raw);
+      const dictionaryAvailable = parseKitchenDictionaryAvailable(raw);
+      // Older logs used "available (cached)" rather than a bare status.
+      const available =
+        dictionaryAvailable ?? /^(?:available|enabled|ok|loaded|true|ready)(?:\s+\(cached\))?$/i.test(raw);
       backends[name as KitchenBackendName] = { available, raw };
     }
   }
