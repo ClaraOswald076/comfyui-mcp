@@ -76,6 +76,12 @@ function makeCtx(opts?: { panelOrigin?: string }): { ctx: PanelToolCtx; calls: F
   return { ctx, calls };
 }
 
+function graphLoadCall(calls: Forwarded[]): Forwarded {
+  const call = calls.find((entry) => entry.cmd === "graph_load");
+  if (!call) throw new Error("graph_load was not dispatched");
+  return call;
+}
+
 function loadWorkflow() {
   const def = buildPanelToolDefs().find((d) => d.name === "panel_load_workflow");
   if (!def) throw new Error("panel_load_workflow not found");
@@ -127,8 +133,8 @@ describe("panel_load_workflow: userdata fallback for a custom --user-directory (
     // workflow_list while proving nothing about what this test guards, which is that the
     // graph is not loaded twice.
     expect(calls.filter((c) => c.cmd === "graph_load")).toHaveLength(1);
-    expect(calls[0]).toMatchObject({ cmd: "graph_load" });
-    expect(calls[0].graph).toMatchObject(graph);
+    expect(graphLoadCall(calls)).toMatchObject({ cmd: "graph_load" });
+    expect(graphLoadCall(calls).graph).toMatchObject(graph);
   });
 
   it("fails LOUDLY (no graph_load) when the userdata library 404s the name", async () => {
@@ -178,7 +184,7 @@ describe("panel_load_workflow: userdata fallback for a custom --user-directory (
       expect(res.isError).toBeUndefined();
       expect(fetchApi).toHaveBeenCalled(); // authoritative source was consulted first
       expect(calls.filter((c) => c.cmd === "graph_load")).toHaveLength(1);
-      expect(calls[0].graph).toMatchObject(runtime); // NOT the stale default-dir file
+      expect(graphLoadCall(calls).graph).toMatchObject(runtime); // NOT the stale default-dir file
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -503,7 +509,7 @@ describe("readWorkflowFromPath: a refusal is never mistaken for an unreachable s
 
       if (sep === "\\") {
         expect(res.isError).toBeUndefined();
-        expect(calls[0].graph).toMatchObject(staged);
+        expect(graphLoadCall(calls).graph).toMatchObject(staged);
       } else {
         expect(res.isError).toBe(true);
         expect(calls).toHaveLength(0);
@@ -529,7 +535,7 @@ describe("readWorkflowFromPath: a refusal is never mistaken for an unreachable s
       const res = await loadWorkflow().handler({ path: "recipes/foo.json" }, ctx);
 
       expect(res.isError).toBeUndefined();
-      expect(calls[0].graph).toMatchObject(staged);
+      expect(graphLoadCall(calls).graph).toMatchObject(staged);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -553,7 +559,7 @@ describe("readWorkflowFromPath: a refusal is never mistaken for an unreachable s
 
       expect(res.isError).toBeUndefined();
       expect(calls.filter((c) => c.cmd === "graph_load")).toHaveLength(1);
-      expect(calls[0].graph).toMatchObject(staged);
+      expect(graphLoadCall(calls).graph).toMatchObject(staged);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -661,7 +667,7 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
 
     expect(res.isError).toBeUndefined();
     expect(calls.filter((c) => c.cmd === "graph_load")).toHaveLength(1);
-    expect(calls[0].graph).toMatchObject(graph);
+    expect(graphLoadCall(calls).graph).toMatchObject(graph);
     // It fetched the SERVER's key, not a locally reconstructed path.
     expect(fetchApi).toHaveBeenCalledWith(`/api/userdata/${encodeURIComponent(`workflows/${nfc}`)}`);
   });
@@ -681,7 +687,7 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
 
     expect(res.isError).toBeUndefined();
     expect(calls.filter((c) => c.cmd === "graph_load")).toHaveLength(1);
-    expect(calls[0].graph).toMatchObject(graph);
+    expect(graphLoadCall(calls).graph).toMatchObject(graph);
     expect(fetchApi).toHaveBeenCalledWith(`/api/userdata/${encodeURIComponent(`workflows/${nfd}`)}`);
   });
 
@@ -726,7 +732,7 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     const res = await loadWorkflow().handler({ path: `workflows/workflows/${nfd}` }, ctx);
 
     expect(res.isError).toBeUndefined();
-    expect(calls[0].graph).toMatchObject(graph);
+    expect(graphLoadCall(calls).graph).toMatchObject(graph);
     expect(fetchApi).toHaveBeenCalledWith(
       `/api/userdata/${encodeURIComponent(`workflows/workflows/${nfc}`)}`,
     );
@@ -768,7 +774,7 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     const res = await loadWorkflow().handler({ path: `recipes/${nfd}` }, ctx);
 
     expect(res.isError).toBeUndefined();
-    expect(calls[0].graph).toMatchObject(graph);
+    expect(graphLoadCall(calls).graph).toMatchObject(graph);
     expect(fetchApi).toHaveBeenCalledWith(WORKFLOW_LIBRARY_LISTING_ROUTE);
     expect(fetchApi).toHaveBeenCalledWith(
       `/api/userdata/${encodeURIComponent(`workflows/recipes/${nfc}`)}`,
@@ -829,7 +835,7 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     const res = await loadWorkflow().handler({ path: "WORKFLOWS/foo.json" }, ctx);
 
     expect(res.isError).toBeUndefined();
-    expect(calls[0].graph).toMatchObject(nested); // the NESTED file, not the root one
+      expect(graphLoadCall(calls).graph).toMatchObject(nested); // the NESTED file, not the root one
     expect(fetchApi).not.toHaveBeenCalledWith(
       `/api/userdata/${encodeURIComponent("workflows/foo.json")}`,
     );
@@ -848,7 +854,7 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     const res = await loadWorkflow().handler({ path: "recipes\\foo.json" }, ctx);
 
     expect(res.isError).toBeUndefined();
-    expect(calls[0].graph).toMatchObject(graph);
+    expect(graphLoadCall(calls).graph).toMatchObject(graph);
     const keys = fetchApi.mock.calls
       .map((c: unknown[]) => String(c[0]))
       .filter((u: string) => u.startsWith("/api/userdata/"))
@@ -870,7 +876,7 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     const res = await loadWorkflow().handler({ path: "recipes\\foo.json" }, ctx);
 
     expect(res.isError).toBeUndefined();
-    expect(calls[0].graph).toMatchObject(literal);
+    expect(graphLoadCall(calls).graph).toMatchObject(literal);
     expect(fetchApi).not.toHaveBeenCalledWith(
       `/api/userdata/${encodeURIComponent("workflows/recipes/foo.json")}`,
     );
@@ -982,7 +988,7 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
 
     expect(res.isError).toBeUndefined();
     expect(calls.filter((c) => c.cmd === "graph_load")).toHaveLength(1);
-    expect(calls[0].graph).toMatchObject(graph);
+    expect(graphLoadCall(calls).graph).toMatchObject(graph);
     expect(fetchApi).not.toHaveBeenCalledWith(
       `/api/userdata/${encodeURIComponent(`workflows/${upper}`)}`,
     );
@@ -1084,7 +1090,7 @@ describe("readWorkflowFromPath: a list-style 'workflows/…' path is not double-
       `/api/userdata/${encodeURIComponent("workflows/workflows/Daily Anime Portrait - Fast Preview.json")}`,
     );
     expect(calls.filter((c) => c.cmd === "graph_load")).toHaveLength(1);
-    expect(calls[0].graph).toMatchObject(graph);
+    expect(graphLoadCall(calls).graph).toMatchObject(graph);
   });
 
   it("a bare name (no prefix) still resolves to the same single-prefixed key", async () => {
@@ -1117,7 +1123,7 @@ describe("readWorkflowFromPath: a list-style 'workflows/…' path is not double-
 
       expect(res.isError).toBeUndefined();
       expect(calls.filter((c) => c.cmd === "graph_load")).toHaveLength(1);
-      expect(calls[0].graph).toMatchObject(staged);
+    expect(graphLoadCall(calls).graph).toMatchObject(staged);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -1226,7 +1232,7 @@ describe("panel_load_workflow after a confirmed restart (#1845)", () => {
     expect(res.isError).toBeUndefined();
     expect(fetchApi).toHaveBeenCalledTimes(2);
     expect(calls.filter((c) => c.cmd === "graph_load")).toHaveLength(1);
-    expect(calls[0].graph).toMatchObject(graph);
+    expect(graphLoadCall(calls).graph).toMatchObject(graph);
   });
 
   it("reads the library through the connected panel origin when the headless target is refused", async () => {
@@ -1249,7 +1255,7 @@ describe("panel_load_workflow after a confirmed restart (#1845)", () => {
       `http://localhost:8188/api/userdata/${encodeURIComponent("workflows/minimaxH3InfiniteVideoRef2va9Img3_v2Turbo.json")}`,
     );
     expect(calls.filter((c) => c.cmd === "graph_load")).toHaveLength(1);
-    expect(calls[0].graph).toMatchObject(graph);
+    expect(graphLoadCall(calls).graph).toMatchObject(graph);
   });
 
   it("loads from the trusted workspace when COMFYUI_PATH env is unset", async () => {
@@ -1278,7 +1284,7 @@ describe("panel_load_workflow after a confirmed restart (#1845)", () => {
 
       expect(res.isError).toBeUndefined();
       expect(calls.filter((c) => c.cmd === "graph_load")).toHaveLength(1);
-      expect(calls[0].graph).toMatchObject(staged);
+    expect(graphLoadCall(calls).graph).toMatchObject(staged);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

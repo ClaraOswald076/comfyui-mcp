@@ -7947,6 +7947,121 @@ NOTE: an API-format load CAN re-mint the canvas workflow instance. If your next 
   );
 }
 
+/**
+ * #2106 — a panel can apply a UI graph and then lose the fetch carrying the reply.
+ *
+ * Reconcile only the narrow, post-dispatch transport failure reported by the issue. A
+ * dispatched request id is required: without it, "Failed to fetch" may be a pre-write
+ * refusal and there is no mutation to reconcile. The live graph must also have the exact
+ * requested content and still belong to the workflow instance that was active before the
+ * load. Anything less remains outcome-unknown, so a real load failure is never turned into
+ * a success by a coincidental canvas shape.
+ */
+function isBarePanelFetchFailure(res: ToolResult): boolean {
+  return res.isError === true && /^(?:Error:\s*)?Failed to fetch$/i.test(textOfToolResult(res));
+}
+
+function uiWorkflowNodeCount(value: unknown): number | undefined {
+  if (!value || typeof value !== "object" || !Array.isArray((value as { nodes?: unknown }).nodes)) {
+    return undefined;
+  }
+  return (value as { nodes: unknown[] }).nodes.length;
+}
+
+function loadOutcomeUnknown(res: ToolResult, dispatchedRid: string | undefined): ToolResult {
+  if (!dispatchedRid) return res;
+  return appendToolResultText(
+    res,
+    `\n\nOUTCOME UNKNOWN: panel_load_workflow was dispatched, but the panel reply failed with ` +
+      `"Failed to fetch" and the live canvas did not prove the requested UI graph on the ` +
+      `same workflow instance. Do not retry blindly. To retry this exact mutation, re-issue ` +
+      `identical args plus retry_of:"${dispatchedRid}"; otherwise call normally.`,
+  );
+}
+
+async function reconcileFailedPanelLoad(
+  res: ToolResult,
+  ctx: PanelToolCtx,
+  data: unknown,
+  graphBefore: unknown,
+  tabAtDispatch: string,
+  fenceBefore: FenceRead,
+  dispatchedRid: string | undefined,
+): Promise<ToolResult> {
+  if (!isBarePanelFetchFailure(res) || !dispatchedRid) return res;
+
+  const expectedNodeCount = uiWorkflowNodeCount(data);
+  if (
+    expectedNodeCount === undefined ||
+    graphBefore == null ||
+    fenceBefore.known !== true ||
+    typeof fenceBefore.uuid !== "string" ||
+    ctx.tabId !== tabAtDispatch
+  ) {
+    return loadOutcomeUnknown(res, dispatchedRid);
+  }
+  // A matching post-failure graph is only a causal proof when the pre-dispatch
+  // graph was different. If the requested graph was already present, the reads
+  // cannot tell whether this RID changed anything, so keep the retry token.
+  if (openLiveMatchesDestContent(graphBefore, data)) {
+    return loadOutcomeUnknown(res, dispatchedRid);
+  }
+
+  try {
+    const serialized = await ctx.call({ cmd: "graph_serialize" }, 8000);
+    if (ctx.tabId !== tabAtDispatch || serialized.isError) {
+      return loadOutcomeUnknown(res, dispatchedRid);
+    }
+    const serializedPayload = parseToolResultJson(serialized);
+    const liveWorkflow = serializedPayload?.workflow;
+    const liveNodeCount =
+      typeof serializedPayload?.node_count === "number" &&
+      Number.isInteger(serializedPayload.node_count) &&
+      serializedPayload.node_count >= 0
+        ? serializedPayload.node_count
+        : uiWorkflowNodeCount(liveWorkflow);
+    if (liveNodeCount !== expectedNodeCount) {
+      return loadOutcomeUnknown(res, dispatchedRid);
+    }
+    // Count alone is not proof: an old same-sized graph on the same workflow
+    // instance would otherwise be reported as the requested load. Reuse the
+    // existing fail-closed content matcher, which checks node identities/types,
+    // link topology, non-empty widget values, and nested subgraph content while
+    // tolerating frontend schema/presentation normalization.
+    if (!openLiveMatchesDestContent(liveWorkflow, data)) {
+      return loadOutcomeUnknown(res, dispatchedRid);
+    }
+
+    const listed = await ctx.call({ cmd: "workflow_list" }, 6000);
+    if (ctx.tabId !== tabAtDispatch || listed.isError) {
+      return loadOutcomeUnknown(res, dispatchedRid);
+    }
+    const listedPayload = parseToolResultJson(listed);
+    if (!listedPayload) return loadOutcomeUnknown(res, dispatchedRid);
+    const corroborated = corroborateActiveForFence(listedPayload);
+    if (!corroborated.ok) return loadOutcomeUnknown(res, dispatchedRid);
+    const liveUuid = responseWorkflowUuid(corroborated.active);
+    if (!liveUuid || liveUuid !== fenceBefore.uuid) {
+      return loadOutcomeUnknown(res, dispatchedRid);
+    }
+
+    return ok({
+      loaded: true,
+      reconciled: true,
+      acknowledged_after_error: true,
+      format: "ui",
+      node_count: liveNodeCount,
+      workflow_uuid: liveUuid,
+      response_error: "Failed to fetch",
+      note:
+        "The panel applied the requested UI graph, but its reply failed after dispatch. " +
+        "The same workflow instance now contains the expected graph; do not retry.",
+    });
+  } catch {
+    return loadOutcomeUnknown(res, dispatchedRid);
+  }
+}
+
 async function rebindWorkflowFence(
   ctx: PanelToolCtx,
   opts?: { adopt?: boolean },
@@ -14503,8 +14618,37 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             throw new Error("Provide one of `pack` (a bundled pack name), `path` (a workflow .json on disk), or `graph` (a UI workflow).");
           }
           // Generous timeout — loading a large graph onto the live canvas can take a moment.
-          const loaded = await ctx.call({ cmd: "graph_load", graph: data }, 30000);
-          if (loaded.isError) return loaded;
+          const tabAtDispatch = ctx.tabId;
+          const fenceBefore = currentWorkflowFence(ctx);
+          let graphBefore: unknown;
+          if (uiWorkflowNodeCount(data) !== undefined) {
+            try {
+              const before = await ctx.call({ cmd: "graph_serialize" }, 8000);
+              if (!before.isError) graphBefore = parseToolResultJson(before)?.workflow;
+            } catch {
+              // Without a pre-dispatch snapshot, a later matching graph cannot
+              // prove that this request caused the transition.
+            }
+          }
+          let dispatchedRid: string | undefined;
+          const loaded = await ctx.call(
+            { cmd: "graph_load", graph: data },
+            30000,
+            (rid) => {
+              dispatchedRid = rid;
+            },
+          );
+          if (loaded.isError) {
+            return reconcileFailedPanelLoad(
+              loaded,
+              ctx,
+              data,
+              graphBefore,
+              tabAtDispatch,
+              fenceBefore,
+              dispatchedRid,
+            );
+          }
           // Keyed on the reply SAYING the graph was replaced, not merely on the call not
           // erroring (codex r2). A non-error envelope that reports `loaded:false` did not
           // replace anything, and telling that caller their fence is stale would be a
