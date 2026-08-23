@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.75] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- reconcile panel workflow-load fetch failures without blind retries (#2106).
+
 ## [0.52.74] - 2026-08-23
 
 ### MCP
