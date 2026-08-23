@@ -17,12 +17,14 @@ import {
   unlinkSync,
   writeSync,
 } from "node:fs";
+import { isIP } from "node:net";
 import { homedir, platform } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import { getSystemStats, resetClient, resetObjectInfoCache } from "../comfyui/client.js";
 import {
   config,
+  getBootLocalComfyUIBaseUrl,
   getComfyUIBaseUrl,
   getComfyuiTargetGeneration,
   isRemoteMode,
@@ -1114,6 +1116,138 @@ export async function readServingArgv(
       /* a timer we cannot clear is a leak at worst; it is unref'd and self-resolves */
     }
   }
+}
+
+/**
+ * Read `/system_stats.argv` from an explicitly anchored base. This is used only
+ * for the local-proxy restart proof: the mutable client target may be the panel
+ * helper, while the server-authorized boot base is the ComfyUI API we are willing
+ * to reboot. Keeping this separate from `readServingArgv` prevents an accidental
+ * re-read through the proxy from becoming the backend identity proof.
+ */
+async function readServingArgvAtBase(
+  base: string,
+  timeoutMs = 3000,
+): Promise<string[] | undefined> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  try {
+    const res = await comfyuiFetch(`${base.replace(/\/+$/, "")}/system_stats`, {
+      signal: controller.signal,
+    });
+    if (!res.ok) return undefined;
+    const body = (await res.json()) as {
+      system?: { argv?: unknown };
+    };
+    const argv = body?.system?.argv;
+    return Array.isArray(argv) && argv.every((arg) => typeof arg === "string") && argv.length > 0
+      ? [...argv]
+      : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function explicitPortFromArgv(argv: string[] | undefined): number | undefined {
+  if (!argv) return undefined;
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i]?.trim();
+    const raw = token === "--port" ? argv[i + 1] : token?.startsWith("--port=") ? token.slice(7) : undefined;
+    if (raw == null || !/^\d{1,5}$/.test(raw)) continue;
+    const port = Number(raw);
+    if (port >= 1 && port <= 65535) return port;
+  }
+  return undefined;
+}
+
+function sameArgv(a: string[] | undefined, b: string[] | undefined): boolean {
+  return a != null && b != null && a.length === b.length && a.every((arg, i) => arg === b[i]);
+}
+
+export interface VerifiedProxyRestartTarget {
+  /** The mutable target currently fronted by the panel/helper. */
+  proxyBase: string;
+  /** The immutable, server-authorized local boot endpoint. */
+  backendBase: string;
+  /** Target generation at which both identity reads were made. */
+  generation: number;
+  /** ComfyUI's own argv, observed identically through both endpoints. */
+  argv: string[];
+}
+
+/**
+ * The proxy proof must identify concrete listeners, not names whose resolution
+ * can change between the proof and the reboot. Keep this narrower than the
+ * general local-VRAM locality rule, which intentionally treats `localhost` as
+ * local for non-destructive provider handling.
+ */
+function isConcreteLoopbackHttpBase(raw: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+  const hostname = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  return isIP(hostname) > 0 && (hostname === "127.0.0.1" || hostname === "::1");
+}
+
+/**
+ * Resolve the narrow EZi/CEI shape without ever claiming the helper listener is
+ * ComfyUI. A proxy is eligible only when:
+ *
+ *  - the mutable target and immutable boot target are both loopback endpoints on
+ *    different ports;
+ *  - `/system_stats.argv` is non-empty and byte-for-byte identical through the
+ *    proxy and the boot endpoint; and
+ *  - that argv explicitly names the immutable endpoint's port.
+ *
+ * The generation/base checks fence the two awaited reads against a retarget. If
+ * any proof is missing, callers retain the ordinary refusal/ownership path.
+ */
+export async function resolveVerifiedProxyRestartTarget(): Promise<VerifiedProxyRestartTarget | undefined> {
+  // Some process-control unit fixtures intentionally provide only the config
+  // surface they exercise. Missing boot provenance means no proxy exception.
+  let bootBaseGetter: (() => string | null) | undefined;
+  try {
+    bootBaseGetter = getBootLocalComfyUIBaseUrl;
+  } catch {
+    // A partial test module mock may omit this optional seam.
+    return undefined;
+  }
+  if (typeof bootBaseGetter !== "function") return undefined;
+  const proxyBase = getComfyUIBaseUrl().replace(/\/+$/, "");
+  const backendBase = bootBaseGetter()?.replace(/\/+$/, "") ?? "";
+  if (!proxyBase || !backendBase || proxyBase === backendBase) return undefined;
+  if (!isConcreteLoopbackHttpBase(proxyBase) || !isConcreteLoopbackHttpBase(backendBase)) {
+    return undefined;
+  }
+
+  let proxyUrl: URL;
+  let backendUrl: URL;
+  try {
+    proxyUrl = new URL(proxyBase);
+    backendUrl = new URL(backendBase);
+  } catch {
+    return undefined;
+  }
+  if (proxyUrl.protocol !== backendUrl.protocol || proxyUrl.port === backendUrl.port) return undefined;
+  const backendPort = Number(backendUrl.port || (backendUrl.protocol === "https:" ? 443 : 80));
+  if (!Number.isInteger(backendPort) || backendPort < 1 || backendPort > 65535) return undefined;
+
+  const generation = getComfyuiTargetGeneration();
+  const proxyArgv = await readServingArgv();
+  const backendArgv = await readServingArgvAtBase(backendBase);
+  if (!sameArgv(proxyArgv, backendArgv) || explicitPortFromArgv(backendArgv) !== backendPort) return undefined;
+  if (!backendArgv) return undefined;
+  if (getComfyuiTargetGeneration() !== generation || getComfyUIBaseUrl().replace(/\/+$/, "") !== proxyBase) {
+    return undefined;
+  }
+  return { proxyBase, backendBase, generation, argv: backendArgv };
 }
 
 /**
@@ -4024,6 +4158,10 @@ async function restartViaManagerReboot(context: {
    * `lastProcessInfo` so startComfyUI can rebuild that command.
    */
   selfRelaunch?: boolean;
+  /** Explicit backend endpoint for a verified local proxy (issue #2118). */
+  targetBase?: string;
+  /** Mutable target to fence while dispatching to `targetBase`. */
+  targetFenceBase?: string;
 }): Promise<RestartResult> {
   logger.info(`Restarting ${context.label} ComfyUI via ComfyUI-Manager reboot...`);
 
@@ -4045,10 +4183,11 @@ async function restartViaManagerReboot(context: {
   // the caller's read and this handshake is not seen. The caller's own identify
   // fences bound its reading to a live instance at the time it was taken; this
   // fences everything from here on.
-  const anchoredBase = getComfyUIBaseUrl();
+  const anchoredBase = context.targetBase ?? getComfyUIBaseUrl();
+  const targetFenceBase = context.targetFenceBase ?? anchoredBase;
   const witness = await acquireInstanceWitness(anchoredBase);
   try {
-    return await restartViaManagerRebootDispatch(context, anchoredBase, witness);
+    return await restartViaManagerRebootDispatch(context, anchoredBase, targetFenceBase, witness);
   } finally {
     witness?.close();
   }
@@ -4061,8 +4200,11 @@ async function restartViaManagerRebootDispatch(
     isDesktop?: boolean;
     supervisionNote?: string;
     selfRelaunch?: boolean;
+    targetBase?: string;
+    targetFenceBase?: string;
   },
   anchoredBase: string,
+  targetFenceBase: string,
   witness: InstanceWitness | undefined,
 ): Promise<RestartResult> {
   // #848: capture what it is running BEFORE the reboot, so the report afterwards can
@@ -4090,7 +4232,9 @@ async function restartViaManagerRebootDispatch(
   // reported the health of a third (codex gate P0/P1).
   const priorArgv = context.prior?.argv.length
     ? context.prior.argv
-    : await readServingArgv();
+    : context.targetBase
+      ? await readServingArgvAtBase(anchoredBase)
+      : await readServingArgv();
   const argvGeneration = context.prior?.argv.length
     ? context.prior.generation
     : selfReadGeneration;
@@ -4121,7 +4265,7 @@ async function restartViaManagerRebootDispatch(
   // equal but means the two readings may not describe the same server, so that
   // comparison declines while this dispatch correctly proceeds — the reboot goes
   // to the URL we read either way.
-  if (getComfyUIBaseUrl() !== anchoredBase) {
+  if (getComfyUIBaseUrl().replace(/\/+$/, "") !== targetFenceBase.replace(/\/+$/, "")) {
     return {
       stopped: false,
       started: false,
@@ -4337,7 +4481,9 @@ async function restartViaManagerRebootDispatch(
   //   - witness closed BEFORE the dispatch → the instance whose argv we read was
   //     gone before the reboot went out; the reboot reached a successor and the
   //     two readings may describe different lineages — decline.
-  const afterArgv = await readServingArgv();
+  const afterArgv = context.targetBase
+    ? await readServingArgvAtBase(anchoredBase)
+    : await readServingArgv();
   const targetStable = getComfyuiTargetGeneration() === argvGeneration;
   const witnessClosedAt = witness?.closedAt();
   const identityContinuous =
@@ -4694,6 +4840,20 @@ export async function restartComfyUI(): Promise<RestartResult> {
   // process info, so it also works when the server is too wedged to answer.
   if (config.comfyuiRestartCommand) {
     return restartViaConfiguredCommand(config.comfyuiRestartCommand);
+  }
+  // EZi/CEI can serve the panel through a local helper port while the real
+  // ComfyUI child remains on the immutable boot port (#2118). The helper is
+  // deliberately NOT treated as an owned ComfyUI listener: when both endpoints
+  // corroborate the same explicit backend argv, use Manager against that backend
+  // and keep the ordinary process-ownership refusal for every other shape.
+  const verifiedProxy = await resolveVerifiedProxyRestartTarget();
+  if (verifiedProxy) {
+    return restartViaManagerReboot({
+      label: "EZi/CEI-proxied",
+      prior: { argv: verifiedProxy.argv, generation: verifiedProxy.generation },
+      targetBase: verifiedProxy.backendBase,
+      targetFenceBase: verifiedProxy.proxyBase,
+    });
   }
   logger.info("Restarting ComfyUI...");
 

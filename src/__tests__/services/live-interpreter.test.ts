@@ -77,6 +77,14 @@ describe("commandLineMatchesArgv — correlate the process against the server's 
     expect(commandLineMatchesArgv(proxyCmd, COMFY_ARGV)).toBe(false);
   });
 
+  it("reproduces EZi/CEI ownership refusal for the helper wrapper (#2118)", () => {
+    const eziWrapperCmd =
+      'C:\\ComfyUI\\.venv\\Scripts\\python.exe -c "import runpy; runpy.run_path(\'C:\\ComfyUI\\main.py\')" ' +
+      "--port 50404";
+    const backendArgv = ["C:\\ComfyUI\\main.py", "--port", "8188"];
+    expect(commandLineMatchesArgv(eziWrapperCmd, backendArgv)).toBe(false);
+  });
+
   it("does NOT match a DIFFERENT ComfyUI instance launched with other arguments", () => {
     const otherCmd = "C:\\Other\\.venv\\Scripts\\python.exe -s ComfyUI\\main.py --listen 0.0.0.0";
     expect(commandLineMatchesArgv(otherCmd, COMFY_ARGV)).toBe(false);
