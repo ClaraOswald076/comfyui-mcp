@@ -87,6 +87,7 @@ const {
   reinstallCustomNode,
   updateCustomNode,
   queueUpdateAllCustomNodes,
+  detectManagerApi,
   setQueueTimingForTests,
   resetManagerApiCacheForTests,
   fetchManagerTaskHistoryEntry,
@@ -249,6 +250,20 @@ describe("#646 Manager API dialect cache invalidation", () => {
   afterAll(() => {
     if (PRIOR_TTL_ENV === undefined) delete process.env.COMFYUI_MCP_MANAGER_API_TTL_MS;
     else process.env.COMFYUI_MCP_MANAGER_API_TTL_MS = PRIOR_TTL_ENV;
+  });
+
+  it("does not translate an authenticated-proxy 401 into 'Manager is missing' (#2085)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("", { status: 401, statusText: "Unauthorized" })),
+    );
+
+    const error = (await detectManagerApi(BASE).catch((e: unknown) => e)) as Error;
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toMatch(/HTTP 401/);
+    expect(error.message).toMatch(/authentication failure/i);
+    expect(error.message).toMatch(/not evidence that ComfyUI-Manager is missing/i);
+    expect(error.message).not.toMatch(/queue API is not reachable.*installed and enabled/i);
   });
 
   it("re-detects after a restart at the SAME url (explicit invalidation)", async () => {

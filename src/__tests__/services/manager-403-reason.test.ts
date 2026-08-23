@@ -6,7 +6,10 @@
 
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { explainManagerForbidden } from "../../services/node-management.js";
+import {
+  explainManagerAuthenticationRequired,
+  explainManagerForbidden,
+} from "../../services/node-management.js";
 
 const j = (o: unknown) => JSON.stringify(o);
 
@@ -73,5 +76,23 @@ describe("#1089 Manager 403 names its own reason", () => {
     // …and the raw body is still carried in details, so nothing is LOST by
     // summarising it in the message.
     expect(window).toMatch(/body: text/);
+  });
+});
+
+describe("#2085 an auth gate is not a missing Manager", () => {
+  it("explains 401 as the ComfyUI/proxy authentication layer", () => {
+    const t = explainManagerAuthenticationRequired(401);
+    expect(t).toMatch(/HTTP 401/);
+    expect(t).toMatch(/authentication failure/i);
+    expect(t).toMatch(/not evidence that ComfyUI-Manager is missing/i);
+    expect(t).toMatch(/COMFYUI_AUTH_TOKEN/);
+    expect(t).toMatch(/browser cookies/i);
+  });
+
+  it("identifies 407 as proxy authentication and ignores unrelated statuses", () => {
+    expect(explainManagerAuthenticationRequired(407)).toMatch(/proxy authentication layer/i);
+    for (const status of [200, 400, 403, 404, 500]) {
+      expect(explainManagerAuthenticationRequired(status)).toBe("");
+    }
   });
 });
