@@ -5351,6 +5351,87 @@ function parseQueriedNodeType(payload: Record<string, unknown> | null): string |
   return null;
 }
 
+type QueriedNodeIdentity = { id: string; type: string };
+
+function canonicalQueriedNodeId(value: unknown): string | null {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) ? String(value) : null;
+  }
+  if (typeof value !== "string" || !NODE_ID_PATTERN.test(value)) return null;
+  const normalized = normalizeNodeId(value);
+  return typeof normalized === "number" && !Number.isSafeInteger(normalized)
+    ? null
+    : String(normalized);
+}
+
+function parseQueriedNodeIdentityRow(row: unknown): QueriedNodeIdentity | null {
+  if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+  const record = row as Record<string, unknown>;
+  const id = canonicalQueriedNodeId(record.id);
+  if (!id) return null;
+
+  const type = record.type;
+  const classType = record.class_type;
+  if (type !== undefined && typeof type !== "string") return null;
+  if (classType !== undefined && typeof classType !== "string") return null;
+  if (typeof type === "string" && typeof classType === "string" && type !== classType) {
+    return null;
+  }
+  const resolvedType = typeof type === "string" ? type : classType;
+  return resolvedType ? { id, type: resolvedType } : null;
+}
+
+/** Strict identity parser for the DaSiWa refusal gate. Unlike the older type-only
+ * parser above, this accepts exactly one non-truncated row and authenticates its id. */
+function parseVerifiedQueriedNodeIdentity(
+  payload: Record<string, unknown> | null,
+): QueriedNodeIdentity | null {
+  if (!payload) return null;
+  if (
+    Object.prototype.hasOwnProperty.call(payload, "truncated") &&
+    payload.truncated !== false
+  ) {
+    return null;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(payload, "nodes")) {
+    return Array.isArray(payload.nodes) && payload.nodes.length === 1
+      ? parseQueriedNodeIdentityRow(payload.nodes[0])
+      : null;
+  }
+
+  if (typeof payload.text !== "string") return null;
+  const rows: QueriedNodeIdentity[] = [];
+  for (const line of payload.text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    if (trimmed.startsWith("#")) {
+      const compact = trimmed.match(/^#(\S+)\s+(\S+)(?:\s|$)/);
+      if (!compact) return null;
+      const id = canonicalQueriedNodeId(compact[1]);
+      if (!id) return null;
+      rows.push({ id, type: compact[2] });
+      continue;
+    }
+
+    if (trimmed.startsWith("{")) {
+      let row: unknown;
+      try {
+        row = JSON.parse(trimmed);
+      } catch {
+        return null;
+      }
+      const parsed = parseQueriedNodeIdentityRow(row);
+      if (!parsed) return null;
+      rows.push(parsed);
+      continue;
+    }
+    return null;
+  }
+  return rows.length === 1 ? rows[0] : null;
+}
+
 function animaRegionalPromptRefusal(type: string, widget: string): ToolResult {
   const wired = ANIMA_REGIONAL_WIRED_PROMPT_INPUT[widget];
   const route = wired
@@ -5395,25 +5476,93 @@ function daSiWaStackRefusal(type: string): ToolResult {
   );
 }
 
+function daSiWaIdentityRefusal(reason: string): ToolResult {
+  return fail(
+    `panel_set_widget refused "${DASIWA_STACK_WIDGET}" because the panel probe could not ` +
+      `prove the requested node is the intended ${DASIWA_LTX2_LORA_LOADER} (${reason}). ` +
+      `No graph_set_widget was dispatched. Edit the stack rows in the node UI instead; ` +
+      `do not retry this write until the node identity can be read exactly.`,
+  );
+}
+
+function isUsablePanelConnectionIdentity(
+  identity: { generation: number; tabSessionId: string } | undefined,
+): identity is { generation: number; tabSessionId: string } {
+  return (
+    !!identity &&
+    Number.isSafeInteger(identity.generation) &&
+    typeof identity.tabSessionId === "string" &&
+    identity.tabSessionId.length > 0
+  );
+}
+
 /** Refuse the DaSiWa stack widget whose custom UI deterministically overwrites a
- *  graph_set_widget write after acknowledging it. Probe only this widget and fail
- *  open when the read cannot identify the node, matching the LC123 refusal policy. */
+ *  graph_set_widget write after acknowledging it. This gate fails closed unless
+ *  the probe proves the requested node and remains bound to the same panel tab. */
 async function refuseDaSiWaStackWrite(
   ctx: PanelToolCtx,
   nodeId: unknown,
   widget: string,
 ): Promise<ToolResult | null> {
   if (widget !== DASIWA_STACK_WIDGET) return null;
-  const probe = await ctx.call({
-    cmd: "graph_query",
-    ids: [nodeId],
-    fields: "compact",
-    limit: 1,
-  });
-  if (probe.isError) return null;
-  const type = parseQueriedNodeType(parseToolResultJson(probe));
-  if (type !== DASIWA_LTX2_LORA_LOADER) return null;
-  return daSiWaStackRefusal(type);
+
+  const tabBefore = ctx.tabId;
+  let identityBefore: { generation: number; tabSessionId: string } | undefined;
+  try {
+    identityBefore = ctx.panelConnectionIdentity?.();
+  } catch {
+    return daSiWaIdentityRefusal("the bound browser-tab identity was unreadable");
+  }
+  if (!isUsablePanelConnectionIdentity(identityBefore)) {
+    return daSiWaIdentityRefusal("the bound browser-tab identity was unavailable");
+  }
+
+  let probe: ToolResult;
+  try {
+    probe = await ctx.call({
+      cmd: "graph_query",
+      ids: [nodeId],
+      fields: "compact",
+      limit: 1,
+    });
+  } catch {
+    return daSiWaIdentityRefusal("the graph_query probe failed before identity could be verified");
+  }
+
+  if (ctx.tabId !== tabBefore) {
+    return daSiWaIdentityRefusal("the probe was answered by a different panel tab");
+  }
+  let identityAfter: { generation: number; tabSessionId: string } | undefined;
+  try {
+    identityAfter = ctx.panelConnectionIdentity?.();
+  } catch {
+    return daSiWaIdentityRefusal("the panel-tab identity became unreadable after the probe");
+  }
+  if (!isUsablePanelConnectionIdentity(identityAfter)) {
+    return daSiWaIdentityRefusal("the panel-tab identity became unavailable after the probe");
+  }
+  if (
+    identityAfter.tabSessionId !== identityBefore.tabSessionId ||
+    identityAfter.generation !== identityBefore.generation
+  ) {
+    return daSiWaIdentityRefusal("the panel-tab connection changed during the probe");
+  }
+  if (probe.isError) {
+    return daSiWaIdentityRefusal("the graph_query probe returned an error");
+  }
+
+  const identity = parseVerifiedQueriedNodeIdentity(parseToolResultJson(probe));
+  const requestedId = canonicalQueriedNodeId(nodeId);
+  if (!identity || !requestedId) {
+    return daSiWaIdentityRefusal(
+      "the graph_query reply was malformed, truncated, or did not contain exactly one verifiable row",
+    );
+  }
+  if (identity.id !== requestedId) {
+    return daSiWaIdentityRefusal("the graph_query row identified a different node_id");
+  }
+  if (identity.type !== DASIWA_LTX2_LORA_LOADER) return null;
+  return daSiWaStackRefusal(identity.type);
 }
 
 // ---- #809: turn the panel's silent `truncated: true` booleans into a remedy --------
