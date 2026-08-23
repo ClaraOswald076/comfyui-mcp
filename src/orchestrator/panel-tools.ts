@@ -15107,7 +15107,15 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                   node_id: nodeId,
                   widget,
                   value,
-                  ...(expectedNodeType ? { expected_node_type: expectedNodeType } : {}),
+                  // The final identity probe authenticates the ORIGINAL target.
+                  // A promoted-widget recovery can deliberately re-enter a
+                  // different inner node; carrying the outer type into that
+                  // write would make the Panel's direct-target fence reject a
+                  // valid inner mutation. The inner route has its own panel
+                  // target/workflow guards, so omit this outer-only fence there.
+                  ...(expectedNodeType && String(nodeId) === String(args.node_id)
+                    ? { expected_node_type: expectedNodeType }
+                    : {}),
                 },
                 OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
               ),

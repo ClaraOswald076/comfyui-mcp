@@ -3017,6 +3017,64 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     old.close();
   });
 
+  it("rechecks expected_node_type capability after a graph-lane wait and reconnect", async () => {
+    const modern = await connectPanel("tmp:queued-node-type", "queued");
+    await waitFor(() =>
+      expect(bridge.tabs().some((t) => t.tab_id === "tmp:queued-node-type")).toBe(true),
+    );
+    const frames: Array<Record<string, unknown>> = [];
+    modern.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString()) as Record<string, unknown>;
+      if (msg.rid && msg.cmd) frames.push(msg);
+    });
+    const predecessor = bridge.send({ cmd: "graph_outline" } as never, {
+      tabId: "tmp:queued-node-type",
+    });
+    await waitFor(() => expect(frames.some((frame) => frame.cmd === "graph_outline")).toBe(true));
+    const fenced = bridge.send(
+      {
+        cmd: "graph_set_widget",
+        node_id: 7,
+        widget: "stack_data",
+        value: "NEW",
+        expected_node_type: "OtherLoraLoader",
+      },
+      { tabId: "tmp:queued-node-type" },
+    );
+
+    // A stale reconnect lands on the same socket while the fenced write is
+    // waiting behind the predecessor. The initial gate saw the modern hello;
+    // the launch gate must inspect this downgraded hello before sending.
+    modern.send(
+      JSON.stringify({
+        type: "hello",
+        tab_id: "tmp:queued-node-type",
+        title: "old queued panel",
+        enforces_workflow_stamp: true,
+        enforces_workflow_stamp_at_write: true,
+      }),
+    );
+    await waitFor(() =>
+      expect(bridge.tabExpectedNodeTypeFenceCapability("tmp:queued-node-type")).toBe(false),
+    );
+    const first = frames.find((frame) => frame.cmd === "graph_outline");
+    const firstRid = first?.rid;
+    expect(firstRid).toBeTruthy();
+    if (!firstRid) throw new Error("graph_outline was not dispatched");
+    modern.send(JSON.stringify({ rid: firstRid, ok: true, result: {} }));
+    await predecessor;
+
+    const caught = await fenced.then(
+      () => null,
+      (err) => err,
+    );
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toMatch(/atomic expected-node-type write fence/);
+    expect(isCapabilityRefusal(caught)).toBe(true);
+    expect(dispatchOutcomeOf(caught)).toBe(false);
+    modern.close();
+  });
+
   it("ALLOWS active-workflow mutations (graph AND workflow_*) for a panel that DOES enforce the stamp (#570 P0c)", async () => {
     const modern = await connectPanel("tmp:modern", "M"); // connectPanel advertises enforcement + has a resolver stamp
     autoReply(modern, "modern");

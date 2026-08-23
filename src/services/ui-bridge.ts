@@ -1520,6 +1520,14 @@ export interface BridgeCommand {
   [key: string]: unknown;
 }
 
+function expectedNodeTypeFenceRefusal(tabId: string): Error {
+  return new Error(
+    `graph_set_widget was refused before dispatch because panel tab ${tabId} ` +
+      `does not advertise the atomic expected-node-type write fence. Update the ` +
+      `panel to 0.15.58+ and hard-refresh the browser tab.`,
+  );
+}
+
 /** Normalize a WebSocket handshake `Origin` header into a canonical scheme://host:port
  *  string, or undefined when it is absent, the opaque literal `"null"` (a sandboxed /
  *  file:// / data: origin, which proves nothing), or unparseable. The browser sets this
@@ -4953,11 +4961,7 @@ export class UiBridge {
       !conn.enforcesExpectedNodeTypeAtWrite
     ) {
       const refusal = markDispatched(
-        new Error(
-          `graph_set_widget was refused before dispatch because panel tab ${conn.tabId} ` +
-            `does not advertise the atomic expected-node-type write fence. Update the ` +
-            `panel to 0.15.58+ and hard-refresh the browser tab.`,
-        ),
+        expectedNodeTypeFenceRefusal(conn.tabId),
         false,
       );
       return Promise.reject(markCapabilityRefusal(refusal));
@@ -5346,6 +5350,19 @@ export class UiBridge {
       } catch (err) {
         return Promise.reject(
           markDispatched(err instanceof Error ? err : new Error(String(err)), false),
+        );
+      }
+      // The graph lane may have waited behind another command. Re-read the
+      // capability on the connection that will actually receive the frame;
+      // a reconnect during that wait must not turn the optional fence into a
+      // silently ignored field on an older panel.
+      if (
+        cmd.cmd === "graph_set_widget" &&
+        Object.prototype.hasOwnProperty.call(cmd, "expected_node_type") &&
+        !live.enforcesExpectedNodeTypeAtWrite
+      ) {
+        return Promise.reject(
+          markCapabilityRefusal(markDispatched(expectedNodeTypeFenceRefusal(live.tabId), false)),
         );
       }
       if (live.sock.readyState !== WebSocket.OPEN) {

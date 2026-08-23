@@ -37,6 +37,10 @@ const CONTRADICTORY =
   `Cannot set widget on subgraph node 78: "width" is not a promoted widget on this subgraph ` +
   `(promoted: width, height, seed, control_after_generate, steps, cfg, sampler_name, scheduler, denoise, batch_size).`;
 
+const STACK_DATA_CONTRADICTORY =
+  `Cannot set widget on subgraph node 78: "stack_data" is not a promoted widget on this subgraph ` +
+  `(promoted: stack_data).`;
+
 const AMBIGUOUS =
   `promoted widget "text" is ambiguous - 2 promoted inputs match; refusing to guess.`;
 
@@ -67,9 +71,11 @@ function bridge(opts: {
   ambiguous?: boolean;
   scopeLost?: boolean;
   promotedDetail?: Record<string, unknown>;
+  stackDataIdentity?: Record<string, unknown>;
 }) {
   const calls: Array<Record<string, unknown>> = [];
   let writes = 0;
+  let graphQueries = 0;
   const b = {
     send: async (cmd: Record<string, unknown>) => {
       calls.push({ ...cmd });
@@ -77,6 +83,7 @@ function bridge(opts: {
         writes += 1;
         if (writes === 1 && opts.ambiguous) throw new Error(AMBIGUOUS);
         if (writes === 1 && opts.scopeLost) throw new Error(SCOPE_REFUSAL);
+        if (writes === 1 && opts.stackDataIdentity) throw new Error(STACK_DATA_CONTRADICTORY);
         const which =
           writes === 1
             ? (opts.firstWrite ?? "contradict")
@@ -102,6 +109,8 @@ function bridge(opts: {
         return { scope: "root" };
       }
       if (cmd.cmd === "graph_query") {
+        graphQueries += 1;
+        if (opts.stackDataIdentity && graphQueries <= 2) return opts.stackDataIdentity;
         return (
           opts.promotedDetail ?? {
             nodes: [
@@ -124,6 +133,8 @@ function bridge(opts: {
     tabs: () => [{ tab_id: TAB, title: "wf", connected_at: 0 }],
     resolveActiveTabId: () => TAB,
     tabCanMutateGraph: () => true,
+    tabConnectionIdentity: () => ({ generation: 1, tabSessionId: "browser-tab-a" }),
+    tabExpectedNodeTypeFenceCapability: () => true,
     tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
   } as unknown as PanelToolCtx["bridge"];
   return { b, calls };
@@ -249,6 +260,34 @@ describe("resolveInnerPromotedTarget", () => {
 });
 
 describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
+  it("does not carry the outer node-type fence into a promoted inner retry (#2107)", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "stack_data", value: "NEW" },
+      {
+        stackDataIdentity: { nodes: [{ id: 78, type: "OtherLoraLoader" }] },
+        subgraph: {
+          subgraph_of: { node_id: 78, title: "OtherLoraLoader" },
+          node_count: 1,
+          nodes: [{ id: 76, type: "OtherLoraLoader", widgets: { stack_data: "old" } }],
+        },
+      },
+    );
+
+    expect(isError).toBe(false);
+    expect(calls.map((c) => c.cmd)).toEqual([
+      "graph_query",
+      "graph_query",
+      "graph_set_widget",
+      "graph_get_subgraph",
+      "graph_enter_subgraph",
+      "graph_set_widget",
+      "graph_exit_subgraph",
+    ]);
+    expect(calls[2]).toMatchObject({ expected_node_type: "OtherLoraLoader" });
+    expect(calls[5]).not.toHaveProperty("expected_node_type");
+    expect(text).toMatch(/inner widget this promotion lists/);
+  });
+
   it("reports ambiguous promoted name/label candidates without a second write (#2015)", async () => {
     const { text, isError, calls } = await setWidget(
       { node_id: 190, widget: "text", value: "hello" },
