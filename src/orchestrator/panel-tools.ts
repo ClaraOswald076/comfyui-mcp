@@ -5311,6 +5311,9 @@ const ANIMA_REGIONAL_WIRED_PROMPT_INPUT: Record<string, string> = {
   negative_prompt: "negative_prompt_in",
 };
 
+const DASIWA_STACK_WIDGET = "stack_data";
+const DASIWA_LTX2_LORA_LOADER = "DaSiWa_LTX2LoraLoader";
+
 function isAnimaRegionalPromptWidget(widget: string): boolean {
   return ANIMA_REGIONAL_PROMPT_WIDGETS.has(widget);
 }
@@ -5380,6 +5383,37 @@ async function refuseAnimaRegionalPromptWrite(
   const type = parseQueriedNodeType(parseToolResultJson(probe));
   if (!type || !ANIMA_REGIONAL_CANVAS_TYPES.has(type)) return null;
   return animaRegionalPromptRefusal(type, widget);
+}
+
+function daSiWaStackRefusal(type: string): ToolResult {
+  return fail(
+    `panel_set_widget cannot set "${DASIWA_STACK_WIDGET}" on ${type}. ` +
+      `The node's custom multi-row widget owns the LoRA stack in its internal JS state and ` +
+      `re-serializes that state over widget.value, so the normal graph_set_widget success ` +
+      `echo would be a false success. Edit the stack rows in the node UI instead; do not retry ` +
+      `panel_set_widget for this widget.`,
+  );
+}
+
+/** Refuse the DaSiWa stack widget whose custom UI deterministically overwrites a
+ *  graph_set_widget write after acknowledging it. Probe only this widget and fail
+ *  open when the read cannot identify the node, matching the LC123 refusal policy. */
+async function refuseDaSiWaStackWrite(
+  ctx: PanelToolCtx,
+  nodeId: unknown,
+  widget: string,
+): Promise<ToolResult | null> {
+  if (widget !== DASIWA_STACK_WIDGET) return null;
+  const probe = await ctx.call({
+    cmd: "graph_query",
+    ids: [nodeId],
+    fields: "compact",
+    limit: 1,
+  });
+  if (probe.isError) return null;
+  const type = parseQueriedNodeType(parseToolResultJson(probe));
+  if (type !== DASIWA_LTX2_LORA_LOADER) return null;
+  return daSiWaStackRefusal(type);
 }
 
 // ---- #809: turn the panel's silent `truncated: true` booleans into a remedy --------
@@ -14734,7 +14768,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_set_widget",
-      "Set a widget value on a node in the user's open graph (steps, cfg, seed, ckpt_name, text prompts, …). Returns the previous and new value (a string longer than 1000 chars is echoed as {chars, sha256, preview} so batched calls stay inside the outer tool-result budget — pass `echo: \"full\"` for the verbatim string). Undoable with Ctrl+Z. To CLEAR a text widget to an empty string, pass `clear: true` (some MCP clients drop an empty-string `value` from the serialized payload, so `value: \"\"` may not arrive — `clear: true` always works). For the LTXDirector timeline node (WhatDreamsCost CSGlide), set `timeline_data` with the FULL timeline JSON (segments + global_prompt) to drive its custom timeline UI — this re-syncs the editor and regenerates its derived `local_prompts`/`segment_lengths`/`guide_strength` widgets; setting those derived widgets directly is refused (they are silently reverted). For AnimaRegionalCanvasInline / Krea2RegionalCanvasInline (LC123), quality/scene/red/green/blue/negative prompt writes are refused: the custom textarea and node.properties.animaPrompts overwrite widget.value on APPLY. Drive quality/scene/negative via a PrimitiveStringMultiline wired into quality_prompt_in / scene_prompt_in / negative_prompt_in; red/green/blue have no socket.",
+      "Set a widget value on a node in the user's open graph (steps, cfg, seed, ckpt_name, text prompts, …). Returns the previous and new value (a string longer than 1000 chars is echoed as {chars, sha256, preview} so batched calls stay inside the outer tool-result budget — pass `echo: \"full\"` for the verbatim string). Undoable with Ctrl+Z. To CLEAR a text widget to an empty string, pass `clear: true` (some MCP clients drop an empty-string `value` from the serialized payload, so `value: \"\"` may not arrive — `clear: true` always works). For the LTXDirector timeline node (WhatDreamsCost CSGlide), set `timeline_data` with the FULL timeline JSON (segments + global_prompt) to drive its custom timeline UI — this re-syncs the editor and regenerates its derived `local_prompts`/`segment_lengths`/`guide_strength` widgets; setting those derived widgets directly is refused (they are silently reverted). For AnimaRegionalCanvasInline / Krea2RegionalCanvasInline (LC123), quality/scene/red/green/blue/negative prompt writes are refused: the custom textarea and node.properties.animaPrompts overwrite widget.value on APPLY. Drive quality/scene/negative via a PrimitiveStringMultiline wired into quality_prompt_in / scene_prompt_in / negative_prompt_in; red/green/blue have no socket. DaSiWa_LTX2LoraLoader's `stack_data` write is also refused: its custom multi-row widget reserializes its own JS state over `widget.value`, so the echoed write would be a false success; edit the stack rows in the node UI instead.",
       {
         node_id: nodeId().describe("Node id from panel_graph_outline / panel_query_graph."),
         widget: z.string().describe("Widget name (e.g. 'steps', 'cfg', 'text')."),
@@ -14774,6 +14808,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           args.widget as string,
         );
         if (blocked) return blocked;
+        const daSiWaBlocked = await refuseDaSiWaStackWrite(
+          ctx,
+          args.node_id,
+          args.widget as string,
+        );
+        if (daSiWaBlocked) return daSiWaBlocked;
         // #599: the frontend runs refresh-before-validate here (pulls a fresh
         // /object_info so a just-staged/-downloaded/-installed value is accepted on
         // a single revalidation, #338/#458) — that authoritative fetch can outlast

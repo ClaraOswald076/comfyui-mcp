@@ -465,6 +465,71 @@ describe("panel-tools: panel_set_widget Anima regional textarea (#1658)", () => 
   });
 });
 
+describe("panel-tools: panel_set_widget DaSiWa stack_data (#2107)", () => {
+  const SET_OK = {
+    set: { node_id: 2571, widget: "stack_data", previous: "old", value: "NEW" },
+  };
+
+  async function run(queryReply: unknown): Promise<{ res: ToolResult; cmds: string[] }> {
+    const cmds: string[] = [];
+    const res = (await defByName("panel_set_widget").handler(
+      { node_id: 2571, widget: "stack_data", value: "NEW" },
+      {
+        call: async (cmd: Record<string, unknown>) => {
+          cmds.push(String(cmd.cmd));
+          if (cmd.cmd === "graph_query") {
+            if (typeof queryReply === "object" && queryReply !== null && "isError" in queryReply) {
+              return queryReply;
+            }
+            return { content: [{ type: "text" as const, text: JSON.stringify(queryReply, null, 2) }] };
+          }
+          return { content: [{ type: "text" as const, text: JSON.stringify(SET_OK, null, 2) }] };
+        },
+      } as unknown as PanelToolCtx,
+    )) as ToolResult;
+    return { res, cmds };
+  }
+
+  it("refuses stack_data on DaSiWa_LTX2LoraLoader before graph_set_widget", async () => {
+    const { res, cmds } = await run({ text: '#2571 DaSiWa_LTX2LoraLoader "Lora HIGH" · stack_data=old' });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/cannot set "stack_data" on DaSiWa_LTX2LoraLoader/);
+    expect(res.content[0].text).toMatch(/custom multi-row widget/);
+    expect(res.content[0].text).toMatch(/false success/);
+    expect(res.content[0].text).toMatch(/Edit the stack rows in the node UI/);
+    expect(cmds).toEqual(["graph_query"]);
+  });
+
+  it("reads structured node identity and still refuses the unsafe write", async () => {
+    const { res, cmds } = await run({ nodes: [{ id: 2571, type: "DaSiWa_LTX2LoraLoader" }] });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("DaSiWa_LTX2LoraLoader");
+    expect(cmds).toEqual(["graph_query"]);
+  });
+
+  it("does not block stack_data on another node type", async () => {
+    const { res, cmds } = await run({ text: '#3 OtherLoraLoader "other" · stack_data=old' });
+    expect(res.isError).toBeUndefined();
+    expect(JSON.parse(res.content[0].text!).set.value).toBe("NEW");
+    expect(cmds).toEqual(["graph_query", "graph_set_widget"]);
+  });
+
+  it("fails open when the identity probe is unavailable", async () => {
+    const { res, cmds } = await run({
+      isError: true,
+      content: [{ type: "text", text: "Error: no connected tab" }],
+    });
+    expect(res.isError).toBeUndefined();
+    expect(cmds).toEqual(["graph_query", "graph_set_widget"]);
+  });
+
+  it("documents the refusal on the tool itself", () => {
+    const description = defByName("panel_set_widget").description;
+    expect(description).toContain("DaSiWa_LTX2LoraLoader");
+    expect(description).toContain("stack_data");
+  });
+});
+
 describe("panel-tools: panel_add_node frontend-only virtual types (#741)", () => {
   // #741: Note/MarkdownNote/Reroute/PrimitiveNode are frontend-only virtual types —
   // they exist only in LiteGraph, never in the backend /object_info. The MCP side
