@@ -7953,9 +7953,9 @@ NOTE: an API-format load CAN re-mint the canvas workflow instance. If your next 
  * Reconcile only the narrow, post-dispatch transport failure reported by the issue. A
  * dispatched request id is required: without it, "Failed to fetch" may be a pre-write
  * refusal and there is no mutation to reconcile. The live graph must also have the exact
- * requested node count and still belong to the workflow instance that was active before
- * the load. Anything less remains outcome-unknown, so a real load failure is never turned
- * into a success by a coincidental canvas shape.
+ * requested content and still belong to the workflow instance that was active before the
+ * load. Anything less remains outcome-unknown, so a real load failure is never turned into
+ * a success by a coincidental canvas shape.
  */
 function isBarePanelFetchFailure(res: ToolResult): boolean {
   return res.isError === true && /^(?:Error:\s*)?Failed to fetch$/i.test(textOfToolResult(res));
@@ -7966,36 +7966,6 @@ function uiWorkflowNodeCount(value: unknown): number | undefined {
     return undefined;
   }
   return (value as { nodes: unknown[] }).nodes.length;
-}
-
-/** Stable identity for the nodes in a UI graph; layout/widget state is checked by
- * the normal load path, while this proof prevents an old same-sized graph from
- * being mistaken for the requested one. */
-function uiWorkflowNodeSignature(value: unknown): string | undefined {
-  if (!value || typeof value !== "object" || !Array.isArray((value as { nodes?: unknown }).nodes)) {
-    return undefined;
-  }
-  const nodes = (value as { nodes: unknown[] }).nodes;
-  const signature: string[] = [];
-  for (const raw of nodes) {
-    if (!raw || typeof raw !== "object") return undefined;
-    const node = raw as { id?: unknown; type?: unknown };
-    if ((typeof node.id !== "number" && typeof node.id !== "string") || typeof node.type !== "string") {
-      return undefined;
-    }
-    signature.push(`${String(node.id)}\u0000${node.type}`);
-  }
-  return signature.sort().join("\u0001");
-}
-
-function uiWorkflowLinkSignature(value: unknown): string | undefined {
-  if (!value || typeof value !== "object" || !Array.isArray((value as { links?: unknown }).links)) {
-    return undefined;
-  }
-  return (value as { links: unknown[] }).links
-    .map((link) => JSON.stringify(link))
-    .sort()
-    .join("\u0001");
 }
 
 function loadOutcomeUnknown(res: ToolResult, dispatchedRid: string | undefined): ToolResult {
@@ -8020,11 +7990,8 @@ async function reconcileFailedPanelLoad(
   if (!isBarePanelFetchFailure(res) || !dispatchedRid) return res;
 
   const expectedNodeCount = uiWorkflowNodeCount(data);
-  const expectedNodeSignature = uiWorkflowNodeSignature(data);
-  const expectedLinkSignature = uiWorkflowLinkSignature(data);
   if (
     expectedNodeCount === undefined ||
-    expectedNodeSignature === undefined ||
     fenceBefore.known !== true ||
     typeof fenceBefore.uuid !== "string" ||
     ctx.tabId !== tabAtDispatch
@@ -8048,10 +8015,12 @@ async function reconcileFailedPanelLoad(
     if (liveNodeCount !== expectedNodeCount) {
       return loadOutcomeUnknown(res, dispatchedRid);
     }
-    if (
-      uiWorkflowNodeSignature(liveWorkflow) !== expectedNodeSignature ||
-      (expectedLinkSignature !== undefined && uiWorkflowLinkSignature(liveWorkflow) !== expectedLinkSignature)
-    ) {
+    // Count alone is not proof: an old same-sized graph on the same workflow
+    // instance would otherwise be reported as the requested load. Reuse the
+    // existing fail-closed content matcher, which checks node identities/types,
+    // link topology, non-empty widget values, and nested subgraph content while
+    // tolerating frontend schema/presentation normalization.
+    if (!openLiveMatchesDestContent(liveWorkflow, data)) {
       return loadOutcomeUnknown(res, dispatchedRid);
     }
 
@@ -8078,7 +8047,7 @@ async function reconcileFailedPanelLoad(
       response_error: "Failed to fetch",
       note:
         "The panel applied the requested UI graph, but its reply failed after dispatch. " +
-        "The same workflow instance now contains the expected node count; do not retry.",
+        "The same workflow instance now contains the expected graph; do not retry.",
     });
   } catch {
     return loadOutcomeUnknown(res, dispatchedRid);
