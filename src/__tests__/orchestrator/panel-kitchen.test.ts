@@ -129,6 +129,7 @@ describe("panel_kitchen", () => {
       matched: 2,
       shown: 1,
       truncated: true,
+      truncated_by: "max_chars",
       text: JSON.stringify(unetRow(12)),
     });
 

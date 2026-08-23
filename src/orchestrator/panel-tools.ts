@@ -19974,9 +19974,15 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         if (query.isError) return query;
         const graph = normalizeGraphQueryResult(query);
         if (graph.truncated === true) {
+          const truncationCause =
+            graph.truncated_by === "limit"
+              ? "the graph_query row limit"
+              : graph.truncated_by === "max_chars"
+                ? "the panel's max_chars ceiling"
+                : "a panel response cap";
           return fail(
             `panel_kitchen could not assess the complete live graph: graph_query truncated its ` +
-              `detail rows at the panel's max_chars ceiling. Narrow the live graph with a ` +
+              `detail rows at ${truncationCause}. Narrow the live graph with a ` +
               `more specific workflow or retry after reducing the number of UNETLoaders.`,
           );
         }
