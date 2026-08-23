@@ -42,7 +42,6 @@ import {
   resolveEffectiveComfyUIBaseLive,
   resolveEffectiveComfyUICodeBaseLive,
   resolveCustomNodesScanBaseLiveStrict,
-  getLiveServerSnapshot,
   resolveInstallInterpreter,
   type InstallInterpreterResolution,
 } from "./workspace-env.js";
@@ -983,14 +982,18 @@ function looksLikeGitManifestSource(id: string): boolean {
 
 async function resolveLocalManifestCustomNodesBase(): Promise<string | undefined> {
   if (isRemoteMode()) return undefined;
-  // With no COMFYUI_PATH/configured root, a saved default is only a local
-  // workspace candidate. For the direct Git fallback it is not an authorized
-  // target unless the panel-connected local server is reachable now.
-  if (!process.env.COMFYUI_PATH && !config.comfyuiPath) {
-    const live = await getLiveServerSnapshot();
-    if (!live.reachable) return undefined;
+  try {
+    // With no COMFYUI_PATH, a saved/default config root is only a local
+    // workspace candidate. It is not an authorized clone target unless the
+    // panel-connected local server provides live evidence for its scan root.
+    return await resolveCustomNodesScanBaseLiveStrict({
+      requireLive: !process.env.COMFYUI_PATH,
+    });
+  } catch {
+    // An unavailable/ambiguous live root must not block the Manager attempt.
+    // It only removes the optional local-clone route.
+    return undefined;
   }
-  return resolveCustomNodesScanBaseLiveStrict();
 }
 
 async function applyManifestSections(
@@ -1139,19 +1142,6 @@ async function applyManifestSections(
       );
       continue;
     }
-    if (localMode && looksLikeGitManifestSource(id) && !customNodesBase) {
-      results.push(
-        report(
-          "custom_node",
-          id,
-          "failed",
-          "apply_manifest could not verify a local ComfyUI custom_nodes root for this Git source. " +
-            "The direct clone was refused; connect the panel to a reachable local ComfyUI " +
-            "whose live install or --base-directory is available, then retry.",
-        ),
-      );
-      continue;
-    }
     if (nodeAlreadyInstalled(id, installedNodes)) {
       results.push(report("custom_node", id, "skipped", "Custom node is already installed."));
       continue;
@@ -1171,6 +1161,9 @@ async function applyManifestSections(
     const installOutcome = installCustomNode({
       id,
       ...(customNodesBase ? { comfyuiPath: customNodesBase } : {}),
+      ...(looksLikeGitManifestSource(id)
+        ? { localCloneFallback: "verified-only" as const }
+        : {}),
     })
       .then((res) => ({ kind: "settled" as const, res }))
       .catch((err) => ({ kind: "error" as const, err }));

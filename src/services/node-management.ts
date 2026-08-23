@@ -25,6 +25,7 @@ import {
   detectLocalWriteTargetMismatch,
   resolveEffectiveComfyUIBase,
   resolveEffectiveComfyUICodeBase,
+  resolveCustomNodesScanBaseLiveStrict,
   resolveInstallInterpreter,
 } from "./workspace-env.js";
 import {
@@ -2654,7 +2655,9 @@ function discardFailedClone(
  * refused before queueing by its `security_level` / `allow_git_url_install`
  * policy. Both arrive as a status on the POST itself:
  *
- *   404 — the route is not registered on this build
+ *   404 — the route is not registered on this build. Git installs use
+ *   `/manager/queue/install`, `/v2/manager/queue/task`, or the legacy-UI
+ *   `/v2/manager/queue/batch` envelope.
  *
  * 403 is admitted only when Manager's authoritative JSON error shape names its
  * own policy gate, or when one of the exact legacy Manager policy responses is
@@ -2712,7 +2715,7 @@ function managerEnqueueRefusal(err: unknown): number | undefined {
   if (typeof status !== "number") return undefined;
   if (
     typeof url !== "string" ||
-    !/\/manager\/queue\/(?:task|install)(?:[?#]|$)/.test(url)
+    !/\/manager\/queue\/(?:task|install|batch)(?:[?#]|$)/.test(url)
   ) {
     return undefined;
   }
@@ -2849,15 +2852,19 @@ async function cloneCustomNodeFallback(
     /** #1470 — did `gitRef` come from the `version` selector rather than an explicit
      *  `ref`? Only a version-derived ref may be skipped when the repo does not have it. */
     refFromVersion?: boolean;
+    /** Do not re-read the shared saved-default resolver when the caller's
+     *  call-scoped target was deliberately unavailable. */
+    allowSharedWorkspaceFallback?: boolean;
   },
 ): Promise<NodeOpResult> {
   const because =
     opts?.managerRefusalNote ?? `"${repoName}" is not in the ComfyUI-Manager registry`;
-  // basePath is the CALL-SCOPED local ComfyUI root (apply_manifest threads an
-  // adopted saved-default/live root here WITHOUT mutating global config, so a
-  // panel-connected local session with no COMFYUI_PATH can still clone an
-  // unregistered git pack); fall back to the shared data/base resolver.
-  const comfyuiBase = basePath ?? resolveEffectiveComfyUIBase();
+  // basePath is the CALL-SCOPED local ComfyUI root. When the caller has already
+  // established that no safe root exists, do not re-read the saved-default
+  // resolver and recreate the wrong-machine clone hazard.
+  const comfyuiBase =
+    basePath ??
+    (opts?.allowSharedWorkspaceFallback === false ? undefined : resolveEffectiveComfyUIBase());
   // Same hazard as the CLI paths (codex gate P0): the guard below catches "no
   // path", but the dangerous case is HAVING one while connected elsewhere. A
   // clone into a stale local tree would report a successful install of a pack the
@@ -3084,8 +3091,12 @@ export interface InstallOptions {
   /** CALL-SCOPED local ComfyUI data/base root for the git-clone / ref-checkout
    *  fallback, threaded by callers (e.g. apply_manifest) that resolve an adopted
    *  saved-default/live `--base-directory` WITHOUT mutating global config. Falls
-   *  back to the shared data/base resolver when omitted. */
+   *  back to verified live custom_nodes evidence when COMFYUI_PATH is unset; it
+   *  does not authorize a saved default by itself. */
   comfyuiPath?: string;
+  /** The caller has already resolved the only safe local clone root. When set,
+   *  an absent comfyuiPath means Manager-only, never a second local-root lookup. */
+  localCloneFallback?: "verified-only";
 }
 
 /**
@@ -3165,6 +3176,26 @@ function comfyCliUnavailableReason(workspace: string | undefined): string | unde
   return undefined;
 }
 
+async function resolveInstallLocalWorkspace(
+  opts: InstallOptions,
+): Promise<string | undefined> {
+  if (opts.comfyuiPath !== undefined) return opts.comfyuiPath;
+  if (opts.localCloneFallback === "verified-only") return undefined;
+
+  // An unset COMFYUI_PATH is not permission to use the saved default. The
+  // connected local server must identify a usable custom_nodes scan root, or
+  // this operation remains Manager-only. This resolver never throws for an
+  // unavailable/ambiguous live root; the Manager attempt still proceeds.
+  if (!process.env.COMFYUI_PATH && !isRemoteMode()) {
+    try {
+      return await resolveCustomNodesScanBaseLiveStrict({ requireLive: true });
+    } catch {
+      return undefined;
+    }
+  }
+  return resolveEffectiveComfyUIBase();
+}
+
 async function installCustomNodeImpl(
   opts: InstallOptions,
 ): Promise<NodeOpResult> {
@@ -3200,24 +3231,21 @@ async function installCustomNodeImpl(
   if (source === "git") assertSafeGitUrl(gitId);
 
   // Keep the mutation, its post-queue verification, AND any local filesystem
-  // work on the target selected for this invocation — captured NOW, before the
-  // first await: a panel retarget in between must not split them across two
-  // installs. cliWorkspace is the pack/data root (COMFYUI_PATH, an adopted
-  // live `--base-directory`, or the saved default); the CLI --workspace, the
-  // ref checkout, and the clone fallback all take this ONE root, so a git
-  // install with a ref can never install into the workspace and then fail the
-  // checkout for want of a path (codex gate rounds 5-6).
+  // work on the target selected for this invocation. The Manager base is
+  // captured before the live-root lookup so a panel retarget cannot move the
+  // HTTP half of this operation while the filesystem target is being verified.
+  // With COMFYUI_PATH unset, a live custom_nodes root is required; a saved
+  // default is machine-local configuration, not proof of what this panel target
+  // scans.
   const managerBase = managerBaseUrl();
-  const cliWorkspace = opts.comfyuiPath ?? resolveEffectiveComfyUIBase();
+  const cliWorkspace =
+    source === "git" || opts.useCmCli
+      ? await resolveInstallLocalWorkspace(opts)
+      : opts.comfyuiPath ?? resolveEffectiveComfyUIBase();
   const presenceCtx = capturePackPresenceContext(cliWorkspace);
   // #1765 — and is that root the install this session is actually CONNECTED to?
   // Pinned to the very cliWorkspace the write will use, so a panel retarget
   // mid-call cannot judge one install's root against another's server.
-  //
-  // AFTER presenceCtx, deliberately: this is the first await in the function, and
-  // capturePackPresenceContext must be taken at operation ENTRY from the mode and
-  // config as they are NOW (codex gate round 11 — computing it after an await lets
-  // a mid-op retarget pair Manager A's answer with disk B).
   //
   // Taken only when a LOCAL write is reachable for this call: a registry install
   // goes through ComfyUI-Manager, which targets the connected server by
@@ -3369,6 +3397,7 @@ async function installCustomNodeImpl(
           cliWorkspace,
           {
             refFromVersion,
+            allowSharedWorkspaceFallback: cliWorkspace !== undefined,
             managerRefusalNote:
               refusedBy === 403
                 ? `ComfyUI-Manager REFUSED the git-URL install (HTTP 403) via its ` +
@@ -3402,7 +3431,10 @@ async function installCustomNodeImpl(
       );
     }
     return withCliNote(
-      await cloneCustomNodeFallback(gitId, repoName, gitRef, status, cliWorkspace, { refFromVersion }),
+      await cloneCustomNodeFallback(gitId, repoName, gitRef, status, cliWorkspace, {
+        refFromVersion,
+        allowSharedWorkspaceFallback: cliWorkspace !== undefined,
+      }),
     );
   }
 
