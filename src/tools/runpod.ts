@@ -92,7 +92,15 @@ async function probe(url: string, timeoutMs = 8000): Promise<{ ok: boolean; stat
   const t = setTimeout(() => ctl.abort(), timeoutMs);
   try {
     const res = await fetch(url, { signal: ctl.signal });
-    return { ok: res.ok, status: res.status };
+    if (!res.ok) return { ok: false, status: res.status };
+    try {
+      const body: unknown = await res.json();
+      return body !== null && typeof body === "object" && !Array.isArray(body)
+        ? { ok: true, status: res.status }
+        : { ok: false, status: res.status, error: "response was not a JSON object" };
+    } catch {
+      return { ok: false, status: res.status, error: "response was not valid JSON" };
+    }
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   } finally {
@@ -437,14 +445,14 @@ export function registerRunpodTools(server: McpServer): void {
             const url = runpodProxyUrl(pod.id);
             const probeRes = await probe(`${url}/system_stats`);
             if (!probeRes.ok) {
-              return { content: [{ type: "text", text: `Pod \`${pod.id}\` exposes ComfyUI but it isn't answering yet at ${url} (${probeRes.status ?? probeRes.error}). It may still be booting — wait ~30s, or run runpod_watch action:"troubleshoot".` }] };
+              return { content: [{ type: "text", text: `Pod \`${pod.id}\` exposes ComfyUI but it isn't answering yet at ${url} (${probeRes.error ?? probeRes.status}). It may still be booting — wait ~30s, or run runpod_watch action:"troubleshoot".` }] };
             }
             // Readiness needs MORE than /system_stats (#269): a ComfyUI whose core is
             // up but whose queue/prompt endpoint is broken would answer /system_stats
             // yet fail every render. Verify /queue answers too before declaring ready.
             const queueProbe = await probe(`${url}/queue`);
             if (!queueProbe.ok) {
-              return { content: [{ type: "text", text: `Pod \`${pod.id}\` answers /system_stats but its queue endpoint isn't ready at ${url} (${queueProbe.status ?? queueProbe.error}) — ComfyUI may still be initializing. Wait ~30s, or run runpod_watch action:"troubleshoot".` }] };
+              return { content: [{ type: "text", text: `Pod \`${pod.id}\` answers /system_stats but its queue endpoint isn't ready at ${url} (${queueProbe.error ?? queueProbe.status}) — ComfyUI may still be initializing. Wait ~30s, or run runpod_watch action:"troubleshoot".` }] };
             }
             const applied = setComfyuiTarget(url);
             if (!applied) return { content: [{ type: "text", text: `Resolved ${url} but could not retarget (unexpected URL parse failure).` }] };
@@ -615,7 +623,7 @@ export function registerRunpodTools(server: McpServer): void {
             if (p.ok) {
               lines.push(`✅ ComfyUI is answering at ${url}. The pod is healthy — connect with runpod action:"connect".`);
             } else {
-              lines.push(`❌ Port ${RUNPOD_COMFYUI_PORT} is exposed but ComfyUI did not answer at ${url}/system_stats (${p.status ?? p.error}). Likely still starting, or ComfyUI crashed on boot. → Wait ~30s and re-check; if it persists, view the pod's logs in the console (a missing model/custom node can abort ComfyUI on startup).`);
+              lines.push(`❌ Port ${RUNPOD_COMFYUI_PORT} is exposed but ComfyUI did not answer at ${url}/system_stats (${p.error ?? p.status}). Likely still starting, or ComfyUI crashed on boot. → Wait ~30s and re-check; if it persists, view the pod's logs in the console (a missing model/custom node can abort ComfyUI on startup).`);
             }
             return { content: [{ type: "text", text: lines.join("\n") }] };
           }
