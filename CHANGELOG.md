@@ -6,6 +6,22 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.76] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- prevent false-success DaSiWa `stack_data` writes after node replacement (#2107).
+- preserve DaSiWa refusal in promoted retries
+- fence promoted inner widget retries
+- close widget write race fences
+- require expected node type write fence
+- bind stack widget writes to target type
+- fence DaSiWa widget identity before write
+- fail closed on DaSiWa widget identity
+- refuse DaSiWa stack widget writes
+
+
 ## [0.52.75] - 2026-08-23
 
 ### MCP
