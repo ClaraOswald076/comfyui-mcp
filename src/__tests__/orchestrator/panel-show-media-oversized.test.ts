@@ -14,6 +14,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writ
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PanelToolCtx, ToolResult } from "../../orchestrator/panel-tools.js";
+import type { PanelVersionReading } from "../../services/ui-bridge.js";
 
 const state = vi.hoisted(() => ({
   outputDir: "" as string,
@@ -86,7 +87,7 @@ const { buildPanelToolDefs } = await import("../../orchestrator/panel-tools.js")
 
 type Forwarded = Record<string, unknown>;
 
-function makeCtx(): { ctx: PanelToolCtx; calls: Forwarded[] } {
+function makeCtx(opts: { headless?: boolean; version?: PanelVersionReading } = {}): { ctx: PanelToolCtx; calls: Forwarded[] } {
   const calls: Forwarded[] = [];
   const ctx = {
     call: async (cmd: Forwarded) => {
@@ -94,7 +95,10 @@ function makeCtx(): { ctx: PanelToolCtx; calls: Forwarded[] } {
       return { content: [{ type: "text", text: JSON.stringify(cmd) }] } as ToolResult;
     },
     confirm: async () => "yes" as const,
-    bridge: { isHeadless: () => false } as unknown as PanelToolCtx["bridge"],
+    bridge: {
+      isHeadless: () => opts.headless ?? false,
+      advertisedPanelVersion: () => opts.version ?? {},
+    } as unknown as PanelToolCtx["bridge"],
     tabId: "test-tab",
   } as PanelToolCtx;
   return { ctx, calls };
@@ -102,10 +106,11 @@ function makeCtx(): { ctx: PanelToolCtx; calls: Forwarded[] } {
 
 async function showMedia(
   items: Array<Record<string, unknown>>,
+  opts: { headless?: boolean; version?: PanelVersionReading } = {},
 ): Promise<{ res: ToolResult; calls: Forwarded[] }> {
   const def = buildPanelToolDefs().find((d) => d.name === "panel_show_media");
   if (!def) throw new Error("panel_show_media not found");
-  const { ctx, calls } = makeCtx();
+  const { ctx, calls } = makeCtx(opts);
   const res = (await def.handler({ items }, ctx)) as ToolResult;
   return { res, calls };
 }
@@ -518,5 +523,33 @@ describe("panel_show_media: an oversized AUDIO file takes the same routes (#1572
     const text = textOf(res);
     expect(text).toContain(", audio)");
     expect(text).toMatch(/real filesystem WRITE/);
+  });
+
+  it("refuses a staged audio file before copying it for a proven-old panel", async () => {
+    const before = existsSync(join(outDir, "_panel_staged"))
+      ? readdirSync(join(outDir, "_panel_staged")).length
+      : 0;
+    const { res, calls } = await showMedia(
+      [{ source: { path: bigAudioOutside, stage: true } }],
+      { version: { raw: "0.11.41", version: "0.11.41" } },
+    );
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+    expect(textOf(res)).toMatch(/cannot paint "audio"/);
+    const after = existsSync(join(outDir, "_panel_staged"))
+      ? readdirSync(join(outDir, "_panel_staged")).length
+      : 0;
+    expect(after).toBe(before);
+  });
+
+  it("refuses local audio before dispatching it to a headless client", async () => {
+    const { res, calls } = await showMedia(
+      [{ source: { path: bigAudioUnderRoot } }],
+      { headless: true },
+    );
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+    expect(textOf(res)).toMatch(/headless client/i);
+    expect(textOf(res)).toMatch(/audio player/i);
   });
 });

@@ -19531,6 +19531,40 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         };
         const MAX_BYTES = 20 * 1024 * 1024; // 20 MB
 
+        // Capability refusal must be a preflight, before the loop can perform
+        // the opt-in stage:true filesystem write. A mixed batch such as a
+        // staged image followed by audio must not leave a persistent copy when
+        // a proven-old panel will refuse the audio item. The same preflight also
+        // keeps local audio out of the known headless clients: they have no
+        // audio painter, and #2018's honest accounting cannot make an absent
+        // player render the item.
+        const panelCompatibility = {
+          reading: tabPanelVersionReading(ctx),
+          advertisedKinds: tabAdvertisedShowMediaKinds(ctx),
+        };
+        const knownAudioItems: Array<Record<string, unknown>> = [];
+        const knownAudioPaths: string[] = [];
+        for (const item of items) {
+          const src = item.source;
+          const filename = "path" in src ? src.path : src.filename;
+          if (AUDIO_EXTS.has(extname(filename).toLowerCase())) {
+            knownAudioItems.push({ kind: "audio", filename });
+            if ("path" in src) knownAudioPaths.push(filename);
+          }
+        }
+        if (knownAudioItems.length > 0) {
+          const blocked = showMediaItemsPanelCannotPaint(knownAudioItems, panelCompatibility);
+          if (blocked.length > 0) {
+            return fail(formatShowMediaKindUnsupported(blocked));
+          }
+          if (knownAudioPaths.length > 0 && resolveClientKind(ctx).kind === "headless") {
+            return fail(
+              "panel_show_media cannot send audio to this headless client: it has no audio player. " +
+                "Use an interactive ComfyUI browser panel tab to play the audio instead.",
+            );
+          }
+        }
+
         const resolved: Array<Record<string, unknown>> = [];
         /** Oversized items that took the /view reference route instead (#648). */
         const forwarded: ForwardedByReference[] = [];
@@ -19760,8 +19794,7 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // panel that omitted the field is never told to update. Image/video
         // skip the check entirely.
         const blocked = showMediaItemsPanelCannotPaint(resolved, {
-          reading: tabPanelVersionReading(ctx),
-          advertisedKinds: tabAdvertisedShowMediaKinds(ctx),
+          ...panelCompatibility,
         });
         if (blocked.length > 0) {
           return fail(formatShowMediaKindUnsupported(blocked));
