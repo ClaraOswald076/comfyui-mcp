@@ -606,9 +606,10 @@ if (cloudActive) {
 
 export const config: Config = { ...parsedConfig, resolvedPort };
 
-// ── LAZY DOWNLOAD CREDENTIALS (#826) ────────────────────────────────────────
-// The two download tokens above are snapshotted from process.env at MODULE LOAD,
-// and the canonical .env is read exactly once at boot. In the comfyui MCP CHILD
+// ── LAZY RUNTIME CREDENTIALS (#826, #2085) ──────────────────────────────────
+// The download tokens and gateway credentials above are snapshotted from
+// process.env at MODULE LOAD, and the canonical .env is read exactly once at
+// boot. In the comfyui MCP CHILD
 // that is fatal: `panel_request_secret` writes the token to ~/.comfyui-mcp/.env
 // and then relies on the orchestrator RESPAWNING this process to inject it. When
 // that respawn does not fire, a snapshotted credential is invisible forever —
@@ -1063,14 +1064,19 @@ export function getComfyUIBaseUrl(): string {
  */
 export function getComfyUIAuthHeaders(): Record<string, string> {
   const headers: Record<string, string> = {};
-  const token = config.comfyuiAuthToken?.trim();
+  // panel_request_secret writes these fixed keys to the canonical .env after
+  // config.ts has loaded. Resolve them at request time so the orchestrator's
+  // own ComfyUI/Manager requests pick up a save or revoke without a restart.
+  // The key names stay explicit: this does not turn arbitrary environment
+  // variables into request headers or alter the child/agent secret boundary.
+  const token = freshSecretValue("COMFYUI_AUTH_TOKEN")?.trim();
   if (token) {
-    const header = config.comfyuiAuthHeader?.trim() || "Authorization";
+    const header = freshSecretValue("COMFYUI_AUTH_HEADER")?.trim() || "Authorization";
     // An unset/empty scheme defaults to "Bearer" for the Authorization header and
     // to none (raw token) for any custom header. Set COMFYUI_AUTH_SCHEME to force
     // a specific scheme (e.g. "Token").
     const scheme =
-      config.comfyuiAuthScheme?.trim() ||
+      freshSecretValue("COMFYUI_AUTH_SCHEME")?.trim() ||
       (header.toLowerCase() === "authorization" ? "Bearer" : "");
     headers[header] = scheme ? `${scheme} ${token}` : token;
   }
@@ -1078,8 +1084,8 @@ export function getComfyUIAuthHeaders(): Record<string, string> {
   // so a half-configured token never produces a broken request. Additive: works
   // alongside or instead of COMFYUI_AUTH_TOKEN, and applies to every ComfyUI
   // endpoint (harmless on endpoints not behind Cloudflare Access — they ignore it).
-  const cfId = config.cfAccessClientId?.trim();
-  const cfSecret = config.cfAccessClientSecret?.trim();
+  const cfId = freshSecretValue("CF_ACCESS_CLIENT_ID")?.trim();
+  const cfSecret = freshSecretValue("CF_ACCESS_CLIENT_SECRET")?.trim();
   if (cfId && cfSecret) {
     headers["CF-Access-Client-Id"] = cfId;
     headers["CF-Access-Client-Secret"] = cfSecret;

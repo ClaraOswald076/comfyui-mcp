@@ -231,6 +231,44 @@ describe("remote self-hosted: path prefix + generic auth (#52)", () => {
     expect(mod.isCloudMode()).toBe(false);
     expect(mod.isRemoteMode()).toBe(true);
   });
+
+  it("re-reads panel-saved gateway credentials without reloading config (#2085)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cmcp-config-auth-"));
+    process.env.COMFYUI_MCP_ENV_FILE = join(dir, ".env");
+
+    try {
+      const mod = await import("../config.js");
+      const { removeComfyuiSecret, setComfyuiSecret } = await import("../services/panel-secrets.js");
+
+      // config.ts has already loaded with empty auth values. Exercise the same
+      // persisted panel path used by panel_request_secret, then call the real
+      // production header builder again in this still-running module.
+      expect(mod.getComfyUIAuthHeaders()).toEqual({});
+      setComfyuiSecret("COMFYUI_AUTH_TOKEN", "panel-token");
+      setComfyuiSecret("COMFYUI_AUTH_HEADER", "X-Panel-Token");
+      setComfyuiSecret("COMFYUI_AUTH_SCHEME", "Token");
+      setComfyuiSecret("CF_ACCESS_CLIENT_ID", "access-id");
+      setComfyuiSecret("CF_ACCESS_CLIENT_SECRET", "access-secret");
+      expect(mod.getComfyUIAuthHeaders()).toEqual({
+        "X-Panel-Token": "Token panel-token",
+        "CF-Access-Client-Id": "access-id",
+        "CF-Access-Client-Secret": "access-secret",
+      });
+
+      setComfyuiSecret("COMFYUI_AUTH_TOKEN", "rotated-token");
+      expect(mod.getComfyUIAuthHeaders()["X-Panel-Token"]).toBe("Token rotated-token");
+
+      removeComfyuiSecret("COMFYUI_AUTH_TOKEN");
+      removeComfyuiSecret("COMFYUI_AUTH_HEADER");
+      removeComfyuiSecret("COMFYUI_AUTH_SCHEME");
+      removeComfyuiSecret("CF_ACCESS_CLIENT_ID");
+      removeComfyuiSecret("CF_ACCESS_CLIENT_SECRET");
+      expect(mod.getComfyUIAuthHeaders()).toEqual({});
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      delete process.env.COMFYUI_MCP_ENV_FILE;
+    }
+  });
 });
 
 describe("COMFYUI_PATH nested/wrapper self-heal (doubled-path bug)", () => {
