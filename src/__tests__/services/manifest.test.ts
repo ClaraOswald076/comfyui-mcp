@@ -218,6 +218,9 @@ vi.mock("../../services/workspace-env.js", () => ({
     effectiveCodeBaseLiveMock(...(a as [])),
   resolveEffectiveComfyUIBaseLive: (...a: unknown[]) =>
     effectiveBaseLiveMock(...(a as [])),
+  resolveCustomNodesScanBaseLiveStrict: (...a: unknown[]) =>
+    effectiveBaseLiveMock(...(a as [])),
+  getLiveServerSnapshot: async () => ({ reachable: true }),
   // Mirrors the real resolver enough for the pip tests: an install-root python.
   resolveRootInterpreter: (root: string | undefined) =>
     root ? `${root}/python` : "python",

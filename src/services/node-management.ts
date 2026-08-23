@@ -2656,9 +2656,10 @@ function discardFailedClone(
  *
  *   404 — the route is not registered on this build
  *
- * 403 is admitted only when Manager's body explicitly names its own
- * `security_level` / `allow_git_url_install` policy gate. A bare 403 may be an
- * authentication/permission layer and stays fail-closed. 405 is deliberately
+ * 403 is admitted only when Manager's authoritative JSON error shape names its
+ * own policy gate, or when one of the exact legacy Manager policy responses is
+ * present. A bare 403 may be an authentication/permission layer and stays
+ * fail-closed. 405 is deliberately
  * NOT here. On this API it is the DIALECT-MISMATCH signal
  * (ComfyUI's frontend catchall answering a route registered under the other
  * generation), and the self-heal retry in #646 already owns it — diverting to a
@@ -2675,6 +2676,34 @@ function discardFailedClone(
  * failure is anything else (including 401, bare 403, 407, a transport error, a
  * timeout, or a 500) and must keep propagating.
  */
+const LEGACY_MANAGER_SECURITY_ERROR =
+  "A security error has occurred. Please check the terminal logs";
+
+/**
+ * Keep the old plain-text Manager response working without treating arbitrary
+ * response text as proof of Manager ownership. JSON is the current authoritative
+ * Manager shape; the two exact strings are retained for the legacy response and
+ * the existing local compatibility fixture.
+ */
+function isManagerOwnedGitPolicy403(body: unknown): boolean {
+  if (typeof body !== "string") return false;
+  const text = body.trim();
+  if (
+    text === LEGACY_MANAGER_SECURITY_ERROR ||
+    text === "gated by security_level"
+  ) {
+    return true;
+  }
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const reason = (parsed as { error?: unknown }).error;
+    return reason === "security_level" || reason === "allow_git_url_install";
+  } catch {
+    return false;
+  }
+}
+
 function managerEnqueueRefusal(err: unknown): number | undefined {
   if (!(err instanceof NodeManagementError)) return undefined;
   const details = err.details as { status?: unknown; body?: unknown; url?: unknown } | undefined;
@@ -2690,8 +2719,7 @@ function managerEnqueueRefusal(err: unknown): number | undefined {
   if (status === 404) return status;
   if (
     status === 403 &&
-    typeof details?.body === "string" &&
-    /security_level|allow_git_url_install/i.test(details.body)
+    isManagerOwnedGitPolicy403(details?.body)
   ) {
     return status;
   }
@@ -2719,8 +2747,9 @@ function initialManagerQueueAbsenceWasProven(err: unknown): boolean {
 
 /**
  * A direct clone is safe after either a Manager-native policy refusal whose body
- * explicitly proves no task was queued, or a route-level absence plus a fresh
- * probe proving BOTH queue dialects are 404 on the same captured ComfyUI base.
+ * explicitly proves no task was queued, a direct enqueue route-level 404, or a
+ * detection failure followed by a fresh probe proving BOTH queue dialects are
+ * 404 on the same captured ComfyUI base.
  * A bare 401/403/407, timeout, 5xx, malformed response, or unrelated reachability
  * error remains fail-closed.
  */
@@ -2730,9 +2759,12 @@ async function managerAbsenceAllowsGitFallback(
 ): Promise<boolean> {
   const status = errorStatus(err);
   const preQueueRefusal = managerEnqueueRefusal(err);
-  if (preQueueRefusal === 403) return true;
-  const routeWasAbsent = preQueueRefusal === 404;
-  if (status !== undefined && !routeWasAbsent) return false;
+  // The enqueue route's own 404 is already a pre-queue refusal. Preserve the
+  // legacy contract that authorized a direct clone on that route-level fact;
+  // the fresh status probes are required only for the new detection-failure
+  // path, where the enqueue error carries no route-level refusal.
+  if (preQueueRefusal === 403 || preQueueRefusal === 404) return true;
+  if (status !== undefined) return false;
   if (
     status === undefined &&
     (!isManagerQueueDetectionFailure(err) || !initialManagerQueueAbsenceWasProven(err))
@@ -3342,8 +3374,8 @@ async function installCustomNodeImpl(
                 ? `ComfyUI-Manager REFUSED the git-URL install (HTTP 403) via its ` +
                   `security_level / allow_git_url_install policy gate. Nothing was queued there.`
                 : refusedBy === 404
-                  ? `ComfyUI-Manager's git-install route returned HTTP 404, and a fresh probe confirmed ` +
-                    `both queue/status dialects are absent. Nothing was queued there.`
+                  ? `ComfyUI-Manager's git-install route returned HTTP 404 before queueing. ` +
+                    `Nothing was queued there.`
                   : `ComfyUI-Manager is confirmed absent: both queue/status dialects returned HTTP 404 ` +
                     `on the connected ComfyUI. Nothing was queued there.`,
           },

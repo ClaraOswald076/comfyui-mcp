@@ -203,12 +203,19 @@ function stubFetch(opts: {
    * The response describes the REQUEST, so nothing was queued.
    */
   queueOpStatus?: number;
+  /** Exact body returned by the Manager queue operation when queueOpStatus is set. */
+  queueOpBody?: string;
   /** Body for `https://api.comfy.org/nodes/:id` (registry-zip empty-pack fallback). */
   registryDetails?: unknown;
   /** Body for v4 per-task queue history lookups. */
   managerTaskHistory?: unknown | ((uiId: string) => unknown);
   /** Shape of both Manager queue/status dialect probes for fallback tests. */
-  managerQueueStatus?: "absent" | "malformed" | "timeout" | "server-error";
+  managerQueueStatus?:
+    | "absent"
+    | "malformed"
+    | "timeout"
+    | "server-error"
+    | "method-not-allowed";
 } = {}) {
   const calls: Call[] = [];
   let statusIdx = 0;
@@ -244,6 +251,9 @@ function stubFetch(opts: {
         if (opts.managerQueueStatus === "server-error") {
           return new Response("server error", { status: 500 });
         }
+        if (opts.managerQueueStatus === "method-not-allowed") {
+          return new Response("method not allowed", { status: 405 });
+        }
       }
       if (path === "/v2/manager/queue/status") {
         const s = statusSeq[Math.min(statusIdx, statusSeq.length - 1)];
@@ -268,7 +278,8 @@ function stubFetch(opts: {
             (body as { kind?: string } | undefined)?.kind === "install");
         if (opts.queueOpStatus !== undefined && isInstallOp) {
           return new Response(
-            "A security error has occurred. Please check the terminal logs",
+            opts.queueOpBody ??
+              "A security error has occurred. Please check the terminal logs",
             { status: opts.queueOpStatus },
           );
         }
@@ -682,9 +693,10 @@ describe("node-management service", () => {
       expect(cloneEnv?.GIT_ASKPASS).toBe("echo");
     });
 
-    // #463 — a direct clone is allowed only after the connected ComfyUI proves
-    // that BOTH Manager queue/status dialects are absent. A queue operation's
-    // own 404 is not enough: the Manager may still expose the other dialect.
+    // #463 — a detection failure is allowed to reach a direct clone only after
+    // the connected ComfyUI proves that BOTH Manager queue/status dialects are
+    // absent. This is distinct from a queue operation's own route-level 404,
+    // which is already a pre-queue refusal and retains the legacy fallback.
     it("falls back to a direct git clone only after both queue dialects return 404", async () => {
       stubFetch({ managerQueueStatus: "absent" });
       let cloned = false;
@@ -712,7 +724,7 @@ describe("node-management service", () => {
       ).toBeDefined();
     });
 
-    for (const status of [401, 403, 407, 404]) {
+    for (const status of [401, 407]) {
       it(`#463: Manager git enqueue HTTP ${status} does not authorize a local clone`, async () => {
         stubFetch({ installedBody: {}, queueOpStatus: status });
         mockedExists.mockImplementation((p: unknown) => {
@@ -734,7 +746,81 @@ describe("node-management service", () => {
       });
     }
 
-    for (const managerQueueStatus of ["timeout", "server-error", "malformed"] as const) {
+    it("#463: preserves the legacy Manager security-error 403 fallback contract", async () => {
+      stubFetch({ installedBody: {}, queueOpStatus: 403 });
+      let cloned = false;
+      mockedExists.mockImplementation((p: unknown) => {
+        const s = String(p);
+        if (s.includes("requirements.txt") || s.includes("install.py")) return false;
+        if (s.includes(".venv") || s.includes("cm-cli.py")) return false;
+        return s.includes(NODE_DIR_UTILS) || s.endsWith("comfyui-teskors-utils")
+          ? cloned
+          : false;
+      });
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") cloned = true;
+        return "";
+      }) as never);
+
+      const res = await installCustomNode({
+        id: "https://github.com/teskor-hub/comfyui-teskors-utils",
+      });
+
+      expect(res.mechanism).toBe("git-clone");
+      expect(res.message).toMatch(/HTTP 403/);
+      expect(
+        mockedExec.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone"),
+      ).toBeDefined();
+    });
+
+    for (const body of ["Forbidden", "<html><body>security_level</body></html>"]) {
+      it(`#463: a bare or proxy/HTML 403 does not authorize a local clone (${body})`, async () => {
+        stubFetch({ installedBody: {}, queueOpStatus: 403, queueOpBody: body });
+        mockedExists.mockImplementation(() => false);
+        mockedExec.mockImplementation((() => "") as never);
+
+        await expect(
+          installCustomNode({ id: "https://github.com/teskor-hub/comfyui-teskors-utils" }),
+        ).rejects.toThrow(/403/);
+        expect(
+          mockedExec.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone"),
+        ).toBeUndefined();
+      });
+    }
+
+    it("#463: a direct Manager enqueue 404 retains the route-level clone fallback", async () => {
+      stubFetch({ installedBody: {}, queueOpStatus: 404 });
+      let cloned = false;
+      mockedExists.mockImplementation((p: unknown) => {
+        const s = String(p);
+        if (s.includes("requirements.txt") || s.includes("install.py")) return false;
+        if (s.includes(".venv") || s.includes("cm-cli.py")) return false;
+        return s.includes(NODE_DIR_UTILS) || s.endsWith("comfyui-teskors-utils")
+          ? cloned
+          : false;
+      });
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") cloned = true;
+        return "";
+      }) as never);
+
+      const res = await installCustomNode({
+        id: "https://github.com/teskor-hub/comfyui-teskors-utils",
+      });
+
+      expect(res.mechanism).toBe("git-clone");
+      expect(res.message).toMatch(/HTTP 404/);
+      expect(
+        mockedExec.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone"),
+      ).toBeDefined();
+    });
+
+    for (const managerQueueStatus of [
+      "timeout",
+      "server-error",
+      "malformed",
+      "method-not-allowed",
+    ] as const) {
       it(`#463: a ${managerQueueStatus} queue-status probe does not authorize a local clone`, async () => {
         stubFetch({ managerQueueStatus });
         mockedExists.mockImplementation(() => false);

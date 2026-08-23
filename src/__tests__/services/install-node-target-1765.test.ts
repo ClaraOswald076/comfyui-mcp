@@ -97,7 +97,8 @@ vi.mock("../../comfyui/client.js", () => ({
 // They reach `cloneCustomNodeFallback` from two different call sites, and a
 // guard on only one of them is a guard that is not there. ────────────────────
 const http = vi.hoisted(() => ({
-  mode: "refuse-enqueue" as "refuse-enqueue" | "accept-enqueue",
+  mode: "refuse-enqueue" as "refuse-enqueue" | "accept-enqueue" | "manager-absent",
+  calls: [] as string[],
 }));
 vi.mock("../../comfyui/fetch.js", () => {
   const json = (body: unknown) =>
@@ -107,11 +108,15 @@ vi.mock("../../comfyui/fetch.js", () => {
     });
   return {
     comfyuiFetch: async (url: string) => {
+      http.calls.push(url);
       if (http.mode === "refuse-enqueue") {
         return new Response("gated by security_level", {
           status: 403,
           statusText: "Forbidden",
         });
+      }
+      if (http.mode === "manager-absent") {
+        return new Response("missing", { status: 404, statusText: "Not Found" });
       }
       const { pathname } = new URL(url);
       if (pathname === "/manager/queue/install") return json({ ui_id: "queued" });
@@ -153,6 +158,7 @@ vi.mock("node:child_process", async () => {
       git.calls.push([file, ...args]);
       if (file === "git" && args[0] === "clone") {
         const dest = args[args.length - 1];
+        http.calls.push(`git clone:${dest}`);
         fs.mkdirSync(dest, { recursive: true });
         fs.writeFileSync(path.join(dest, "__init__.py"), "NODE_CLASS_MAPPINGS = {}\n");
       }
@@ -188,10 +194,13 @@ vi.mock("../../services/live-interpreter.js", async (importOriginal) => {
 });
 
 const { installCustomNode } = await import("../../services/node-management.js");
+const { applyManifest } = await import("../../services/manifest.js");
 const { configureWorkspace, resetWorkspaceConfig } = await import(
   "../../services/workspace-env.js"
 );
-const { setManagerApiCacheForTests } = await import("../../services/manager-api-cache.js");
+const { resetManagerApiCache, setManagerApiCacheForTests } = await import(
+  "../../services/manager-api-cache.js"
+);
 const { setQueueTimingForTests } = await import("../../services/node-management.js");
 setQueueTimingForTests({ pollIntervalMs: 1, startupGraceMs: 0, timeoutMs: 5_000 });
 
@@ -219,6 +228,7 @@ let priorEnvPath: string | undefined;
 
 beforeEach(() => {
   git.calls = [];
+  http.calls = [];
   probe.calls = 0;
   probe.result = undefined;
   http.mode = "refuse-enqueue";
@@ -462,5 +472,48 @@ describe("#1765 — install_custom_node must not write into an install this sess
     expect(error).toBeDefined();
     expect(error).not.toMatch(/two DIFFERENT ComfyUI installs/);
     expect(live.statsCalls).toBe(0);
+  });
+});
+
+describe("#463 — apply_manifest uses the verified panel-connected local scan root", () => {
+  it("clones a Git manifest source with COMFYUI_PATH unset and reports it applied", async () => {
+    http.mode = "manager-absent";
+    resetManagerApiCache("#463 manifest probe regression");
+
+    const result = await applyManifest({
+      manifest: { custom_nodes: [REPO], models: [] },
+    });
+
+    expect(result.results).toMatchObject([
+      { action: "custom_node", item: REPO, status: "applied" },
+    ]);
+    expect(clonedInto()).toBe(join(CONNECTED, PACK_DIR));
+    expect(existsSync(join(SAVED_DEFAULT, PACK_DIR))).toBe(false);
+
+    const statusCalls = http.calls
+      .map((url, index) => ({ url, index }))
+      .filter(({ url }) =>
+        url.includes("/v2/manager/queue/status") || url.includes("/manager/queue/status"),
+      );
+    const cloneIndex = http.calls.findIndex((value) => value.startsWith("git clone:"));
+    expect(statusCalls.length).toBeGreaterThanOrEqual(4);
+    expect(statusCalls.every(({ url }) => url.startsWith("http://127.0.0.1:8189/"))).toBe(true);
+    expect(Math.max(...statusCalls.map(({ index }) => index))).toBeLessThan(cloneIndex);
+  });
+
+  it("refuses the Git fallback when the no-path local target cannot be verified", async () => {
+    http.mode = "manager-absent";
+    live.reachable = false;
+    resetManagerApiCache("#463 unverified manifest target");
+
+    const result = await applyManifest({
+      manifest: { custom_nodes: [REPO], models: [] },
+    });
+
+    expect(result.results).toMatchObject([
+      { action: "custom_node", item: REPO, status: "failed" },
+    ]);
+    expect(result.results[0]?.message).toMatch(/could not verify.*custom_nodes root/i);
+    expect(clonedInto()).toBeUndefined();
   });
 });
