@@ -1,4 +1,11 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+const comfyClientMocks = vi.hoisted(() => ({
+  getLogs: vi.fn(),
+  getSystemStats: vi.fn(),
+}));
+
+vi.mock("../../comfyui/client.js", () => comfyClientMocks);
 import {
   KITCHEN_PROBE_SOURCE,
   applyKitchenRecommendation,
@@ -34,6 +41,12 @@ const LOG = [
   "Using Comfy Kitchen attention",
 ].join("\n");
 
+const DICTIONARY_LOG = [
+  "comfy-kitchen version: 0.2.31",
+  "Found comfy_kitchen backend eager: {'available': True, 'disabled': False, 'reason': None}",
+  "Found comfy_kitchen backend triton: {'available': False, 'disabled': True, 'reason': 'not supported'}",
+].join("\n");
+
 function status(over: Partial<KitchenStatus> = {}): KitchenStatus {
   const base = mergeKitchenStatus({
     location: "LOCAL",
@@ -57,6 +70,7 @@ const UNET_API = {
 
 afterEach(() => {
   resetKitchenHintSession();
+  comfyClientMocks.getLogs.mockReset();
 });
 
 describe("parseKitchenLog", () => {
@@ -68,6 +82,55 @@ describe("parseKitchenLog", () => {
     expect(parsed.ckAttentionLog).toEqual(known(true));
     expect(parsed.tritonEnabledLog).toEqual(known(true));
     expect(parsed.tritonVersion).toEqual(known("3.7.0"));
+  });
+
+  it("reads availability from dictionary-shaped backend startup lines", () => {
+    const parsed = parseKitchenLog(DICTIONARY_LOG);
+
+    expect(parsed.backends.eager).toEqual({
+      available: true,
+      raw: "{'available': True, 'disabled': False, 'reason': None}",
+    });
+    expect(parsed.backends.triton).toEqual({
+      available: false,
+      raw: "{'available': False, 'disabled': True, 'reason': 'not supported'}",
+    });
+  });
+
+  it.each([
+    ["an unavailable key", "{'unavailable': true}"],
+    ["a trueish value", "{'available': trueish}"],
+    ["a nested-looking reason", "{reason: available: True}"],
+  ])("does not infer availability from %s", (_caseName, raw) => {
+    const parsed = parseKitchenLog(`Found comfy_kitchen backend eager: ${raw}`);
+
+    expect(parsed.backends.eager).toEqual({ available: false, raw });
+  });
+
+  it.each([
+    ["a nested available property", "{'nested': {'available': True}}"],
+    ["trailing garbage", "{'available': True} garbage"],
+  ])("rejects %s as a backend dictionary", (_caseName, raw) => {
+    const parsed = parseKitchenLog(`Found comfy_kitchen backend eager: ${raw}`);
+
+    expect(parsed.backends.eager).toEqual({ available: false, raw });
+  });
+
+  it.each([
+    ["a double comma", "{'available': True,,}"],
+    ["an initial empty member", "{,'available': True}"],
+    ["an empty key", "{'available': True, :}"],
+    ["an empty value", "{'available': True, 'x':}"],
+  ])("rejects %s as a malformed dictionary", (_caseName, raw) => {
+    const parsed = parseKitchenLog(`Found comfy_kitchen backend eager: ${raw}`);
+
+    expect(parsed.backends.eager).toEqual({ available: false, raw });
+  });
+
+  it("preserves the legacy cached availability status", () => {
+    const parsed = parseKitchenLog("Found comfy_kitchen backend eager: available (cached)");
+
+    expect(parsed.backends.eager).toEqual({ available: true, raw: "available (cached)" });
   });
 
   it("does not treat a missing attention line as a no", () => {
@@ -330,6 +393,41 @@ describe("applyKitchenRecommendation", () => {
 });
 
 describe("gatherKitchenStatus", () => {
+  it("uses the default log fetch before merging backend availability", async () => {
+    comfyClientMocks.getLogs.mockResolvedValueOnce(DICTIONARY_LOG.split("\n"));
+    const remote = await gatherKitchenStatus({
+      location: "REMOTE",
+      stats: {
+        system: {
+          argv: [],
+          comfy_package_versions: [{ name: "comfy-kitchen", installed: "0.2.31" }],
+        },
+        devices: [],
+      },
+    });
+
+    expect(comfyClientMocks.getLogs).toHaveBeenCalledWith({ maxLines: 2000 });
+    expect(remote.backends.eager.available).toEqual(known(true));
+    expect(remote.backends.triton.available).toEqual(known(false));
+  });
+
+  it("carries dictionary-shaped backend availability through status aggregation", async () => {
+    const remote = await gatherKitchenStatus({
+      location: "REMOTE",
+      logText: DICTIONARY_LOG,
+      stats: {
+        system: {
+          argv: [],
+          comfy_package_versions: [{ name: "comfy-kitchen", installed: "0.2.31" }],
+        },
+        devices: [],
+      },
+    });
+
+    expect(remote.backends.eager.available).toEqual(known(true));
+    expect(remote.backends.triton.available).toEqual(known(false));
+  });
+
   it("merges log + stats + probe and reports present without guessing on a remote host", async () => {
     const remote = await gatherKitchenStatus({
       location: "REMOTE",
