@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.78] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- pin manifest install target generation and Manager-only fallback (#463)
+- close manager-only manifest clone gap
+- gate manager queue clone fallback
+- fall back when Manager is proven absent
+
+
 ## [0.52.77] - 2026-08-23
 
 ### MCP
