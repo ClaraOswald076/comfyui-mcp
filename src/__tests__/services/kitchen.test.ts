@@ -34,6 +34,12 @@ const LOG = [
   "Using Comfy Kitchen attention",
 ].join("\n");
 
+const DICTIONARY_LOG = [
+  "comfy-kitchen version: 0.2.31",
+  "Found comfy_kitchen backend eager: {'available': True, 'disabled': False, 'reason': None}",
+  "Found comfy_kitchen backend triton: {'available': False, 'disabled': True, 'reason': 'not supported'}",
+].join("\n");
+
 function status(over: Partial<KitchenStatus> = {}): KitchenStatus {
   const base = mergeKitchenStatus({
     location: "LOCAL",
@@ -68,6 +74,19 @@ describe("parseKitchenLog", () => {
     expect(parsed.ckAttentionLog).toEqual(known(true));
     expect(parsed.tritonEnabledLog).toEqual(known(true));
     expect(parsed.tritonVersion).toEqual(known("3.7.0"));
+  });
+
+  it("reads availability from dictionary-shaped backend startup lines", () => {
+    const parsed = parseKitchenLog(DICTIONARY_LOG);
+
+    expect(parsed.backends.eager).toEqual({
+      available: true,
+      raw: "{'available': True, 'disabled': False, 'reason': None}",
+    });
+    expect(parsed.backends.triton).toEqual({
+      available: false,
+      raw: "{'available': False, 'disabled': True, 'reason': 'not supported'}",
+    });
   });
 
   it("does not treat a missing attention line as a no", () => {
@@ -330,6 +349,23 @@ describe("applyKitchenRecommendation", () => {
 });
 
 describe("gatherKitchenStatus", () => {
+  it("carries dictionary-shaped backend availability through status aggregation", async () => {
+    const remote = await gatherKitchenStatus({
+      location: "REMOTE",
+      logText: DICTIONARY_LOG,
+      stats: {
+        system: {
+          argv: [],
+          comfy_package_versions: [{ name: "comfy-kitchen", installed: "0.2.31" }],
+        },
+        devices: [],
+      },
+    });
+
+    expect(remote.backends.eager.available).toEqual(known(true));
+    expect(remote.backends.triton.available).toEqual(known(false));
+  });
+
   it("merges log + stats + probe and reports present without guessing on a remote host", async () => {
     const remote = await gatherKitchenStatus({
       location: "REMOTE",

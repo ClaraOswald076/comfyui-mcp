@@ -228,12 +228,15 @@ export function logTextFromPayload(data: unknown): string {
 export function parseKitchenLog(text: string): KitchenLogParse {
   const versionMatch = text.match(/comfy-kitchen version:\s*(\S+)/i);
   const backends: KitchenLogParse["backends"] = {};
-  const backendRe = /Found comfy_kitchen backend\s+(\w+)\s*:\s*(\S+)/gi;
+  const backendRe = /Found comfy_kitchen backend\s+(\w+)\s*:\s*([^\r\n]+)/gi;
   for (const m of text.matchAll(backendRe)) {
     const name = m[1]!.toLowerCase();
     if ((KITCHEN_BACKENDS as readonly string[]).includes(name)) {
-      const raw = m[2]!;
-      const available = /^(available|enabled|ok|loaded|true|ready)/i.test(raw);
+      const raw = m[2]!.trim();
+      const field = /['"]?available['"]?\s*:\s*(true|false)/i.exec(raw);
+      const available = field
+        ? field[1]!.toLowerCase() === "true"
+        : /^(available|enabled|ok|loaded|true|ready)/i.test(raw);
       backends[name as KitchenBackendName] = { available, raw };
     }
   }
