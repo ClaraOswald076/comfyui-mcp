@@ -201,6 +201,8 @@ interface ManagerFetchOptions {
   base?: string;
   /** Treat a non-2xx response as a soft failure (return undefined) instead of throwing. */
   soft?: boolean;
+  /** Preserve the status class that a soft capability probe observed. */
+  onSoftFailure?: (status: number | undefined) => void;
 }
 
 /**
@@ -294,7 +296,13 @@ async function managerFetch<T>(
   path: string,
   options: ManagerFetchOptions = {},
 ): Promise<T | undefined> {
-  const { method = "GET", body, base = managerBaseUrl(), soft = false } = options;
+  const {
+    method = "GET",
+    body,
+    base = managerBaseUrl(),
+    soft = false,
+    onSoftFailure,
+  } = options;
   const url = `${base}${path}`;
   logger.debug("Manager API request", { url, method });
 
@@ -309,7 +317,10 @@ async function managerFetch<T>(
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
   } catch (err) {
-    if (soft) return undefined;
+    if (soft) {
+      onSoftFailure?.(undefined);
+      return undefined;
+    }
     throw new NodeManagementError(
       `ComfyUI-Manager API unreachable at ${url}. Is ComfyUI running with ComfyUI-Manager installed? (${
         err instanceof Error ? err.message : String(err)
@@ -323,6 +334,7 @@ async function managerFetch<T>(
     // text, never a wrong conclusion. Verified there is no branch on this value.
     const text = await res.text().catch(() => "");
     if (soft) {
+      onSoftFailure?.(res.status);
       // A soft probe may ignore an absent route or a transient server error, but
       // authentication is actionable evidence. Returning undefined here made
       // detectManagerApi() fall through to its false "Manager is missing"
@@ -495,6 +507,9 @@ function looksLikeQueueStatus(s: unknown): boolean {
  */
 export type ManagerQueueAvailability = "available" | "absent" | "unreadable";
 
+/** Internal marker carried by the all-soft queue-generation probe. */
+const MANAGER_QUEUE_DETECTION_FAILURE = "manager-queue-detection";
+
 /**
  * Probe both queue/status dialects while preserving their HTTP status. This is
  * intentionally separate from `managerFetch(..., { soft: true })`, whose
@@ -659,13 +674,26 @@ async function probeManagerApi(base: string): Promise<ManagerApi> {
   // conclusion describes a server that may be gone and must not be pinned over
   // the newer state (#646).
   const stamp = managerApiCacheStamp();
-  const v2 = await managerFetch<QueueStatus>("/v2/manager/queue/status", { base, soft: true });
+  const queueStatusCodes: Array<number | undefined> = [undefined, undefined];
+  const v2 = await managerFetch<QueueStatus>("/v2/manager/queue/status", {
+    base,
+    soft: true,
+    onSoftFailure: (status) => {
+      queueStatusCodes[0] = status;
+    },
+  });
   if (looksLikeQueueStatus(v2)) {
     const api = await resolveV2SubDialect(base);
     cacheManagerApi(base, api, stamp);
     return api;
   }
-  const legacy = await managerFetch<QueueStatus>("/manager/queue/status", { base, soft: true });
+  const legacy = await managerFetch<QueueStatus>("/manager/queue/status", {
+    base,
+    soft: true,
+    onSoftFailure: (status) => {
+      queueStatusCodes[1] = status;
+    },
+  });
   if (looksLikeQueueStatus(legacy)) {
     // /manager/queue/status answering ALMOST always means the released 3.x
     // custom-node Manager — but do NOT brand it "legacy 3.x" (and speak 3.x
@@ -700,6 +728,11 @@ async function probeManagerApi(base: string): Promise<ManagerApi> {
       "nor /manager/queue/status answered with a queue status). Is ComfyUI-Manager " +
       "installed and enabled on the connected ComfyUI? The pip comfyui_manager " +
       "package only activates when ComfyUI is started with --enable-manager.",
+    {
+      kind: MANAGER_QUEUE_DETECTION_FAILURE,
+      base,
+      queueStatusCodes,
+    },
   );
 }
 
@@ -2615,16 +2648,18 @@ function discardFailedClone(
 }
 
 /**
- * Did ComfyUI-Manager REFUSE the enqueue outright, before queueing anything? (#1129)
+ * Did ComfyUI-Manager reject the route outright, before queueing anything?
  *
- * A git-URL install is gated server-side by `security_level` and
- * `allow_git_url_install`, and a legacy 3.x host that does not serve the route at
- * all answers the same way. All three arrive as a status on the POST itself:
+ * A legacy 3.x git-URL route can be absent, and a Manager-native install can be
+ * refused before queueing by its `security_level` / `allow_git_url_install`
+ * policy. Both arrive as a status on the POST itself:
  *
- *   403 — "A security error has occurred" (the policy gate)
  *   404 — the route is not registered on this build
  *
- * 405 is deliberately NOT here. On this API it is the DIALECT-MISMATCH signal
+ * 403 is admitted only when Manager's body explicitly names its own
+ * `security_level` / `allow_git_url_install` policy gate. A bare 403 may be an
+ * authentication/permission layer and stays fail-closed. 405 is deliberately
+ * NOT here. On this API it is the DIALECT-MISMATCH signal
  * (ComfyUI's frontend catchall answering a route registered under the other
  * generation), and the self-heal retry in #646 already owns it — diverting to a
  * clone would pre-empt a Manager install that is about to succeed on the right
@@ -2636,14 +2671,79 @@ function discardFailedClone(
  * That is the whole warrant for continuing — and it is why 5xx is excluded, where
  * a task may well have been accepted before the handler fell over.
  *
- * Returns the status, or undefined when the failure is anything else (a transport
- * error, a timeout, a 500) and must keep propagating.
+ * Returns 404, or the explicitly Manager-owned policy 403, or undefined when the
+ * failure is anything else (including 401, bare 403, 407, a transport error, a
+ * timeout, or a 500) and must keep propagating.
  */
 function managerEnqueueRefusal(err: unknown): number | undefined {
   if (!(err instanceof NodeManagementError)) return undefined;
-  const status = (err.details as { status?: unknown } | undefined)?.status;
+  const details = err.details as { status?: unknown; body?: unknown; url?: unknown } | undefined;
+  const status = details?.status;
+  const url = details?.url;
   if (typeof status !== "number") return undefined;
-  return status === 403 || status === 404 ? status : undefined;
+  if (
+    typeof url !== "string" ||
+    !/\/manager\/queue\/(?:task|install)(?:[?#]|$)/.test(url)
+  ) {
+    return undefined;
+  }
+  if (status === 404) return status;
+  if (
+    status === 403 &&
+    typeof details?.body === "string" &&
+    /security_level|allow_git_url_install/i.test(details.body)
+  ) {
+    return status;
+  }
+  return undefined;
+}
+
+function isManagerQueueDetectionFailure(err: unknown): boolean {
+  if (!(err instanceof NodeManagementError) || !err.details || typeof err.details !== "object") {
+    return false;
+  }
+  return (err.details as { kind?: unknown }).kind === MANAGER_QUEUE_DETECTION_FAILURE;
+}
+
+function initialManagerQueueAbsenceWasProven(err: unknown): boolean {
+  if (!(err instanceof NodeManagementError) || !err.details || typeof err.details !== "object") {
+    return false;
+  }
+  const codes = (err.details as { queueStatusCodes?: unknown }).queueStatusCodes;
+  return (
+    Array.isArray(codes) &&
+    codes.length === 2 &&
+    codes.every((status) => status === 404)
+  );
+}
+
+/**
+ * A direct clone is safe after either a Manager-native policy refusal whose body
+ * explicitly proves no task was queued, or a route-level absence plus a fresh
+ * probe proving BOTH queue dialects are 404 on the same captured ComfyUI base.
+ * A bare 401/403/407, timeout, 5xx, malformed response, or unrelated reachability
+ * error remains fail-closed.
+ */
+async function managerAbsenceAllowsGitFallback(
+  err: unknown,
+  base: string,
+): Promise<boolean> {
+  const status = errorStatus(err);
+  const preQueueRefusal = managerEnqueueRefusal(err);
+  if (preQueueRefusal === 403) return true;
+  const routeWasAbsent = preQueueRefusal === 404;
+  if (status !== undefined && !routeWasAbsent) return false;
+  if (
+    status === undefined &&
+    (!isManagerQueueDetectionFailure(err) || !initialManagerQueueAbsenceWasProven(err))
+  ) {
+    return false;
+  }
+  try {
+    return (await probeManagerQueueAvailability(base)) === "absent";
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -3212,7 +3312,9 @@ async function installCustomNodeImpl(
       // A remote target keeps the original error: the clone would write to a
       // LOCAL tree that is not the server we are connected to, so "the Manager
       // refused" is the honest and complete answer there.
-      if (refusedBy === undefined || isRemoteMode()) throw err;
+      if (isRemoteMode() || !(await managerAbsenceAllowsGitFallback(err, managerBase))) {
+        throw err;
+      }
       // BEFORE the log line, which says "cloning directly" and would otherwise be
       // recording an action that then does not happen.
       if (localWriteMismatch) {
@@ -3220,18 +3322,32 @@ async function installCustomNodeImpl(
           wrongInstallRefusal(localWriteMismatch, 'install_custom_node (action:"install", git clone)', managerBase),
         );
       }
-      logger.info("Manager refused the git install enqueue — cloning directly", {
+      logger.info("Manager refused or was proven absent — cloning directly", {
         status: refusedBy,
         gitId,
       });
       return withCliNote(
-        await cloneCustomNodeFallback(gitId, repoName, gitRef, { manager_refused: refusedBy }, cliWorkspace, {
-          refFromVersion,
-          managerRefusalNote:
-            `ComfyUI-Manager REFUSED the git-URL install (HTTP ${refusedBy}) — on a legacy 3.x ` +
-            `host that is its security_level / allow_git_url_install gate, or a build that does ` +
-            `not serve the route. Nothing was queued there.`,
-        }),
+        await cloneCustomNodeFallback(
+          gitId,
+          repoName,
+          gitRef,
+          refusedBy === 403 || refusedBy === 404
+            ? { manager_refused: refusedBy }
+            : { manager_absent: true },
+          cliWorkspace,
+          {
+            refFromVersion,
+            managerRefusalNote:
+              refusedBy === 403
+                ? `ComfyUI-Manager REFUSED the git-URL install (HTTP 403) via its ` +
+                  `security_level / allow_git_url_install policy gate. Nothing was queued there.`
+                : refusedBy === 404
+                  ? `ComfyUI-Manager's git-install route returned HTTP 404, and a fresh probe confirmed ` +
+                    `both queue/status dialects are absent. Nothing was queued there.`
+                  : `ComfyUI-Manager is confirmed absent: both queue/status dialects returned HTTP 404 ` +
+                    `on the connected ComfyUI. Nothing was queued there.`,
+          },
+        ),
       );
     }
 

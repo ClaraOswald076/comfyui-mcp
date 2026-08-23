@@ -207,6 +207,8 @@ function stubFetch(opts: {
   registryDetails?: unknown;
   /** Body for v4 per-task queue history lookups. */
   managerTaskHistory?: unknown | ((uiId: string) => unknown);
+  /** Shape of both Manager queue/status dialect probes for fallback tests. */
+  managerQueueStatus?: "absent" | "malformed" | "timeout" | "server-error";
 } = {}) {
   const calls: Call[] = [];
   let statusIdx = 0;
@@ -228,6 +230,20 @@ function stubFetch(opts: {
       }
       if (path.startsWith("/v2/customnode/installed")) {
         return jsonResponse(opts.installedBody ?? {});
+      }
+      if (path === "/v2/manager/queue/status" || path === "/manager/queue/status") {
+        if (opts.managerQueueStatus === "absent") {
+          return new Response("missing", { status: 404 });
+        }
+        if (opts.managerQueueStatus === "malformed") {
+          return new Response("<!doctype html>", { status: 200 });
+        }
+        if (opts.managerQueueStatus === "timeout") {
+          throw new Error("request timed out");
+        }
+        if (opts.managerQueueStatus === "server-error") {
+          return new Response("server error", { status: 500 });
+        }
       }
       if (path === "/v2/manager/queue/status") {
         const s = statusSeq[Math.min(statusIdx, statusSeq.length - 1)];
@@ -666,51 +682,70 @@ describe("node-management service", () => {
       expect(cloneEnv?.GIT_ASKPASS).toBe("echo");
     });
 
-    // #1129 — a REFUSED enqueue is not the end of the road.
-    //
-    // The 3.x git-URL install is gated by security_level + allow_git_url_install,
-    // and a host that does not serve the route answers the same way. Both come
-    // back as a status on the POST, which throws — so the direct-clone fallback,
-    // which needs no Manager at all and is exactly what the user would do by
-    // hand, was unreachable in the one case it exists for. A reporter on legacy
-    // 3.x got "not reachable", then a 404 with "A security error has occurred",
-    // and was left with no install path on a machine whose custom_nodes
-    // directory was sitting right there.
-    // 405 is excluded on purpose: on this API it is the dialect-mismatch signal
-    // that the #646 self-heal retry owns, and the "no dialect self-heal" case
-    // below pins that.
-    for (const status of [403, 404]) {
-      it(`#1129: Manager REFUSES the git enqueue with ${status} → clones directly and says why`, async () => {
+    // #463 — a direct clone is allowed only after the connected ComfyUI proves
+    // that BOTH Manager queue/status dialects are absent. A queue operation's
+    // own 404 is not enough: the Manager may still expose the other dialect.
+    it("falls back to a direct git clone only after both queue dialects return 404", async () => {
+      stubFetch({ managerQueueStatus: "absent" });
+      let cloned = false;
+      mockedExists.mockImplementation((p: unknown) => {
+        const s = String(p);
+        if (s.includes("requirements.txt") || s.includes("install.py")) return false;
+        if (s.includes(".venv") || s.includes("cm-cli.py")) return false;
+        if (s.includes(NODE_DIR_UTILS) || s.endsWith("comfyui-teskors-utils")) return cloned;
+        return false;
+      });
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") cloned = true;
+        return "";
+      }) as never);
+
+      const res = await installCustomNode({
+        id: "https://github.com/teskor-hub/comfyui-teskors-utils",
+      });
+
+      expect(res.mechanism).toBe("git-clone");
+      expect(res.message).toMatch(/confirmed absent/);
+      expect(res.message).toMatch(/both queue\/status dialects returned HTTP 404/);
+      expect(
+        mockedExec.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone"),
+      ).toBeDefined();
+    });
+
+    for (const status of [401, 403, 407, 404]) {
+      it(`#463: Manager git enqueue HTTP ${status} does not authorize a local clone`, async () => {
         stubFetch({ installedBody: {}, queueOpStatus: status });
-        let cloned = false;
         mockedExists.mockImplementation((p: unknown) => {
           const s = String(p);
           if (s.includes("requirements.txt") || s.includes("install.py")) return false;
           if (s.includes(".venv") || s.includes("cm-cli.py")) return false;
-          if (s.includes(NODE_DIR_UTILS) || s.endsWith("comfyui-teskors-utils")) return cloned;
           return false;
         });
         mockedExec.mockImplementation(((bin: string, args: string[]) => {
-          if (bin === "git" && args[0] === "clone") cloned = true;
           return "";
         }) as never);
 
-        const res = await installCustomNode({
-          id: "https://github.com/teskor-hub/comfyui-teskors-utils",
-        });
-
-        expect(res.mechanism).toBe("git-clone");
-        // The reason must be the REFUSAL, not "not in the registry" — that would
-        // be a wrong explanation for a correct action, and it is what a reader
-        // would go on to act on.
-        expect(res.message).toMatch(new RegExp(`REFUSED the git-URL install \\(HTTP ${status}\\)`));
-        expect(res.message).toMatch(/security_level \/ allow_git_url_install/);
-        expect(res.message).toMatch(/Nothing was queued there/);
-        expect(res.message).not.toMatch(/not in the ComfyUI-Manager registry/);
-        // And it actually cloned.
+        await expect(
+          installCustomNode({ id: "https://github.com/teskor-hub/comfyui-teskors-utils" }),
+        ).rejects.toThrow(new RegExp(String(status)));
         expect(
           mockedExec.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone"),
-        ).toBeDefined();
+        ).toBeUndefined();
+      });
+    }
+
+    for (const managerQueueStatus of ["timeout", "server-error", "malformed"] as const) {
+      it(`#463: a ${managerQueueStatus} queue-status probe does not authorize a local clone`, async () => {
+        stubFetch({ managerQueueStatus });
+        mockedExists.mockImplementation(() => false);
+        mockedExec.mockImplementation((() => "") as never);
+
+        await expect(
+          installCustomNode({ id: "https://github.com/teskor-hub/comfyui-teskors-utils" }),
+        ).rejects.toBeInstanceOf(NodeManagementError);
+        expect(
+          mockedExec.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone"),
+        ).toBeUndefined();
       });
     }
 
