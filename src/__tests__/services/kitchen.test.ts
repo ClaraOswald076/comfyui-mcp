@@ -1,4 +1,11 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+const comfyClientMocks = vi.hoisted(() => ({
+  getLogs: vi.fn(),
+  getSystemStats: vi.fn(),
+}));
+
+vi.mock("../../comfyui/client.js", () => comfyClientMocks);
 import {
   KITCHEN_PROBE_SOURCE,
   applyKitchenRecommendation,
@@ -63,6 +70,7 @@ const UNET_API = {
 
 afterEach(() => {
   resetKitchenHintSession();
+  comfyClientMocks.getLogs.mockReset();
 });
 
 describe("parseKitchenLog", () => {
@@ -87,6 +95,16 @@ describe("parseKitchenLog", () => {
       available: false,
       raw: "{'available': False, 'disabled': True, 'reason': 'not supported'}",
     });
+  });
+
+  it.each([
+    ["an unavailable key", "{'unavailable': true}"],
+    ["a trueish value", "{'available': trueish}"],
+    ["a nested-looking reason", "{reason: available: True}"],
+  ])("does not infer availability from %s", (_caseName, raw) => {
+    const parsed = parseKitchenLog(`Found comfy_kitchen backend eager: ${raw}`);
+
+    expect(parsed.backends.eager).toEqual({ available: false, raw });
   });
 
   it("does not treat a missing attention line as a no", () => {
@@ -349,6 +367,24 @@ describe("applyKitchenRecommendation", () => {
 });
 
 describe("gatherKitchenStatus", () => {
+  it("uses the default log fetch before merging backend availability", async () => {
+    comfyClientMocks.getLogs.mockResolvedValueOnce(DICTIONARY_LOG.split("\n"));
+    const remote = await gatherKitchenStatus({
+      location: "REMOTE",
+      stats: {
+        system: {
+          argv: [],
+          comfy_package_versions: [{ name: "comfy-kitchen", installed: "0.2.31" }],
+        },
+        devices: [],
+      },
+    });
+
+    expect(comfyClientMocks.getLogs).toHaveBeenCalledWith({ maxLines: 2000 });
+    expect(remote.backends.eager.available).toEqual(known(true));
+    expect(remote.backends.triton.available).toEqual(known(false));
+  });
+
   it("carries dictionary-shaped backend availability through status aggregation", async () => {
     const remote = await gatherKitchenStatus({
       location: "REMOTE",

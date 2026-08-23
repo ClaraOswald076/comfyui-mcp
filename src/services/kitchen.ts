@@ -233,10 +233,12 @@ export function parseKitchenLog(text: string): KitchenLogParse {
     const name = m[1]!.toLowerCase();
     if ((KITCHEN_BACKENDS as readonly string[]).includes(name)) {
       const raw = m[2]!.trim();
-      const field = /['"]?available['"]?\s*:\s*(true|false)/i.exec(raw);
+      const field = /(?:\{|,)\s*(?:"available"|'available'|available)\s*:\s*(true|false)(?=\s*(?:,|}))/i.exec(
+        raw,
+      );
       const available = field
         ? field[1]!.toLowerCase() === "true"
-        : /^(available|enabled|ok|loaded|true|ready)/i.test(raw);
+        : /^(?:available|enabled|ok|loaded|true|ready)$/i.test(raw);
       backends[name as KitchenBackendName] = { available, raw };
     }
   }
