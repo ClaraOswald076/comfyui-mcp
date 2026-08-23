@@ -123,13 +123,12 @@ describe("a load discloses the fence it just invalidated (#1478)", () => {
     expect(out.stamp).not.toBe(OTHER_UUID);
   });
 
-  it("costs no extra round trip", async () => {
-    // The earlier version called the re-derivation, which on a panel that cannot
-    // corroborate spends up to four 6-second probes plus recheck sleeps — to reach an
-    // answer it must not use. Only the load itself goes out now.
+  it("takes one bounded preflight snapshot before the load", async () => {
+    // The snapshot distinguishes a post-error state transition from a graph that
+    // was already identical before this RID was dispatched.
     await load();
 
-    expect(sent).toEqual(["graph_load"]);
+    expect(sent).toEqual(["graph_serialize", "graph_load"]);
   });
 
   it("a reply that did NOT replace the graph gets no stale-fence claim (codex r2)", async () => {
