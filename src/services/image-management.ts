@@ -1,7 +1,8 @@
 import { readFile, copyFile, readdir, stat } from "node:fs/promises";
 import { join, basename, extname, relative, sep } from "node:path";
 import { config, isRemoteMode } from "../config.js";
-import { getHistory } from "../comfyui/client.js";
+import { getHistory, getObjectInfo, resetObjectInfoCache } from "../comfyui/client.js";
+import type { ObjectInfo } from "../comfyui/types.js";
 import { ValidationError, ModelError, ComfyUIError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { resolveOutputDir, resolveInputDir } from "./output-dir.js";
@@ -1084,6 +1085,89 @@ export const uploadAudioLocal = (sourcePath: string, filename?: string) =>
 
 export type MediaKind = "image" | "video" | "audio";
 
+export type StageLoaderSelectability = "verified" | "root-fallback" | "unverified";
+
+const STAGE_LOADER_INPUTS: Readonly<Record<MediaKind, ReadonlyMap<string, ReadonlySet<string>>>> = {
+  image: new Map([
+    ["LoadImage", new Set(["image"])],
+    ["LoadImageMask", new Set(["image"])],
+    ["LoadImageOutput", new Set(["image"])],
+  ]),
+  video: new Map([
+    ["VHS_LoadVideo", new Set(["video"])],
+    ["VHS_LoadVideoPath", new Set(["video"])],
+    ["VHS_LoadVideoFFmpeg", new Set(["video"])],
+    ["VHS_LoadVideoFFmpegPath", new Set(["video"])],
+  ]),
+  audio: new Map([
+    ["LoadAudio", new Set(["audio"])],
+    ["VHS_LoadAudio", new Set(["audio"])],
+    ["VHS_LoadAudioUpload", new Set(["audio"])],
+  ]),
+};
+
+/** Read every ComfyUI combo shape that can enumerate loader filenames. */
+function comboOptions(spec: unknown): string[] | null {
+  if (!Array.isArray(spec)) return null;
+  if (Array.isArray(spec[0])) {
+    return spec[0].filter((value): value is string => typeof value === "string");
+  }
+  const options = (spec[1] as { options?: unknown } | undefined)?.options;
+  if (!Array.isArray(options)) return null;
+  return options
+    .map((value) =>
+      value && typeof value === "object" && !Array.isArray(value) && "key" in value
+        ? (value as { key?: unknown }).key
+        : value,
+    )
+    .filter((value): value is string => typeof value === "string");
+}
+
+/**
+ * Verify the exact input reference against ComfyUI's fresh loader choices.
+ * `null` means the server did not expose a usable loader list, so callers must
+ * not turn an unverified upload into a claim that a widget can select it.
+ */
+function loaderReferenceIsSelectable(
+  objectInfo: ObjectInfo,
+  kind: MediaKind,
+  reference: string,
+): boolean | null {
+  let sawEnumerableList = false;
+  for (const [classType, inputNames] of STAGE_LOADER_INPUTS[kind]) {
+    const def = objectInfo?.[classType];
+    if (!def || typeof def !== "object") continue;
+    for (const inputName of inputNames) {
+      const spec = def.input?.required?.[inputName] ?? def.input?.optional?.[inputName];
+      if (!spec) continue;
+      const options = comboOptions(spec);
+      if (options) sawEnumerableList = true;
+      if (options?.includes(reference)) return true;
+    }
+  }
+  return sawEnumerableList ? false : null;
+}
+
+async function verifyLoaderReference(
+  kind: MediaKind,
+  reference: string,
+): Promise<boolean | null> {
+  try {
+    // The upload changes the server-side file list, not the node definitions.
+    // Invalidate the shared snapshot so this check cannot certify against the
+    // pre-stage /object_info response (#2082).
+    resetObjectInfoCache();
+    return loaderReferenceIsSelectable(await getObjectInfo(), kind, reference);
+  } catch (err) {
+    logger.warn("Could not verify staged input against /object_info", {
+      kind,
+      reference,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
 const MIME_BY_KIND: Record<MediaKind, Record<string, string>> = {
   image: IMAGE_MIME,
   video: VIDEO_MIME,
@@ -1137,6 +1221,10 @@ export interface StagedInput {
   type: string;
   /** Detected/forced media kind. */
   kind: MediaKind;
+  /** Whether a fresh loader option list verified the returned reference. */
+  loaderSelectable: StageLoaderSelectability;
+  /** The requested nested reference, when a host required the root fallback. */
+  requestedFilename?: string;
 }
 
 /**
@@ -1175,11 +1263,51 @@ export async function stageOutputAsInput(
     targetName,
   });
 
+  const referenceOf = (result: { name: string; subfolder?: string }) =>
+    result.subfolder ? `${result.subfolder}/${result.name}` : result.name;
   const result = await uploadImageHttp(targetName, data, mimeType);
+  const stagedReference = referenceOf(result);
+  const nestedTarget = targetName.includes("/") || targetName.includes("\\");
+  const nestedSelectable = await verifyLoaderReference(kind, stagedReference);
+
+  if (nestedTarget && nestedSelectable === false) {
+    // Some ComfyUI builds store a nested upload correctly but do not expose
+    // nested input paths in the loader combo. Re-register the same bytes at the
+    // root so the returned value is actually selectable, rather than claiming
+    // that the nested path works because /upload/image returned 200.
+    const rootName = basename(targetName);
+    // Never replace an unrelated root file when the host requires this
+    // compatibility fallback. ComfyUI will choose a unique name when the
+    // requested root name already exists, and the returned name is verified
+    // below before being reported as selectable.
+    const rootResult = await uploadImageHttp(rootName, data, mimeType, false);
+    const rootReference = referenceOf(rootResult);
+    const rootSelectable = await verifyLoaderReference(kind, rootReference);
+    if (rootSelectable === true) {
+      return {
+        filename: rootResult.name,
+        subfolder: rootResult.subfolder ?? "",
+        type: rootResult.type,
+        kind,
+        loaderSelectable: "root-fallback",
+        requestedFilename: stagedReference,
+      };
+    }
+    return {
+      filename: rootResult.name,
+      subfolder: rootResult.subfolder ?? "",
+      type: rootResult.type,
+      kind,
+      loaderSelectable: "unverified",
+      requestedFilename: stagedReference,
+    };
+  }
+
   return {
     filename: result.name,
-    subfolder: result.subfolder,
+    subfolder: result.subfolder ?? "",
     type: result.type,
     kind,
+    loaderSelectable: nestedSelectable === true ? "verified" : "unverified",
   };
 }

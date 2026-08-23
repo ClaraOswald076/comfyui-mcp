@@ -34,9 +34,13 @@ vi.mock("node:fs/promises", () => ({
 
 const uploadImageHttpMock = vi.fn();
 const fetchImageMock = vi.fn();
+const getObjectInfoMock = vi.fn();
+const resetObjectInfoCacheMock = vi.fn();
 vi.mock("../../comfyui/client.js", () => ({
   uploadImageHttp: (...a: unknown[]) => uploadImageHttpMock(...a),
   fetchImage: (...a: unknown[]) => fetchImageMock(...a),
+  getObjectInfo: (...a: unknown[]) => getObjectInfoMock(...a),
+  resetObjectInfoCache: (...a: unknown[]) => resetObjectInfoCacheMock(...a),
 }));
 
 import { config } from "../../config.js";
@@ -56,6 +60,7 @@ beforeEach(() => {
   (config as { comfyuiPath?: string }).comfyuiPath = "/comfy";
   readFileMock.mockResolvedValue(Buffer.from("data"));
   uploadImageHttpMock.mockResolvedValue({ name: "x" });
+  getObjectInfoMock.mockResolvedValue({});
   copyFileMock.mockResolvedValue(undefined);
 });
 
@@ -223,7 +228,87 @@ describe("stageOutputAsInput (output → input via server API)", () => {
       subfolder: "",
       type: "input",
       kind: "image",
+      loaderSelectable: "unverified",
     });
+  });
+
+  it("verifies a nested stage reference against the fresh loader combo", async () => {
+    uploadImageHttpMock.mockResolvedValueOnce({
+      name: "example.png",
+      subfolder: "stage",
+      type: "input",
+    });
+    getObjectInfoMock.mockResolvedValueOnce({
+      LoadImage: {
+        input: { required: { image: ["COMBO", { options: ["stage/example.png"] }] } },
+      },
+    });
+
+    const r = await stageOutputAsInput({
+      filename: "source.png",
+      asFilename: "stage/example.png",
+    });
+
+    expect(uploadImageHttpMock).toHaveBeenCalledTimes(1);
+    expect(r).toMatchObject({
+      filename: "example.png",
+      subfolder: "stage",
+      loaderSelectable: "verified",
+    });
+    expect(resetObjectInfoCacheMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to a root filename when the host omits nested paths from LoadImage", async () => {
+    uploadImageHttpMock
+      .mockResolvedValueOnce({ name: "example.png", subfolder: "stage", type: "input" })
+      .mockResolvedValueOnce({ name: "example_1.png", subfolder: "", type: "input" });
+    getObjectInfoMock
+      .mockResolvedValueOnce({
+        LoadImage: {
+          input: { required: { image: ["COMBO", { options: ["other.png"] }] } },
+        },
+      })
+      .mockResolvedValueOnce({
+        LoadImage: {
+          input: { required: { image: ["COMBO", { options: ["example_1.png"] }] } },
+        },
+      });
+
+    const r = await stageOutputAsInput({
+      filename: "source.png",
+      asFilename: "stage/example.png",
+    });
+
+    expect(uploadImageHttpMock).toHaveBeenCalledTimes(2);
+    expect(uploadImageHttpMock.mock.calls[1]).toEqual([
+      "example.png",
+      expect.any(Buffer),
+      "image/png",
+      false,
+    ]);
+    expect(r).toMatchObject({
+      filename: "example_1.png",
+      subfolder: "",
+      loaderSelectable: "root-fallback",
+      requestedFilename: "stage/example.png",
+    });
+  });
+
+  it("does not claim loader selectability when /object_info is unavailable", async () => {
+    uploadImageHttpMock.mockResolvedValueOnce({
+      name: "example.png",
+      subfolder: "stage",
+      type: "input",
+    });
+    getObjectInfoMock.mockRejectedValueOnce(new Error("server unavailable"));
+
+    const r = await stageOutputAsInput({
+      filename: "source.png",
+      asFilename: "stage/example.png",
+    });
+
+    expect(r.loaderSelectable).toBe("unverified");
+    expect(uploadImageHttpMock).toHaveBeenCalledTimes(1);
   });
 
   it("infers video and uploads with the video mime", async () => {
