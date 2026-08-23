@@ -396,6 +396,10 @@ export async function startDownloadJob(
   /** Post-download work (sidecars, type checks). Its lines land on `job.notes`
    *  so they reach the user even when the download outlives the tool call. */
   onComplete?: (path: string) => Promise<string[]>,
+  /** Optional call-scoped route decision supplied by apply_manifest. When present,
+   *  it must drive both the identity key and the writer, just like the decision
+   *  computed here for ordinary download_model calls. */
+  dispatchToManagerOverride?: boolean,
 ): Promise<Entry> {
   // Identity depends on mode. LOCAL: resolve the canonical on-disk destination
   // with the SAME resolver the write uses (throws on an invalid filename/subfolder
@@ -414,7 +418,8 @@ export async function startDownloadJob(
   // so a reconnect/reachability flip between two evaluations would split the job —
   // Manager-key + local-writer (or a duplicate job) for one request (#420 codex
   // round 1). One decision keys the identity AND drives the writer.
-  const dispatchToManager = await shouldDispatchDownloadToManager();
+  const dispatchToManager =
+    dispatchToManagerOverride ?? (await shouldDispatchDownloadToManager());
 
   // DEDUP INDEX (route-independent) vs WRITER ROUTE (the single decision above) are
   // deliberately separated (#420 codex round 2). The in-flight lookup/registration
