@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.69] - 2026-08-23
+
 ### MCP
 
 #### Fixed
