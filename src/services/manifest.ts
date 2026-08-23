@@ -15,7 +15,12 @@ import {
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import { config, isRemoteMode } from "../config.js";
+import {
+  config,
+  getComfyUIBaseUrl,
+  getComfyuiTargetGeneration,
+  isRemoteMode,
+} from "../config.js";
 import {
   installCustomNode,
   installModelViaManager,
@@ -41,6 +46,7 @@ import { resolveModelsDir } from "./output-dir.js";
 import {
   resolveEffectiveComfyUIBaseLive,
   resolveEffectiveComfyUICodeBaseLive,
+  resolveCustomNodesScanBaseLiveStrict,
   resolveInstallInterpreter,
   type InstallInterpreterResolution,
 } from "./workspace-env.js";
@@ -913,9 +919,9 @@ function remoteModelTarget(model: ComfyManifest["models"][number]): {
   return { name: filename, type, save_path, filename, category };
 }
 
-async function installedNodesOrEmpty(): Promise<InstalledNode[]> {
+async function installedNodesOrEmpty(managerBase?: string): Promise<InstalledNode[]> {
   try {
-    return await listInstalledNodes();
+    return await listInstalledNodes({}, managerBase);
   } catch (err) {
     logger.warn("Could not list installed custom nodes before manifest apply", {
       error: err instanceof Error ? err.message : String(err),
@@ -927,6 +933,12 @@ async function installedNodesOrEmpty(): Promise<InstalledNode[]> {
 export async function applyManifest(
   opts: ApplyManifestOptions,
 ): Promise<ApplyManifestResult> {
+  // Capture the HTTP target and its monotonic generation before the first
+  // await. Live root discovery below is asynchronous; if a panel retargets
+  // while it runs, the install path must refuse rather than pair the old root
+  // with a newly recaptured Manager target.
+  const managerBase = getComfyUIBaseUrl();
+  const targetGeneration = getComfyuiTargetGeneration();
   const manifest = await resolveManifest(opts);
 
   // Resolve the LOCAL ComfyUI data base this call should target, WITHOUT mutating the
@@ -937,20 +949,30 @@ export async function applyManifest(
   // Both roots are live-first so one apply_manifest cannot split mutations
   // across two unrelated installs when config and the connected server differ:
   //   dataBase — live --base-directory, then configuration, then main.py
-  //              (same as node_pack, #1715/#1770). Pack clone/checkout land here.
+  //              for ordinary local data/model availability.
+  //   customNodesBase — the live custom_nodes scan root; unlike dataBase, this
+  //              does not fall back to a saved default when COMFYUI_PATH is unset.
   //   codeBase — live main.py, then COMFYUI_CODE_PATH, then the data base.
   //              Pip/venv land here.
   // The actual on-disk model DESTINATION is always re-derived live-first by the
   // downloader (resolveModelsDir), so dataBase only governs data-filesystem
   // availability, never where a model lands.
   const localDataBase = await resolveLocalManifestBase();
+  // A custom node is visible to ComfyUI under the running process's actual
+  // scan root: its live --base-directory, or the live main.py checkout when no
+  // base-directory is set. This must not fall back to a saved default workspace
+  // when COMFYUI_PATH is unset (#463).
+  const localCustomNodesBase = await resolveLocalManifestCustomNodesBase();
   const localCodeBase = isRemoteMode()
     ? undefined
     : (await resolveEffectiveComfyUICodeBaseLive()) ?? localDataBase;
 
   return applyManifestSections(manifest, {
     dataBase: localDataBase,
+    customNodesBase: localCustomNodesBase,
     codeBase: localCodeBase,
+    managerBase,
+    targetGeneration,
   }, describeManifestSource(opts));
 }
 
@@ -967,11 +989,34 @@ async function resolveLocalManifestBase(): Promise<string | undefined> {
   return resolveEffectiveComfyUIBaseLive();
 }
 
+function looksLikeGitManifestSource(id: string): boolean {
+  return /^(?:https?:\/\/|git@|git\+)/i.test(id) || /\.git(?:[?#]|$)/i.test(id);
+}
+
+async function resolveLocalManifestCustomNodesBase(): Promise<string | undefined> {
+  if (isRemoteMode()) return undefined;
+  try {
+    // With no COMFYUI_PATH, a saved/default config root is only a local
+    // workspace candidate. It is not an authorized clone target unless the
+    // panel-connected local server provides live evidence for its scan root.
+    return await resolveCustomNodesScanBaseLiveStrict({
+      requireLive: !process.env.COMFYUI_PATH,
+    });
+  } catch {
+    // An unavailable/ambiguous live root must not block the Manager attempt.
+    // It only removes the optional local-clone route.
+    return undefined;
+  }
+}
+
 async function applyManifestSections(
   manifest: ComfyManifest,
   localRoots: {
     dataBase: string | undefined;
+    customNodesBase: string | undefined;
     codeBase: string | undefined;
+    managerBase: string;
+    targetGeneration: number;
   },
   source: string,
 ): Promise<ApplyManifestResult> {
@@ -986,7 +1031,7 @@ async function applyManifestSections(
   // route pip/model handling remotely instead of touching either local tree.
   // custom_nodes and models can still be handled remotely through ComfyUI-Manager's
   // HTTP API, but pip/apt have no remote equivalent.
-  const { dataBase, codeBase } = localRoots;
+  const { dataBase, customNodesBase, codeBase, managerBase, targetGeneration } = localRoots;
   const localMode = !isRemoteMode();
   const hasLocalDataFs = localMode && Boolean(dataBase);
   const hasLocalCodeFs = localMode && Boolean(codeBase);
@@ -1089,10 +1134,22 @@ async function applyManifestSections(
   let nodeBudgetSpent = false;
   // Even the INITIAL installed-list probe is budget-bounded — a hung Manager here
   // must not blow the tools/call timeout before we can report anything.
-  const initialList = await raceDeadline(installedNodesOrEmpty(), nodeDeadline);
+  const initialList = await raceDeadline(installedNodesOrEmpty(managerBase), nodeDeadline);
   const installedNodes = initialList === BUDGET_TIMEOUT ? [] : initialList;
   if (initialList === BUDGET_TIMEOUT) nodeBudgetSpent = true;
   for (const id of manifest.custom_nodes) {
+    if (getComfyuiTargetGeneration() !== targetGeneration) {
+      results.push(
+        report(
+          "custom_node",
+          id,
+          "failed",
+          "ComfyUI's target changed while apply_manifest was checking installed nodes. " +
+            "No install or local clone was attempted; retry after the target settles.",
+        ),
+      );
+      continue;
+    }
     const isPanelTarget = targetsPanelPackExactly(id);
     if (isPanelTarget) {
       // `apply_manifest` has a Manager target but no authoritative association
@@ -1130,7 +1187,12 @@ async function applyManifestSections(
     // (#1715/#1770). Pip uses codeBase independently above.
     const installOutcome = installCustomNode({
       id,
-      ...(dataBase ? { comfyuiPath: dataBase } : {}),
+      ...(customNodesBase ? { comfyuiPath: customNodesBase } : {}),
+      ...(looksLikeGitManifestSource(id)
+        ? { localCloneFallback: "verified-only" as const }
+        : {}),
+      managerBase,
+      targetGeneration,
     })
       .then((res) => ({ kind: "settled" as const, res }))
       .catch((err) => ({ kind: "error" as const, err }));
@@ -1156,6 +1218,13 @@ async function applyManifestSections(
       );
       continue;
     }
+    if (outcome.res.mechanism === "git-clone") {
+      // The fallback has already verified the clone's destination and pack
+      // shape. Manager's installed-list endpoint cannot report an unregistered
+      // direct clone, especially when Manager itself is absent (#463).
+      results.push(report("custom_node", id, "applied", outcome.res.message));
+      continue;
+    }
     // ComfyUI-Manager marks a git-URL task "done" (queue drained) even when it
     // cloned NOTHING — e.g. a repo not in its registry resolves to nothing, no
     // dir is created, but the queue still empties cleanly. So a successful
@@ -1165,11 +1234,23 @@ async function applyManifestSections(
     // reboot) and confirm the node is actually present before reporting success.
     // Budget-bounded too: if the confirm can't complete in time we report pending
     // (conservative — the install itself already settled) rather than overrun.
-    const verified = await raceDeadline(installedNodesOrEmpty(), nodeDeadline);
+    const verified = await raceDeadline(installedNodesOrEmpty(managerBase), nodeDeadline);
     if (verified === BUDGET_TIMEOUT) {
       nodeBudgetSpent = true;
       stillInstalling.push(id);
       results.push(report("custom_node", id, "pending", formatStillInstallingMessage()));
+      continue;
+    }
+    if (getComfyuiTargetGeneration() !== targetGeneration) {
+      results.push(
+        report(
+          "custom_node",
+          id,
+          "failed",
+          "ComfyUI's target changed while apply_manifest was verifying the install. " +
+            "The result was not reported as applied; retry after the target settles.",
+        ),
+      );
       continue;
     }
     if (nodeAlreadyInstalled(id, verified)) {

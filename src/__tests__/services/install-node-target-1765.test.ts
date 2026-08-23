@@ -54,9 +54,11 @@ const cfg = vi.hoisted(() => ({
   comfyuiSsl: false,
   githubToken: undefined as string | undefined,
 }));
+const target = vi.hoisted(() => ({ generation: 0 }));
 vi.mock("../../config.js", () => ({
   config: cfg,
   getComfyUIBaseUrl: () => `http://${cfg.comfyuiHost}:${cfg.resolvedPort}`,
+  getComfyuiTargetGeneration: () => target.generation,
   getComfyUIAuthHeaders: () => ({}),
   isLoopbackHost: (host: string | undefined) =>
     !host || ["127.0.0.1", "::1", "localhost", "0.0.0.0", "::"].includes(host),
@@ -70,6 +72,7 @@ vi.mock("../../config.js", () => ({
 const live = vi.hoisted(() => ({
   argv: [] as string[],
   reachable: true,
+  onStats: undefined as (() => void) | undefined,
   /** How many times the running server was asked to describe itself. Zero is the
    *  measurement that proves the shipped code never consulted it. */
   statsCalls: 0,
@@ -77,6 +80,9 @@ const live = vi.hoisted(() => ({
 vi.mock("../../comfyui/client.js", () => ({
   getSystemStats: async () => {
     live.statsCalls += 1;
+    const onStats = live.onStats;
+    live.onStats = undefined;
+    onStats?.();
     if (!live.reachable) throw new Error("connect ECONNREFUSED 127.0.0.1:8189");
     return { system: { argv: live.argv } };
   },
@@ -97,7 +103,8 @@ vi.mock("../../comfyui/client.js", () => ({
 // They reach `cloneCustomNodeFallback` from two different call sites, and a
 // guard on only one of them is a guard that is not there. ────────────────────
 const http = vi.hoisted(() => ({
-  mode: "refuse-enqueue" as "refuse-enqueue" | "accept-enqueue",
+  mode: "refuse-enqueue" as "refuse-enqueue" | "accept-enqueue" | "manager-absent",
+  calls: [] as string[],
 }));
 vi.mock("../../comfyui/fetch.js", () => {
   const json = (body: unknown) =>
@@ -107,11 +114,15 @@ vi.mock("../../comfyui/fetch.js", () => {
     });
   return {
     comfyuiFetch: async (url: string) => {
+      http.calls.push(url);
       if (http.mode === "refuse-enqueue") {
         return new Response("gated by security_level", {
           status: 403,
           statusText: "Forbidden",
         });
+      }
+      if (http.mode === "manager-absent") {
+        return new Response("missing", { status: 404, statusText: "Not Found" });
       }
       const { pathname } = new URL(url);
       if (pathname === "/manager/queue/install") return json({ ui_id: "queued" });
@@ -153,6 +164,7 @@ vi.mock("node:child_process", async () => {
       git.calls.push([file, ...args]);
       if (file === "git" && args[0] === "clone") {
         const dest = args[args.length - 1];
+        http.calls.push(`git clone:${dest}`);
         fs.mkdirSync(dest, { recursive: true });
         fs.writeFileSync(path.join(dest, "__init__.py"), "NODE_CLASS_MAPPINGS = {}\n");
       }
@@ -188,10 +200,13 @@ vi.mock("../../services/live-interpreter.js", async (importOriginal) => {
 });
 
 const { installCustomNode } = await import("../../services/node-management.js");
+const { applyManifest } = await import("../../services/manifest.js");
 const { configureWorkspace, resetWorkspaceConfig } = await import(
   "../../services/workspace-env.js"
 );
-const { setManagerApiCacheForTests } = await import("../../services/manager-api-cache.js");
+const { resetManagerApiCache, setManagerApiCacheForTests } = await import(
+  "../../services/manager-api-cache.js"
+);
 const { setQueueTimingForTests } = await import("../../services/node-management.js");
 setQueueTimingForTests({ pollIntervalMs: 1, startupGraceMs: 0, timeoutMs: 5_000 });
 
@@ -219,11 +234,14 @@ let priorEnvPath: string | undefined;
 
 beforeEach(() => {
   git.calls = [];
+  http.calls = [];
   probe.calls = 0;
   probe.result = undefined;
+  live.onStats = undefined;
   http.mode = "refuse-enqueue";
   live.reachable = true;
   live.statsCalls = 0;
+  target.generation = 0;
   live.argv = [join(CONNECTED, "main.py"), "--port", "8189"];
   cfg.comfyuiPath = undefined;
   priorEnvPath = process.env.COMFYUI_PATH;
@@ -247,26 +265,13 @@ afterEach(() => {
 afterAll(() => rmSync(SANDBOX, { recursive: true, force: true }));
 
 describe("#1765 — install_custom_node must not write into an install this session is not connected to", () => {
-  it("REFUSES the reporter's case instead of reporting a success in the wrong tree", async () => {
+  it("uses the verified live root instead of the saved default", async () => {
     const { ok, error } = await install({ id: REPO, source: "git" });
 
-    // NOTHING ran. Before this change the same inputs returned
-    // { mechanism: "git-clone", details: { nodeDir: "<SAVED_DEFAULT>/custom_nodes/..." } }.
-    expect(ok).toBeUndefined();
-    expect(clonedInto()).toBeUndefined();
+    expect(error).toBeUndefined();
+    expect(ok).toMatchObject({ mechanism: "git-clone" });
+    expect(clonedInto()).toBe(join(CONNECTED, PACK_DIR));
     expect(existsSync(join(SAVED_DEFAULT, PACK_DIR))).toBe(false);
-    expect(existsSync(join(CONNECTED, PACK_DIR))).toBe(false);
-
-    // And the refusal NAMES both installs, which selector produced each, and the
-    // remedy — the reporter could only tell the write had gone astray by reading
-    // `nodeDir` out of a success payload.
-    expect(error).toContain(SAVED_DEFAULT);
-    expect(error).toContain(CONNECTED);
-    expect(error).toContain("http://127.0.0.1:8189");
-    expect(error).toContain("SAVED DEFAULT WORKSPACE");
-    expect(error).toContain("--base-directory");
-    expect(error).toMatch(/two DIFFERENT ComfyUI installs/);
-    expect(error).toContain(`COMFYUI_PATH=${CONNECTED}`);
   });
 
   it("asks the running server which install it is — the shipped path never did", async () => {
@@ -284,7 +289,7 @@ describe("#1765 — install_custom_node must not write into an install this sess
     expect(clonedInto()).toBe(join(SAVED_DEFAULT, PACK_DIR));
   });
 
-  it("REFUSES on the other road to the same clone — the Manager accepted, then had nothing", async () => {
+  it("uses the verified live root when Manager accepts but resolves nothing", async () => {
     // The reporter's own shape: the queue takes the task, drains, and the pack is
     // still not installed because it is unregistered. That reaches
     // cloneCustomNodeFallback from a DIFFERENT call site than the 403 divert.
@@ -292,11 +297,10 @@ describe("#1765 — install_custom_node must not write into an install this sess
 
     const { ok, error } = await install({ id: REPO, source: "git" });
 
-    expect(ok).toBeUndefined();
-    expect(clonedInto()).toBeUndefined();
+    expect(error).toBeUndefined();
+    expect(ok).toMatchObject({ mechanism: "git-clone" });
+    expect(clonedInto()).toBe(join(CONNECTED, PACK_DIR));
     expect(existsSync(join(SAVED_DEFAULT, PACK_DIR))).toBe(false);
-    expect(error).toMatch(/two DIFFERENT ComfyUI installs/);
-    expect(error).toContain(CONNECTED);
   });
 
   it("still clones on that road when the configured root IS the connected install", async () => {
@@ -310,18 +314,17 @@ describe("#1765 — install_custom_node must not write into an install this sess
     expect(clonedInto()).toBe(join(SAVED_DEFAULT, PACK_DIR));
   });
 
-  it("refuses when the server's --base-directory names a different tree", async () => {
+  it("uses the live --base-directory as the custom_nodes target", async () => {
     live.argv = [join(CONNECTED, "main.py"), "--base-directory", DATA_ROOT];
 
     const { ok, error } = await install({ id: REPO, source: "git" });
 
-    expect(ok).toBeUndefined();
-    expect(clonedInto()).toBeUndefined();
-    expect(error).toContain(DATA_ROOT);
-    expect(error).toContain("--base-directory");
+    expect(error).toBeUndefined();
+    expect(ok).toMatchObject({ mechanism: "git-clone" });
+    expect(clonedInto()).toBe(join(DATA_ROOT, PACK_DIR));
   });
 
-  it("fails OPEN when --base-directory is relative and unresolvable", async () => {
+  it("fails closed when --base-directory is relative and unresolvable", async () => {
     // The server WAS given a base directory, but a relative one with no server
     // cwd to resolve it against. It scans custom_nodes/ from a directory we
     // cannot name — and the main.py root, which argv does give us, is then
@@ -331,9 +334,9 @@ describe("#1765 — install_custom_node must not write into an install this sess
 
     const { ok, error } = await install({ id: REPO, source: "git" });
 
-    expect(error).toBeUndefined();
-    expect(ok).toMatchObject({ mechanism: "git-clone" });
-    expect(clonedInto()).toBe(join(SAVED_DEFAULT, PACK_DIR));
+    expect(ok).toBeUndefined();
+    expect(clonedInto()).toBeUndefined();
+    expect(error).toMatch(/no ComfyUI path is set|local ComfyUI install/i);
   });
 
   it("clones normally when the server's --base-directory IS the configured root", async () => {
@@ -379,17 +382,17 @@ describe("#1765 — install_custom_node must not write into an install this sess
     expect(clonedInto()).toBe(join(SAVED_DEFAULT, PACK_DIR));
   });
 
-  it("fails OPEN when the server cannot be reached — an outage is not evidence", async () => {
+  it("fails closed when the server cannot be reached — an outage is not a clone target", async () => {
     live.reachable = false;
 
     const { ok, error } = await install({ id: REPO, source: "git" });
 
-    expect(error).toBeUndefined();
-    expect(ok).toMatchObject({ mechanism: "git-clone" });
-    expect(clonedInto()).toBe(join(SAVED_DEFAULT, PACK_DIR));
+    expect(ok).toBeUndefined();
+    expect(clonedInto()).toBeUndefined();
+    expect(error).toMatch(/no ComfyUI path is set|local ComfyUI install/i);
   });
 
-  it("REFUSES the relative-main.py shape too, via the OS process observation", async () => {
+  it("uses a verified root from the OS process observation", async () => {
     // The shape the live rig actually reports, and the one `comfy launch`
     // produces: a relative launch script and no server cwd. Nothing in argv
     // names a root; the interpreter the OS says is on the port does.
@@ -398,40 +401,38 @@ describe("#1765 — install_custom_node must not write into an install this sess
 
     const { ok, error } = await install({ id: REPO, source: "git" });
 
-    expect(ok).toBeUndefined();
-    expect(clonedInto()).toBeUndefined();
-    expect(existsSync(join(SAVED_DEFAULT, PACK_DIR))).toBe(false);
-    expect(error).toContain(CONNECTED);
-    expect(error).toContain("OS process listening on that port");
+    expect(error).toBeUndefined();
+    expect(ok).toMatchObject({ mechanism: "git-clone" });
+    expect(clonedInto()).toBe(join(CONNECTED, PACK_DIR));
     expect(probe.calls).toBeGreaterThan(0);
   });
 
-  it("fails OPEN when the relative main.py can be anchored on NOTHING", async () => {
+  it("fails closed when the relative main.py cannot be anchored", async () => {
     // Relative script, and the OS observation yields no interpreter (a remote
-    // proxy, a permissions failure, an unreadable process table). Unprovable is
-    // not the same as wrong, so nothing is refused.
+    // proxy, a permissions failure, an unreadable process table). No live root
+    // is then authorized for a local clone.
     live.argv = ["ComfyUI/main.py", "--port", "8189"];
     probe.result = undefined;
 
     const { ok, error } = await install({ id: REPO, source: "git" });
 
-    expect(error).toBeUndefined();
-    expect(ok).toMatchObject({ mechanism: "git-clone" });
-    expect(clonedInto()).toBe(join(SAVED_DEFAULT, PACK_DIR));
+    expect(ok).toBeUndefined();
+    expect(clonedInto()).toBeUndefined();
+    expect(error).toMatch(/no ComfyUI path is set|local ComfyUI install/i);
   });
 
-  it("fails OPEN when the observed interpreter belongs to no install we can anchor", async () => {
+  it("fails closed when the observed interpreter belongs to no install we can anchor", async () => {
     // A SYSTEM python: walking up from it reaches directories that are not the
     // install at all, which is the unsoundness `interpreterBelongsToInstall`
-    // exists to reject. It must not produce a root, and so must not refuse.
+    // exists to reject. It must not produce a clone target.
     live.argv = ["ComfyUI/main.py", "--port", "8189"];
     probe.result = { python: join(SANDBOX, "python", "python.exe"), pid: 4243 };
 
     const { ok, error } = await install({ id: REPO, source: "git" });
 
-    expect(error).toBeUndefined();
-    expect(ok).toMatchObject({ mechanism: "git-clone" });
-    expect(clonedInto()).toBe(join(SAVED_DEFAULT, PACK_DIR));
+    expect(ok).toBeUndefined();
+    expect(clonedInto()).toBeUndefined();
+    expect(error).toMatch(/no ComfyUI path is set|local ComfyUI install/i);
   });
 
   it("refuses the comfy-cli branch too — --workspace has the identical hazard", async () => {
@@ -440,13 +441,11 @@ describe("#1765 — install_custom_node must not write into an install this sess
     try {
       const { ok, error } = await install({ id: REPO, source: "git", useCmCli: true });
 
-      expect(ok).toBeUndefined();
-      expect(error).toMatch(/two DIFFERENT ComfyUI installs/);
-      expect(error).toContain("comfy-cli");
-      // The subprocess never ran: no `comfy ... install` and no `git clone`.
-      expect(git.calls.filter((c) => c[0] === FAKE_COMFY_CLI)).toHaveLength(0);
+      expect(error).toBeUndefined();
+      expect(ok).toMatchObject({ mechanism: "comfy-cli" });
+      // The verified live root is used; the direct-clone fallback is not involved.
+      expect(git.calls.filter((c) => c[0] === "git" && c[1] === "clone")).toHaveLength(0);
       expect(clonedInto()).toBeUndefined();
-      expect(existsSync(join(SAVED_DEFAULT, PACK_DIR))).toBe(false);
     } finally {
       if (priorCli === undefined) delete process.env.COMFY_CLI_PATH;
       else process.env.COMFY_CLI_PATH = priorCli;
@@ -462,5 +461,115 @@ describe("#1765 — install_custom_node must not write into an install this sess
     expect(error).toBeDefined();
     expect(error).not.toMatch(/two DIFFERENT ComfyUI installs/);
     expect(live.statsCalls).toBe(0);
+  });
+});
+
+describe("#463 — apply_manifest uses the verified panel-connected local scan root", () => {
+  it("clones a Git manifest source with COMFYUI_PATH unset and reports it applied", async () => {
+    http.mode = "manager-absent";
+    resetManagerApiCache("#463 manifest probe regression");
+
+    const result = await applyManifest({
+      manifest: { custom_nodes: [REPO], models: [] },
+    });
+
+    expect(result.results).toMatchObject([
+      { action: "custom_node", item: REPO, status: "applied" },
+    ]);
+    expect(clonedInto()).toBe(join(CONNECTED, PACK_DIR));
+    expect(existsSync(join(SAVED_DEFAULT, PACK_DIR))).toBe(false);
+
+    const statusCalls = http.calls
+      .map((url, index) => ({ url, index }))
+      .filter(({ url }) =>
+        url.includes("/v2/manager/queue/status") || url.includes("/manager/queue/status"),
+      );
+    const cloneIndex = http.calls.findIndex((value) => value.startsWith("git clone:"));
+    expect(statusCalls.length).toBeGreaterThanOrEqual(4);
+    expect(statusCalls.every(({ url }) => url.startsWith("http://127.0.0.1:8189/"))).toBe(true);
+    expect(Math.max(...statusCalls.map(({ index }) => index))).toBeLessThan(cloneIndex);
+  });
+
+  it("refuses the Git fallback when the no-path local target cannot be verified", async () => {
+    http.mode = "manager-absent";
+    live.reachable = false;
+    resetManagerApiCache("#463 unverified manifest target");
+
+    const result = await applyManifest({
+      manifest: { custom_nodes: [REPO], models: [] },
+    });
+
+    expect(result.results).toMatchObject([
+      { action: "custom_node", item: REPO, status: "failed" },
+    ]);
+    expect(result.results[0]?.message).toMatch(/no ComfyUI path is set|local ComfyUI install/i);
+    expect(clonedInto()).toBeUndefined();
+  });
+
+  it("refuses when the target retargets during apply_manifest's awaited probe", async () => {
+    http.mode = "manager-absent";
+    resetManagerApiCache("#463 target-generation race");
+    const retargetDuringThirdProbe = () => {
+      if (live.statsCalls < 3) {
+        live.onStats = retargetDuringThirdProbe;
+        return;
+      }
+      // The custom_nodes root was already verified for the original target A.
+      // Make the newly selected target B unreachable before installCustomNode
+      // starts; an unreachable mismatch check must not wash out this retarget.
+      cfg.resolvedPort = 8190;
+      target.generation += 1;
+      live.reachable = false;
+    };
+    live.onStats = retargetDuringThirdProbe;
+
+    const result = await applyManifest({
+      manifest: { custom_nodes: [REPO], models: [] },
+    });
+
+    expect(result.results).toMatchObject([
+      { action: "custom_node", item: REPO, status: "failed" },
+    ]);
+    expect(result.results[0]?.message).toMatch(/target changed/i);
+    expect(clonedInto()).toBeUndefined();
+    // The initial Manager read and any attempted install must remain pinned to
+    // A; no request may be recaptured against the unreachable B target.
+    expect(http.calls.length).toBeGreaterThan(0);
+    expect(http.calls.every((url) => url.startsWith("http://127.0.0.1:8189/"))).toBe(true);
+  });
+
+  it("attempts Manager before refusing a clone for an ambiguous live root", async () => {
+    http.mode = "accept-enqueue";
+    live.argv = ["main.py", "--port", "8189"];
+
+    const result = await applyManifest({
+      manifest: { custom_nodes: [REPO], models: [] },
+    });
+
+    expect(result.results).toMatchObject([
+      { action: "custom_node", item: REPO, status: "failed" },
+    ]);
+    expect(http.calls.some((url) => url.endsWith("/manager/queue/install"))).toBe(true);
+    expect(clonedInto()).toBeUndefined();
+    expect(result.results[0]?.message).toMatch(/no ComfyUI path is set|local ComfyUI install/i);
+  });
+
+  it("attempts Manager when no local root is available instead of preflight-refusing", async () => {
+    http.mode = "accept-enqueue";
+    live.reachable = false;
+    // A configured/saved root is still not proof of the panel target when the
+    // explicit COMFYUI_PATH is unset. It must not be used for the clone.
+    cfg.comfyuiPath = SAVED_DEFAULT;
+
+    const result = await applyManifest({
+      manifest: { custom_nodes: [REPO], models: [] },
+    });
+
+    expect(result.results).toMatchObject([
+      { action: "custom_node", item: REPO, status: "failed" },
+    ]);
+    expect(http.calls.some((url) => url.endsWith("/manager/queue/install"))).toBe(true);
+    expect(clonedInto()).toBeUndefined();
+    expect(result.results[0]?.message).not.toMatch(/could not verify.*custom_nodes root/i);
   });
 });

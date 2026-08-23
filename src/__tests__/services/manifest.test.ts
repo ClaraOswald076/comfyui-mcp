@@ -103,6 +103,8 @@ const installInterpreterMock = vi.hoisted(() =>
 
 vi.mock("../../config.js", () => ({
   config: mockConfig,
+  getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
+  getComfyuiTargetGeneration: () => 0,
   // apply_manifest routes models through the Manager in remote mode (no
   // comfyuiPath). isRemoteMode mirrors that gate for the tests.
   isRemoteMode: () => mockConfig.remote ?? !mockConfig.comfyuiPath,
@@ -218,6 +220,9 @@ vi.mock("../../services/workspace-env.js", () => ({
     effectiveCodeBaseLiveMock(...(a as [])),
   resolveEffectiveComfyUIBaseLive: (...a: unknown[]) =>
     effectiveBaseLiveMock(...(a as [])),
+  resolveCustomNodesScanBaseLiveStrict: (...a: unknown[]) =>
+    effectiveBaseLiveMock(...(a as [])),
+  getLiveServerSnapshot: async () => ({ reachable: true }),
   // Mirrors the real resolver enough for the pip tests: an install-root python.
   resolveRootInterpreter: (root: string | undefined) =>
     root ? `${root}/python` : "python",
@@ -952,6 +957,8 @@ describe("applyManifest", () => {
     expect(installCustomNodeMock).toHaveBeenCalledWith({
       id: "split-root-pack",
       comfyuiPath: dataRoot,
+      managerBase: "http://127.0.0.1:8188",
+      targetGeneration: 0,
     });
     expect(installInterpreterMock).not.toHaveBeenCalledWith(dataRoot);
   });
@@ -1890,7 +1897,11 @@ describe("applyManifest", () => {
       expect(byAction.pip.status).toBe("skipped");
       expect(execFileSyncMock).not.toHaveBeenCalled();
       // custom_nodes still go through the Manager HTTP install (remote-ok).
-      expect(installCustomNodeMock).toHaveBeenCalledWith({ id: "x" });
+      expect(installCustomNodeMock).toHaveBeenCalledWith({
+        id: "x",
+        managerBase: "http://127.0.0.1:8188",
+        targetGeneration: 0,
+      });
       // models route through installModelViaManager, NOT the local downloadModel.
       expect(downloadModelMock).not.toHaveBeenCalled();
       expect(installModelViaManagerMock).toHaveBeenCalledWith({

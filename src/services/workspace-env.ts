@@ -293,6 +293,10 @@ export async function resolveEffectiveComfyUIBaseLive(): Promise<string | undefi
  *      currently unavailable on disk.
  *   4. Else the configured data base (offline / unreachable).
  *
+ * Callers making a panel-connected clone decision may pass `requireLive:true`
+ * to suppress step 4. A saved default is useful for offline authoring, but it
+ * is not proof that the live panel target scans that directory.
+ *
  * Remote mode → undefined. Never throws. `node_pack` (scaffold / verify /
  * write / read / patch / git / publish-by-name) threads this so authoring and
  * verification cannot target different roots.
@@ -302,7 +306,14 @@ interface CustomNodesScanBaseLiveOutcome {
   unavailableBaseDirectory: string | undefined;
 }
 
-async function customNodesScanBaseLiveOutcome(): Promise<CustomNodesScanBaseLiveOutcome> {
+export interface CustomNodesScanBaseLiveOptions {
+  /** Do not fall back to configuration when live evidence is unavailable. */
+  requireLive?: boolean;
+}
+
+async function customNodesScanBaseLiveOutcome(
+  options: CustomNodesScanBaseLiveOptions = {},
+): Promise<CustomNodesScanBaseLiveOutcome> {
   if (isRemoteMode()) return { base: undefined, unavailableBaseDirectory: undefined };
 
   const snapshot = await getLiveServerSnapshot();
@@ -330,11 +341,16 @@ async function customNodesScanBaseLiveOutcome(): Promise<CustomNodesScanBaseLive
       return { base: live.root, unavailableBaseDirectory: undefined };
     }
   }
+  if (options.requireLive) {
+    return { base: undefined, unavailableBaseDirectory: undefined };
+  }
   return { base: resolveEffectiveComfyUIBase(), unavailableBaseDirectory: undefined };
 }
 
-export async function resolveCustomNodesScanBaseLive(): Promise<string | undefined> {
-  return (await customNodesScanBaseLiveOutcome()).base;
+export async function resolveCustomNodesScanBaseLive(
+  options?: CustomNodesScanBaseLiveOptions,
+): Promise<string | undefined> {
+  return (await customNodesScanBaseLiveOutcome(options)).base;
 }
 
 /**
@@ -344,8 +360,10 @@ export async function resolveCustomNodesScanBaseLive(): Promise<string | undefin
  * to COMFYUI_PATH. That fallback is unsafe when ComfyUI itself has already
  * selected a different, currently unavailable scan root.
  */
-export async function resolveCustomNodesScanBaseLiveStrict(): Promise<string | undefined> {
-  const result = await customNodesScanBaseLiveOutcome();
+export async function resolveCustomNodesScanBaseLiveStrict(
+  options?: CustomNodesScanBaseLiveOptions,
+): Promise<string | undefined> {
+  const result = await customNodesScanBaseLiveOutcome(options);
   if (result.unavailableBaseDirectory !== undefined) {
     throw new ValidationError(
       `The connected ComfyUI declares --base-directory "${result.unavailableBaseDirectory}" ` +
