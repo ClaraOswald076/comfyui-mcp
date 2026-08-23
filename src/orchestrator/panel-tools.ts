@@ -4182,16 +4182,22 @@ function annotateQueueStatusWithManifestPartial(res: ToolResult): ToolResult {
 }
 
 /** Parse a ctx.call ToolResult's text payload as JSON, or null if not parseable. */
-function parseToolResultJson(res: ToolResult): Record<string, unknown> | null {
+function parseToolResultValue(res: ToolResult): unknown {
   if (!res || res.isError) return null;
   const text = res?.content?.find((c) => c.type === "text")?.text;
   if (typeof text !== "string") return null;
   try {
-    const parsed = JSON.parse(text) as unknown;
-    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+    return JSON.parse(text) as unknown;
   } catch {
     return null;
   }
+}
+
+function parseToolResultJson(res: ToolResult): Record<string, unknown> | null {
+  const parsed = parseToolResultValue(res);
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>)
+    : null;
 }
 
 /**
@@ -4202,13 +4208,16 @@ function parseToolResultJson(res: ToolResult): Record<string, unknown> | null {
  * rows that follow it or make panel_kitchen report a transport failure.
  */
 function normalizeGraphQueryResult(res: ToolResult): Record<string, unknown> {
-  const parsed = parseToolResultJson(res);
+  const parsed = parseToolResultValue(res);
   if (!parsed) return { nodes: [] };
-  if (Array.isArray(parsed.nodes)) return parsed;
+  if (Array.isArray(parsed)) return { nodes: parsed };
+  if (typeof parsed !== "object") return { nodes: [] };
+  const record = parsed as Record<string, unknown>;
+  if (Array.isArray(record.nodes)) return record;
 
-  if (typeof parsed.text !== "string") return { nodes: [] };
+  if (typeof record.text !== "string") return { nodes: [] };
   const nodes: Record<string, unknown>[] = [];
-  for (const line of parsed.text.split(/\r?\n/)) {
+  for (const line of record.text.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     try {
@@ -4220,7 +4229,7 @@ function normalizeGraphQueryResult(res: ToolResult): Record<string, unknown> {
       // Ignore one malformed JSON row; other graph_query rows remain usable.
     }
   }
-  return { nodes };
+  return { ...record, nodes };
 }
 
 function toolResultText(res: ToolResult): string {
