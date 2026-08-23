@@ -98,6 +98,7 @@ import {
   type FindNodesFields,
   GROUP_ID_MESSAGE,
   GROUP_ID_PATTERN,
+  GROUP_REF_MESSAGE,
   normalizeGroupId,
   normalizeShowMediaItem,
   normalizeTodoItemKeys,
@@ -13701,15 +13702,108 @@ const groupId = () =>
  * undefined` at `group_id` puts both halves of the answer in front of the caller
  * and makes them join it.
  */
-function resolveGroupIdArg(
+function resolveGroupRefArg(
   tool: string,
   args: Record<string, unknown>,
-): { ok: true; value: number } | { ok: false; error: string } {
-  return pickAlias<number>(
+): { ok: true; value: number | string } | { ok: false; error: string } {
+  return pickAlias<number | string>(
     tool,
     { name: "group_id", value: args.group_id as number | undefined },
-    { name: "group", value: args.group as number | undefined },
+    { name: "group", value: args.group as number | string | undefined },
   );
+}
+
+type GroupMutationTarget =
+  | { ok: true; value: number | string }
+  | { ok: false; result: ToolResult };
+
+/**
+ * Resolve the title form of `group` before reaching the panel's ID-only group
+ * mutators. The panel already exposes the complete group rider on graph_query,
+ * and its subgraph-group resolver uses the same case-insensitive substring
+ * semantics. Reuse that observation, but refuse when it cannot identify exactly
+ * one current group rather than guessing which box to edit or remove.
+ */
+async function resolveGroupMutationTarget(
+  ref: number | string,
+  ctx: PanelToolCtx,
+): Promise<GroupMutationTarget> {
+  if (typeof ref !== "string") return { ok: true, value: ref };
+
+  const query = await ctx.call({ cmd: "graph_query", fields: "ids", limit: 1 }, 8000);
+  if (query.isError) return { ok: false, result: query };
+  const payload = parseToolResultJson(query);
+  const groups = payload?.groups;
+  if (!Array.isArray(groups)) {
+    return {
+      ok: false,
+      result: fail(
+        `Cannot resolve group title "${ref}": the live graph did not return its groups index. ` +
+          "Re-read with panel_query_graph and retry with group_id.",
+      ),
+    };
+  }
+
+  const needle = ref.toLowerCase();
+  const matches = groups.filter((group): group is Record<string, unknown> => {
+    if (!group || typeof group !== "object" || Array.isArray(group)) return false;
+    const title = (group as Record<string, unknown>).title;
+    return typeof title === "string" && title.toLowerCase().includes(needle);
+  });
+
+  if (matches.length === 0) {
+    return {
+      ok: false,
+      result: fail(
+        `No group title matching "${ref}" was found in the current graph. ` +
+          "Use panel_query_graph to inspect groups[].title, or pass group_id.",
+      ),
+    };
+  }
+
+  if (matches.length > 1) {
+    const candidates = matches
+      .map((group) => {
+        const id = group.id;
+        const title = typeof group.title === "string" ? group.title : "?";
+        return `${String(title)} (id ${String(id)})`;
+      })
+      .join(", ");
+    return {
+      ok: false,
+      result: fail(
+        `Group title "${ref}" is ambiguous: it matches ${candidates}. ` +
+          "Use group_id with the exact id instead of guessing.",
+      ),
+    };
+  }
+
+  const match = matches[0];
+  if (match.title_clipped === true) {
+    return {
+      ok: false,
+      result: fail(
+        `Cannot safely resolve group title "${ref}": the matching title was clipped in the live groups index. ` +
+          "Re-read the graph and use group_id with the exact id.",
+      ),
+    };
+  }
+  const id = match.id;
+  if (
+    !(
+      (typeof id === "number" && Number.isSafeInteger(id)) ||
+      (typeof id === "string" && id.length > 0)
+    )
+  ) {
+    return {
+      ok: false,
+      result: fail(
+        `Cannot safely resolve group title "${ref}": its live group entry has no usable id. ` +
+          "Use panel_query_graph to inspect the current groups index.",
+      ),
+    };
+  }
+  return { ok: true, value: id };
 }
 
 /**
@@ -13784,17 +13878,23 @@ const todoChecklist = () =>
   );
 
 /** The shared schema pair every group tool takes, so the three cannot drift into
- *  disagreeing about which spellings they accept (#1968). Both are optional in
- *  the SHAPE and exactly one is required by `resolveGroupIdArg` — a cross-field
+ *  disagreeing about which spellings they accept (#1968/#2108). Both are optional
+ *  in the SHAPE and exactly one is required by `resolveGroupRefArg` — a cross-field
  *  rule a flat ZodRawShape cannot express, handled the same way
  *  `validatePanelEditNodeArgs` handles node_id/node_ids. */
 const GROUP_ID_ARGS = {
   group_id: groupId()
     .optional()
     .describe("Group id from panel_query_graph's groups[] / panel_create_group."),
-  group: groupId()
+  group: z
+    .union(
+      [groupId(), z.string().trim().min(1, GROUP_REF_MESSAGE)],
+      { error: unionErrorFor(GROUP_REF_MESSAGE) },
+    )
     .optional()
-    .describe("Alias for group_id — the same id under the name panel_subgraph_group takes and panel_create_group returns."),
+    .describe(
+      "Group title (case-insensitive substring) or numeric id; this is the title-aware alias for group_id.",
+    ),
 };
 
 /**
@@ -18036,21 +18136,23 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
     ),
     def(
       "panel_move_group",
-      "Move a group box to a new top-left [x, y] on the user's open graph. By default the nodes inside the group move with it (like dragging the group header); pass move_nodes:false to move only the box. Group id comes from panel_query_graph (the `groups` array on every result) or panel_create_group, as `group_id` or `group`. Undoable.",
+      "Move a group box to a new top-left [x, y] on the user's open graph. By default the nodes inside the group move with it (like dragging the group header); pass move_nodes:false to move only the box. Identify it by numeric id from panel_query_graph / panel_create_group via `group_id`, or by case-insensitive group-title substring via `group`. Undoable.",
       {
         ...GROUP_ID_ARGS,
         pos: xy().describe("New top-left [x, y] (two numbers)."),
         move_nodes: z.boolean().optional().describe("Move the contained nodes too (default true)."),
       },
       async (args: A, ctx) => {
-        const id = resolveGroupIdArg("panel_move_group", args);
-        if (!id.ok) return fail(id.error);
-        return ctx.call({ cmd: "graph_move_group", group_id: id.value, pos: args.pos, move_nodes: args.move_nodes });
+        const ref = resolveGroupRefArg("panel_move_group", args);
+        if (!ref.ok) return fail(ref.error);
+        const target = await resolveGroupMutationTarget(ref.value, ctx);
+        if (!target.ok) return target.result;
+        return ctx.call({ cmd: "graph_move_group", group_id: target.value, pos: args.pos, move_nodes: args.move_nodes });
       },
     ),
     def(
       "panel_edit_group",
-      "Edit a group box: its title, color, font_size, and/or bounds [x, y, width, height]. Only the fields you pass are changed. Identify it with `group_id` or `group`. Undoable.",
+      "Edit a group box: its title, color, font_size, and/or bounds [x, y, width, height]. Only the fields you pass are changed. Identify it by numeric id via `group_id`, or by case-insensitive group-title substring via `group`. Undoable.",
       {
         ...GROUP_ID_ARGS,
         title: z.string().optional().describe("New label."),
@@ -18061,12 +18163,14 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           .describe("Resize/reposition the box: [x, y, width, height] (four numbers)."),
       },
       async (args: A, ctx) => {
-        const id = resolveGroupIdArg("panel_edit_group", args);
-        if (!id.ok) return fail(id.error);
+        const ref = resolveGroupRefArg("panel_edit_group", args);
+        if (!ref.ok) return fail(ref.error);
+        const target = await resolveGroupMutationTarget(ref.value, ctx);
+        if (!target.ok) return target.result;
         return ctx.call(
           {
             cmd: "graph_edit_group",
-            group_id: id.value,
+            group_id: target.value,
             title: args.title,
             color: args.color,
             font_size: args.font_size,
@@ -18078,12 +18182,14 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
     ),
     def(
       "panel_remove_group",
-      "Remove a group box from the user's open graph. The nodes inside the group are NOT deleted — only the box. Pass the id as `group_id` (or `group` — the same argument under either name). Undoable.",
+      "Remove a group box from the user's open graph. The nodes inside the group are NOT deleted — only the box. Identify it by numeric id via `group_id`, or by case-insensitive group-title substring via `group`. Undoable.",
       { ...GROUP_ID_ARGS },
       async (args: A, ctx) => {
-        const id = resolveGroupIdArg("panel_remove_group", args);
-        if (!id.ok) return fail(id.error);
-        return ctx.call({ cmd: "graph_remove_group", group_id: id.value }, 15000);
+        const ref = resolveGroupRefArg("panel_remove_group", args);
+        if (!ref.ok) return fail(ref.error);
+        const target = await resolveGroupMutationTarget(ref.value, ctx);
+        if (!target.ok) return target.result;
+        return ctx.call({ cmd: "graph_remove_group", group_id: target.value }, 15000);
       },
     ),
     def(
