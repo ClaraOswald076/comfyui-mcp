@@ -17,6 +17,7 @@ import {
   unlinkSync,
   writeSync,
 } from "node:fs";
+import { isIP } from "node:net";
 import { homedir, platform } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
@@ -1178,6 +1179,24 @@ export interface VerifiedProxyRestartTarget {
 }
 
 /**
+ * The proxy proof must identify concrete listeners, not names whose resolution
+ * can change between the proof and the reboot. Keep this narrower than the
+ * general local-VRAM locality rule, which intentionally treats `localhost` as
+ * local for non-destructive provider handling.
+ */
+function isConcreteLoopbackHttpBase(raw: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+  const hostname = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  return isIP(hostname) > 0 && (hostname === "127.0.0.1" || hostname === "::1");
+}
+
+/**
  * Resolve the narrow EZi/CEI shape without ever claiming the helper listener is
  * ComfyUI. A proxy is eligible only when:
  *
@@ -1204,7 +1223,9 @@ export async function resolveVerifiedProxyRestartTarget(): Promise<VerifiedProxy
   const proxyBase = getComfyUIBaseUrl().replace(/\/+$/, "");
   const backendBase = bootBaseGetter()?.replace(/\/+$/, "") ?? "";
   if (!proxyBase || !backendBase || proxyBase === backendBase) return undefined;
-  if (!isLoopbackServerUrl(proxyBase) || !isLoopbackServerUrl(backendBase)) return undefined;
+  if (!isConcreteLoopbackHttpBase(proxyBase) || !isConcreteLoopbackHttpBase(backendBase)) {
+    return undefined;
+  }
 
   let proxyUrl: URL;
   let backendUrl: URL;
@@ -1214,9 +1235,6 @@ export async function resolveVerifiedProxyRestartTarget(): Promise<VerifiedProxy
   } catch {
     return undefined;
   }
-  // Match the panel binding gate's fail-closed treatment of DNS-ambiguous
-  // `localhost`: the proxy exception is for a concrete local listener only.
-  if (proxyUrl.hostname.toLowerCase() === "localhost") return undefined;
   if (proxyUrl.protocol !== backendUrl.protocol || proxyUrl.port === backendUrl.port) return undefined;
   const backendPort = Number(backendUrl.port || (backendUrl.protocol === "https:" ? 443 : 80));
   if (!Number.isInteger(backendPort) || backendPort < 1 || backendPort > 65535) return undefined;
