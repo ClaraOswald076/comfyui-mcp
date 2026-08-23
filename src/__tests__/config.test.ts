@@ -238,7 +238,12 @@ describe("remote self-hosted: path prefix + generic auth (#52)", () => {
 
     try {
       const mod = await import("../config.js");
-      const { removeComfyuiSecret, setComfyuiSecret } = await import("../services/panel-secrets.js");
+      const {
+        CREDENTIAL_SLOTS,
+        clearPanelSecret,
+        listPanelSecretsMasked,
+        setComfyuiSecret,
+      } = await import("../services/panel-secrets.js");
 
       // config.ts has already loaded with empty auth values. Exercise the same
       // persisted panel path used by panel_request_secret, then call the real
@@ -255,15 +260,26 @@ describe("remote self-hosted: path prefix + generic auth (#52)", () => {
         "CF-Access-Client-Secret": "access-secret",
       });
 
+      const gatewayKeys = [
+        "COMFYUI_AUTH_TOKEN",
+        "COMFYUI_AUTH_HEADER",
+        "COMFYUI_AUTH_SCHEME",
+        "CF_ACCESS_CLIENT_ID",
+        "CF_ACCESS_CLIENT_SECRET",
+      ];
+      const gatewaySlots = CREDENTIAL_SLOTS.filter((slot) => gatewayKeys.includes(slot.envKeys[0]));
+      expect(gatewaySlots.map((slot) => slot.envKeys[0])).toEqual(gatewayKeys);
+      const gatewayRows = listPanelSecretsMasked().filter((slot) => gatewaySlots.some((gateway) => gateway.id === slot.id));
+      expect(gatewayRows).toHaveLength(gatewaySlots.length);
+      expect(gatewayRows.every((slot) => slot.set)).toBe(true);
+
       setComfyuiSecret("COMFYUI_AUTH_TOKEN", "rotated-token");
       expect(mod.getComfyUIAuthHeaders()["X-Panel-Token"]).toBe("Token rotated-token");
 
-      removeComfyuiSecret("COMFYUI_AUTH_TOKEN");
-      removeComfyuiSecret("COMFYUI_AUTH_HEADER");
-      removeComfyuiSecret("COMFYUI_AUTH_SCHEME");
-      removeComfyuiSecret("CF_ACCESS_CLIENT_ID");
-      removeComfyuiSecret("CF_ACCESS_CLIENT_SECRET");
+      for (const slot of gatewaySlots) clearPanelSecret(slot.id);
       expect(mod.getComfyUIAuthHeaders()).toEqual({});
+      const clearedRows = listPanelSecretsMasked().filter((slot) => gatewaySlots.some((gateway) => gateway.id === slot.id));
+      expect(clearedRows.every((slot) => !slot.set && slot.masked === null)).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
       delete process.env.COMFYUI_MCP_ENV_FILE;
