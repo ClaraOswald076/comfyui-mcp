@@ -88,10 +88,17 @@ export interface OAuthStatusRecord {
 //   CIVITAI_API_TOKEN  → download_model action:"download_civitai" (config.civitaiApiToken)
 //   HUGGINGFACE_TOKEN  → HuggingFace downloads   (config.huggingfaceToken)
 //   HF_TOKEN           → HuggingFace alias some tooling/hub libs honor
+//   COMFYUI_AUTH_*     → ComfyUI/reverse-proxy authentication headers
+//   CF_ACCESS_*        → Cloudflare Access service-token headers
 export const COMFYUI_SECRET_ENV_ALLOWLIST = [
   "CIVITAI_API_TOKEN",
   "HUGGINGFACE_TOKEN",
   "HF_TOKEN",
+  "COMFYUI_AUTH_TOKEN",
+  "COMFYUI_AUTH_HEADER",
+  "COMFYUI_AUTH_SCHEME",
+  "CF_ACCESS_CLIENT_ID",
+  "CF_ACCESS_CLIENT_SECRET",
   "GEMINI_API_KEY",
   "GOOGLE_GENERATIVE_AI_API_KEY",
   "GOOGLE_API_KEY",
@@ -2387,6 +2394,11 @@ export const CREDENTIAL_SLOTS: CredentialSlot[] = [
   ),
   { id: "civitai", label: "Civitai", envKeys: ["CIVITAI_API_TOKEN"], store: "comfyui", help: "Model downloads" },
   { id: "huggingface", label: "HuggingFace", envKeys: ["HF_TOKEN", "HUGGINGFACE_TOKEN"], store: "comfyui", help: "Model downloads" },
+  { id: "comfyui-auth-token", label: "ComfyUI gateway token", envKeys: ["COMFYUI_AUTH_TOKEN"], store: "comfyui", help: "Remote ComfyUI / reverse-proxy authentication" },
+  { id: "comfyui-auth-header", label: "ComfyUI gateway header", envKeys: ["COMFYUI_AUTH_HEADER"], store: "comfyui", help: "Custom reverse-proxy authentication header" },
+  { id: "comfyui-auth-scheme", label: "ComfyUI gateway scheme", envKeys: ["COMFYUI_AUTH_SCHEME"], store: "comfyui", help: "Reverse-proxy authentication scheme" },
+  { id: "cf-access-client-id", label: "Cloudflare Access client ID", envKeys: ["CF_ACCESS_CLIENT_ID"], store: "comfyui", help: "Cloudflare Access service token" },
+  { id: "cf-access-client-secret", label: "Cloudflare Access client secret", envKeys: ["CF_ACCESS_CLIENT_SECRET"], store: "comfyui", help: "Cloudflare Access service token" },
   { id: "google", label: "Google / Gemini", envKeys: ["GEMINI_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY", "GOOGLE_API_KEY"], store: "comfyui", help: "Nano Banana concept images" },
   { id: "runcomfy", label: "RunComfy", envKeys: ["RUNCOMFY_API_KEY"], store: "comfyui", help: "Cloud pods / training" },
   { id: "runpod", label: "RunPod", envKeys: ["RUNPOD_API_KEY"], store: "comfyui", help: "Manage GPU pods (status/start/stop/connect)" },

@@ -76,6 +76,14 @@ route, an API gateway, an SSO edge) — this is **not** Comfy Cloud:
   (the direct HTTP calls and the underlying client/WebSocket library). This is independent of
   cloud mode, so a gateway-auth'd instance is never misread as Comfy Cloud.
 
+The secure `panel_request_secret` path accepts these gateway keys for the built-in `comfyui`
+server. They are re-read for each subsequent ComfyUI/Manager request, so a saved credential
+takes effect without restarting the orchestrator or calling `panel_reload`. The corresponding
+gateway keys also appear as masked slots in the panel credential surface; clearing a slot
+revokes that key for subsequent requests without a restart. `panel_request_secret` remains
+save-only and rejects blank input. The built-in tool child may still be rebuilt by the existing
+secret-change path.
+
 <ParamField path="COMFYUI_AUTH_TOKEN" type="string">
   Auth token for a self-hosted ComfyUI behind a gateway. When set, sent on every ComfyUI
   request. Never logged.

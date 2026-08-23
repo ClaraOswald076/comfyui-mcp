@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildComfyuiMcpEnv,
+  buildAgentSpawnEnv,
   comfyuiSecretKeys,
   isAllowedComfyuiSecretKey,
   loadComfyuiSecretEnv,
@@ -230,8 +231,45 @@ describe("panel-secrets (canonical .env store)", () => {
       expect(isAllowedComfyuiSecretKey("CIVITAI_API_TOKEN")).toBe(true);
       expect(isAllowedComfyuiSecretKey("HUGGINGFACE_TOKEN")).toBe(true);
       expect(isAllowedComfyuiSecretKey("HF_TOKEN")).toBe(true);
+      for (const key of [
+        "COMFYUI_AUTH_TOKEN",
+        "COMFYUI_AUTH_HEADER",
+        "COMFYUI_AUTH_SCHEME",
+        "CF_ACCESS_CLIENT_ID",
+        "CF_ACCESS_CLIENT_SECRET",
+      ]) {
+        expect(isAllowedComfyuiSecretKey(key)).toBe(true);
+      }
       expect(isAllowedComfyuiSecretKey("NODE_OPTIONS")).toBe(false);
       expect(isAllowedComfyuiSecretKey("PATH")).toBe(false);
+    });
+
+    it("routes gateway credentials to the tool child, never an agent provider", () => {
+      setComfyuiSecret("COMFYUI_AUTH_TOKEN", "proxy-token");
+      setComfyuiSecret("COMFYUI_AUTH_HEADER", "X-Proxy-Token");
+      setComfyuiSecret("COMFYUI_AUTH_SCHEME", "Token");
+      setComfyuiSecret("CF_ACCESS_CLIENT_ID", "access-id");
+      setComfyuiSecret("CF_ACCESS_CLIENT_SECRET", "access-secret");
+
+      const toolEnv = buildComfyuiMcpEnv({});
+      expect(toolEnv).toMatchObject({
+        COMFYUI_AUTH_TOKEN: "proxy-token",
+        COMFYUI_AUTH_HEADER: "X-Proxy-Token",
+        COMFYUI_AUTH_SCHEME: "Token",
+        CF_ACCESS_CLIENT_ID: "access-id",
+        CF_ACCESS_CLIENT_SECRET: "access-secret",
+      });
+
+      const agentEnv = buildAgentSpawnEnv();
+      for (const key of [
+        "COMFYUI_AUTH_TOKEN",
+        "COMFYUI_AUTH_HEADER",
+        "COMFYUI_AUTH_SCHEME",
+        "CF_ACCESS_CLIENT_ID",
+        "CF_ACCESS_CLIENT_SECRET",
+      ]) {
+        expect(agentEnv[key]).toBeUndefined();
+      }
     });
 
     it("REJECTS a non-allowlisted key on save and writes nothing", () => {
