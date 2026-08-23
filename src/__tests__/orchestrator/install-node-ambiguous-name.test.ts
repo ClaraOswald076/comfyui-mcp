@@ -468,13 +468,15 @@ describe("the ambiguous from-source install is refused, not picked (#1616)", () 
     expect(out.sent?.channel).toBe("default");
   });
 
-  it("the tool's DESCRIPTION says the refusal exists, before any call is made", () => {
+  it("the tool's DESCRIPTION states the supported v4 contract, before any call is made", () => {
     const text = installNodeDef().description ?? "";
-    expect(text).toMatch(/REFUSES instead of picking/i);
-    expect(text).toMatch(/111 bare names/);
-    expect(text).toMatch(/28 are ambiguous inside ONE channel/i);
-    // And the 3.x false positive is disclosed where a caller reads before calling.
-    expect(text).toMatch(/Manager 3\.x/);
+    expect(text).toMatch(/panel runtime refuses Git URLs before Manager v4 queueing/i);
+    expect(text).toMatch(/ignores the supplied repository/i);
+    expect(text).toMatch(/resolves by bare name/i);
+    expect(text).toMatch(/id from panel_search_nodes/i);
+    expect(text).toMatch(/install_custom_node\(source:'git'\)/i);
+    expect(text).toMatch(/legacy Manager 3\.x direct-URL routing/i);
+    expect(text).not.toMatch(/REFUSES instead of picking/i);
   });
 });
 

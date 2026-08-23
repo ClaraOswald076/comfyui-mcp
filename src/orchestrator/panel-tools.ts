@@ -17750,26 +17750,18 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
     ),
     def(
       "panel_install_node",
-      "Install a custom-node pack into the user's ComfyUI via the BUILT-IN Manager (queues the install). Pass `id` (registry id like 'comfyui-kjnodes' or 'author/repo') from panel_search_nodes, or `repository` (git URL) to request a nightly/from-source install — see the v4 limit below before relying on it. A search result whose `id` IS a git URL (legacy/repository-style entries) is auto-routed to a from-source 'nightly' install — 'latest' cannot resolve for those. " +
-        "⚠️ ON MANAGER v4, `repository` IS NOT THE URL THAT GETS CLONED (#1539). Read out of ComfyUI-Manager V4.2.2's own source and confirmed on a live V4.2.2: a 'nightly' install resolves the pack by its BARE REPO NAME against the CHANNEL's custom-node-list, then clones the URL recorded in THAT entry; the `repository` you pass is stored in the task params and never read. So what decides success is whether the repo is listed in the channel this call asks for — and a miss does NOT simply stop: on 'nightly' v4 falls back to the COMFY REGISTRY entry whose id is that same bare name and clones whatever repository it is registered to, so an unlisted name can still install someone else's code. Only when the registry lacks the id too do you get \"Node '<name>@nightly' not found in [ManagerChannel.<channel>, ManagerDatabaseSource.<mode>]\", naming that channel. " +
-        "RESOLVING BY NAME MEANS A SUCCESS CAN ALSO BE THE WRONG REPO, and for the names where that is MEASURED rather than hypothetical this tool now REFUSES instead of picking (#1616). 111 bare names resolve to different repositories depending on the channel — 60 of them disagree between 'default' and 'dev', and 28 are ambiguous inside ONE channel (two entries under one name collapse onto a single key and the survivor is upstream list order). If you pass a git URL whose bare name is one of those and you name no `channel`, the call is refused before dispatch and both candidate repositories are named for you. Naming a `channel` dispatches instead, with the concrete collision quoted — but read what it quotes before trusting it: for the 28 intra-channel names that argument selects NOTHING (both entries are in the one list, and v4 keeps whichever its order keeps), and no `channel` value can separate them. The bypass exists because Manager 3.x carries the URL in `files` and clones it as passed, which this check cannot distinguish since the panel picks the dialect after the request leaves the orchestrator; on v4, install_custom_node (source:'git') is what clones the URL you typed. Outside that measured set the hazard stands: if the channel lists your pack's name under someone else, THAT author's repository installs and the call still reports success — the queued reply names the owner you passed, so confirm with panel_list_nodes that it is what landed. " +
-        "WHAT WAS OURS: this call used to ask the 'dev' channel, a ~1200-pack side list sharing 3 entries with the ~5900-pack 'default' list — so it could miss a pack panel_search_nodes had just returned to you (that search reads a channel-INDEPENDENT map, measured). It now asks 'default', the channel the registry-id path already used; pass `channel` to override. " +
-        "STILL NOT GUARANTEED, and do not read the fix as one: it depends on HOW Manager was installed. A Manager cloned into custom_nodes fetches the channel's real list, where 'default' carries ~5900 packs — there this works. A PIP/Desktop Manager (`is_manager_pip_package()` is just 'not inside a custom_nodes tree') never fetches: it reads a per-channel-URL cache or, failing that, the ~3600-pack snapshot bundled in the package, so `mode` is inert and packs added since that snapshot resolve on NEITHER channel. Measured: the only cache a stock host writes at startup is for a DIFFERENT URL than the name 'default' resolves to, so a pip host serves the bundled list. The fix is an improvement there only in the sense of doing no harm — old 'dev' and new 'default' both land on that same file. Whether a listed repo then always installs was not measured either. " +
-        "A NOT-FOUND RULES OUT ONE CHANNEL, NOT THE PACK. The channels are near-disjoint (default ~5900 packs, dev ~1200, sharing 3), so a miss says the pack is absent from the channel THIS CALL ASKED and nothing more — try an explicit `channel` (e.g. 'dev') before concluding it does not exist. This tool will NOT retry another channel for you: v4 resolves by BARE REPO NAME and clones the URL in the channel's entry rather than the one you passed, and 60 names sit in 'default' and 'dev' under DIFFERENT repositories, so a silent retry could install a repo you never named. (That is also why you should confirm with panel_list_nodes that what landed is the repo you meant.) Once the channels that could plausibly carry it are ruled out, clone it into custom_nodes yourself and restart, or use install_custom_node (source:'git'), which needs a LOCAL ComfyUI because it clones onto THIS machine's filesystem — not necessarily the one the panel drives. On Manager 3.x we send a DIFFERENT request shape that carries the URL directly (that much is our own code); whether 3.x then installs an unlisted repo was NOT measured here, so treat 'it worked before on 3.x' as unverified rather than as a regression on our side. " +
-        "A ComfyUI restart (panel_restart_comfyui) is usually required afterward to load the nodes — poll panel_node_queue_status first. Prefer this over the headless install_custom_node tool. " +
-        "⚠️ QUEUE-DONE IS NOT INSTALLED: Manager marks a task 'done' (queue drained) even when the git clone produced NOTHING — an empty dir, a transient git failure, or a repo not in its registry. So after the queue is idle you MUST VERIFY with panel_list_nodes that each pack actually appears before you restart or report success; a pack you installed that is absent from that list did NOT install (retry it, or install it from its git `repository` URL — but see the v4 note above: on Manager v4 that retry resolves against ONE channel's list, so re-running the identical call fails identically every time — change the `channel` first, and clone it yourself only once the plausible channels are ruled out). " +
-        "Install packs ONE AT A TIME and confirm each populated before the next — batching several installs then restarting is exactly how you end up with empty dirs and a broken restart.",
+      "Install a custom-node pack into the user's ComfyUI through the BUILT-IN Manager. Registry ids are supported: pass an id from panel_search_nodes (or another known registry id), then poll panel_node_queue_status and verify with panel_list_nodes before restarting. The panel runtime refuses Git URLs before Manager v4 queueing because v4 ignores the supplied repository and resolves by bare name, so a URL is not a successful v4 from-source install. Use an id from panel_search_nodes; use install_custom_node(source:'git') only when its local target is the same ComfyUI as this panel. If the panel drives another machine, install the repository on the ComfyUI host instead. The repository input remains normalized for legacy Manager 3.x direct-URL routing, but that compatibility path is not a v4 guarantee. The channel input can select a Manager channel for a supported registry-id install; it does not bypass the v4 Git-URL refusal. Install packs one at a time and confirm each is present before restarting.",
       {
-        id: z.string().optional().describe("Registry id or 'author/repo'."),
+        id: z.string().optional().describe("Registry id returned by panel_search_nodes."),
         repository: z
           .string()
           .optional()
           .describe(
-            "Git URL, to REQUEST a nightly/from-source install. On Manager v4 this URL is recorded but never cloned: the pack is resolved by its bare repo name against the CHANNEL's node list and the URL in that entry is what gets cloned, so an install only proceeds for a repo the asked-for channel lists (#1539, measured on V4.2.2). This call asks the 'default' channel unless you pass `channel`.",
+            "Git URL for legacy Manager 3.x direct-URL routing only. The panel runtime refuses arbitrary Git URLs before Manager v4 queueing because v4 ignores the supplied repository and resolves by bare name; this is not a successful v4 from-source install. Use an id from panel_search_nodes, or install_custom_node(source:'git') only when the local target is the same ComfyUI; otherwise install on the ComfyUI host.",
           ),
-        version: z.string().optional().describe("Specific version; default 'latest' (or 'nightly' with repository)."),
-        channel: z.string().optional().describe("Manager channel (default 'default'). On a git-URL install this picks WHICH node list the repo is looked up in — pass 'dev' only for a pack that genuinely lives on that channel (#1539)."),
-        mode: z.enum(["remote", "local", "cache"]).optional().describe("DB source (default 'remote'). Inert on a pip Manager v4, which reads its cached/bundled list either way."),
+        version: z.string().optional().describe("Specific registry version; default 'latest'."),
+        channel: z.string().optional().describe("Optional Manager channel for a supported registry-id install. It does not bypass Manager v4's refusal of arbitrary Git URLs."),
+        mode: z.enum(["remote", "local", "cache"]).optional().describe("DB source (default 'remote')."),
       },
       async (args: A, ctx) => {
         // The panel pack is installable like any other, and this path has NO
@@ -17777,6 +17769,9 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         // spellings (registry id and git URL) — see panel-pin-guard.
         assertPanelNotTargetedUnverifiable("panel_install_node", args.id);
         assertPanelNotTargetedUnverifiable("panel_install_node", args.repository);
+        // The panel owns dialect detection and enforces the v4 Git-URL refusal;
+        // these normalized fields remain here so legacy Manager 3.x can receive
+        // its direct `files:[url]` request shape.
         // #789 — a search result whose `id` is a repository URL (the Manager's
         // legacy/repository-style entries) cannot install as id+"latest": the
         // Manager resolves that as a registry version and rejects it ("not
@@ -17795,14 +17790,14 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           { cmd: "nodes_install", ...cmdArgs },
           30000,
         );
-        // #1129 — settle BEFORE the note is appended. The note is glued on after
-        // the JSON body, which makes the payload unparseable as JSON, so a probe
-        // running afterwards reads `null`, concludes the panel never claimed a
-        // queue, and silently does nothing. Found by printing the real reply
-        // rather than by reasoning about it: the first version of this shipped
-        // the check and the check never ran.
+        // #1129 — settle BEFORE any supplemental note is appended. The note is glued on
+        // after the JSON body, which makes the payload unparseable as JSON, so a probe
+        // running afterwards reads `null`, concludes the panel never claimed a queue,
+        // and silently does nothing. Git notes describe v4 bare-name resolution, but
+        // v4 Git requests now fail before this point and legacy 3.x receives files:[url]
+        // directly; appending that v4 note to a legacy success would be false.
         const settled = await settleDroppedEnqueue(ctx, res, dispatch);
-        if (note) {
+        if (note && !cmdArgs.repository) {
           const text = settled.content.find((c) => c.type === "text");
           if (text && text.type === "text") {
             text.text += `\n\nNOTE: ${note}`;

@@ -99,7 +99,9 @@ async function dispatchInstall(
     send: async (cmd: Record<string, unknown>) => {
       if (cmd.cmd === "nodes_install") {
         sent = cmd;
-        return { queued: true, pending: true, id: "comfyui-anima-ipadapter", dialect: "v2" };
+        // This MCP-only fixture represents the legacy direct-URL relay. The
+        // panel's real v4 refusal is covered by browser_tests in the paired repo.
+        return { queued: true, pending: true, id: "comfyui-anima-ipadapter", dialect: "legacy" };
       }
       // Leave the #1129 dropped-enqueue probe inconclusive so it appends nothing.
       return { status: { in_progress_count: 0, is_processing: true } };
@@ -122,10 +124,10 @@ async function dispatchInstall(
   return { sent, text: res.content.map((c) => (c as { text?: string }).text ?? "").join(" ") };
 }
 
-describe("the git-URL install asks a channel that can list the pack (#1539)", () => {
-  it("THE REPORT'S OWN INPUT: a bare repository URL no longer asks the 'dev' channel", () => {
-    // The whole bug in one assertion. `dev` lists 1210 packs and shares 3 with the
-    // 5887-pack default list; the reporter's pack is in default, not dev.
+describe("legacy direct-URL normalization remains intact (#1539)", () => {
+  it("normalizes the reporter's URL for the legacy direct-URL route", () => {
+    // Manager v4 refuses arbitrary Git URLs before queueing. These fields remain
+    // normalized because legacy Manager 3.x carries the URL directly.
     const out = nodesInstallCommandArgs({ repository: REPORTED_URL });
     expect(out.repository).toBe(REPORTED_URL);
     expect(out.version).toBe("nightly");
@@ -133,10 +135,10 @@ describe("the git-URL install asks a channel that can list the pack (#1539)", ()
     expect(out.channel).not.toBe("dev");
   });
 
-  it("a URL arriving as `id` takes the same channel — both spellings reach the same route", () => {
-    // #789 reroutes a URL-shaped `id` onto the from-source path. If only the
-    // `repository` spelling were fixed, the identical request would still fail when
-    // written the other way, which is how a half-fix survives review.
+  it("a URL arriving as `id` takes the same legacy route", () => {
+    // #789 reroutes a URL-shaped `id` onto the direct-URL path. If only the
+    // `repository` spelling were normalized, the identical legacy request would
+    // still fail when written the other way.
     const out = nodesInstallCommandArgs({ id: REPORTED_URL });
     expect(out.id).toBeUndefined();
     expect(out.repository).toBe(REPORTED_URL);
@@ -194,7 +196,7 @@ describe("the git-URL install asks a channel that can list the pack (#1539)", ()
   });
 });
 
-describe("EVERY spelling the panel routes as git gets the channel (#1539 gate round 3)", () => {
+describe("legacy direct-URL normalization covers every git spelling (#1539)", () => {
   // The hole the gate found, and it swallowed the reporter's own pack. The orchestrator
   // decided "is this a git install?" with a NARROWER predicate than the panel's:
   //
@@ -415,15 +417,15 @@ describe("the FIRST attempt's wrong-author risk is disclosed too (#1539 gate rou
     expect(note).toMatch(/need not be the ComfyUI this panel drives/i);
   });
 
-  it("REACHES THE CALLER — asserted on the tool's returned text, not the args", async () => {
+  it("does not append the v4-only warning to a legacy-shaped response", async () => {
     const cmd = await dispatchInstall({ repository: COLLIDING });
     expect(cmd.sent.channel).toBe("default");
-    expect(cmd.text).toMatch(/NOT NECESSARILY THE URL YOU PASSED/i);
-    expect(cmd.text).toMatch(/BlenderNeko\/ComfyUI_TiledKSampler you passed/);
+    expect(cmd.text).not.toMatch(/NOT NECESSARILY THE URL YOU PASSED/i);
+    expect(cmd.text).not.toMatch(/BlenderNeko\/ComfyUI_TiledKSampler you passed/);
   });
 });
 
-describe("panel_install_node actually DISPATCHES the channel (#1539 wiring)", () => {
+describe("panel_install_node preserves legacy direct-URL dispatch normalization (#1539)", () => {
   it("sends channel 'default' to the panel for the reporter's request", async () => {
     const { sent } = await dispatchInstall({ repository: REPORTED_URL });
     expect(sent.cmd).toBe("nodes_install");
@@ -436,127 +438,65 @@ describe("panel_install_node actually DISPATCHES the channel (#1539 wiring)", ()
     expect(sent.channel).toBe("dev");
   });
 
-  it("the channel disclosure REACHES THE CALLER, not just the args object", async () => {
-    // A note computed and never appended is the #1129 failure again — that probe
-    // shipped once and never ran. This asserts on the tool's returned TEXT.
+  it("does not append the v4-only channel disclosure to a legacy-shaped response", async () => {
     const { sent, text } = await dispatchInstall({ repository: REPORTED_URL });
     expect(sent.channel).toBe("default");
-    expect(text).toMatch(/asked ComfyUI-Manager's "default" channel/i);
-    expect(text).toMatch(/rules the pack out of "default" ONLY/);
+    expect(text).not.toMatch(/asked ComfyUI-Manager's "default" channel/i);
+    expect(text).not.toMatch(/rules the pack out of "default" ONLY/);
   });
 });
 
-describe("panel_install_node describes what was measured (#1539)", () => {
-  // A REVERSION FENCE, and nothing more: every asserted string lives in the definition
-  // under test, so a wrong claim written consistently in both places would pass. The
-  // truth of these claims rests on the run recorded at the top of this file.
-
-  it("names the version measured and the mechanism that actually decides the outcome", () => {
+describe("panel_install_node advertises the supported contract (#1539)", () => {
+  it("directs callers to registry ids and explains the v4 Git-URL refusal", () => {
     const text = installNodeDef().description ?? "";
-    expect(text).toMatch(/V4\.2\.2/, "so a later Manager can be re-checked, not assumed");
-    expect(text).toMatch(/IS NOT THE URL THAT GETS CLONED/i);
-    expect(text).toMatch(/bare repo name/i);
-    expect(text).toMatch(/whether the repo is listed in the channel this call asks for/i);
+    expect(text).toMatch(/Registry ids are supported/i);
+    expect(text).toMatch(/id from panel_search_nodes/i);
+    expect(text).toMatch(/panel runtime refuses Git URLs before Manager v4 queueing/i);
+    expect(text).toMatch(/ignores the supplied repository/i);
+    expect(text).toMatch(/resolves by bare name/i);
+    expect(text).toMatch(/not a successful v4 from-source install/i);
+    expect(text).toMatch(/install_custom_node\(source:'git'\)/i);
+    expect(text).toMatch(/same ComfyUI/i);
+    expect(text).toMatch(/ComfyUI host/i);
   });
 
-  it("quotes the error with the channel as a VARIABLE, not hard-coded to dev", () => {
-    // The old text quoted `[ManagerChannel.dev, ManagerDatabaseSource.cache]` literally.
-    // After this change the tool no longer asks for dev, so that quote would send a
-    // reader looking for a string their own call can no longer produce.
+  it("does not retain the old v4 from-source promise or channel retry advice", () => {
     const text = installNodeDef().description ?? "";
-    expect(text).toMatch(/ManagerChannel\.<channel>/);
-    expect(text).not.toMatch(/\[ManagerChannel\.dev, ManagerDatabaseSource\.cache\]/);
+    expect(text).not.toMatch(/auto-routed to a from-source/i);
+    expect(text).not.toMatch(/what gets cloned/i);
+    expect(text).not.toMatch(/retry.*channel/i);
+    expect(text).not.toMatch(/success can also be the wrong repo/i);
+    expect(text).toMatch(/legacy Manager 3\.x direct-URL routing/i);
+    expect(text).toMatch(/does not bypass the v4 Git-URL refusal/i);
   });
 
-  it("owns the part that was ours instead of calling the whole thing upstream", () => {
-    const text = installNodeDef().description ?? "";
-    expect(text).toMatch(/WHAT WAS OURS/);
-    expect(text).toMatch(/used to ask the 'dev' channel/i);
-    // The retracted claim must be gone, not merely softened: it was measured false
-    // against the reporter's own pack, which IS listed.
-    expect(text).not.toMatch(/UPSTREAM limitation/i);
-    expect(text).not.toMatch(/DOES NOT INSTALL A REPO THE MANAGER'S REGISTRY DOES NOT LIST/i);
-    expect(text).not.toMatch(/being listed is necessary/i);
-  });
-
-  it("does NOT let the fix read as a guarantee", () => {
-    // The failure mode of a fix like this is a description that now over-promises in
-    // the opposite direction. Both limits that were measured have to survive.
-    const text = installNodeDef().description ?? "";
-    expect(text).toMatch(/STILL NOT GUARANTEED/);
-    expect(text).toMatch(/`mode` is inert/i);
-    expect(text).toMatch(/not measured/i);
-  });
-
-  it("attributes the pip fallback to PACKAGING, not to the channel config (gate round 2)", () => {
-    // The shipped caveat said the bundled-snapshot fallback hits "a host configured to a
-    // non-default channel URL". Measured false: `is_manager_pip_package()` is just "not
-    // inside a custom_nodes tree", so it fires on every pip/Desktop install whatever the
-    // config — and a stock host's one startup-written cache is for a DIFFERENT URL than
-    // the name 'default' resolves to. Blaming the configuration would send a reader to
-    // check a setting that is not the cause.
-    const text = installNodeDef().description ?? "";
-    expect(text).not.toMatch(/host configured to a non-default channel URL/i);
-    expect(text).toMatch(/not inside a custom_nodes tree/i);
-    expect(text).toMatch(/cloned into custom_nodes fetches/i);
-    // And it must not claim the pip host is fixed — there it is a no-op, not a win.
-    expect(text).toMatch(/both land on that same file/i);
-  });
-
-  it("does NOT turn a one-channel miss into a verdict about the pack (review P1)", () => {
-    // The shipped sentence said "the pack is absent from every channel this Manager can
-    // read". A `default` miss establishes nothing about `dev` — the same class of
-    // over-claim this PR retracted, handing out harmful recovery advice.
-    const text = installNodeDef().description ?? "";
-    expect(text).not.toMatch(/absent from every channel this Manager can read/i);
-    expect(text).toMatch(/A NOT-FOUND RULES OUT ONE CHANNEL, NOT THE PACK/);
-    expect(text).toMatch(/absent from the channel THIS CALL ASKED and nothing more/i);
-    expect(text).toMatch(/will NOT retry another channel for you/i);
-    expect(text).toMatch(/could install a repo you never named/i);
-  });
-
-  it("warns that a SUCCESS can be the wrong author, not just a retry (gate round 2)", () => {
-    // The blurb framed the 35 colliding names purely as a reason not to auto-retry. The
-    // same resolution makes the FIRST attempt substitutable, and that one reports
-    // success — so a caller who never reads the retry paragraph is the one at risk.
-    const text = installNodeDef().description ?? "";
-    expect(text).toMatch(/A SUCCESS CAN ALSO BE THE WRONG REPO/);
-    expect(text).toMatch(/THAT author's repository installs and the call still reports success/i);
-    expect(text).toMatch(/names the owner you passed/i);
-  });
-
-  it("keeps the local-only precondition on the tool that CAN clone", () => {
-    const text = installNodeDef().description ?? "";
-    expect(text).toMatch(/install_custom_node/);
-    expect(text).toMatch(/LOCAL ComfyUI/);
-    expect(text).toMatch(/not necessarily the one the panel drives/i);
-  });
-
-  it("the LATER recovery advice still agrees with the caveat above it", () => {
-    // Review precedent from the first pass: a contradiction a few sentences on talks a
-    // user into a retry loop that cannot succeed. The advice now names the real reason
-    // a retry is futile — absence from every readable channel — rather than "unlisted".
-    const text = installNodeDef().description ?? "";
-    const retryAdvice = text.slice(text.indexOf("a pack you installed that is absent"));
-    expect(retryAdvice).toMatch(/resolves against ONE channel.s list/i);
-    // Names the action that CAN change the outcome (a different channel) before the
-    // one that gives up. The old wording said "clone it yourself instead of retrying",
-    // which skipped straight past the retry that actually works.
-    expect(retryAdvice).toMatch(/change the `channel` first/i);
-    expect(retryAdvice).toMatch(/once the plausible channels are ruled out/i);
-  });
-
-  it("the repository and channel PARAMS carry it too", () => {
-    // A caller reading the schema may never see the tool blurb.
+  it("repeats the same contract in the repository and channel schema", () => {
     const def = installNodeDef() as unknown as {
       schema?: Record<string, { description?: string; _def?: { description?: string } }>;
     };
-    const descOf = (k: string): string => {
-      const f = def.schema?.[k];
-      return f?.description ?? f?._def?.description ?? "";
+    const descOf = (key: string): string => {
+      const field = def.schema?.[key];
+      return field?.description ?? field?._def?.description ?? "";
     };
-    expect(descOf("repository")).toMatch(/recorded but never cloned/i);
-    expect(descOf("repository")).toMatch(/'default' channel unless you pass `channel`/i);
-    expect(descOf("channel")).toMatch(/WHICH node list/i);
+    const repository = descOf("repository");
+    const channel = descOf("channel");
+    const version = descOf("version");
+    const id = descOf("id");
+
+    expect(id).toMatch(/Registry id returned by panel_search_nodes/i);
+    expect(id).not.toMatch(/author\/repo/i);
+
+    expect(repository).toMatch(/legacy Manager 3\.x direct-URL routing/i);
+    expect(repository).toMatch(/panel runtime refuses arbitrary Git URLs before Manager v4 queueing/i);
+    expect(repository).toMatch(/ignores the supplied repository/i);
+    expect(repository).toMatch(/id from panel_search_nodes/i);
+    expect(repository).toMatch(/install_custom_node\(source:'git'\)/i);
+    expect(repository).toMatch(/same ComfyUI/i);
+    expect(repository).toMatch(/ComfyUI host/i);
+
+    expect(channel).toMatch(/supported registry-id install/i);
+    expect(channel).toMatch(/does not bypass Manager v4.*refusal.*Git URLs/i);
+    expect(channel).not.toMatch(/which node list/i);
+    expect(version).not.toMatch(/nightly.*repository/i);
   });
 });
