@@ -161,6 +161,7 @@ import {
   syncNodeDependencies,
   setQueueTimingForTests,
   resetManagerApiCacheForTests,
+  probeManagerQueueAvailability,
   NodeManagementError,
 } from "../../services/node-management.js";
 import { ProcessControlError, ValidationError } from "../../utils/errors.js";
@@ -320,6 +321,64 @@ describe("node-management service", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     delete process.env.COMFYUI_PYTHON;
+  });
+
+  describe("probeManagerQueueAvailability (#2096)", () => {
+    function installProbeFetch(
+      responses: Record<string, Response | (() => Response | Promise<Response>)>,
+    ) {
+      const calls: string[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname;
+          calls.push(path);
+          const response = responses[path];
+          if (!response) throw new Error(`unexpected probe path ${path}`);
+          return typeof response === "function" ? await response() : response;
+        }),
+      );
+      return calls;
+    }
+
+    it("requires both dialect endpoints to return 404 before calling Manager absent", async () => {
+      const calls = installProbeFetch({
+        "/v2/manager/queue/status": new Response("missing", { status: 404 }),
+        "/manager/queue/status": new Response("missing", { status: 404 }),
+      });
+      await expect(probeManagerQueueAvailability("http://same-host:8188")).resolves.toBe("absent");
+      expect(calls).toEqual(["/v2/manager/queue/status", "/manager/queue/status"]);
+    });
+
+    it.each([
+      ["a mixed 404 and 500", {
+        "/v2/manager/queue/status": new Response("missing", { status: 404 }),
+        "/manager/queue/status": new Response("server error", { status: 500 }),
+      }],
+      ["a malformed 2xx and a 404", {
+        "/v2/manager/queue/status": new Response("<!doctype html>", { status: 200 }),
+        "/manager/queue/status": new Response("missing", { status: 404 }),
+      }],
+    ])("keeps %s as unreadable", async (_name, responses) => {
+      installProbeFetch(responses);
+      await expect(probeManagerQueueAvailability("http://same-host:8188")).resolves.toBe("unreadable");
+    });
+
+    it("keeps a timeout as unreadable instead of absence", async () => {
+      installProbeFetch({
+        "/v2/manager/queue/status": () => Promise.reject(new Error("timeout")),
+        "/manager/queue/status": new Response("missing", { status: 404 }),
+      });
+      await expect(probeManagerQueueAvailability("http://same-host:8188")).resolves.toBe("unreadable");
+    });
+
+    it("recognizes a real queue payload as available", async () => {
+      installProbeFetch({
+        "/v2/manager/queue/status": jsonResponse({ pending_count: 0, in_progress_count: 0, is_processing: false }),
+        "/manager/queue/status": new Response("missing", { status: 404 }),
+      });
+      await expect(probeManagerQueueAvailability("http://same-host:8188")).resolves.toBe("available");
+    });
   });
 
   // ---- install -----------------------------------------------------------

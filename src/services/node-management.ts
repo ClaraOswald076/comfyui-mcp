@@ -488,6 +488,57 @@ function looksLikeQueueStatus(s: unknown): boolean {
 }
 
 /**
+ * What the two Manager queue/status routes established for ONE connected
+ * ComfyUI. A 404 on only one route is not enough: the other route may be the
+ * dialect this host serves, and a timeout/5xx/HTML response is not evidence
+ * that Manager is absent.
+ */
+export type ManagerQueueAvailability = "available" | "absent" | "unreadable";
+
+/**
+ * Probe both queue/status dialects while preserving their HTTP status. This is
+ * intentionally separate from `managerFetch(..., { soft: true })`, whose
+ * contract is to erase non-authentication failures for ordinary callers.
+ *
+ * `absent` is deliberately narrow: BOTH routes must answer HTTP 404 on the
+ * SAME captured base. Everything else that is not a recognizable queue payload
+ * is `unreadable`, including network errors, 5xx, auth/permission failures,
+ * malformed 2xx bodies, and a mixed 404/non-404 result.
+ */
+export async function probeManagerQueueAvailability(
+  base = managerBaseUrl(),
+): Promise<ManagerQueueAvailability> {
+  const statuses: number[] = [];
+  for (const path of ["/v2/manager/queue/status", "/manager/queue/status"]) {
+    let res: Response;
+    try {
+      res = await comfyuiFetch(`${base}${path}`, { method: "GET" });
+    } catch {
+      return "unreadable";
+    }
+    statuses.push(res.status);
+    if (res.ok) {
+      let raw: string;
+      try {
+        raw = await res.text();
+      } catch {
+        return "unreadable";
+      }
+      if (!raw) continue;
+      try {
+        if (looksLikeQueueStatus(JSON.parse(raw))) return "available";
+      } catch {
+        // A malformed response is not absence; continue so the other dialect
+        // still gets a chance to establish a real queue surface.
+      }
+    }
+  }
+  return statuses.length === 2 && statuses.every((status) => status === 404)
+    ? "absent"
+    : "unreadable";
+}
+
+/**
  * Authoritative Manager MAJOR-version probe (issue #555). The two Manager
  * generations expose their version string on DISJOINT paths and nowhere else:
  *   • v4 (pip comfyui-manager) → GET /v2/manager/version   → text "V4.2.2"
