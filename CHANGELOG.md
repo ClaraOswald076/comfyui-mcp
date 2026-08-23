@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.73] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- normalize text-serialized panel graph rows for `panel_kitchen` (#2109).
+
+
 ## [0.52.72] - 2026-08-23
 
 ### MCP
