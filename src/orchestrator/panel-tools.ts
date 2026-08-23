@@ -4182,16 +4182,54 @@ function annotateQueueStatusWithManifestPartial(res: ToolResult): ToolResult {
 }
 
 /** Parse a ctx.call ToolResult's text payload as JSON, or null if not parseable. */
-function parseToolResultJson(res: ToolResult): Record<string, unknown> | null {
+function parseToolResultValue(res: ToolResult): unknown {
   if (!res || res.isError) return null;
   const text = res?.content?.find((c) => c.type === "text")?.text;
   if (typeof text !== "string") return null;
   try {
-    const parsed = JSON.parse(text) as unknown;
-    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+    return JSON.parse(text) as unknown;
   } catch {
     return null;
   }
+}
+
+function parseToolResultJson(res: ToolResult): Record<string, unknown> | null {
+  const parsed = parseToolResultValue(res);
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>)
+    : null;
+}
+
+/**
+ * Normalize the panel's graph_query detail reply for graph consumers. Newer
+ * panel executors return matching detail rows as JSON Lines in `text` inside a
+ * wrapper object, while older/current executors may return `{ nodes: [...] }`.
+ * A malformed row is only one bad observation; it must not discard the valid
+ * rows that follow it or make panel_kitchen report a transport failure.
+ */
+function normalizeGraphQueryResult(res: ToolResult): Record<string, unknown> {
+  const parsed = parseToolResultValue(res);
+  if (!parsed) return { nodes: [] };
+  if (Array.isArray(parsed)) return { nodes: parsed };
+  if (typeof parsed !== "object") return { nodes: [] };
+  const record = parsed as Record<string, unknown>;
+  if (Array.isArray(record.nodes)) return record;
+
+  if (typeof record.text !== "string") return { nodes: [] };
+  const nodes: Record<string, unknown>[] = [];
+  for (const line of record.text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const row = JSON.parse(trimmed) as unknown;
+      if (row && typeof row === "object" && !Array.isArray(row)) {
+        nodes.push(row as Record<string, unknown>);
+      }
+    } catch {
+      // Ignore one malformed JSON row; other graph_query rows remain usable.
+    }
+  }
+  return { ...record, nodes };
 }
 
 function toolResultText(res: ToolResult): string {
@@ -19931,8 +19969,23 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           types: ["UNETLoader"],
           fields: "detail",
           limit: 200,
+          max_chars: 60000,
         });
-        const graph = parseToolResultJson(query) ?? { nodes: [] };
+        if (query.isError) return query;
+        const graph = normalizeGraphQueryResult(query);
+        if (graph.truncated === true) {
+          const truncationCause =
+            graph.truncated_by === "limit"
+              ? "the graph_query row limit"
+              : graph.truncated_by === "max_chars"
+                ? "the panel's max_chars ceiling"
+                : "a panel response cap";
+          return fail(
+            `panel_kitchen could not assess the complete live graph: graph_query truncated its ` +
+              `detail rows at ${truncationCause}. Narrow the live graph with a ` +
+              `more specific workflow or retry after reducing the number of UNETLoaders.`,
+          );
+        }
         const recs = await assessKitchenGraph(status, graph);
         if (args.action === "assess") {
           const hint = kitchenProactiveHint(status, recs);
