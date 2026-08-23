@@ -321,6 +321,35 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
     expect(text).toMatch(/post-enter identity probe did not verify/);
   });
 
+  it("refuses a promoted inner DaSiWa stack write without a second mutation", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "stack_data", value: "NEW" },
+      {
+        stackDataIdentity: { nodes: [{ id: 78, type: "OtherLoraLoader" }] },
+        stackDataInnerIdentity: { nodes: [{ id: 76, type: "DaSiWa_LTX2LoraLoader" }] },
+        subgraph: {
+          subgraph_of: { node_id: 78, title: "OtherLoraLoader" },
+          node_count: 1,
+          nodes: [{ id: 76, type: "DaSiWa_LTX2LoraLoader", widgets: { stack_data: "old" } }],
+        },
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(calls.map((c) => c.cmd)).toEqual([
+      "graph_query",
+      "graph_query",
+      "graph_set_widget",
+      "graph_get_subgraph",
+      "graph_enter_subgraph",
+      "graph_query",
+      "graph_exit_subgraph",
+    ]);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(1);
+    expect(text).toMatch(/promoted inner node 76 was identified as DaSiWa_LTX2LoraLoader/);
+    expect(text).toMatch(/No inner graph_set_widget was dispatched/);
+  });
+
   it("reports ambiguous promoted name/label candidates without a second write (#2015)", async () => {
     const { text, isError, calls } = await setWidget(
       { node_id: 190, widget: "text", value: "hello" },

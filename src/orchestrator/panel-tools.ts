@@ -15301,6 +15301,19 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 })`,
             );
           }
+          if (innerIdentity.type === DASIWA_LTX2_LORA_LOADER) {
+            const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+            return appendToolResultText(
+              first,
+              `\n\n(The promoted inner node ${inner.innerNodeId} was identified as ` +
+                `${DASIWA_LTX2_LORA_LOADER}; ${textOfToolResult(daSiWaStackRefusal(innerIdentity.type))} ` +
+                `No inner graph_set_widget was dispatched.${
+                  exited.isError
+                    ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}`
+                    : ""
+                })`,
+            );
+          }
           innerExpectedNodeType = innerIdentity.type;
         }
 
