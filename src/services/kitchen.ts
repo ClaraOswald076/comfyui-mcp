@@ -256,7 +256,8 @@ function splitTopLevelDictionary(raw: string): string[] | undefined {
       if (!open || !matchingClose(open, ch)) return undefined;
     } else if (ch === "," && stack.length === 0) {
       const member = text.slice(start, i).trim();
-      if (member) members.push(member);
+      if (!member) return undefined;
+      members.push(member);
       start = i + 1;
     }
   }
@@ -302,9 +303,10 @@ function parseKitchenDictionaryAvailable(raw: string): boolean | undefined {
     const colon = topLevelColon(member);
     if (colon < 0) return undefined;
     const key = member.slice(0, colon).trim();
+    const value = member.slice(colon + 1).trim();
+    if (!key || !value) return undefined;
     if (!/^(?:"available"|'available'|available)$/i.test(key)) continue;
 
-    const value = member.slice(colon + 1).trim();
     if (!/^true$/i.test(value) && !/^false$/i.test(value)) return undefined;
     if (available !== undefined) return undefined;
     available = /^true$/i.test(value);

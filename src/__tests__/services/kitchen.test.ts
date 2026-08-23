@@ -116,6 +116,17 @@ describe("parseKitchenLog", () => {
     expect(parsed.backends.eager).toEqual({ available: false, raw });
   });
 
+  it.each([
+    ["a double comma", "{'available': True,,}"],
+    ["an initial empty member", "{,'available': True}"],
+    ["an empty key", "{'available': True, :}"],
+    ["an empty value", "{'available': True, 'x':}"],
+  ])("rejects %s as a malformed dictionary", (_caseName, raw) => {
+    const parsed = parseKitchenLog(`Found comfy_kitchen backend eager: ${raw}`);
+
+    expect(parsed.backends.eager).toEqual({ available: false, raw });
+  });
+
   it("preserves the legacy cached availability status", () => {
     const parsed = parseKitchenLog("Found comfy_kitchen backend eager: available (cached)");
 
