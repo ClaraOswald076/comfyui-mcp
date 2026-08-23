@@ -137,13 +137,15 @@ describe("the rgthree skill states the facts that were verified against the pack
     expect(SKILL).not.toMatch(/`panel_strip_workflow` resolves them/);
   });
 
-  it("warns that a fresh Power Lora Loader has NO lora_N rows to write", () => {
-    // Gate P1. addNewLoraWidget runs only from configure() (loading a saved graph) and
-    // from the on-canvas "➕ Add Lora" button, which needs a mouse event and a chooser
-    // dialog. No panel tool presses it, so the documented write would be the agent's
-    // FIRST call after adding a loader — and it fails with `has no widget`.
+  it("explains that panel_set_widget creates fresh Power Lora Loader rows", () => {
+    // Gate P1. A fresh loader has no rows and its Add Lora button is mouse-only, but
+    // the panel's write-boundary route calls the node's own add method and reports the
+    // created name, so the skill must preserve that usable route.
     expect(SKILL).toMatch(/no `lora_N` widgets at all/);
-    expect(SKILL).toMatch(/No panel tool can press it/);
+    expect(SKILL).toMatch(/mouse event that no panel tool can press/i);
+    expect(SKILL).toMatch(/Rows CAN be created programmatically/);
+    expect(SKILL).toMatch(/created_widget: "lora_1"/);
+    expect(SKILL).toMatch(/Create rows \*\*in order\*\*/);
   });
 
   it("writes a whole row as a JSON STRING, which is what the schema accepts", () => {
