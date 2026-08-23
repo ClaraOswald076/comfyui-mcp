@@ -831,6 +831,27 @@ function managerBodyExcerpt(details: unknown): string {
   return ` ComfyUI-Manager said: ${clipped}`;
 }
 
+/** A bounded, credential-stripped per-task result from Manager queue history. */
+function managerTaskResultExcerpt(result: unknown): string {
+  const raw = typeof result === "string" ? result.replace(/\s+/g, " ").trim() : "";
+  if (!raw) return "";
+  const body = redactCredentialsForDisplay(raw);
+  const MAX = 600;
+  return body.length > MAX ? `${body.slice(0, MAX)}… (truncated)` : body;
+}
+
+function safeManagerTaskDetails(
+  record: ManagerTaskHistoryEntry,
+  result: string,
+): ManagerTaskHistoryEntry {
+  return {
+    uiId: record.uiId,
+    kind: record.kind,
+    statusStr: record.statusStr,
+    ...(result ? { result } : {}),
+  };
+}
+
 /** Wrap a legacy-Manager failure with the upgrade guidance (keeps details). */
 function annotateLegacyError(
   err: unknown,
@@ -5320,15 +5341,32 @@ export async function installModelViaManager(
   // retry/drain, AND the landing watcher (the file lands on the server the task
   // was dispatched to, so that is the only server worth polling).
   const base = managerBaseUrl();
-  const status = await queueManagerTask("install-model", taskParams, base);
-  // NOTE: the Manager queue reports the task "done" once it DRAINS, even when
-  // the underlying OperationResult failed (e.g. a 404 download, or Manager's
-  // security gate rejecting a network fetch) — and with an aria2 sidecar
-  // (COMFYUI_MANAGER_ARIA2_SERVER) it drains at HANDOFF, while the host is
-  // still streaming gigabytes. The v2 queue/status endpoint only exposes
-  // aggregate counts (no per-task result), so a clean drain here does NOT
-  // prove the file landed — phrase the result as "dispatched", not
-  // "installed", and leave final verification to a list on the pod.
+  const queued = await queueManagerTaskTracked("install-model", taskParams, base);
+  const status = queued.status;
+  let taskRecord: ManagerTaskHistoryEntry | null | undefined;
+  try {
+    taskRecord = await fetchManagerTaskHistoryEntry(queued.uiId, base);
+  } catch {
+    taskRecord = undefined;
+  }
+  const taskStatus = taskRecord?.statusStr?.trim().toLowerCase();
+  if (taskRecord && (taskStatus === "failed" || taskStatus === "error")) {
+    const excerpt = managerTaskResultExcerpt(taskRecord?.result);
+    throw new NodeManagementError(
+      `ComfyUI-Manager recorded the server-side model download task as ${taskStatus}. ` +
+        `The queue drained, but that only proves the task finished running; it does not prove ` +
+        `the model file landed or is valid.` +
+        (excerpt ? ` Manager result: ${excerpt}` : ""),
+      { queueStatus: status, managerTask: safeManagerTaskDetails(taskRecord, excerpt), uiId: queued.uiId },
+    );
+  }
+  // NOTE: the Manager queue reports the task "done" once it DRAINS, and with
+  // an aria2 sidecar (COMFYUI_MANAGER_ARIA2_SERVER) it drains at HANDOFF,
+  // while the host is still streaming gigabytes. On v4, queue/history can tell
+  // us that OUR task already failed; older or unreadable history cannot. A
+  // clean drain (or unknown history) still does NOT prove the file landed —
+  // phrase the result as "dispatched", not "installed", and leave final
+  // verification to a list on the pod.
   //
   // DEPLOYMENT: remote model install requires the pod's ComfyUI-Manager to be
   // in network_mode=personal_cloud (or loopback) with permissive security; a
@@ -5343,8 +5381,8 @@ export async function installModelViaManager(
       `${params.type} on the connected ComfyUI via ComfyUI-Manager. The queue ` +
       `drained, but that only means the download was HANDED OFF (with an aria2 ` +
       `sidecar the host keeps streaming after the queue drains), and Manager ` +
-      `reports tasks "done" even on failure with no per-task result — so ` +
-      `success is NOT guaranteed. The file appears in the server's ` +
+      `history did not prove the file landed — so success is ` +
+      `NOT guaranteed. The file appears in the server's ` +
       `/models/<category> listing only once the download COMPLETES (in-progress ` +
       `files are hidden), and Manager may store it under its own type dir ` +
       `(e.g. unet/, clip/) which ComfyUI aliases to diffusion_models/` +
