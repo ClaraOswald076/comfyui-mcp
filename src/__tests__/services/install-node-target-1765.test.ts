@@ -54,9 +54,11 @@ const cfg = vi.hoisted(() => ({
   comfyuiSsl: false,
   githubToken: undefined as string | undefined,
 }));
+const target = vi.hoisted(() => ({ generation: 0 }));
 vi.mock("../../config.js", () => ({
   config: cfg,
   getComfyUIBaseUrl: () => `http://${cfg.comfyuiHost}:${cfg.resolvedPort}`,
+  getComfyuiTargetGeneration: () => target.generation,
   getComfyUIAuthHeaders: () => ({}),
   isLoopbackHost: (host: string | undefined) =>
     !host || ["127.0.0.1", "::1", "localhost", "0.0.0.0", "::"].includes(host),
@@ -70,6 +72,7 @@ vi.mock("../../config.js", () => ({
 const live = vi.hoisted(() => ({
   argv: [] as string[],
   reachable: true,
+  onStats: undefined as (() => void) | undefined,
   /** How many times the running server was asked to describe itself. Zero is the
    *  measurement that proves the shipped code never consulted it. */
   statsCalls: 0,
@@ -77,6 +80,9 @@ const live = vi.hoisted(() => ({
 vi.mock("../../comfyui/client.js", () => ({
   getSystemStats: async () => {
     live.statsCalls += 1;
+    const onStats = live.onStats;
+    live.onStats = undefined;
+    onStats?.();
     if (!live.reachable) throw new Error("connect ECONNREFUSED 127.0.0.1:8189");
     return { system: { argv: live.argv } };
   },
@@ -231,9 +237,11 @@ beforeEach(() => {
   http.calls = [];
   probe.calls = 0;
   probe.result = undefined;
+  live.onStats = undefined;
   http.mode = "refuse-enqueue";
   live.reachable = true;
   live.statsCalls = 0;
+  target.generation = 0;
   live.argv = [join(CONNECTED, "main.py"), "--port", "8189"];
   cfg.comfyuiPath = undefined;
   priorEnvPath = process.env.COMFYUI_PATH;
@@ -496,6 +504,38 @@ describe("#463 — apply_manifest uses the verified panel-connected local scan r
     ]);
     expect(result.results[0]?.message).toMatch(/no ComfyUI path is set|local ComfyUI install/i);
     expect(clonedInto()).toBeUndefined();
+  });
+
+  it("refuses when the target retargets during apply_manifest's awaited probe", async () => {
+    http.mode = "manager-absent";
+    resetManagerApiCache("#463 target-generation race");
+    const retargetDuringThirdProbe = () => {
+      if (live.statsCalls < 3) {
+        live.onStats = retargetDuringThirdProbe;
+        return;
+      }
+      // The custom_nodes root was already verified for the original target A.
+      // Make the newly selected target B unreachable before installCustomNode
+      // starts; an unreachable mismatch check must not wash out this retarget.
+      cfg.resolvedPort = 8190;
+      target.generation += 1;
+      live.reachable = false;
+    };
+    live.onStats = retargetDuringThirdProbe;
+
+    const result = await applyManifest({
+      manifest: { custom_nodes: [REPO], models: [] },
+    });
+
+    expect(result.results).toMatchObject([
+      { action: "custom_node", item: REPO, status: "failed" },
+    ]);
+    expect(result.results[0]?.message).toMatch(/target changed/i);
+    expect(clonedInto()).toBeUndefined();
+    // The initial Manager read and any attempted install must remain pinned to
+    // A; no request may be recaptured against the unreachable B target.
+    expect(http.calls.length).toBeGreaterThan(0);
+    expect(http.calls.every((url) => url.startsWith("http://127.0.0.1:8189/"))).toBe(true);
   });
 
   it("attempts Manager before refusing a clone for an ambiguous live root", async () => {

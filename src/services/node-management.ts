@@ -2,7 +2,12 @@ import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
-import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
+import {
+  config,
+  getComfyUIBaseUrl,
+  getComfyuiTargetGeneration,
+  isRemoteMode,
+} from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { resetObjectInfoCache } from "../comfyui/client.js";
 import { progressEnabled, reportDownloadProgress } from "./download-progress.js";
@@ -2318,11 +2323,22 @@ export interface PackPresenceContext {
 }
 
 /** Capture the presence context for one operation, before its first await. */
-export function capturePackPresenceContext(diskRoot?: string): PackPresenceContext {
+export interface PackPresenceCaptureOptions {
+  /** Do not consult the shared configured/saved root when no call-scoped root exists. */
+  allowConfiguredFallback?: boolean;
+}
+
+export function capturePackPresenceContext(
+  diskRoot?: string,
+  options: PackPresenceCaptureOptions = {},
+): PackPresenceContext {
   const remote = isRemoteMode();
   return {
     remote,
-    diskRoot: remote ? undefined : (diskRoot ?? resolveEffectiveComfyUIBase()),
+    diskRoot:
+      remote || (diskRoot === undefined && options.allowConfiguredFallback === false)
+        ? undefined
+        : (diskRoot ?? resolveEffectiveComfyUIBase()),
   };
 }
 
@@ -3097,6 +3113,10 @@ export interface InstallOptions {
   /** The caller has already resolved the only safe local clone root. When set,
    *  an absent comfyuiPath means Manager-only, never a second local-root lookup. */
   localCloneFallback?: "verified-only";
+  /** Call-scoped Manager base captured with the target generation at operation entry. */
+  managerBase?: string;
+  /** Monotonic ComfyUI target generation captured with managerBase. */
+  targetGeneration?: number;
 }
 
 /**
@@ -3196,6 +3216,24 @@ async function resolveInstallLocalWorkspace(
   return resolveEffectiveComfyUIBase();
 }
 
+function assertInstallTargetStable(
+  expectedGeneration: number,
+  managerBase: string,
+): void {
+  const actualGeneration = getComfyuiTargetGeneration();
+  if (actualGeneration === expectedGeneration) return;
+  throw new ProcessControlError(
+    "ComfyUI's target changed while this custom-node install was being prepared. " +
+      "The Manager request and any local clone were refused; retry after the target settles.",
+    {
+      kind: "target-generation-changed",
+      managerBase,
+      expectedGeneration,
+      actualGeneration,
+    },
+  );
+}
+
 async function installCustomNodeImpl(
   opts: InstallOptions,
 ): Promise<NodeOpResult> {
@@ -3237,12 +3275,16 @@ async function installCustomNodeImpl(
   // With COMFYUI_PATH unset, a live custom_nodes root is required; a saved
   // default is machine-local configuration, not proof of what this panel target
   // scans.
-  const managerBase = managerBaseUrl();
+  const managerBase = opts.managerBase ?? managerBaseUrl();
+  const targetGeneration = opts.targetGeneration ?? getComfyuiTargetGeneration();
   const cliWorkspace =
     source === "git" || opts.useCmCli
       ? await resolveInstallLocalWorkspace(opts)
       : opts.comfyuiPath ?? resolveEffectiveComfyUIBase();
-  const presenceCtx = capturePackPresenceContext(cliWorkspace);
+  assertInstallTargetStable(targetGeneration, managerBase);
+  const presenceCtx = capturePackPresenceContext(cliWorkspace, {
+    allowConfiguredFallback: cliWorkspace !== undefined,
+  });
   // #1765 — and is that root the install this session is actually CONNECTED to?
   // Pinned to the very cliWorkspace the write will use, so a panel retarget
   // mid-call cannot judge one install's root against another's server.
@@ -3254,6 +3296,7 @@ async function installCustomNodeImpl(
     source === "git" || opts.useCmCli === true
       ? await detectLocalWriteTargetMismatch(cliWorkspace)
       : undefined;
+  assertInstallTargetStable(targetGeneration, managerBase);
   // THE PRE-STATE, OBSERVED BEFORE THE OPERATION (codex gate P0). The "already
   // installed" verdict below used to be inferred from POST-op disk state alone:
   // a pack that was absent before the call and installed as a registry ZIP —
@@ -3372,7 +3415,10 @@ async function installCustomNodeImpl(
       // A remote target keeps the original error: the clone would write to a
       // LOCAL tree that is not the server we are connected to, so "the Manager
       // refused" is the honest and complete answer there.
-      if (isRemoteMode() || !(await managerAbsenceAllowsGitFallback(err, managerBase))) {
+      assertInstallTargetStable(targetGeneration, managerBase);
+      const absenceAllows = await managerAbsenceAllowsGitFallback(err, managerBase);
+      assertInstallTargetStable(targetGeneration, managerBase);
+      if (isRemoteMode() || !absenceAllows) {
         throw err;
       }
       // BEFORE the log line, which says "cloning directly" and would otherwise be
@@ -3386,31 +3432,32 @@ async function installCustomNodeImpl(
         status: refusedBy,
         gitId,
       });
-      return withCliNote(
-        await cloneCustomNodeFallback(
-          gitId,
-          repoName,
-          gitRef,
-          refusedBy === 403 || refusedBy === 404
-            ? { manager_refused: refusedBy }
-            : { manager_absent: true },
-          cliWorkspace,
-          {
-            refFromVersion,
-            allowSharedWorkspaceFallback: cliWorkspace !== undefined,
-            managerRefusalNote:
-              refusedBy === 403
-                ? `ComfyUI-Manager REFUSED the git-URL install (HTTP 403) via its ` +
-                  `security_level / allow_git_url_install policy gate. Nothing was queued there.`
-                : refusedBy === 404
-                  ? `ComfyUI-Manager's git-install route returned HTTP 404 before queueing. ` +
-                    `Nothing was queued there.`
-                  : `ComfyUI-Manager is confirmed absent: both queue/status dialects returned HTTP 404 ` +
-                    `on the connected ComfyUI. Nothing was queued there.`,
-          },
-        ),
+      const cloned = await cloneCustomNodeFallback(
+        gitId,
+        repoName,
+        gitRef,
+        refusedBy === 403 || refusedBy === 404
+          ? { manager_refused: refusedBy }
+          : { manager_absent: true },
+        cliWorkspace,
+        {
+          refFromVersion,
+          allowSharedWorkspaceFallback: cliWorkspace !== undefined,
+          managerRefusalNote:
+            refusedBy === 403
+              ? `ComfyUI-Manager REFUSED the git-URL install (HTTP 403) via its ` +
+                `security_level / allow_git_url_install policy gate. Nothing was queued there.`
+              : refusedBy === 404
+                ? `ComfyUI-Manager's git-install route returned HTTP 404 before queueing. ` +
+                  `Nothing was queued there.`
+                : `ComfyUI-Manager is confirmed absent: both queue/status dialects returned HTTP 404 ` +
+                  `on the connected ComfyUI. Nothing was queued there.`,
+        },
       );
+      assertInstallTargetStable(targetGeneration, managerBase);
+      return withCliNote(cloned);
     }
+    assertInstallTargetStable(targetGeneration, managerBase);
 
     // VERIFY: /v2/customnode/installed reflects on-disk custom_nodes, so a
     // freshly-cloned pack shows up even before a reboot. If the Manager actually
@@ -3418,6 +3465,7 @@ async function installCustomNodeImpl(
     const installed = await listInstalledNodesAt(managerBase).catch(
       () => [] as InstalledNode[],
     );
+    assertInstallTargetStable(targetGeneration, managerBase);
     if (nodeInstalledMatches(gitId, installed)) {
       return withCliNote({
         mechanism: "manager-http",
@@ -3430,12 +3478,12 @@ async function installCustomNodeImpl(
         wrongInstallRefusal(localWriteMismatch, 'install_custom_node (action:"install", git clone)', managerBase),
       );
     }
-    return withCliNote(
-      await cloneCustomNodeFallback(gitId, repoName, gitRef, status, cliWorkspace, {
-        refFromVersion,
-        allowSharedWorkspaceFallback: cliWorkspace !== undefined,
-      }),
-    );
+    const cloned = await cloneCustomNodeFallback(gitId, repoName, gitRef, status, cliWorkspace, {
+      refFromVersion,
+      allowSharedWorkspaceFallback: cliWorkspace !== undefined,
+    });
+    assertInstallTargetStable(targetGeneration, managerBase);
+    return withCliNote(cloned);
   }
 
   // Registry (plain CNR id). Keep the prior defaults channel "default" /
@@ -3451,10 +3499,12 @@ async function installCustomNodeImpl(
     channel,
     mode,
   }, managerBase);
+  assertInstallTargetStable(targetGeneration, managerBase);
   // #797: verify across BOTH sources (Manager list + local disk) and keep
   // "could not determine" distinct from "determined absent" — an unreadable
   // Manager list collapsed to [] used to read as "not found in the registry".
   const presence = await resolvePackPresence(id, managerBase, presenceCtx);
+  assertInstallTargetStable(targetGeneration, managerBase);
   switch (presence.state) {
     case "manager-listed":
       return withCliNote({
@@ -5340,8 +5390,9 @@ async function listInstalledNodesAt(
 
 export async function listInstalledNodes(
   opts: ListInstalledOptions = {},
+  base = managerBaseUrl(),
 ): Promise<InstalledNode[]> {
-  return listInstalledNodesAt(managerBaseUrl(), opts);
+  return listInstalledNodesAt(base, opts);
 }
 
 // ---------------------------------------------------------------------------

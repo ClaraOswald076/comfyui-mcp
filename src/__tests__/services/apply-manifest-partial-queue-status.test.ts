@@ -11,6 +11,8 @@ const listInstalledNodesMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../../config.js", () => ({
   config: { comfyuiPath: "/fake/ComfyUI" },
+  getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
+  getComfyuiTargetGeneration: () => 0,
   isRemoteMode: () => false,
 }));
 

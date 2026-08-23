@@ -29,6 +29,7 @@ vi.mock("../../config.js", () => {
     config,
     getComfyUIBaseUrl: () =>
       `${config.comfyuiSsl ? "https" : "http"}://${config.comfyuiHost}:${config.resolvedPort}`,
+    getComfyuiTargetGeneration: () => 0,
     getComfyUIAuthHeaders: () => ({}),
     isLoopbackHost: (host: string | undefined) =>
       !host || ["127.0.0.1", "::1", "localhost", "0.0.0.0", "::"].includes(host.toLowerCase().replace(/^\[|\]$/g, "")),
