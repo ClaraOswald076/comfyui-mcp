@@ -131,12 +131,23 @@ is a widget named **`lora_1`, `lora_2`, …** whose value is a composite object
 identified by the **presence of a `lora` key**, and the node's control widgets are
 appended *after* them, so do not index positionally — **address the row by name**.
 
-**You can only edit rows that ALREADY EXIST.** A freshly added Power Lora Loader has
-**no `lora_N` widgets at all** — rows are created by the node's on-canvas "➕ Add Lora"
-button, which opens a chooser on a mouse event. No panel tool can press it, so
-`panel_set_widget` on `lora_1` right after `panel_add_node` fails with `has no widget`.
-Read the node's real widget list first (`panel_query_graph`), and to build a stack from
-scratch either ask the user to add the rows, or wire plain `LoraLoader` nodes instead.
+**Rows CAN be created programmatically.** A freshly added Power Lora Loader has
+**no `lora_N` widgets at all** — the on-canvas "➕ Add Lora" button opens a chooser on a
+mouse event that no panel tool can press, but `panel_set_widget` does not need it:
+writing `lora_1` (then `lora_2`, …) with a **JSON object STRING** creates the row and
+the reply carries `created_widget: "lora_1"`. Create rows **in order**, one call each:
+
+```
+panel_set_widget(node_id=<id>, widget="lora_1",
+  value='{"on":true,"lora":"subdir/turbo.safetensors","strength":1,"strengthTwo":null}')
+
+# A Windows subdir separator is a JSON escape — write it DOUBLED in the string:
+#   "lora":"Anima\\Tools\\turbo.safetensors"
+```
+
+Re-read with `panel_query_graph {ids:[<id>], fields:'detail'}` to confirm the row
+landed. If you need a stack from scratch, create `lora_1`, then `lora_2`, and so on;
+do not assume a skipped number is the next row.
 
 On an existing row, write ONE field with **dotted sub-field addressing** — it merges
 onto the current object and preserves every other field:
