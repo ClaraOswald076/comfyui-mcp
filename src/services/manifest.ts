@@ -33,6 +33,7 @@ import {
   resolveExistingModelFile,
   managerModelDestination,
   MODEL_SUBDIRS,
+  shouldDispatchDownloadToManager,
   type ModelType,
 } from "./model-resolver.js";
 import { startDownloadJob, describePlacement, type DownloadJob } from "./download-jobs.js";
@@ -663,6 +664,39 @@ function defaultFilenameForUrl(url: string): string {
   return basename(new URL(url).pathname) || "model.safetensors";
 }
 
+/** Resolve a manifest destination without needing a local models root. */
+function manifestModelTarget(model: ComfyManifest["models"][number]): {
+  targetSubfolder: string;
+  filename: string;
+} {
+  if (model.local_path) {
+    if (isAbsolute(model.local_path)) {
+      throw new ValidationError(
+        `Model local_path must be relative to models/: ${model.local_path}`,
+      );
+    }
+    const segments = model.local_path.split(/[/\\]+/).filter(Boolean);
+    if (segments.length === 0 || segments.includes("..")) {
+      throw new ValidationError(
+        `Model local_path escapes the models directory: ${model.local_path}`,
+      );
+    }
+    if (segments.length < 2) {
+      throw new ValidationError(
+        `Model local_path must include a category subfolder (e.g. 'checkpoints/foo.safetensors'): ${model.local_path}`,
+      );
+    }
+    return {
+      targetSubfolder: segments.slice(0, -1).join("/"),
+      filename: segments[segments.length - 1],
+    };
+  }
+  return {
+    targetSubfolder: model.model_type ?? "checkpoints",
+    filename: model.filename ?? defaultFilenameForUrl(model.url),
+  };
+}
+
 async function resolveLocalModelPath(
   model: ComfyManifest["models"][number],
 ): Promise<{ targetSubfolder: string; filename: string; targetPath: string }> {
@@ -870,38 +904,12 @@ function remoteModelTarget(model: ComfyManifest["models"][number]): {
   /** OUR canonical category folder — for the panel download-tray watcher. */
   category: string;
 } {
-  if (model.local_path) {
-    if (isAbsolute(model.local_path)) {
-      throw new ValidationError(
-        `Model local_path must be relative to models/: ${model.local_path}`,
-      );
-    }
-    const segments = model.local_path.split(/[/\\]+/).filter(Boolean);
-    if (segments.length === 0 || segments.includes("..")) {
-      throw new ValidationError(
-        `Model local_path escapes the models directory: ${model.local_path}`,
-      );
-    }
-    const filename = segments[segments.length - 1];
-    const dirSegments = segments.slice(0, -1);
-    if (dirSegments.length === 0) {
-      throw new ValidationError(
-        `Model local_path must include a category subfolder (e.g. 'checkpoints/foo.safetensors'): ${model.local_path}`,
-      );
-    }
-    // Map our category folder to a Manager-valid { type, save_path }. Nested
-    // paths are handed to Manager verbatim; top-level categories resolve via the
-    // type-map ("default") or fall back to the folder name.
-    const { type, save_path } = managerModelDestination(
-      dirSegments[0],
-      dirSegments.length > 1 ? dirSegments.join("/") : undefined,
-    );
-    return { name: filename, type, save_path, filename, category: dirSegments[0] };
-  }
-
-  const category: ModelType = model.model_type ?? "checkpoints";
-  const filename = model.filename ?? defaultFilenameForUrl(model.url);
-  const { type, save_path } = managerModelDestination(category);
+  const { targetSubfolder, filename } = manifestModelTarget(model);
+  const category = targetSubfolder.split("/")[0] as ModelType;
+  const { type, save_path } = managerModelDestination(
+    category,
+    targetSubfolder === category ? undefined : targetSubfolder,
+  );
   return { name: filename, type, save_path, filename, category };
 }
 
@@ -982,6 +990,40 @@ async function applyManifestSections(
   const localMode = !isRemoteMode();
   const hasLocalDataFs = localMode && Boolean(dataBase);
   const hasLocalCodeFs = localMode && Boolean(codeBase);
+
+  // The data root answers where custom_nodes and the ordinary models/ tree live,
+  // but it is not the complete answer for model downloads. A connected local
+  // ComfyUI may name its models directory independently with --models-directory,
+  // or the live download resolver may derive it from the serving install while the
+  // generic data-root resolver cannot. Reuse the same live-first route predicate
+  // the download_model path uses before resolving a local target (#2089). Keep
+  // this separate from dataBase: using the models directory as the custom-node
+  // root would target a different filesystem contract.
+  let hasLocalModelFs = hasLocalDataFs;
+  let localModelResolutionError: string | undefined;
+  // Any local session can be Manager-routed: an explicit --models-directory may
+  // be unresolvable even while COMFYUI_PATH exists, and reconnects can change the
+  // answer between calls. Capture the route BEFORE attempting local model
+  // resolution: a retarget in between must not leave a stale local preflight
+  // deciding the model branch. The override is threaded to startDownloadJob below
+  // so its identity key and writer use this same call-scoped decision.
+  let dispatchModelsToManager = isRemoteMode();
+  const routeOverrideNeeded = localMode && manifest.models.length > 0;
+  if (routeOverrideNeeded) {
+    try {
+      dispatchModelsToManager = await shouldDispatchDownloadToManager();
+    } catch (err) {
+      localModelResolutionError ??= err instanceof Error ? err.message : String(err);
+    }
+    if (!dispatchModelsToManager) {
+      try {
+        await resolveModelsDir();
+        hasLocalModelFs = true;
+      } catch (err) {
+        localModelResolutionError ??= err instanceof Error ? err.message : String(err);
+      }
+    }
+  }
 
   for (const pkg of manifest.apt) {
     results.push(
@@ -1165,22 +1207,24 @@ async function applyManifestSections(
   for (const model of manifest.models) {
     const item = model.local_path ?? model.filename ?? model.url;
     try {
-      if (!hasLocalDataFs) {
+      if (!hasLocalModelFs && !dispatchModelsToManager && !isRemoteMode()) {
+        results.push(
+          report(
+            "model",
+            item,
+            "skipped",
+            "Model install could not resolve a local models directory for the connected ComfyUI, and no Manager route was available. " +
+              (localModelResolutionError ??
+                "Set COMFYUI_PATH, save a default workspace, or connect to a ComfyUI whose models directory can be detected."),
+          ),
+        );
+        continue;
+      }
+      if (isRemoteMode()) {
         // REMOTE: no local filesystem to scan/write. Route the download to the
         // ComfyUI host via ComfyUI-Manager's install-model task (server-side
         // fetch, returns at handoff). Cloud mode has no Manager, so report it as
-        // unsupported.
-        if (!isRemoteMode()) {
-          results.push(
-            report(
-              "model",
-              item,
-              "skipped",
-              "Model install is not supported against this ComfyUI (no local filesystem and no ComfyUI-Manager HTTP API); install it on the ComfyUI host.",
-            ),
-          );
-          continue;
-        }
+        // unsupported before this branch.
         const { name, type, save_path, filename, category } = remoteModelTarget(model);
         const res = await installModelViaManager({
           name,
@@ -1205,6 +1249,24 @@ async function applyManifestSections(
               "list_local_models before relying on it.",
           ),
         );
+        continue;
+      }
+      if (dispatchModelsToManager) {
+        // A local target can still be Manager-routed when the live server is
+        // reachable but its models directory cannot be safely resolved. Use the
+        // background job path so the accepted-vs-landed verdict and progress
+        // polling match download_model. `manifestModelTarget` supplies the
+        // Manager identity without touching a local root.
+        const { targetSubfolder, filename } = manifestModelTarget(model);
+        const { job, settled } = await startDownloadJob(
+          model.url,
+          targetSubfolder,
+          filename,
+          undefined,
+          undefined,
+          true,
+        );
+        enqueued.push({ item, job, settled });
         continue;
       }
       const target = await resolveLocalModelPath(model);
@@ -1353,6 +1415,9 @@ async function applyManifestSections(
         model.url,
         target.targetSubfolder,
         target.filename,
+        undefined,
+        undefined,
+        routeOverrideNeeded ? dispatchModelsToManager : undefined,
       );
       enqueued.push({ item, job, settled, staleOutsideLiveRoots });
     } catch (err) {

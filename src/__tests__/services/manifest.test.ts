@@ -1359,6 +1359,7 @@ describe("applyManifest", () => {
     mockConfig.comfyuiPath = undefined;
     mockConfig.remote = false; // local loopback target, just no COMFYUI_PATH
     savedWorkspaceMock.mockReturnValue("/saved/ComfyUI");
+    shouldDispatchToManagerMock.mockResolvedValueOnce(false);
     existsSyncMock.mockImplementation((p: unknown) => {
       const s = String(p);
       return (
@@ -1391,6 +1392,7 @@ describe("applyManifest", () => {
     mockConfig.remote = false; // local loopback target reached over the panel session
     savedWorkspaceMock.mockReturnValue(undefined);
     liveComfyBaseMock.mockResolvedValue("/live/ComfyUI");
+    shouldDispatchToManagerMock.mockResolvedValueOnce(false);
     existsSyncMock.mockImplementation((p: unknown) => {
       const s = String(p);
       return (
@@ -1412,6 +1414,112 @@ describe("applyManifest", () => {
     expect(downloadModelMock).toHaveBeenCalled();
     // Call-scoped: the adopted live path must NOT persist process-wide.
     expect(mockConfig.comfyuiPath).toBeUndefined();
+  });
+
+  it("uses the live models resolver when the generic data root is unavailable (#2089)", async () => {
+    // A server may expose a usable models root through --models-directory (or the
+    // live download resolver) without yielding a generic dataBase for custom_nodes.
+    // The old manifest gate skipped the model before resolveLocalModelPath could
+    // use that authoritative route.
+    mockConfig.comfyuiPath = undefined;
+    mockConfig.remote = false;
+    savedWorkspaceMock.mockReturnValue(undefined);
+    liveComfyBaseMock.mockResolvedValue(undefined);
+    effectiveBaseLiveMock.mockResolvedValue(undefined);
+    modelsDirMock.mockResolvedValue("/live/ComfyUI/models");
+    shouldDispatchToManagerMock.mockResolvedValueOnce(false);
+
+    const result = await applyManifest({
+      manifest: {
+        models: [
+          { url: "https://example.com/m.safetensors", model_type: "loras", filename: "m.safetensors" },
+        ],
+      },
+    });
+
+    expect(result.summary).toMatchObject({ applied: 1, failed: 0, skipped: 0 });
+    expect(downloadModelMock).toHaveBeenCalled();
+    expect(installModelViaManagerMock).not.toHaveBeenCalled();
+    // The route was captured before local target resolution and threaded through
+    // startDownloadJob; it must not re-read mutable connection state mid-call.
+    expect(shouldDispatchToManagerMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses Manager when a local reconnect has no resolvable models root (#2089)", async () => {
+    mockConfig.comfyuiPath = undefined;
+    mockConfig.remote = false;
+    savedWorkspaceMock.mockReturnValue(undefined);
+    liveComfyBaseMock.mockResolvedValue(undefined);
+    effectiveBaseLiveMock.mockResolvedValue(undefined);
+    modelsDirMock.mockRejectedValueOnce(
+      new Error("The connected ComfyUI models directory could not be resolved"),
+    );
+    shouldDispatchToManagerMock.mockResolvedValueOnce(true);
+
+    const result = await applyManifest({
+      manifest: {
+        models: [
+          { url: "https://example.com/m.safetensors", model_type: "loras", filename: "m.safetensors" },
+        ],
+      },
+    });
+
+    expect(result.summary).toMatchObject({ applied: 0, failed: 0, pending: 1 });
+    expect(result.results[0]?.message).toMatch(/ACCEPTED.*NOT verified/i);
+    const managerRouteCall = downloadModelMock.mock.calls[0] as unknown[] | undefined;
+    expect(managerRouteCall?.[1]).toBe("loras");
+    expect(managerRouteCall?.[2]).toBe("m.safetensors");
+    expect(managerRouteCall?.[4]).toBe(true);
+  });
+
+  it("does not let a configured data root suppress Manager routing for an unresolvable model root (#2089)", async () => {
+    // COMFYUI_PATH can still resolve custom-node/pip operations while the live
+    // server's explicit --models-directory is relative and lacks cwd. The model
+    // route must follow download_model's Manager decision, not the data root.
+    mockConfig.comfyuiPath = COMFY;
+    mockConfig.remote = false;
+    modelsDirMock.mockRejectedValueOnce(
+      new Error("relative --models-directory has no reported working directory"),
+    );
+    shouldDispatchToManagerMock.mockResolvedValueOnce(true);
+
+    const result = await applyManifest({
+      manifest: {
+        models: [
+          { url: "https://example.com/m.safetensors", model_type: "loras", filename: "m.safetensors" },
+        ],
+      },
+    });
+
+    expect(result.summary).toMatchObject({ applied: 0, failed: 0, pending: 1 });
+    const managerRouteCall = downloadModelMock.mock.calls[0] as unknown[] | undefined;
+    expect(managerRouteCall?.[4]).toBe(true);
+    expect(result.results[0]?.message).toMatch(/ACCEPTED.*NOT verified/i);
+  });
+
+  it("reports the local path-resolution reason when neither local models nor Manager is available (#2089)", async () => {
+    mockConfig.comfyuiPath = undefined;
+    mockConfig.remote = false;
+    savedWorkspaceMock.mockReturnValue(undefined);
+    liveComfyBaseMock.mockResolvedValue(undefined);
+    effectiveBaseLiveMock.mockResolvedValue(undefined);
+    modelsDirMock.mockRejectedValueOnce(
+      new Error("relative --models-directory has no reported working directory"),
+    );
+    shouldDispatchToManagerMock.mockResolvedValueOnce(false);
+
+    const result = await applyManifest({
+      manifest: {
+        models: [
+          { url: "https://example.com/m.safetensors", model_type: "loras", filename: "m.safetensors" },
+        ],
+      },
+    });
+
+    expect(result.summary).toMatchObject({ applied: 0, failed: 0, skipped: 1 });
+    expect(result.results[0]?.message).toMatch(/could not resolve a local models directory/i);
+    expect(result.results[0]?.message).toMatch(/relative --models-directory/i);
+    expect(result.results[0]?.message).not.toMatch(/no local filesystem and no ComfyUI-Manager HTTP API/i);
   });
 
   it("reports a custom_node as PENDING (not failed) when the Manager queue is still installing at the budget (#489)", async () => {
