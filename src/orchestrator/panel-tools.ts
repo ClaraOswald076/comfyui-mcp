@@ -19969,8 +19969,17 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           types: ["UNETLoader"],
           fields: "detail",
           limit: 200,
+          max_chars: 60000,
         });
+        if (query.isError) return query;
         const graph = normalizeGraphQueryResult(query);
+        if (graph.truncated === true) {
+          return fail(
+            `panel_kitchen could not assess the complete live graph: graph_query truncated its ` +
+              `detail rows at the panel's max_chars ceiling. Narrow the live graph with a ` +
+              `more specific workflow or retry after reducing the number of UNETLoaders.`,
+          );
+        }
         const recs = await assessKitchenGraph(status, graph);
         if (args.action === "assess") {
           const hint = kitchenProactiveHint(status, recs);

@@ -67,6 +67,7 @@ async function assessLiveGraph(graphQueryReply: unknown) {
     types: ["UNETLoader"],
     fields: "detail",
     limit: 200,
+    max_chars: 60000,
   });
   return JSON.parse(textOf(res)) as { loaders: Array<Record<string, unknown>> };
 }
@@ -120,6 +121,28 @@ describe("panel_kitchen", () => {
     const body = await assessLiveGraph(graph);
 
     expect(body.loaders).toEqual([]);
+  });
+
+  it("refuses a truncated graph_query instead of assessing a partial graph", async () => {
+    resetKitchenHintSession();
+    const harness = panelKitchenHarness({
+      matched: 2,
+      shown: 1,
+      truncated: true,
+      text: JSON.stringify(unetRow(12)),
+    });
+
+    const res = await harness.def.handler({ action: "assess" } as never, harness.ctx);
+
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/truncated.*detail rows/i);
+    expect(harness.sent).toContainEqual({
+      cmd: "graph_query",
+      types: ["UNETLoader"],
+      fields: "detail",
+      limit: 200,
+      max_chars: 60000,
+    });
   });
 
   it("apply of an unknown id names the assess ids rather than guessing", async () => {
