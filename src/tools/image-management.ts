@@ -995,6 +995,21 @@ export function registerImageManagementTools(server: McpServer): void {
             const stagedRef = staged.subfolder
               ? `${staged.subfolder}/${staged.filename}`
               : staged.filename;
+            const loaderInstruction =
+              staged.loaderSelectable === "unverified"
+                ? `The staged reference is "${stagedRef}" for ${loaderHint}.`
+                : `Use "${stagedRef}" as ${loaderHint}.`;
+            const selectabilityNote =
+              staged.loaderSelectable === "verified"
+                ? `The fresh /object_info loader list verifies that "${stagedRef}" is selectable.`
+                : staged.loaderSelectable === "root-fallback"
+                  ? `This ComfyUI stored the requested nested path "${staged.requestedFilename}" ` +
+                    `but did not enumerate it in its loader list, so the same bytes were also ` +
+                    `registered at the root as "${stagedRef}". The fresh /object_info loader ` +
+                    `list verifies the root reference; use that one.`
+                  : `The upload succeeded, but a fresh /object_info response did not prove that ` +
+                    `"${stagedRef}" is present in a loader list. Do not assume the widget can ` +
+                    `select it; inspect the loader or retry after panel_refresh_nodes.`;
             return {
               content: [
                 {
@@ -1004,7 +1019,8 @@ export function registerImageManagementTools(server: McpServer): void {
                     `Input filename: ${stagedRef}\n` +
                     `subfolder: ${staged.subfolder || "(none)"}\n` +
                     `type: ${staged.type}\n\n` +
-                    `Use "${stagedRef}" as ${loaderHint}.\n\n` +
+                    `${loaderInstruction}\n\n` +
+                    `${selectabilityNote}\n\n` +
                     `NOTE: the open ComfyUI tab's loader dropdown was populated at page-load, ` +
                     `so this just-registered input is not in it yet — call panel_refresh_nodes ` +
                     `first (it re-pulls /object_info so the new file becomes selectable), THEN ` +

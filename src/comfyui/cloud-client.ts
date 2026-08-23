@@ -362,6 +362,7 @@ export async function uploadImageHttp(
   filename: string,
   data: Buffer,
   mimeType = "image/png",
+  overwrite = true,
 ): Promise<{ name: string; subfolder: string; type: string }> {
   // #946 — same split as client.ts's uploadImageHttp: a `filename` carrying a
   // path ("assets/clip.mp4") is a subfolder request, and the API takes that as
@@ -372,7 +373,7 @@ export async function uploadImageHttp(
   const blob = new Blob([data], { type: mimeType });
   formData.append("image", blob, name);
   formData.append("type", "input");
-  formData.append("overwrite", "true");
+  formData.append("overwrite", String(overwrite));
   if (subfolder) formData.append("subfolder", subfolder);
   // multipart sets its own Content-Type; skip the JSON header.
   const res = await cloudFetch("/upload/image", {

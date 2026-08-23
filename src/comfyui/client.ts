@@ -1207,8 +1207,9 @@ export async function uploadImageHttp(
   filename: string,
   data: Buffer,
   mimeType = "image/png",
+  overwrite = true,
 ): Promise<{ name: string; subfolder: string; type: string }> {
-  if (isCloudMode()) return cloudClient.uploadImageHttp(filename, data, mimeType);
+  if (isCloudMode()) return cloudClient.uploadImageHttp(filename, data, mimeType, overwrite);
   const client = getClient();
   // #946 — a `filename` carrying a path ("assets/clip.mp4") is a SUBFOLDER
   // request, and ComfyUI's /upload/image takes that as its own form field, not
@@ -1222,7 +1223,7 @@ export async function uploadImageHttp(
   const blob = new Blob([data], { type: mimeType });
   formData.append("image", blob, name);
   formData.append("type", "input");
-  formData.append("overwrite", "true");
+  formData.append("overwrite", String(overwrite));
   if (subfolder) formData.append("subfolder", subfolder);
   const res = await comfyApiFetch("/upload/image", {
     method: "POST",

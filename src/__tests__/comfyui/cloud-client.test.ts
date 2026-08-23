@@ -160,6 +160,12 @@ describe("cloud-client", () => {
     expect((form.get("image") as File).name).toBe("clip.mp4");
   });
 
+  it("can request a unique name instead of overwriting an existing input", async () => {
+    await uploadImageHttp("clip.mp4", Buffer.from("x"), "video/mp4", false);
+    const form = calls.at(-1)?.init?.body as FormData;
+    expect(form.get("overwrite")).toBe("false");
+  });
+
   it("uploadImageHttp refuses a traversal before anything is sent", async () => {
     await expect(uploadImageHttp("../escape.png", Buffer.from("x"))).rejects.toThrow(
       /walks outside/,

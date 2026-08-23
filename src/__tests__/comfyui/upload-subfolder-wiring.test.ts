@@ -79,6 +79,12 @@ describe("#946: uploadImageHttp sends the subfolder as its own field", () => {
     expect((sentForm().get("image") as File).name).toBe("clip.mp4");
   });
 
+  it("can request a unique name instead of overwriting an existing input", async () => {
+    fetchApi.mockResolvedValue(okJson({ name: "clip_1.mp4", subfolder: "", type: "input" }));
+    await uploadImageHttp("clip.mp4", Buffer.from("x"), "video/mp4", false);
+    expect(sentForm().get("overwrite")).toBe("false");
+  });
+
   it("refuses a traversal before anything is sent", async () => {
     await expect(uploadImageHttp("../escape.png", Buffer.from("x"))).rejects.toThrow(
       /walks outside/,
