@@ -134,11 +134,16 @@ describe("#1968 panel_remove_group: `group` is the same argument as `group_id`",
     expect(h.sent).toHaveLength(0);
   });
 
-  // A non-numeric group ref is still refused — the alias widens the SPELLING, not
-  // the shape. `panel_subgraph_group` resolves a title; graph_remove_group cannot,
-  // and admitting a title here would send the panel an id it throws on.
-  it("does not admit a title string as a group id", () => {
-    expect(accepts("panel_remove_group", { group: "REPLACEMENT MODE" })).toBe(false);
+  it("accepts a non-empty title on the title-aware alias", () => {
+    expect(accepts("panel_remove_group", { group: "REPLACEMENT MODE" })).toBe(true);
+  });
+
+  it("keeps the canonical group_id integer-only", () => {
+    expect(accepts("panel_remove_group", { group_id: "REPLACEMENT MODE" })).toBe(false);
+  });
+
+  it("rejects an empty or whitespace-only title", () => {
+    expect(accepts("panel_remove_group", { group: "   " })).toBe(false);
   });
 });
 
@@ -165,6 +170,90 @@ describe("#1968: every group tool accepts the same two spellings", () => {
     const res = await callTool("panel_move_group", { group_id: 1, group: 2, pos: [0, 0] }, h.ctx);
     expect(res.isError).toBe(true);
     expect(h.sent).toHaveLength(0);
+  });
+});
+
+describe("#2108: group titles resolve consistently for edit, move, and remove", () => {
+  const GROUPS = [
+    { id: 4, title: "Notes, Explanation, Hints" },
+    { id: 9, title: "Output" },
+  ];
+
+  it("resolves a case-insensitive title substring for panel_edit_group", async () => {
+    const h = harness({ graph_query: { groups: GROUPS } });
+    const res = await callTool(
+      "panel_edit_group",
+      { group: "notes, explanation", bounds: [1, 2, 3, 4] },
+      h.ctx,
+    );
+    expect(res.isError).toBeFalsy();
+    expect(h.sent).toEqual([
+      { cmd: "graph_query", fields: "ids", limit: 1 },
+      { cmd: "graph_edit_group", group_id: 4, bounds: [1, 2, 3, 4] },
+    ]);
+  });
+
+  it("resolves a title for panel_move_group", async () => {
+    const h = harness({ graph_query: { groups: GROUPS } });
+    const res = await callTool("panel_move_group", { group: "OUTPUT", pos: [10, 20] }, h.ctx);
+    expect(res.isError).toBeFalsy();
+    expect(h.sent[1]).toMatchObject({ cmd: "graph_move_group", group_id: 9, pos: [10, 20] });
+  });
+
+  it("resolves a title for panel_remove_group", async () => {
+    const h = harness({ graph_query: { groups: GROUPS } });
+    const res = await callTool("panel_remove_group", { group: "hints" }, h.ctx);
+    expect(res.isError).toBeFalsy();
+    expect(h.sent[1]).toMatchObject({ cmd: "graph_remove_group", group_id: 4 });
+  });
+
+  it("refuses an unmatched title without dispatching a mutation", async () => {
+    const h = harness({ graph_query: { groups: GROUPS } });
+    const res = await callTool("panel_edit_group", { group: "missing", title: "x" }, h.ctx);
+    expect(res.isError).toBe(true);
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0].cmd).toBe("graph_query");
+    expect(res.content.map((c) => c.text).join(" ")).toContain("No group title matching");
+  });
+
+  it("refuses an ambiguous title and lists the candidates", async () => {
+    const h = harness({
+      graph_query: {
+        groups: [
+          { id: 4, title: "Notes - left" },
+          { id: 7, title: "Notes - right" },
+        ],
+      },
+    });
+    const res = await callTool("panel_remove_group", { group: "notes" }, h.ctx);
+    expect(res.isError).toBe(true);
+    expect(h.sent).toHaveLength(1);
+    const text = res.content.map((c) => c.text).join(" ");
+    expect(text).toContain("ambiguous");
+    expect(text).toContain("id 4");
+    expect(text).toContain("id 7");
+  });
+
+  it("refuses a clipped title match rather than guessing", async () => {
+    const h = harness({ graph_query: { groups: [{ id: 4, title: "Notes...", title_clipped: true }] } });
+    const res = await callTool("panel_move_group", { group: "notes", pos: [0, 0] }, h.ctx);
+    expect(res.isError).toBe(true);
+    expect(h.sent).toHaveLength(1);
+    expect(res.content.map((c) => c.text).join(" ")).toContain("clipped");
+  });
+
+  it("refuses a title against a truncated group index rather than guessing", async () => {
+    const h = harness({
+      graph_query: {
+        groups_truncated: true,
+        groups: [{ id: 4, title: "Notes" }],
+      },
+    });
+    const res = await callTool("panel_remove_group", { group: "notes" }, h.ctx);
+    expect(res.isError).toBe(true);
+    expect(h.sent).toHaveLength(1);
+    expect(res.content.map((c) => c.text).join(" ")).toContain("truncated");
+    expect(res.content.map((c) => c.text).join(" ")).toContain("hidden");
   });
 });
 

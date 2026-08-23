@@ -36,6 +36,9 @@ export const GROUP_ID_PATTERN = /^-?\d+$/;
 export const GROUP_ID_MESSAGE =
   "a group id must be an integer (e.g. 2) — panel_query_graph's groups[] and panel_create_group both return it";
 
+export const GROUP_REF_MESSAGE =
+  "a group reference must be an integer id (e.g. 2) or a non-empty group title (e.g. 'Notes')";
+
 /**
  * Normalize an accepted group id to the NUMBER the wire has always carried.
  *
