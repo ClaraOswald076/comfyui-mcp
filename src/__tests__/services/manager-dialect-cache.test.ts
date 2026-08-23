@@ -28,7 +28,7 @@ process.env.COMFYUI_MCP_MANAGER_API_TTL_MS = "5000";
 
 // Kept mutable to model the runtime target change that the panel applies while a
 // Manager operation is in flight. vi.hoisted makes it available to the mock factory.
-const target = vi.hoisted(() => ({ base: "http://127.0.0.1:8188" }));
+const target = vi.hoisted(() => ({ base: "http://127.0.0.1:8188", generation: 0 }));
 
 vi.mock("../../config.js", () => {
   const config = {
@@ -41,6 +41,7 @@ vi.mock("../../config.js", () => {
   return {
     config,
     getComfyUIBaseUrl: () => target.base,
+    getComfyuiTargetGeneration: () => target.generation,
     getComfyUIAuthHeaders: () => ({}),
     // node-management's Manager self-update path (#424) imports this; the mock
     // must provide it or the named import fails at load.
@@ -232,6 +233,7 @@ const elapse = (ms: number): void => {
 describe("#646 Manager API dialect cache invalidation", () => {
   beforeEach(() => {
     target.base = BASE;
+    target.generation = 0;
     monotonicOffset = 0;
     wallOffset = 0;
     vi.spyOn(Date, "now").mockImplementation(() => realNow() + wallOffset);
@@ -512,7 +514,7 @@ describe("#646 Manager API dialect cache invalidation", () => {
     });
   });
 
-  it("keeps a dialect self-heal retry and drain on its original target after retarget", async () => {
+  it("refuses completion when a dialect self-heal retargets mid-install", async () => {
     const targetA = BASE;
     const targetB = "http://127.0.0.1:8282";
     let retargeted = false;
@@ -525,23 +527,25 @@ describe("#646 Manager API dialect cache invalidation", () => {
         if (!retargeted && url.startsWith(targetA) && path === "/v2/manager/queue/task") {
           retargeted = true;
           target.base = targetB;
+          target.generation += 1;
           resetManagerApiCache("panel retargeted while Manager request was in flight");
         }
       },
     });
     resetManagerApiCacheForTests("v2");
 
-    await expect(installCustomNode({ id: "comfyui-foo" })).resolves.toMatchObject({
-      mechanism: "manager-http",
+    await expect(installCustomNode({ id: "comfyui-foo" })).rejects.toMatchObject({
+      details: { kind: "target-generation-changed" },
     });
 
     // The mutation began at A, so its retry, queue start, and drain are all
     // pinned to A. B is now the target for subsequent calls, but receives none
-    // from this already-started transaction.
+    // from this already-started transaction. The operation refuses to report
+    // success before post-queue verification because the target changed.
     expect(calls.filter((call) => call.url.startsWith(targetB))).toHaveLength(0);
     expect(calls.some((call) => call.url.startsWith(targetA) && call.path === "/manager/queue/install")).toBe(true);
     expect(calls.some((call) => call.url.startsWith(targetA) && call.path === "/manager/queue/start")).toBe(true);
-    expect(calls.some((call) => call.url.startsWith(targetA) && call.path.startsWith("/customnode/installed"))).toBe(true);
+    expect(calls.some((call) => call.url.startsWith(targetA) && call.path.startsWith("/customnode/installed"))).toBe(false);
   });
 
   it("keeps the update-all tool's enqueue + start on its original target after retarget (#656)", async () => {
@@ -558,6 +562,7 @@ describe("#646 Manager API dialect cache invalidation", () => {
         if (!retargeted && url.startsWith(targetA) && path === "/v2/manager/queue/update_all") {
           retargeted = true;
           target.base = targetB;
+          target.generation += 1;
           resetManagerApiCache("panel retargeted while Manager request was in flight");
         }
       },
@@ -591,6 +596,7 @@ describe("#646 Manager API dialect cache invalidation", () => {
         if (!retargeted && url.startsWith(targetA) && path === "/v2/manager/queue/start" && method === "POST") {
           retargeted = true;
           target.base = targetB;
+          target.generation += 1;
           resetManagerApiCache("panel retargeted while Manager request was in flight");
         }
       },

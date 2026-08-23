@@ -118,7 +118,13 @@ describe("#444 install invalidates the object_info cache", () => {
 
     // A cache-serving read would STILL return REGISTRY_WITHOUT here; the install
     // must invalidate the snapshot so the next read refetches.
-    await installCustomNode({ id: "comfyui-smart-image-crop", useCmCli: true });
+    await installCustomNode({
+      id: "comfyui-smart-image-crop",
+      useCmCli: true,
+      // The fixture has no live ComfyUI to identify a scan root. Pin the
+      // mocked local workspace explicitly so this test reaches the CLI path.
+      comfyuiPath: "/fake/comfy",
+    });
 
     const after = await validateWorkflow(GRAPH as never, { health: false });
     expect(missingNodeTypes(after)).not.toContain("SmartImageCrop");
