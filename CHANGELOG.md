@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.65] - 2026-08-22
+
+### MCP
+
+#### Fixed
+- validate RunPod readiness JSON
+
+
 ## [0.52.64] - 2026-08-22
 
 ### MCP
