@@ -6,6 +6,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.83] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- reject DNS-ambiguous EZi backend targets
+- route EZi proxy restarts to backend
+- reject malformed kitchen dictionaries
+- enforce kitchen backend payload boundaries
+- harden kitchen backend log parsing
+- parse dictionary-shaped kitchen backend logs
+
+
 ## [0.52.82] - 2026-08-23
 
 ### MCP
