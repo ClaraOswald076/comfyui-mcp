@@ -1444,6 +1444,10 @@ export class RunCompletionJournalImpl {
   }
 
   /** Test/diagnostic helpers. */
+  /** Whether this prompt identity still has an open or terminal ticket. */
+  hasTicket(promptId: string): boolean {
+    return this.tickets.has(promptId);
+  }
   ticketFor(promptId: string): RunTicket | undefined {
     return this.tickets.get(promptId);
   }

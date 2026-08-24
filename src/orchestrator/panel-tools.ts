@@ -1218,6 +1218,15 @@ export const __panelToolsTestHooks = {
   setRunLateAckGraceMs(ms: number | null): void {
     runLateAckGraceMsOverride = ms;
   },
+  /** Mark a synthetic graph_run result as the bridge's authoritative reply timeout. */
+  markRunReplyTimeout(res: ToolResult): ToolResult {
+    Object.defineProperty(res, REPLY_TIMEOUT_RESULT, {
+      value: true,
+      enumerable: false,
+      configurable: true,
+    });
+    return res;
+  },
   /** Shrink the #2078 save-timeout settle grace so a still-dirty follow-up does not wait 5s. */
   setSaveTimeoutSettleGraceMs(ms: number | null): void {
     saveTimeoutSettleGraceMsOverride = ms;
@@ -3386,9 +3395,18 @@ function isMidCommandDisconnectResult(res: ToolResult): boolean {
   );
 }
 
-/** A `graph_run` we wrote and then lost the reply for — timeout or disconnect. */
-function isUnackedGraphRunResult(res: ToolResult): boolean {
-  return isReplyTimeoutResult(res) || isMidCommandDisconnectResult(res);
+/** A `graph_run` whose queue receipt still needs reconciliation. */
+function isUnackedGraphRunResult(res: ToolResult, allowPanelQueueUnknown = false): boolean {
+  if (isReplyTimeoutResult(res) || isMidCommandDisconnectResult(res)) return true;
+  // #1728 — Panel can answer normally with queued_unknown while its scoped
+  // dispatch still has an in-flight /prompt request. Only enter the existing
+  // queue grace when NO prompt id was returned; a partial receipt already has
+  // tickets for its known ids and must not be guessed into a different id. The
+  // caller gates this new inference to panel_run's scoped form; full-graph
+  // uncertainty keeps its existing retry guidance.
+  if (!allowPanelQueueUnknown) return false;
+  const parsed = parseToolResultJson(res);
+  return isPanelQueueUncertainty(parsed) && acceptedPromptIds(parsed).length === 0;
 }
 
 /**
@@ -13673,7 +13691,7 @@ function runLateAckGraceMs(): number {
 /**
  * Wait, bounded, for evidence that a `graph_run` we stopped waiting for still
  * queued — and hand back the reply it would have produced on time (#1175,
- * panel#1524).
+ * panel#1524, panel#1728).
  *
  * Two receipts, in this order:
  *
@@ -13687,7 +13705,8 @@ function runLateAckGraceMs(): number {
  *
  * Returns null when there is nothing to reconcile. The negatives are deliberate:
  *
- *  - NOT an unacked post-write (timeout or disconnect) ⇒ nothing to wait for.
+ *  - NOT an unacked post-write (timeout or disconnect), or the Panel's explicit
+ *    id-less queued_unknown receipt (#1728) ⇒ nothing to wait for.
  *    Gated on the bridge's own typed marks, never on message text: an acked
  *    panel error can quote our timeout/OUTCOME UNKNOWN sentence verbatim
  *    (#1468 round 2), and the difference is whether the tab answered, which
@@ -13714,43 +13733,135 @@ function promptAppearedAfterDispatch(preRunningPromptId: string | null | undefin
   return now;
 }
 
+/** Turn exact Panel-captured ids into the same receipt shape as an on-time reply. */
+function latePanelReceiptResult(
+  parsed: Record<string, unknown> | null,
+  latePromptIds: string[],
+): Record<string, unknown> | null {
+  const ids = [...acceptedPromptIds(parsed)];
+  for (const id of latePromptIds) {
+    if (typeof id === "string" && id.trim() !== "" && !ids.includes(id.trim())) ids.push(id.trim());
+  }
+  if (!ids.length) return null;
+  return {
+    queued: true,
+    prompt_id: ids[0],
+    ...(ids.length > 1 ? { prompt_ids: ids } : {}),
+  };
+}
+
 async function reconcileLateRunAck(
   ctx: PanelToolCtx,
   res: ToolResult,
   rid: string | undefined,
   preRunningPromptId?: string | null,
-): Promise<{ result: unknown; lateByMs: number; via: "ack" | "queue" } | null> {
-  if (!isUnackedGraphRunResult(res)) return null;
-  const fromQueue = (): { result: unknown; lateByMs: number; via: "queue" } | null => {
+  allowPanelQueueUnknown = false,
+  expectedTabId?: string,
+  expectedPromptCount = 1,
+): Promise<{ result: unknown; lateByMs: number; via: "ack" | "queue" | "queue-uncertain" | "receipt" } | null> {
+  const parsed = parseToolResultJson(res);
+  // An exact Panel receipt is safe even when a queued_unknown reply already
+  // carried some ids: the bridge event is the producer's own prompt capture,
+  // not a queue guess. Timeout and mid-command disconnect results also need
+  // this exact path: their later receipt is the only authoritative handoff
+  // available after the transport failed. The old queue path remains
+  // id-less-only below.
+  const receiptEligible =
+    Boolean(rid) &&
+    ((allowPanelQueueUnknown && isPanelQueueUncertainty(parsed)) ||
+      isReplyTimeoutResult(res) ||
+      isMidCommandDisconnectResult(res));
+  const queueEligible = isUnackedGraphRunResult(res, allowPanelQueueUnknown);
+  if (!receiptEligible && !queueEligible) return null;
+  const fromQueue = (): {
+    result: unknown;
+    lateByMs: number;
+    via: "queue" | "queue-uncertain";
+  } | null => {
     const promptId = promptAppearedAfterDispatch(preRunningPromptId);
     if (!promptId) return null;
-    return { result: { queued: true, prompt_id: promptId }, lateByMs: 0, via: "queue" };
+    return {
+      result: { queued: true, prompt_id: promptId },
+      lateByMs: 0,
+      via: isPanelQueueUncertainty(parseToolResultJson(res))
+        ? "queue-uncertain"
+        : "queue",
+    };
   };
   const bridge = ctx.bridge;
   const canPeek =
     Boolean(rid) &&
     typeof bridge?.peekLateMutation === "function" &&
     typeof bridge?.takeLateMutation === "function";
+  const canPeekReceipt =
+    Boolean(rid) &&
+    typeof bridge?.peekLateRunReceipt === "function" &&
+    typeof bridge?.takeLateRunReceipt === "function";
   // Stubbed bridges in unit tests have no late-mutation map. One-shot the queue
   // (no grace wait) so a timeout whose prompt did not change still returns in
   // the same tick it always has.
-  if (!canPeek) return fromQueue();
+  if (!canPeek && !canPeekReceipt) return queueEligible ? fromQueue() : null;
   const startedAt = Date.now();
   const deadline = startedAt + runLateAckGraceMs();
+  const expectedReceipts = Math.max(1, Math.min(64, Math.floor(expectedPromptCount)));
+  const waitForBatchReceipts = receiptEligible && canPeekReceipt && expectedReceipts > 1;
+  let queueCandidate: { result: unknown; via: "queue" | "queue-uncertain" } | null = null;
+  let exactReceiptPromptIds: string[] = [];
   for (;;) {
-    const seen = bridge.peekLateMutation(rid!);
+    if (receiptEligible && canPeekReceipt) {
+      const seenReceipt = bridge.peekLateRunReceipt(rid!);
+      if (seenReceipt && (!expectedTabId || seenReceipt.tabId === expectedTabId)) {
+        for (const id of seenReceipt.promptIds) {
+          if (typeof id === "string" && id.trim() !== "" && !exactReceiptPromptIds.includes(id.trim())) {
+            exactReceiptPromptIds.push(id.trim());
+          }
+        }
+        if (exactReceiptPromptIds.length >= expectedReceipts) {
+          const takenReceipt = bridge.takeLateRunReceipt(rid!);
+          const result = takenReceipt ? latePanelReceiptResult(parsed, takenReceipt.promptIds) : null;
+          if (takenReceipt && result) {
+            return { result, lateByMs: takenReceipt.lateByMs, via: "receipt" };
+          }
+        }
+      }
+    }
+    const seen = canPeek ? bridge.peekLateMutation(rid!) : undefined;
     if (seen) {
-      if (seen.cmd !== "graph_run" || !("result" in seen)) return fromQueue();
+      if (seen.cmd !== "graph_run" || !("result" in seen)) return queueEligible ? fromQueue() : null;
       // Only now is it certain this entry will be USED, so draining it costs the
       // caller nothing: they are about to be handed its contents.
       const taken = bridge.takeLateMutation(rid!);
-      if (!taken || !("result" in taken)) return fromQueue();
+      if (!taken || !("result" in taken)) return queueEligible ? fromQueue() : null;
       return { result: taken.result, lateByMs: taken.lateByMs, via: "ack" };
     }
-    const queued = fromQueue();
-    if (queued) return { ...queued, lateByMs: Date.now() - startedAt };
+    if (queueEligible) {
+      const queued = fromQueue();
+      if (queued) {
+        if (!waitForBatchReceipts) return { ...queued, lateByMs: Date.now() - startedAt };
+        queueCandidate = queued;
+      }
+    }
     const left = deadline - Date.now();
-    if (left <= 0) return null;
+    if (left <= 0) {
+      // Exact ids outrank the weaker QueueMonitor observation even when a
+      // partial batch is all that arrived before the bounded grace expired.
+      // Leave later frames to the post-reconcile handoff and let the ticket
+      // phase drain any ids that arrived between this read and ticketing.
+      if (receiptEligible && canPeekReceipt && exactReceiptPromptIds.length) {
+        const takenReceipt = bridge.takeLateRunReceipt(rid!);
+        const result = takenReceipt
+          ? latePanelReceiptResult(parsed, takenReceipt.promptIds)
+          : latePanelReceiptResult(parsed, exactReceiptPromptIds);
+        if (result) {
+          return {
+            result,
+            lateByMs: takenReceipt?.lateByMs ?? Date.now() - startedAt,
+            via: "receipt",
+          };
+        }
+      }
+      return queueCandidate ? { ...queueCandidate, lateByMs: Date.now() - startedAt } : null;
+    }
     await sleep(Math.max(1, Math.min(RUN_LATE_ACK_POLL_MS, left)));
   }
 }
@@ -13779,6 +13890,28 @@ function queueRunReceiptNote(promptId: string): string {
     `prompt when this command was dispatched. Treating that as this run's receipt (queued:true). ` +
     `Nothing was dispatched a second time. Do NOT re-run: a second panel_run would bill/queue ` +
     `another render behind the one already running.`
+  );
+}
+
+/** #1728 — the Panel answered with queued_unknown, then its late prompt became
+ * visible to the watchdog. That is a bounded receipt, not a second dispatch. */
+function panelQueueUncertainReceiptNote(promptId: string): string {
+  return (
+    `\n\n[RECOVERED] The Panel returned queued_unknown before its scoped dispatch ` +
+    `reported a prompt id, but ComfyUI's queue now contains prompt ${promptId} — which was not ` +
+    `running when this command was dispatched. Treating that observation as this run's receipt ` +
+    `(queued:true) and opening its completion ticket. Nothing was dispatched a second time. ` +
+    `Do NOT re-run: a second panel_run could queue a duplicate render.`
+  );
+}
+
+/** #1728 — exact prompt id sent by the Panel after its graph_run reply window. */
+function panelLateReceiptNote(promptId: string): string {
+  return (
+    `\n\n[RECOVERED] The Panel reported prompt ${promptId} after the scoped dispatch ` +
+    `reply window closed. This is the Panel's exact captured prompt id, so its ` +
+    `completion ticket is now open. Nothing was dispatched a second time; do NOT re-run ` +
+    `panel_run or you may queue a duplicate render.`
   );
 }
 
@@ -16411,25 +16544,105 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         const observeRunRid = (rid: string): void => {
           runRid = rid;
         };
+        const makeRunTicketOpts = () => ({
+          // #884 — the REAL routed tab, captured at dispatch (see runTicketTab):
+          // the panel's `executed` event arrives under that id.
+          tabId: runTicketTab,
+          // #704 — …and WHOSE run it is. Unlike the tab, this owner cannot drift
+          // while a late receipt is being delivered.
+          ...(runTicketConversation !== undefined ? { conversation: runTicketConversation } : {}),
+          ...(typeof args.to_node_id === "number" ? { toNodeId: args.to_node_id } : {}),
+          // #1327 — lets the journal claim a completion that beat its own ticket.
+          dispatchedAt: runDispatchedAt,
+        });
+        let lateReceiptHandoffInstalled = false;
+        const installLateReceiptHandoff = (): void => {
+          const handoffRid = runRid;
+          if (
+            lateReceiptHandoffInstalled ||
+            !handoffRid ||
+            typeof ctx.bridge.registerLateRunReceiptHandoff !== "function"
+          ) {
+            return;
+          }
+          const ticketOpts = makeRunTicketOpts();
+          try {
+            ctx.bridge.registerLateRunReceiptHandoff(handoffRid, runTicketTab, (receipt) => {
+              if (receipt.runRid !== handoffRid || receipt.tabId !== runTicketTab) return;
+              const taken =
+                typeof ctx.bridge.takeLateRunReceipt === "function"
+                  ? ctx.bridge.takeLateRunReceipt(handoffRid)
+                  : undefined;
+              const promptIds = taken?.promptIds ?? receipt.promptIds;
+              const opened: string[] = [];
+              for (const rawId of promptIds) {
+                const id = typeof rawId === "string" ? rawId.trim() : "";
+                if (!id) continue;
+                // The normal reply/queue fallback owns the same stable prompt
+                // identity when it wins the race. A late receipt is only a
+                // transport retry of that identity; reopening the journal
+                // ticket would mark it reused and disable exact correlation.
+                // A settled ticket is equally authoritative: late
+                // at-least-once receipt frames must be a no-op.
+                if (RunCompletions.hasTicket(id)) continue;
+                QueueMonitor.markSelfQueued(id);
+                if (RunCompletions.openRun(id, ticketOpts)) opened.push(id);
+              }
+              if (opened.length) ctx.onRunTicketOpened?.(opened);
+            });
+            lateReceiptHandoffInstalled = true;
+          } catch {
+            // The receipt map remains available to the normal bounded drain;
+            // a handoff installation failure must never redispatch the run.
+          }
+        };
         let lateAckNote = "";
-        let res = await ctx.call(runCmd, 20000, observeRunRid);
+        let res: ToolResult;
+        try {
+          res = await ctx.call(runCmd, 20000, observeRunRid);
+        } catch (err) {
+          // A transport implementation may throw instead of returning the
+          // canonical error result. The dispatch rid is still authoritative:
+          // install the bounded owner before exposing the unknown outcome so a
+          // later exact Panel receipt can open its ticket without redispatch.
+          installLateReceiptHandoff();
+          return fail(
+            `panel_run dispatch failed before a reply could be read — its outcome is UNKNOWN ` +
+              `and it may have queued a render. Do NOT re-run blindly: check the queue ` +
+              `(action:"list") or get_history before deciding. (${err instanceof Error ? err.message : String(err)})`,
+          );
+        }
         // #1175 — fold a late acknowledgement into `res` BEFORE anything reads it,
         // so a recovered run takes the identical path an on-time one takes: the same
         // rejection detection, the same prompt-id ticketing, the same anti-poll
         // guidance. Rebuilding the reply here (rather than describing it) is what
         // makes that possible — `ok()` is exactly what ctx.call would have produced.
         const reconcileRun = async (): Promise<void> => {
-          const recovered = await reconcileLateRunAck(ctx, res, runRid, pre.runningPromptId);
+          const recovered = await reconcileLateRunAck(
+            ctx,
+            res,
+            runRid,
+            pre.runningPromptId,
+            typeof args.to_node_id === "number",
+            runTicketTab,
+            typeof args.batch_count === "number"
+              ? Math.max(1, Math.min(64, Math.floor(args.batch_count)))
+              : 1,
+          );
           if (!recovered) return;
           res = ok(recovered.result);
+          const promptId =
+            typeof (recovered.result as { prompt_id?: unknown }).prompt_id === "string"
+              ? (recovered.result as { prompt_id: string }).prompt_id
+              : "?";
           lateAckNote =
-            recovered.via === "queue"
-              ? queueRunReceiptNote(
-                  typeof (recovered.result as { prompt_id?: unknown }).prompt_id === "string"
-                    ? (recovered.result as { prompt_id: string }).prompt_id
-                    : "?",
-                )
-              : lateRunAckNote(recovered.lateByMs);
+            recovered.via === "receipt"
+              ? panelLateReceiptNote(promptId)
+              : recovered.via === "queue-uncertain"
+              ? panelQueueUncertainReceiptNote(promptId)
+              : recovered.via === "queue"
+                ? queueRunReceiptNote(promptId)
+                : lateRunAckNote(recovered.lateByMs);
         };
         await reconcileRun();
         // Derive the verdict from the AUTHORITATIVE reply, not a bare `queued`
@@ -16490,6 +16703,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             await reconcileRun();
             rejection = detectRunRejection(res);
           } catch (err) {
+            // A retry timeout/transport failure still has a concrete rid when the
+            // bridge accepted the dispatch. Register the bounded exact handoff
+            // before returning so a later Panel receipt can open its ticket.
+            installLateReceiptHandoff();
             // A bridge/late-receipt failure after ctx.call already returned must not
             // erase the retry's own result (notably its retry_of token). Preserve it
             // verbatim and stop: no further dispatch is justified by a failed local
@@ -16531,6 +16748,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           }
         }
         if (rejection) {
+          // Timeout and transport failures can return before the ordinary ticket
+          // phase. Keep this exact rid owner alive before exposing the error.
+          installLateReceiptHandoff();
           // Disclose the re-issue on the failure path too: the caller must know a SECOND
           // dispatch went out. The disclosure states only what is CERTIFIED — that the
           // FIRST dispatch queued nothing — and leaves the second attempt's outcome to be
@@ -16576,7 +16796,31 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // ever ticketed, so completions 2..N came back as
         // "does NOT match any run you queued … its origin is UNDETERMINED" — for
         // runs the agent had just queued itself. Ticket all of them.
-        const queuedIds = acceptedPromptIds(runReply);
+        // The Panel sends exact receipts for every captured batch prompt. A
+        // normal reply can race those frames and expose only its first id, so
+        // consume any still-buffered, route-matching receipt before opening
+        // tickets; otherwise a second exact id could be discarded as merely
+        // redundant.
+        let lateReceiptPromptIds: string[] = [];
+        if (
+          runRid &&
+          typeof ctx.bridge.peekLateRunReceipt === "function" &&
+          typeof ctx.bridge.takeLateRunReceipt === "function"
+        ) {
+          try {
+            const pendingReceipt = ctx.bridge.peekLateRunReceipt(runRid);
+            if (pendingReceipt && pendingReceipt.tabId === runTicketTab) {
+              const takenReceipt = ctx.bridge.takeLateRunReceipt(runRid);
+              lateReceiptPromptIds = takenReceipt?.promptIds ?? [];
+            }
+          } catch {}
+        }
+        const queuedIds = [...acceptedPromptIds(runReply)];
+        for (const id of lateReceiptPromptIds) {
+          if (typeof id === "string" && id.trim() !== "" && !queuedIds.includes(id.trim())) {
+            queuedIds.push(id.trim());
+          }
+        }
         const panelQueueUncertain = isPanelQueueUncertainty(runReply);
         // #944: a run ComfyUI accepted while dropping some outputs reaches here
         // (a minted prompt id outranks the rejection signals). Say which outputs
@@ -16609,18 +16853,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // to this exact call by prompt id. This is what lets the orchestrator
         // journal an undelivered completion and replay it into the right run
         // instead of losing it while the agent works through a goal.
-        const ticketOpts = {
-          // #884 — the REAL routed tab, captured at dispatch (see runTicketTab):
-          // the panel's `executed` event arrives under that id.
-          tabId: runTicketTab,
-          // #704 — …and WHOSE run it is. The tab is where the completion is
-          // expected FROM; this is the conversation that gets to call it its own,
-          // which is what still holds after the panel reconnects under a new id.
-          ...(runTicketConversation !== undefined ? { conversation: runTicketConversation } : {}),
-          ...(typeof args.to_node_id === "number" ? { toNodeId: args.to_node_id } : {}),
-          // #1327 — lets the journal claim a completion that beat its own ticket.
-          dispatchedAt: runDispatchedAt,
-        };
+        const ticketOpts = makeRunTicketOpts();
         // Every id gets its own ticket. `correlatable` stays the promise the
         // anti-poll note is allowed to make — true only if at least one run can
         // actually be correlated back.
@@ -16639,6 +16872,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // returns. Promote that in-memory arm immediately after its journal
         // ticket opens, so a completion burst cannot evict this owed run.
         if (ticketedPromptIds.length) ctx.onRunTicketOpened?.(ticketedPromptIds);
+        // #1728 — install the exact rid-scoped owner AFTER the normal reply or
+        // QueueMonitor fallback has opened its tickets. If a receipt was already
+        // buffered, registration drains it immediately; the handoff's ticket
+        // identity fence then makes that delivery a no-op instead of reopening
+        // the ticket as a reused run.
+        installLateReceiptHandoff();
         // Append anti-poll guidance: the agent should go idle after queuing so the
         // executed event auto-injects the output image, rather than busy-polling.
         //
