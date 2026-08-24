@@ -1726,6 +1726,14 @@ export type LateMutation = {
   result?: unknown;
 };
 
+/** A prompt id captured by the Panel after the graph_run reply window (#1728). */
+export type LateRunReceipt = {
+  runRid: string;
+  tabId: string;
+  promptIds: string[];
+  lateByMs: number;
+};
+
 /**
  * Size ceiling on a RETAINED reply payload (#1175).
  *
@@ -2147,6 +2155,8 @@ export class UiBridge {
     string,
     { ok: true; cmd: string; tabId: string; ts: number; lateByMs: number; result?: unknown }
   >();
+  /** Exact prompt receipts sent by the Panel after its graph_run command returned. */
+  private lateRunReceipts = new Map<string, { tabId: string; promptIds: string[]; ts: number }>();
   /**
    * TTL for both maps above.
    *
@@ -3286,6 +3296,13 @@ export class UiBridge {
           msg.title = this.conns.get(effectiveTab)?.title;
           if (msg.type === "user_message") this.setLastActiveTab(effectiveTab);
         }
+        // #1728 — this is a control receipt, not an agent-facing completion.
+        // Retain it by the original graph_run rid so panel_run can open the
+        // server ticket even when the normal command reply was already returned.
+        if (msg.type === "run_receipt") {
+          this.recordLateRunReceipt(msg, effectiveTab);
+          return;
+        }
         this.deliverPanelEvent(msg as PanelEvent);
       }
     });
@@ -4209,6 +4226,51 @@ export class UiBridge {
     };
   }
 
+  /** Record one exact prompt id from the Panel's late graph_run capture. */
+  private recordLateRunReceipt(msg: Record<string, unknown>, tabId: string | null): void {
+    const runRid = typeof msg.run_rid === "string" ? msg.run_rid.trim() : "";
+    const promptId = typeof msg.prompt_id === "string" ? msg.prompt_id.trim() : "";
+    if (!runRid || !promptId || !tabId) return;
+    this.pruneLateMutations();
+    const prior = this.lateRunReceipts.get(runRid);
+    if (prior && prior.tabId !== tabId) return;
+    const promptIds = prior?.promptIds ?? [];
+    if (!promptIds.includes(promptId)) {
+      // A Panel batch is bounded by the same map cardinality as other late
+      // receipts; never let a forged control frame create an unbounded list.
+      if (promptIds.length >= UiBridge.MAX_LATE_MUTATIONS) return;
+      promptIds.push(promptId);
+    }
+    this.lateRunReceipts.set(runRid, { tabId, promptIds, ts: prior?.ts ?? Date.now() });
+  }
+
+  /** Drain a Panel late prompt receipt once, after panel_run consumes it. */
+  takeLateRunReceipt(runRid: string): LateRunReceipt | undefined {
+    this.pruneLateMutations();
+    const hit = this.lateRunReceipts.get(runRid);
+    if (!hit) return undefined;
+    this.lateRunReceipts.delete(runRid);
+    return {
+      runRid,
+      tabId: hit.tabId,
+      promptIds: [...hit.promptIds],
+      lateByMs: Math.max(0, Date.now() - hit.ts),
+    };
+  }
+
+  /** Peek without draining so panel_run only consumes a receipt it can use. */
+  peekLateRunReceipt(runRid: string): LateRunReceipt | undefined {
+    this.pruneLateMutations();
+    const hit = this.lateRunReceipts.get(runRid);
+    if (!hit) return undefined;
+    return {
+      runRid,
+      tabId: hit.tabId,
+      promptIds: [...hit.promptIds],
+      lateByMs: Math.max(0, Date.now() - hit.ts),
+    };
+  }
+
   /** TTL + cardinality bound for both #694 maps. */
   private pruneLateMutations(): void {
     const now = Date.now();
@@ -4218,11 +4280,14 @@ export class UiBridge {
     for (const [rid, e] of this.lateMutations) {
       if (now - e.ts > UiBridge.LATE_MUTATION_TTL_MS) this.lateMutations.delete(rid);
     }
+    for (const [rid, e] of this.lateRunReceipts) {
+      if (now - e.ts > UiBridge.LATE_MUTATION_TTL_MS) this.lateRunReceipts.delete(rid);
+    }
     // Map iteration is insertion-ordered, so dropping from the front drops the
     // oldest. Quiet, unlike the ask-mapping overflow: losing one of 256 late
     // completions costs the caller a notice they can still get by looking, where
     // losing an ask mapping loses a user's answer outright.
-    for (const map of [this.timedOutMutations, this.lateMutations]) {
+    for (const map of [this.timedOutMutations, this.lateMutations, this.lateRunReceipts]) {
       while (map.size > UiBridge.MAX_LATE_MUTATIONS) {
         const oldest = map.keys().next();
         if (oldest.done) break;

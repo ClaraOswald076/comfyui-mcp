@@ -5541,6 +5541,38 @@ describe("UiBridge.connectedServerOrigins (#952)", () => {
   });
 });
 
+describe("#1728: late panel run receipts", () => {
+  it("retains a rid-correlated receipt without forwarding it as an agent event", async () => {
+    const events: unknown[] = [];
+    const sock = await connectPanel("tab-1728-receipt");
+    bridge.onPanelMessage = (event) => events.push(event);
+
+    sock.send(
+      JSON.stringify({
+        type: "run_receipt",
+        run_rid: "run-rid-1728",
+        prompt_id: "prompt-1728",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(bridge.peekLateRunReceipt("run-rid-1728")).toMatchObject({
+        runRid: "run-rid-1728",
+        tabId: "tab-1728-receipt",
+        promptIds: ["prompt-1728"],
+      }),
+    );
+    expect(events.some((event) => (event as { type?: string }).type === "run_receipt")).toBe(false);
+
+    expect(bridge.takeLateRunReceipt("run-rid-1728")).toMatchObject({
+      runRid: "run-rid-1728",
+      promptIds: ["prompt-1728"],
+    });
+    expect(bridge.peekLateRunReceipt("run-rid-1728")).toBeUndefined();
+    sock.close();
+  });
+});
+
 // #875 — the liveness signal the self-restarter's tunnel gate depends on.
 //
 // isHeadless() is STICKY on purpose (a tab that ever connected headless stays so

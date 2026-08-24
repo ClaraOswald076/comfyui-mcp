@@ -13573,14 +13573,38 @@ function promptAppearedAfterDispatch(preRunningPromptId: string | null | undefin
   return now;
 }
 
+/** Turn exact Panel-captured ids into the same receipt shape as an on-time reply. */
+function latePanelReceiptResult(
+  parsed: Record<string, unknown> | null,
+  latePromptIds: string[],
+): Record<string, unknown> | null {
+  const ids = [...acceptedPromptIds(parsed)];
+  for (const id of latePromptIds) {
+    if (typeof id === "string" && id.trim() !== "" && !ids.includes(id.trim())) ids.push(id.trim());
+  }
+  if (!ids.length) return null;
+  return {
+    queued: true,
+    prompt_id: ids[0],
+    ...(ids.length > 1 ? { prompt_ids: ids } : {}),
+  };
+}
+
 async function reconcileLateRunAck(
   ctx: PanelToolCtx,
   res: ToolResult,
   rid: string | undefined,
   preRunningPromptId?: string | null,
   allowPanelQueueUnknown = false,
-): Promise<{ result: unknown; lateByMs: number; via: "ack" | "queue" | "queue-uncertain" } | null> {
-  if (!isUnackedGraphRunResult(res, allowPanelQueueUnknown)) return null;
+  expectedTabId?: string,
+): Promise<{ result: unknown; lateByMs: number; via: "ack" | "queue" | "queue-uncertain" | "receipt" } | null> {
+  const parsed = parseToolResultJson(res);
+  // An exact Panel receipt is safe even when a queued_unknown reply already
+  // carried some ids: the bridge event is the producer's own prompt capture,
+  // not a queue guess. The old queue path remains id-less-only below.
+  const receiptEligible = allowPanelQueueUnknown && isPanelQueueUncertainty(parsed);
+  const queueEligible = isUnackedGraphRunResult(res, allowPanelQueueUnknown);
+  if (!receiptEligible && !queueEligible) return null;
   const fromQueue = (): {
     result: unknown;
     lateByMs: number;
@@ -13601,24 +13625,40 @@ async function reconcileLateRunAck(
     Boolean(rid) &&
     typeof bridge?.peekLateMutation === "function" &&
     typeof bridge?.takeLateMutation === "function";
+  const canPeekReceipt =
+    Boolean(rid) &&
+    typeof bridge?.peekLateRunReceipt === "function" &&
+    typeof bridge?.takeLateRunReceipt === "function";
   // Stubbed bridges in unit tests have no late-mutation map. One-shot the queue
   // (no grace wait) so a timeout whose prompt did not change still returns in
   // the same tick it always has.
-  if (!canPeek) return fromQueue();
+  if (!canPeek && !canPeekReceipt) return queueEligible ? fromQueue() : null;
   const startedAt = Date.now();
   const deadline = startedAt + runLateAckGraceMs();
   for (;;) {
-    const seen = bridge.peekLateMutation(rid!);
+    if (receiptEligible && canPeekReceipt) {
+      const seenReceipt = bridge.peekLateRunReceipt(rid!);
+      if (seenReceipt && (!expectedTabId || seenReceipt.tabId === expectedTabId)) {
+        const takenReceipt = bridge.takeLateRunReceipt(rid!);
+        const result = takenReceipt ? latePanelReceiptResult(parsed, takenReceipt.promptIds) : null;
+        if (takenReceipt && result) {
+          return { result, lateByMs: takenReceipt.lateByMs, via: "receipt" };
+        }
+      }
+    }
+    const seen = canPeek ? bridge.peekLateMutation(rid!) : undefined;
     if (seen) {
-      if (seen.cmd !== "graph_run" || !("result" in seen)) return fromQueue();
+      if (seen.cmd !== "graph_run" || !("result" in seen)) return queueEligible ? fromQueue() : null;
       // Only now is it certain this entry will be USED, so draining it costs the
       // caller nothing: they are about to be handed its contents.
       const taken = bridge.takeLateMutation(rid!);
-      if (!taken || !("result" in taken)) return fromQueue();
+      if (!taken || !("result" in taken)) return queueEligible ? fromQueue() : null;
       return { result: taken.result, lateByMs: taken.lateByMs, via: "ack" };
     }
-    const queued = fromQueue();
-    if (queued) return { ...queued, lateByMs: Date.now() - startedAt };
+    if (queueEligible) {
+      const queued = fromQueue();
+      if (queued) return { ...queued, lateByMs: Date.now() - startedAt };
+    }
     const left = deadline - Date.now();
     if (left <= 0) return null;
     await sleep(Math.max(1, Math.min(RUN_LATE_ACK_POLL_MS, left)));
@@ -13661,6 +13701,16 @@ function panelQueueUncertainReceiptNote(promptId: string): string {
     `running when this command was dispatched. Treating that observation as this run's receipt ` +
     `(queued:true) and opening its completion ticket. Nothing was dispatched a second time. ` +
     `Do NOT re-run: a second panel_run could queue a duplicate render.`
+  );
+}
+
+/** #1728 — exact prompt id sent by the Panel after its graph_run reply window. */
+function panelLateReceiptNote(promptId: string): string {
+  return (
+    `\n\n[RECOVERED] The Panel reported prompt ${promptId} after the scoped dispatch ` +
+    `reply window closed. This is the Panel's exact captured prompt id, so its ` +
+    `completion ticket is now open. Nothing was dispatched a second time; do NOT re-run ` +
+    `panel_run or you may queue a duplicate render.`
   );
 }
 
@@ -16307,6 +16357,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             runRid,
             pre.runningPromptId,
             typeof args.to_node_id === "number",
+            runTicketTab,
           );
           if (!recovered) return;
           res = ok(recovered.result);
@@ -16315,7 +16366,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               ? (recovered.result as { prompt_id: string }).prompt_id
               : "?";
           lateAckNote =
-            recovered.via === "queue-uncertain"
+            recovered.via === "receipt"
+              ? panelLateReceiptNote(promptId)
+              : recovered.via === "queue-uncertain"
               ? panelQueueUncertainReceiptNote(promptId)
               : recovered.via === "queue"
                 ? queueRunReceiptNote(promptId)
@@ -16466,7 +16519,31 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // ever ticketed, so completions 2..N came back as
         // "does NOT match any run you queued … its origin is UNDETERMINED" — for
         // runs the agent had just queued itself. Ticket all of them.
-        const queuedIds = acceptedPromptIds(runReply);
+        // The Panel sends exact receipts for every captured batch prompt. A
+        // normal reply can race those frames and expose only its first id, so
+        // consume any still-buffered, route-matching receipt before opening
+        // tickets; otherwise a second exact id could be discarded as merely
+        // redundant.
+        let lateReceiptPromptIds: string[] = [];
+        if (
+          runRid &&
+          typeof ctx.bridge.peekLateRunReceipt === "function" &&
+          typeof ctx.bridge.takeLateRunReceipt === "function"
+        ) {
+          try {
+            const pendingReceipt = ctx.bridge.peekLateRunReceipt(runRid);
+            if (pendingReceipt && pendingReceipt.tabId === runTicketTab) {
+              const takenReceipt = ctx.bridge.takeLateRunReceipt(runRid);
+              lateReceiptPromptIds = takenReceipt?.promptIds ?? [];
+            }
+          } catch {}
+        }
+        const queuedIds = [...acceptedPromptIds(runReply)];
+        for (const id of lateReceiptPromptIds) {
+          if (typeof id === "string" && id.trim() !== "" && !queuedIds.includes(id.trim())) {
+            queuedIds.push(id.trim());
+          }
+        }
         const panelQueueUncertain = isPanelQueueUncertainty(runReply);
         // #944: a run ComfyUI accepted while dropping some outputs reaches here
         // (a minted prompt id outranks the rejection signals). Say which outputs

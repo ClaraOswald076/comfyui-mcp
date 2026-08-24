@@ -56,17 +56,26 @@ afterEach(() => {
 describe("panel_run late prompt reconciliation (#1728)", () => {
   it("turns an id-less queued_unknown receipt into one ticket without redispatch", async () => {
     let calls = 0;
+    let receiptTaken = false;
     const bridge = {
       send: async () => ({}),
       canReach: () => true,
+      peekLateRunReceipt: (runRid: string) =>
+        runRid === "run-rid-1728"
+          ? { runRid, tabId: "panel-1728", promptIds: ["prompt-1728"], lateByMs: 25 }
+          : undefined,
+      takeLateRunReceipt: (runRid: string) => {
+        if (runRid !== "run-rid-1728" || receiptTaken) return undefined;
+        receiptTaken = true;
+        return { runRid, tabId: "panel-1728", promptIds: ["prompt-1728"], lateByMs: 25 };
+      },
     } as unknown as PanelToolCtx["bridge"];
     const ctx = makePanelToolCtx(bridge, "panel-1728");
-    ctx.call = async () => {
+    ctx.call = async (_cmd, _timeout, observeRid) => {
       calls++;
+      observeRid?.("run-rid-1728");
       // This is the late watchdog observation: the Panel has already answered
       // queued_unknown, but a new prompt is now visible after this dispatch.
-      qm.state.runningPromptId = "prompt-1728";
-      qm.state.queueRemaining = 1;
       return {
         content: [
           {
@@ -89,8 +98,31 @@ describe("panel_run late prompt reconciliation (#1728)", () => {
     expect(res.isError).toBeFalsy();
     expect(text).toMatch(/"prompt_id"\s*:\s*"prompt-1728"/);
     expect(text).toContain("[RECOVERED]");
-    expect(text).toContain("opening its completion ticket");
+    expect(text).toContain("completion ticket");
     expect(RunCompletions.ticketFor("prompt-1728")?.promptId).toBe("prompt-1728");
+    expect(receiptTaken).toBe(true);
+
+    // The real journal path now correlates the later bridge executed frame to
+    // the ticket, and its pending coalescer keeps duplicate frames to one entry.
+    const ticket = RunCompletions.ticketFor("prompt-1728");
+    const first = RunCompletions.record(
+      "panel-1728",
+      { kind: "executed", prompt_id: "prompt-1728", images: [{ filename: "out.png" }] },
+      ticket?.conversation === undefined ? undefined : { conversation: ticket.conversation },
+    );
+    const second = RunCompletions.record(
+      "panel-1728",
+      { kind: "executed", prompt_id: "prompt-1728", images: [{ filename: "out.png" }] },
+      ticket?.conversation === undefined ? undefined : { conversation: ticket.conversation },
+    );
+    expect(first.correlation.status).toBe("matched");
+    expect(second.correlation.status).toBe("matched");
+    const frames: unknown[] = [];
+    RunCompletions.deliverPending("panel-1728", (payload) => {
+      frames.push(payload);
+      return true;
+    });
+    expect(frames).toHaveLength(1);
   });
 
   it("does not infer a full-graph queued_unknown result from a queue observation", async () => {
