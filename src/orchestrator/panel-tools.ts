@@ -16578,6 +16578,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               for (const rawId of promptIds) {
                 const id = typeof rawId === "string" ? rawId.trim() : "";
                 if (!id) continue;
+                // The normal reply/queue fallback owns the same stable prompt
+                // identity when it wins the race. A late receipt is only a
+                // transport retry of that identity; reopening the journal
+                // ticket would mark it reused and disable exact correlation.
+                // A settled ticket is equally authoritative: late
+                // at-least-once receipt frames must be a no-op.
+                if (RunCompletions.hasTicket(id)) continue;
                 QueueMonitor.markSelfQueued(id);
                 if (RunCompletions.openRun(id, ticketOpts)) opened.push(id);
               }
@@ -16590,7 +16597,21 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           }
         };
         let lateAckNote = "";
-        let res = await ctx.call(runCmd, 20000, observeRunRid);
+        let res: ToolResult;
+        try {
+          res = await ctx.call(runCmd, 20000, observeRunRid);
+        } catch (err) {
+          // A transport implementation may throw instead of returning the
+          // canonical error result. The dispatch rid is still authoritative:
+          // install the bounded owner before exposing the unknown outcome so a
+          // later exact Panel receipt can open its ticket without redispatch.
+          installLateReceiptHandoff();
+          return fail(
+            `panel_run dispatch failed before a reply could be read — its outcome is UNKNOWN ` +
+              `and it may have queued a render. Do NOT re-run blindly: check the queue ` +
+              `(action:"list") or get_history before deciding. (${err instanceof Error ? err.message : String(err)})`,
+          );
+        }
         // #1175 — fold a late acknowledgement into `res` BEFORE anything reads it,
         // so a recovered run takes the identical path an on-time one takes: the same
         // rejection detection, the same prompt-id ticketing, the same anti-poll
@@ -16833,12 +16854,6 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // journal an undelivered completion and replay it into the right run
         // instead of losing it while the agent works through a goal.
         const ticketOpts = makeRunTicketOpts();
-        // #1728 — keep an exact, rid-scoped owner alive after the bounded
-        // reconcile. A receipt can be delayed by a closed/reconnecting Panel
-        // route and arrive after this handler has already returned its
-        // queued_unknown recovery. The owner opens only exact prompt tickets;
-        // RunCompletions.openRun remains the idempotency fence.
-        installLateReceiptHandoff();
         // Every id gets its own ticket. `correlatable` stays the promise the
         // anti-poll note is allowed to make — true only if at least one run can
         // actually be correlated back.
@@ -16857,6 +16872,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // returns. Promote that in-memory arm immediately after its journal
         // ticket opens, so a completion burst cannot evict this owed run.
         if (ticketedPromptIds.length) ctx.onRunTicketOpened?.(ticketedPromptIds);
+        // #1728 — install the exact rid-scoped owner AFTER the normal reply or
+        // QueueMonitor fallback has opened its tickets. If a receipt was already
+        // buffered, registration drains it immediately; the handoff's ticket
+        // identity fence then makes that delivery a no-op instead of reopening
+        // the ticket as a reused run.
+        installLateReceiptHandoff();
         // Append anti-poll guidance: the agent should go idle after queuing so the
         // executed event auto-injects the output image, rather than busy-polling.
         //

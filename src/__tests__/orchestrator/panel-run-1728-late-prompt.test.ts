@@ -158,6 +158,135 @@ describe("panel_run late prompt reconciliation (#1728)", () => {
     expect(RunCompletions.ticketFor("prompt-full-foreign")).toBeUndefined();
   });
 
+  it("does not reopen a normal-reply ticket when its exact receipt arrives later", async () => {
+    let handoff: ((receipt: { runRid: string; tabId: string; promptIds: string[] }) => void) | null = null;
+    let receipt: { runRid: string; tabId: string; promptIds: string[] } | undefined;
+    const bridge = {
+      send: async () => ({}),
+      canReach: () => true,
+      peekLateRunReceipt: (runRid: string) =>
+        receipt && receipt.runRid === runRid ? { ...receipt, lateByMs: 250 } : undefined,
+      takeLateRunReceipt: (runRid: string) => {
+        if (!receipt || receipt.runRid !== runRid) return undefined;
+        const taken = { ...receipt, lateByMs: 250 };
+        receipt = undefined;
+        return taken;
+      },
+      registerLateRunReceiptHandoff: (_rid: string, _tabId: string, onReceipt: typeof handoff) => {
+        handoff = onReceipt;
+        return () => {
+          handoff = null;
+        };
+      },
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "panel-normal-late-1728");
+    ctx.call = async (_cmd, _timeout, observeRid) => {
+      observeRid?.("run-rid-normal-late-1728");
+      return {
+        content: [
+          { type: "text", text: JSON.stringify({ queued: true, prompt_id: "prompt-normal-late-1728" }) },
+        ],
+      };
+    };
+
+    await panelRun().handler({ to_node_id: 38 }, ctx);
+    const ticketBeforeReceipt = RunCompletions.ticketFor("prompt-normal-late-1728");
+    expect(ticketBeforeReceipt?.reused).toBeUndefined();
+    const seqBeforeReceipt = ticketBeforeReceipt?.seq;
+
+    receipt = {
+      runRid: "run-rid-normal-late-1728",
+      tabId: "panel-normal-late-1728",
+      promptIds: ["prompt-normal-late-1728"],
+    };
+    handoff?.(receipt);
+
+    const ticketAfterReceipt = RunCompletions.ticketFor("prompt-normal-late-1728");
+    expect(ticketAfterReceipt?.seq).toBe(seqBeforeReceipt);
+    expect(ticketAfterReceipt?.reused).toBeUndefined();
+    RunCompletions.record(
+      "panel-normal-late-1728",
+      { kind: "executed", prompt_id: "prompt-normal-late-1728" },
+      undefined,
+    );
+    RunCompletions.record(
+      "panel-normal-late-1728",
+      { kind: "executed", prompt_id: "prompt-normal-late-1728" },
+      undefined,
+    );
+    const frames: unknown[] = [];
+    RunCompletions.deliverPending("panel-normal-late-1728", (payload) => {
+      frames.push(payload);
+      return true;
+    });
+    expect(frames).toHaveLength(1);
+  });
+
+  it("does not reopen a QueueMonitor fallback ticket when its exact receipt arrives later", async () => {
+    let handoff: ((receipt: { runRid: string; tabId: string; promptIds: string[] }) => void) | null = null;
+    let receipt: { runRid: string; tabId: string; promptIds: string[] } | undefined;
+    const bridge = {
+      send: async () => ({}),
+      canReach: () => true,
+      peekLateRunReceipt: (runRid: string) =>
+        receipt && receipt.runRid === runRid ? { ...receipt, lateByMs: 250 } : undefined,
+      takeLateRunReceipt: (runRid: string) => {
+        if (!receipt || receipt.runRid !== runRid) return undefined;
+        const taken = { ...receipt, lateByMs: 250 };
+        receipt = undefined;
+        return taken;
+      },
+      registerLateRunReceiptHandoff: (_rid: string, _tabId: string, onReceipt: typeof handoff) => {
+        handoff = onReceipt;
+        return () => {
+          handoff = null;
+        };
+      },
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "panel-queue-fallback-1728");
+    ctx.call = async (_cmd, _timeout, observeRid) => {
+      observeRid?.("run-rid-queue-fallback-1728");
+      qm.state.runningPromptId = "prompt-queue-fallback-1728";
+      return {
+        content: [
+          { type: "text", text: JSON.stringify({ queued_unknown: true, indeterminate_count: 1, inFlight: 1 }) },
+        ],
+      };
+    };
+
+    await panelRun().handler({ to_node_id: 38 }, ctx);
+    const ticketBeforeReceipt = RunCompletions.ticketFor("prompt-queue-fallback-1728");
+    expect(ticketBeforeReceipt?.reused).toBeUndefined();
+    const seqBeforeReceipt = ticketBeforeReceipt?.seq;
+
+    receipt = {
+      runRid: "run-rid-queue-fallback-1728",
+      tabId: "panel-queue-fallback-1728",
+      promptIds: ["prompt-queue-fallback-1728"],
+    };
+    handoff?.(receipt);
+
+    const ticketAfterReceipt = RunCompletions.ticketFor("prompt-queue-fallback-1728");
+    expect(ticketAfterReceipt?.seq).toBe(seqBeforeReceipt);
+    expect(ticketAfterReceipt?.reused).toBeUndefined();
+    RunCompletions.record(
+      "panel-queue-fallback-1728",
+      { kind: "executed", prompt_id: "prompt-queue-fallback-1728" },
+      undefined,
+    );
+    RunCompletions.record(
+      "panel-queue-fallback-1728",
+      { kind: "executed", prompt_id: "prompt-queue-fallback-1728" },
+      undefined,
+    );
+    const frames: unknown[] = [];
+    RunCompletions.deliverPending("panel-queue-fallback-1728", (payload) => {
+      frames.push(payload);
+      return true;
+    });
+    expect(frames).toHaveLength(1);
+  });
+
   it("waits for the complete exact batch before falling back to the first queue prompt", async () => {
     let calls = 0;
     let receiptReads = 0;
@@ -349,6 +478,64 @@ describe("panel_run late prompt reconciliation (#1728)", () => {
     );
     const frames: unknown[] = [];
     RunCompletions.deliverPending("panel-timeout-1728", (payload) => {
+      frames.push(payload);
+      return true;
+    });
+    expect(frames).toHaveLength(1);
+  });
+
+  it("registers a transport handoff when ctx.call throws before returning", async () => {
+    let handoff: ((receipt: { runRid: string; tabId: string; promptIds: string[] }) => void) | null = null;
+    let receipt: { runRid: string; tabId: string; promptIds: string[] } | undefined;
+    const bridge = {
+      send: async () => ({}),
+      canReach: () => true,
+      peekLateRunReceipt: (runRid: string) =>
+        receipt && receipt.runRid === runRid ? { ...receipt, lateByMs: 250 } : undefined,
+      takeLateRunReceipt: (runRid: string) => {
+        if (!receipt || receipt.runRid !== runRid) return undefined;
+        const taken = { ...receipt, lateByMs: 250 };
+        receipt = undefined;
+        return taken;
+      },
+      registerLateRunReceiptHandoff: (_rid: string, _tabId: string, onReceipt: typeof handoff) => {
+        handoff = onReceipt;
+        return () => {
+          handoff = null;
+        };
+      },
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "panel-disconnect-1728");
+    ctx.call = async (_cmd, _timeout, observeRid) => {
+      observeRid?.("run-rid-disconnect-1728");
+      throw new Error("bridge socket closed after dispatch");
+    };
+
+    const res = await panelRun().handler({ to_node_id: 38 }, ctx);
+    expect(res.isError).toBe(true);
+    expect(handoff).toBeTypeOf("function");
+
+    receipt = {
+      runRid: "run-rid-disconnect-1728",
+      tabId: "panel-disconnect-1728",
+      promptIds: ["prompt-after-disconnect-1728"],
+    };
+    handoff?.(receipt);
+    expect(RunCompletions.ticketFor("prompt-after-disconnect-1728")?.promptId).toBe(
+      "prompt-after-disconnect-1728",
+    );
+    RunCompletions.record(
+      "panel-disconnect-1728",
+      { kind: "executed", prompt_id: "prompt-after-disconnect-1728" },
+      undefined,
+    );
+    RunCompletions.record(
+      "panel-disconnect-1728",
+      { kind: "executed", prompt_id: "prompt-after-disconnect-1728" },
+      undefined,
+    );
+    const frames: unknown[] = [];
+    RunCompletions.deliverPending("panel-disconnect-1728", (payload) => {
       frames.push(payload);
       return true;
     });
