@@ -8,8 +8,9 @@
 //
 //   - PUBLISHED installs (global / local / npx): periodically re-check the npm
 //     registry. global/local self-update on disk (self-update.ts) and then
-//     restart into the new code; npx respawns pinned to the new version (npx
-//     fetches it on launch).
+//     restart into the new code; an UNPINNED npx launch respawns pinned to the
+//     new version (npx fetches it on launch). An exact npx version pin is a
+//     stability boundary and is never replaced by this process.
 //   - DEV installs (npm link / checkout): NEVER touch the disk — instead watch
 //     the running entry script's mtime and restart when a rebuild lands, so
 //     `npm run build` is all a developer needs.
@@ -36,7 +37,8 @@
 //   COMFYUI_MCP_UPDATE_CHECK_MS        registry re-check period (default 1h)
 
 import { spawn } from "node:child_process";
-import { statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
+import { join, resolve } from "node:path";
 import {
   PACKAGE_NAME,
   checkAndSelfUpdate,
@@ -65,8 +67,88 @@ const IDLE_POLL_MS = 5_000;
  *  than this (change-driven triggers make a true loop impossible anyway). */
 const MIN_UPTIME_MS = 2 * 60 * 1000;
 
+/** npm's exec runner passes the package spec that selected this process. */
+const NPX_PACKAGE_SPEC_ENV = "npm_config_package";
+/** An exact version is a pin; tags and ranges retain the normal update policy. */
+const EXACT_VERSION_SPEC =
+  /^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+
+function envValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const key = Object.keys(env).find((candidate) => candidate.toLowerCase() === name);
+  return key === undefined ? undefined : env[key];
+}
+
+function exactVersionFromSpec(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const prefix = `${PACKAGE_NAME}@`;
+  if (!raw.toLowerCase().startsWith(prefix)) return undefined;
+  const requested = raw.slice(prefix.length).trim();
+  return EXACT_VERSION_SPEC.test(requested) ? requested : undefined;
+}
+
+/** Read the launch spec npm records beside an npx execution cache. */
+function npxCachePackageSpec(packageDir: string | undefined): string | undefined {
+  if (!packageDir) return undefined;
+  try {
+    // npx's package root is `_npx/<hash>`, two levels above the resolved
+    // package (`_npx/<hash>/node_modules/comfyui-mcp`). Its `_npx.packages`
+    // entry preserves an exact positional spec even though the child process
+    // itself receives only the resolved package's argv.
+    const cacheRoot = resolve(packageDir, "..", "..");
+    const metadata = JSON.parse(
+      readFileSync(join(cacheRoot, "package.json"), "utf8"),
+    ) as { _npx?: { packages?: unknown } };
+    const packages = metadata._npx?.packages;
+    if (!Array.isArray(packages)) return undefined;
+    return packages.find(
+      (candidate): candidate is string =>
+        typeof candidate === "string" && candidate.toLowerCase().startsWith(`${PACKAGE_NAME}@`),
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+/** Parse a raw npx command line when one is available to the caller. */
+function npxArgvPackageSpec(argv: readonly string[]): string | undefined {
+  const npxIndex = argv.findIndex((arg) => /(?:^|[\\/])npx(?:\.cmd)?$/i.test(arg));
+  if (npxIndex < 0) return undefined;
+  for (const arg of argv.slice(npxIndex + 1)) {
+    if (arg === "--" || arg === "-y" || arg === "--yes") continue;
+    if (arg.startsWith("-")) continue;
+    if (arg.toLowerCase().startsWith(`${PACKAGE_NAME}@`)) return arg;
+    if (arg.toLowerCase() === PACKAGE_NAME) return undefined;
+    break;
+  }
+  return undefined;
+}
+
+/**
+ * Return the exact version requested by the npx invocation, if one is known.
+ *
+ * Positional npx launches do not pass their package spec in the child
+ * environment or argv. npm does preserve it in the npx cache-root manifest;
+ * that is the production source of truth. Environment/raw-command fallbacks
+ * keep this helper useful for alternate npm runners and direct tests. Treat
+ * only an exact semver as a pin: a bare package, `@latest`, and ranges/tags
+ * retain the existing auto-update behavior.
+ */
+export function npxVersionPin(
+  env: NodeJS.ProcessEnv = process.env,
+  packageDir?: string,
+  argv: readonly string[] = process.argv,
+): string | undefined {
+  return (
+    exactVersionFromSpec(envValue(env, NPX_PACKAGE_SPEC_ENV)?.trim()) ??
+    exactVersionFromSpec(npxArgvPackageSpec(argv)) ??
+    exactVersionFromSpec(npxCachePackageSpec(packageDir))
+  );
+}
+
 export interface SelfRestartDeps {
   env: () => NodeJS.ProcessEnv;
+  /** Raw process argv, injectable for launch-shape tests. */
+  argv?: () => readonly string[];
   detectInstall: () => InstallInfo;
   /** self-update.ts policy engine (updates global/local installs on disk). */
   checkAndSelfUpdate: typeof checkAndSelfUpdate;
@@ -246,6 +328,8 @@ export class SelfRestarter {
   private restarting = false;
   /** Versions already announced when restart is disabled — once each. */
   private announced = new Set<string>();
+  /** Exact npx launch pins are intentional and must not trigger a replacement. */
+  private readonly npxPin: string | undefined;
   /** apply_updates_now: one tick (and its armed restart) may ignore the gate. */
   private forceApply = false;
   stopped = false;
@@ -253,6 +337,10 @@ export class SelfRestarter {
   constructor(deps: Partial<SelfRestartDeps> = {}) {
     this.deps = { ...defaultSelfRestartDeps, ...deps };
     this.info = this.deps.detectInstall();
+    this.npxPin =
+      this.info.mode === "npx"
+        ? npxVersionPin(this.deps.env(), this.info.packageDir, this.deps.argv?.() ?? process.argv)
+        : undefined;
   }
 
   /** Wire the periodic checks. No-op when the master switch is off. */
@@ -266,6 +354,11 @@ export class SelfRestarter {
     if (gen > 0) {
       logger.info(
         `[self-restart] running v${this.info.currentVersion ?? "?"} after self-restart (gen ${gen}, ${this.info.mode})`,
+      );
+    }
+    if (this.npxPin) {
+      logger.info(
+        `[self-restart] npx launch is pinned to ${this.npxPin} — automatic version replacement is disabled`,
       );
     }
 
@@ -353,7 +446,11 @@ export class SelfRestarter {
         return;
       }
       if (this.info.mode === "npx") {
-        // npx can't be updated on disk — respawn pinned to the new version.
+        // npx can't be updated on disk — an unpinned launch respawns pinned to
+        // the new version. An exact package spec is an explicit stability
+        // boundary; never turn `@0.52.66` into `@0.52.67` from inside the
+        // healthy process.
+        if (this.npxPin) return;
         const latest = await this.deps.latestVersion();
         const current = this.info.currentVersion;
         if (!latest || !current || !isNewer(latest, current)) {
