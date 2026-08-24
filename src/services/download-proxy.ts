@@ -1,7 +1,9 @@
 import { execFile } from "node:child_process";
+import { isIP } from "node:net";
 import { platform } from "node:os";
 import { promisify } from "node:util";
 import { EnvHttpProxyAgent, ProxyAgent, type Dispatcher } from "undici";
+import { assertHostResolvesSafe, isBlockedHost } from "./workflow-url.js";
 import { logger } from "../utils/logger.js";
 
 export type DownloadRoute = "direct" | "proxied";
@@ -14,6 +16,7 @@ export type DownloadFetch = (input: FetchInput, init?: FetchInit) => Promise<Res
 const execFileAsync = promisify(execFile);
 const WINDOWS_INTERNET_SETTINGS = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
 const WINDOWS_PROXY_QUERY_TIMEOUT_MS = 1_000;
+const PROXY_DNS_CHECK_TIMEOUT_MS = 1_000;
 
 interface ProxyChoice {
   route: DownloadRoute;
@@ -21,7 +24,7 @@ interface ProxyChoice {
 }
 
 interface ProxyState {
-  choose(url: URL): ProxyChoice;
+  choose(url: URL): ProxyChoice | Promise<ProxyChoice>;
 }
 
 interface ProxyOverrides {
@@ -61,24 +64,31 @@ function normalizedHost(hostname: string): string {
   return hostname.replace(/^\[|\]$/g, "").toLowerCase().replace(/\.$/, "");
 }
 
-/** Loopback is always direct. A local ComfyUI API must not accidentally inherit
- * a model-download proxy merely because the two requests share this process. */
+/** Internal and non-public targets are always direct. A local ComfyUI API must
+ * not inherit a model-download proxy merely because the two requests share this
+ * process, and a corporate proxy must not become an SSRF path to private hosts. */
 export function isDirectLocalHost(hostname: string): boolean {
-  const host = normalizedHost(hostname);
-  if (
-    host === "localhost" ||
-    host.endsWith(".localhost") ||
-    host === "::1" ||
-    host === "::" ||
-    host === "0.0.0.0"
-  ) {
+  return isBlockedHost(normalizedHost(hostname));
+}
+
+/** Only a target proven public may use a configured proxy. A DNS failure is
+ * deliberately direct/fail-closed: the proxy must never be asked to resolve an
+ * unknown hostname on our behalf. Every redirect hop calls this again through
+ * the download fetch seam. */
+async function shouldBypassProxy(url: URL): Promise<boolean> {
+  const host = normalizedHost(url.hostname);
+  if (isDirectLocalHost(host)) return true;
+  if (isIP(host) !== 0) return false;
+  try {
+    await assertHostResolvesSafe(host, PROXY_DNS_CHECK_TIMEOUT_MS);
+    return false;
+  } catch (error) {
+    logger.debug("Could not prove that a model-download host is public; using a direct route.", {
+      host,
+      error: error instanceof Error ? error.message : String(error),
+    });
     return true;
   }
-  if (/^(?:0|127)(?:\.\d{1,3}){3}$/.test(host)) {
-    const octets = host.split(".").map(Number);
-    return octets.every((n) => n >= 0 && n <= 255) && octets[0] === 127;
-  }
-  return false;
 }
 
 function noProxyHostAndPort(value: string): { host: string; port?: string } {
@@ -148,12 +158,12 @@ export function parseProxyServer(raw: string | undefined): { http?: string; http
   return out;
 }
 
-function proxyChoiceForStatic(
+async function proxyChoiceForStatic(
   url: URL,
   agents: { http?: Dispatcher; https?: Dispatcher },
   noProxy: string | undefined,
-): ProxyChoice {
-  if (isDirectLocalHost(url.hostname) || matchesNoProxy(url, noProxy)) return { route: "direct" };
+): Promise<ProxyChoice> {
+  if (matchesNoProxy(url, noProxy) || (await shouldBypassProxy(url))) return { route: "direct" };
   const dispatcher = url.protocol === "https:" ? agents.https : agents.http;
   return dispatcher ? { route: "proxied", dispatcher } : { route: "direct" };
 }
@@ -221,9 +231,13 @@ function envProxyState(): ProxyState | undefined {
       noProxy,
     });
     return {
-      choose: (url) => {
+      choose: async (url) => {
         const configuredProxy = url.protocol === "https:" ? (httpsProxy ?? httpProxy) : httpProxy;
-        return isDirectLocalHost(url.hostname) || matchesNoProxy(url, noProxy) || !configuredProxy
+        return (
+          matchesNoProxy(url, noProxy) ||
+          (await shouldBypassProxy(url)) ||
+          !configuredProxy
+        )
           ? { route: "direct" }
           : { route: "proxied", dispatcher };
       },
@@ -242,8 +256,8 @@ async function loadProxyState(): Promise<ProxyState> {
     try {
       const dispatcher = new ProxyAgent(normalizeProxyUrl(explicit));
       return {
-        choose: (url) =>
-          isDirectLocalHost(url.hostname) ? { route: "direct" } : { route: "proxied", dispatcher },
+        choose: async (url) =>
+          (await shouldBypassProxy(url)) ? { route: "direct" } : { route: "proxied", dispatcher },
       };
     } catch (error) {
       logger.warn("Ignoring invalid COMFYUI_DOWNLOAD_PROXY; model downloads will use a direct route.", {

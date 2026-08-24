@@ -130,14 +130,19 @@ export function isBlockedHost(host: string): boolean {
   // IPv6 (URL.hostname strips the surrounding brackets).
   if (host.includes(":")) {
     const h = host.replace(/^\[|\]$/g, "");
-    if (h === "::1" || h === "::") return true; // loopback / unspecified
-    const low = h.toLowerCase();
+    const low = canonicalIpv6Host(h);
+    if (low === "::1" || low === "::") return true; // loopback / unspecified
     // Unique-local fc00::/7 (fc.. / fd..) and link-local fe80::/10 (fe8/fe9/fea/feb).
     if (/^f[cd]/.test(low)) return true;
     if (/^fe[89ab]/.test(low)) return true;
-    // IPv4-mapped IPv6 (::ffff:127.0.0.1) — extract the trailing v4 literal.
-    const v4 = low.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
-    if (v4) return isBlockedIpv4(v4[1]);
+    // IPv4-mapped IPv6 (::ffff:127.0.0.1 and ::ffff:7f00:1) — URL canonicalizes
+    // both spellings to the hexadecimal form, so classify the embedded v4 value.
+    const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(low);
+    if (mapped) {
+      const hi = Number.parseInt(mapped[1], 16);
+      const lo = Number.parseInt(mapped[2], 16);
+      return isBlockedIpv4(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+    }
     return false;
   }
 
@@ -147,6 +152,15 @@ export function isBlockedHost(host: string): boolean {
   }
 
   return false;
+}
+
+function canonicalIpv6Host(host: string): string {
+  const low = host.toLowerCase();
+  try {
+    return new URL(`http://[${low}]/`).hostname.replace(/^\[|\]$/g, "");
+  } catch {
+    return low;
+  }
 }
 
 function isBlockedIpv4(ip: string): boolean {

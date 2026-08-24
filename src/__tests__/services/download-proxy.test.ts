@@ -10,6 +10,13 @@ import {
 } from "../../services/download-proxy.js";
 import { downloadWithCache, probeRemoteModelPayload } from "../../services/download-cache.js";
 
+// Keep DNS deterministic and offline. The proxy policy must inspect every
+// address returned for a hostname before it is allowed to use a dispatcher.
+const lookupMock = vi.fn(async () => [{ address: "93.184.216.34", family: 4 }]);
+vi.mock("node:dns/promises", () => ({
+  lookup: (...args: unknown[]) => lookupMock(...args),
+}));
+
 function dispatcherOf(call: unknown[]): unknown {
   return (call[1] as { dispatcher?: unknown } | undefined)?.dispatcher;
 }
@@ -27,12 +34,15 @@ describe("download-only proxy routing (#2136)", () => {
   beforeEach(() => {
     vi.unstubAllEnvs();
     __downloadProxyTestHooks.reset();
+    lookupMock.mockReset();
+    lookupMock.mockResolvedValue([{ address: "93.184.216.34", family: 4 }]);
     fetchMock = vi.fn(async () => new Response(new Uint8Array([1, 2, 3])));
     vi.stubGlobal("fetch", fetchMock);
   });
 
   afterEach(() => {
     __downloadProxyTestHooks.reset();
+    lookupMock.mockReset();
     vi.unstubAllEnvs();
     vi.unstubAllGlobals();
   });
@@ -53,9 +63,37 @@ describe("download-only proxy routing (#2136)", () => {
     await downloadFetch("http://[::1]:8188/model.safetensors");
     await downloadFetch("http://0.0.0.0:8188/model.safetensors");
     await downloadFetch("http://[::]:8188/model.safetensors");
+    await downloadFetch("http://[::ffff:7f00:1]:8188/model.safetensors");
+    await downloadFetch("http://10.0.0.5:8188/model.safetensors");
+    await downloadFetch("http://172.16.0.1:8188/model.safetensors");
+    await downloadFetch("http://192.168.1.10:8188/model.safetensors");
+    await downloadFetch("http://169.254.169.254/latest/meta-data/");
+    await downloadFetch("http://[fd00::1]:8188/model.safetensors");
+    await downloadFetch("http://[fe80::1]:8188/model.safetensors");
 
-    expect(fetchMock.mock.calls).toHaveLength(5);
+    expect(fetchMock.mock.calls).toHaveLength(12);
     for (const call of fetchMock.mock.calls) expect(dispatcherOf(call)).toBeUndefined();
+  });
+
+  it("keeps a hostname that resolves to any private address off the proxy", async () => {
+    vi.stubEnv("COMFYUI_DOWNLOAD_PROXY", "http://proxy.example.test:8080");
+    lookupMock.mockResolvedValue([
+      { address: "93.184.216.34", family: 4 },
+      { address: "192.168.1.10", family: 4 },
+    ]);
+
+    await downloadFetch("https://public-looking.example.test/model.safetensors");
+
+    expect(dispatcherOf(fetchMock.mock.calls[0])).toBeUndefined();
+  });
+
+  it("keeps an unresolved hostname off the proxy instead of delegating DNS to it", async () => {
+    vi.stubEnv("COMFYUI_DOWNLOAD_PROXY", "http://proxy.example.test:8080");
+    lookupMock.mockRejectedValue(new Error("EAI_AGAIN"));
+
+    await downloadFetch("https://temporarily-unknown.example.test/model.safetensors");
+
+    expect(dispatcherOf(fetchMock.mock.calls[0])).toBeUndefined();
   });
 
   it("honors NO_PROXY while keeping non-local model hosts proxied", async () => {
@@ -106,6 +144,36 @@ describe("download-only proxy routing (#2136)", () => {
     expect(result.verdict).toBe("non-model");
     expect(fetchMock.mock.calls).toHaveLength(2);
     for (const call of fetchMock.mock.calls) expect(dispatcherOf(call)).toBeDefined();
+  });
+
+  it("re-checks each redirect hop and removes the proxy for a private resolution", async () => {
+    vi.stubEnv("COMFYUI_DOWNLOAD_PROXY", "http://proxy.example.test:8080");
+    lookupMock
+      .mockResolvedValueOnce([{ address: "93.184.216.34", family: 4 }])
+      .mockResolvedValueOnce([{ address: "169.254.169.254", family: 4 }]);
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(null, {
+          status: 302,
+          headers: { location: "https://redirect.example.test/model.safetensors" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(new Uint8Array([0, 255, 0, 255]), {
+          status: 200,
+          headers: { "content-type": "application/octet-stream" },
+        }),
+      );
+
+    const result = await probeRemoteModelPayload(
+      "https://origin.example.test/model.safetensors",
+      ".safetensors",
+    );
+
+    expect(result.verdict).toBe("model");
+    expect(fetchMock.mock.calls).toHaveLength(2);
+    expect(dispatcherOf(fetchMock.mock.calls[0])).toBeDefined();
+    expect(dispatcherOf(fetchMock.mock.calls[1])).toBeUndefined();
   });
 
   it("uses the same proxy route for segmented range requests", async () => {
