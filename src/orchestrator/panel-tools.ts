@@ -13597,6 +13597,7 @@ async function reconcileLateRunAck(
   preRunningPromptId?: string | null,
   allowPanelQueueUnknown = false,
   expectedTabId?: string,
+  expectedPromptCount = 1,
 ): Promise<{ result: unknown; lateByMs: number; via: "ack" | "queue" | "queue-uncertain" | "receipt" } | null> {
   const parsed = parseToolResultJson(res);
   // An exact Panel receipt is safe even when a queued_unknown reply already
@@ -13635,14 +13636,25 @@ async function reconcileLateRunAck(
   if (!canPeek && !canPeekReceipt) return queueEligible ? fromQueue() : null;
   const startedAt = Date.now();
   const deadline = startedAt + runLateAckGraceMs();
+  const expectedReceipts = Math.max(1, Math.min(64, Math.floor(expectedPromptCount)));
+  const waitForBatchReceipts = receiptEligible && canPeekReceipt && expectedReceipts > 1;
+  let queueCandidate: { result: unknown; via: "queue" | "queue-uncertain" } | null = null;
+  let exactReceiptPromptIds: string[] = [];
   for (;;) {
     if (receiptEligible && canPeekReceipt) {
       const seenReceipt = bridge.peekLateRunReceipt(rid!);
       if (seenReceipt && (!expectedTabId || seenReceipt.tabId === expectedTabId)) {
-        const takenReceipt = bridge.takeLateRunReceipt(rid!);
-        const result = takenReceipt ? latePanelReceiptResult(parsed, takenReceipt.promptIds) : null;
-        if (takenReceipt && result) {
-          return { result, lateByMs: takenReceipt.lateByMs, via: "receipt" };
+        for (const id of seenReceipt.promptIds) {
+          if (typeof id === "string" && id.trim() !== "" && !exactReceiptPromptIds.includes(id.trim())) {
+            exactReceiptPromptIds.push(id.trim());
+          }
+        }
+        if (exactReceiptPromptIds.length >= expectedReceipts) {
+          const takenReceipt = bridge.takeLateRunReceipt(rid!);
+          const result = takenReceipt ? latePanelReceiptResult(parsed, takenReceipt.promptIds) : null;
+          if (takenReceipt && result) {
+            return { result, lateByMs: takenReceipt.lateByMs, via: "receipt" };
+          }
         }
       }
     }
@@ -13657,10 +13669,32 @@ async function reconcileLateRunAck(
     }
     if (queueEligible) {
       const queued = fromQueue();
-      if (queued) return { ...queued, lateByMs: Date.now() - startedAt };
+      if (queued) {
+        if (!waitForBatchReceipts) return { ...queued, lateByMs: Date.now() - startedAt };
+        queueCandidate = queued;
+      }
     }
     const left = deadline - Date.now();
-    if (left <= 0) return null;
+    if (left <= 0) {
+      // Exact ids outrank the weaker QueueMonitor observation even when a
+      // partial batch is all that arrived before the bounded grace expired.
+      // Leave later frames to the post-reconcile handoff and let the ticket
+      // phase drain any ids that arrived between this read and ticketing.
+      if (receiptEligible && canPeekReceipt && exactReceiptPromptIds.length) {
+        const takenReceipt = bridge.takeLateRunReceipt(rid!);
+        const result = takenReceipt
+          ? latePanelReceiptResult(parsed, takenReceipt.promptIds)
+          : latePanelReceiptResult(parsed, exactReceiptPromptIds);
+        if (result) {
+          return {
+            result,
+            lateByMs: takenReceipt?.lateByMs ?? Date.now() - startedAt,
+            via: "receipt",
+          };
+        }
+      }
+      return queueCandidate ? { ...queueCandidate, lateByMs: Date.now() - startedAt } : null;
+    }
     await sleep(Math.max(1, Math.min(RUN_LATE_ACK_POLL_MS, left)));
   }
 }
@@ -16358,6 +16392,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             pre.runningPromptId,
             typeof args.to_node_id === "number",
             runTicketTab,
+            typeof args.batch_count === "number"
+              ? Math.max(1, Math.min(64, Math.floor(args.batch_count)))
+              : 1,
           );
           if (!recovered) return;
           res = ok(recovered.result);
@@ -16588,6 +16625,37 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // #1327 — lets the journal claim a completion that beat its own ticket.
           dispatchedAt: runDispatchedAt,
         };
+        // #1728 — keep an exact, rid-scoped owner alive after the bounded
+        // reconcile. A receipt can be delayed by a closed/reconnecting Panel
+        // route and arrive after this handler has already returned its
+        // queued_unknown recovery. The owner opens only exact prompt tickets;
+        // RunCompletions.openRun remains the idempotency fence.
+        if (
+          runRid &&
+          typeof ctx.bridge.registerLateRunReceiptHandoff === "function"
+        ) {
+          try {
+            ctx.bridge.registerLateRunReceiptHandoff(runRid, runTicketTab, (receipt) => {
+              if (receipt.runRid !== runRid || receipt.tabId !== runTicketTab) return;
+              const taken =
+                typeof ctx.bridge.takeLateRunReceipt === "function"
+                  ? ctx.bridge.takeLateRunReceipt(runRid)
+                  : undefined;
+              const promptIds = taken?.promptIds ?? receipt.promptIds;
+              const opened: string[] = [];
+              for (const rawId of promptIds) {
+                const id = typeof rawId === "string" ? rawId.trim() : "";
+                if (!id) continue;
+                QueueMonitor.markSelfQueued(id);
+                if (RunCompletions.openRun(id, ticketOpts)) opened.push(id);
+              }
+              if (opened.length) ctx.onRunTicketOpened?.(opened);
+            });
+          } catch {
+            // The receipt map remains available to the normal bounded drain;
+            // a handoff installation failure must never redispatch the run.
+          }
+        }
         // Every id gets its own ticket. `correlatable` stays the promise the
         // anti-poll note is allowed to make — true only if at least one run can
         // actually be correlated back.

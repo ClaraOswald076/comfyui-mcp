@@ -5571,6 +5571,31 @@ describe("#1728: late panel run receipts", () => {
     expect(bridge.peekLateRunReceipt("run-rid-1728")).toBeUndefined();
     sock.close();
   });
+
+  it("notifies the bounded exact handoff for a receipt that arrives after the normal grace", async () => {
+    const sock = await connectPanel("tab-1728-handoff");
+    const seen: string[][] = [];
+    const dispose = bridge.registerLateRunReceiptHandoff(
+      "run-rid-1728-handoff",
+      "tab-1728-handoff",
+      (receipt) => {
+        seen.push([...receipt.promptIds]);
+        bridge.takeLateRunReceipt(receipt.runRid);
+      },
+      1000,
+    );
+    sock.send(
+      JSON.stringify({
+        type: "run_receipt",
+        run_rid: "run-rid-1728-handoff",
+        prompt_id: "prompt-after-grace-1728",
+      }),
+    );
+    await waitFor(() => expect(seen).toEqual([["prompt-after-grace-1728"]]));
+    expect(bridge.peekLateRunReceipt("run-rid-1728-handoff")).toBeUndefined();
+    dispose();
+    sock.close();
+  });
 });
 
 // #875 — the liveness signal the self-restarter's tunnel gate depends on.

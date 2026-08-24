@@ -1734,6 +1734,8 @@ export type LateRunReceipt = {
   lateByMs: number;
 };
 
+export type LateRunReceiptHandoff = (receipt: LateRunReceipt) => void;
+
 /**
  * Size ceiling on a RETAINED reply payload (#1175).
  *
@@ -2157,6 +2159,11 @@ export class UiBridge {
   >();
   /** Exact prompt receipts sent by the Panel after its graph_run command returned. */
   private lateRunReceipts = new Map<string, { tabId: string; promptIds: string[]; ts: number }>();
+  /** Bounded post-reconcile owners for exact receipts that arrive after panel_run returned. */
+  private lateRunReceiptHandoffs = new Map<
+    string,
+    { tabId: string; expiresAt: number; onReceipt: LateRunReceiptHandoff }
+  >();
   /**
    * TTL for both maps above.
    *
@@ -2168,6 +2175,8 @@ export class UiBridge {
    * what the timeout disclosure told them to do in the first place.
    */
   private static readonly LATE_MUTATION_TTL_MS = 10 * 60 * 1000;
+  /** A ticket handoff outlives the normal reconcile grace, but never indefinitely. */
+  private static readonly LATE_RUN_RECEIPT_HANDOFF_TTL_MS = 60 * 1000;
   /** Hard cardinality bound, so a pathological tab timing out in a loop cannot
    *  grow either map without limit even inside the TTL. */
   private static readonly MAX_LATE_MUTATIONS = 256;
@@ -4242,6 +4251,52 @@ export class UiBridge {
       promptIds.push(promptId);
     }
     this.lateRunReceipts.set(runRid, { tabId, promptIds, ts: prior?.ts ?? Date.now() });
+    const handoff = this.lateRunReceiptHandoffs.get(runRid);
+    if (handoff && handoff.expiresAt > Date.now() && handoff.tabId === tabId) {
+      const receipt = this.peekLateRunReceipt(runRid);
+      if (receipt) {
+        try {
+          handoff.onReceipt(receipt);
+        } catch {
+          // A receipt must remain buffered if its late consumer is transiently
+          // unavailable; the owner can still drain it explicitly.
+        }
+      }
+    }
+  }
+
+  /**
+   * Keep an exact run receipt actionable after panel_run's bounded reconcile
+   * window. Registration also drains an already-buffered receipt, which closes
+   * the race between the normal ticket pass and this late owner.
+   */
+  registerLateRunReceiptHandoff(
+    runRid: string,
+    tabId: string,
+    onReceipt: LateRunReceiptHandoff,
+    ttlMs = UiBridge.LATE_RUN_RECEIPT_HANDOFF_TTL_MS,
+  ): () => void {
+    const rid = typeof runRid === "string" ? runRid.trim() : "";
+    const tab = typeof tabId === "string" ? tabId.trim() : "";
+    if (!rid || !tab || typeof onReceipt !== "function") return () => {};
+    this.pruneLateMutations();
+    const entry = {
+      tabId: tab,
+      expiresAt: Date.now() + Math.max(1, ttlMs),
+      onReceipt,
+    };
+    this.lateRunReceiptHandoffs.set(rid, entry);
+    const current = this.peekLateRunReceipt(rid);
+    if (current && current.tabId === tab) {
+      try {
+        onReceipt(current);
+      } catch {
+        // Keep the map entry for a later frame/explicit drain.
+      }
+    }
+    return () => {
+      if (this.lateRunReceiptHandoffs.get(rid) === entry) this.lateRunReceiptHandoffs.delete(rid);
+    };
   }
 
   /** Drain a Panel late prompt receipt once, after panel_run consumes it. */
@@ -4283,11 +4338,14 @@ export class UiBridge {
     for (const [rid, e] of this.lateRunReceipts) {
       if (now - e.ts > UiBridge.LATE_MUTATION_TTL_MS) this.lateRunReceipts.delete(rid);
     }
+    for (const [rid, e] of this.lateRunReceiptHandoffs) {
+      if (e.expiresAt <= now) this.lateRunReceiptHandoffs.delete(rid);
+    }
     // Map iteration is insertion-ordered, so dropping from the front drops the
     // oldest. Quiet, unlike the ask-mapping overflow: losing one of 256 late
     // completions costs the caller a notice they can still get by looking, where
     // losing an ask mapping loses a user's answer outright.
-    for (const map of [this.timedOutMutations, this.lateMutations, this.lateRunReceipts]) {
+    for (const map of [this.timedOutMutations, this.lateMutations, this.lateRunReceipts, this.lateRunReceiptHandoffs]) {
       while (map.size > UiBridge.MAX_LATE_MUTATIONS) {
         const oldest = map.keys().next();
         if (oldest.done) break;

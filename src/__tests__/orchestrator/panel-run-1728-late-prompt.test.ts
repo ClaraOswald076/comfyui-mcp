@@ -3,7 +3,12 @@
 // the existing bounded queue receipt path, then open the ordinary journal ticket.
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { buildPanelToolDefs, makePanelToolCtx, type PanelToolCtx } from "../../orchestrator/panel-tools.js";
+import {
+  buildPanelToolDefs,
+  makePanelToolCtx,
+  __panelToolsTestHooks,
+  type PanelToolCtx,
+} from "../../orchestrator/panel-tools.js";
 import { RunCompletions } from "../../orchestrator/run-completion-journal.js";
 import { QueueMonitor } from "../../services/queue-monitor.js";
 
@@ -33,6 +38,7 @@ function textOf(res: { content?: Array<{ type: string; text?: string }> }): stri
 }
 
 beforeEach(() => {
+  __panelToolsTestHooks.setRunLateAckGraceMs(450);
   RunCompletions.reset();
   qm.selfQueuedIds.clear();
   qm.lastSelfQueueTs = null;
@@ -45,6 +51,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  __panelToolsTestHooks.setRunLateAckGraceMs(null);
   RunCompletions.reset();
   qm.selfQueuedIds.clear();
   qm.lastSelfQueueTs = null;
@@ -149,5 +156,122 @@ describe("panel_run late prompt reconciliation (#1728)", () => {
     expect(res.isError).toBeFalsy();
     expect(textOf(res)).toContain("no completion ticket can be opened");
     expect(RunCompletions.ticketFor("prompt-full-foreign")).toBeUndefined();
+  });
+
+  it("waits for the complete exact batch before falling back to the first queue prompt", async () => {
+    let calls = 0;
+    let receiptReads = 0;
+    let receiptTaken = false;
+    const allPromptIds = ["batch-prompt-1", "batch-prompt-2", "batch-prompt-3"];
+    const bridge = {
+      send: async () => ({}),
+      canReach: () => true,
+      peekLateRunReceipt: (runRid: string) => {
+        if (runRid !== "run-rid-batch-1728") return undefined;
+        receiptReads += 1;
+        const promptIds = receiptReads < 2 ? allPromptIds.slice(0, 1) : allPromptIds;
+        return { runRid, tabId: "panel-batch-1728", promptIds, lateByMs: 30 };
+      },
+      takeLateRunReceipt: (runRid: string) => {
+        if (runRid !== "run-rid-batch-1728" || receiptTaken) return undefined;
+        receiptTaken = true;
+        return { runRid, tabId: "panel-batch-1728", promptIds: allPromptIds, lateByMs: 30 };
+      },
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "panel-batch-1728");
+    ctx.call = async (_cmd, _timeout, observeRid) => {
+      calls += 1;
+      observeRid?.("run-rid-batch-1728");
+      qm.state.runningPromptId = allPromptIds[0];
+      qm.state.queueRemaining = 2;
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              queued_unknown: true,
+              indeterminate_count: 3,
+              inFlight: 3,
+            }),
+          },
+        ],
+      };
+    };
+
+    const res = await panelRun().handler({ batch_count: 3, to_node_id: 38 }, ctx);
+
+    expect(calls).toBe(1);
+    expect(receiptReads).toBeGreaterThanOrEqual(2);
+    expect(receiptTaken).toBe(true);
+    expect(textOf(res)).toContain('"prompt_ids"');
+    for (const promptId of allPromptIds) {
+      expect(RunCompletions.ticketFor(promptId)?.promptId).toBe(promptId);
+      const ticket = RunCompletions.ticketFor(promptId);
+      RunCompletions.record("panel-batch-1728", { kind: "executed", prompt_id: promptId }, undefined);
+      RunCompletions.record("panel-batch-1728", { kind: "executed", prompt_id: promptId }, undefined);
+      expect(ticket).toBeDefined();
+    }
+    const frames: unknown[] = [];
+    RunCompletions.deliverPending("panel-batch-1728", (payload) => {
+      frames.push(payload);
+      return true;
+    });
+    expect(frames).toHaveLength(3);
+  });
+
+  it("opens the exact ticket when a receipt arrives after the reconcile grace", async () => {
+    __panelToolsTestHooks.setRunLateAckGraceMs(25);
+    let calls = 0;
+    let handoff: ((receipt: { runRid: string; tabId: string; promptIds: string[] }) => void) | null = null;
+    let receipt: { runRid: string; tabId: string; promptIds: string[] } | undefined;
+    const bridge = {
+      send: async () => ({}),
+      canReach: () => true,
+      peekLateRunReceipt: (runRid: string) =>
+        receipt && receipt.runRid === runRid ? { ...receipt, lateByMs: 100 } : undefined,
+      takeLateRunReceipt: (runRid: string) => {
+        if (!receipt || receipt.runRid !== runRid) return undefined;
+        const taken = { ...receipt, lateByMs: 100 };
+        receipt = undefined;
+        return taken;
+      },
+      registerLateRunReceiptHandoff: (_rid: string, _tabId: string, onReceipt: typeof handoff) => {
+        handoff = onReceipt;
+        return () => {
+          handoff = null;
+        };
+      },
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "panel-late-1728");
+    ctx.call = async (_cmd, _timeout, observeRid) => {
+      calls += 1;
+      observeRid?.("run-rid-late-1728");
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ queued_unknown: true, indeterminate_count: 1, inFlight: 1 }),
+          },
+        ],
+      };
+    };
+
+    const res = await panelRun().handler({ to_node_id: 38 }, ctx);
+    expect(calls).toBe(1);
+    expect(RunCompletions.ticketFor("prompt-after-grace")).toBeUndefined();
+    receipt = { runRid: "run-rid-late-1728", tabId: "panel-late-1728", promptIds: ["prompt-after-grace"] };
+    handoff?.(receipt);
+
+    const ticket = RunCompletions.ticketFor("prompt-after-grace");
+    expect(ticket?.promptId).toBe("prompt-after-grace");
+    RunCompletions.record("panel-late-1728", { kind: "executed", prompt_id: "prompt-after-grace" }, undefined);
+    RunCompletions.record("panel-late-1728", { kind: "executed", prompt_id: "prompt-after-grace" }, undefined);
+    const frames: unknown[] = [];
+    RunCompletions.deliverPending("panel-late-1728", (payload) => {
+      frames.push(payload);
+      return true;
+    });
+    expect(frames).toHaveLength(1);
+    expect(res.isError).toBeFalsy();
   });
 });
