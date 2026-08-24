@@ -15,6 +15,7 @@ import { installModelViaManager } from "./node-management.js";
 import { ModelError, ValidationError, unreachableHostMessage } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { downloadWithCache, findResumablePartial, probeRemoteModelPayload } from "./download-cache.js";
+import type { DownloadRoute } from "./download-proxy.js";
 import { reportDownloadProgress } from "./download-progress.js";
 import type { ResumeReporter } from "./download-resume-diag.js";
 import { modelNotFoundMessage } from "./model-root-scope.js";
@@ -3404,6 +3405,8 @@ export async function downloadModel(
    *  job still reads "downloading". Local paths only (the remote Manager dispatch has no
    *  local rename; the caller commits done when this function returns). */
   onLanded?: (targetPath: string) => void,
+  /** Reports the effective local model-download network route to the job status record. */
+  onDownloadRoute?: (route: DownloadRoute) => void,
 ): Promise<string> {
   // Cancelled before we did anything — never start a transfer (local OR server-side).
   if (signal?.aborted) throw new DOMException("The download was cancelled.", "AbortError");
@@ -3536,6 +3539,7 @@ export async function downloadModel(
       onResume,
       signal,
       onLanded,
+      onRoute: onDownloadRoute,
       // #1635 — the failure hint must know a per-request override authenticated
       // this request, so a CivitAI 401 indicts THAT credential instead of
       // claiming no CIVITAI_API_TOKEN is configured.

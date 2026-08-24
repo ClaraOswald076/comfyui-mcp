@@ -207,6 +207,10 @@ export function migrateInFlightJobs(fromDir: string, toDir: string): number {
       // stopped and the caller was told to re-issue, which writes a SECOND copy to
       // the same destination and corrupts the model (node-management.ts:971-979).
       const viaManager = raw.via_manager === true;
+      const downloadRoute =
+        raw.download_route === "direct" || raw.download_route === "proxied"
+          ? raw.download_route
+          : undefined;
       // TYPED, not inferred: an annotated object literal gets excess-property
       // checking, so a key that is NOT on PersistedDownloadJob is a COMPILE
       // error. The five dead keys that lived here for months (`name`, `dest`,
@@ -248,6 +252,7 @@ export function migrateInFlightJobs(fromDir: string, toDir: string): number {
         started_at: num("started_at") ?? Date.now(),
         pid: num("pid"),
         via_manager: viaManager,
+        download_route: downloadRoute,
         // Real keys that were also being dropped. `resume` is what a re-issue
         // needs to continue a partial rather than restart it, and `progressId`
         // links the record back to its tray row.
@@ -808,6 +813,8 @@ export interface PersistedDownloadJob {
   /** True when dispatched to a remote ComfyUI-Manager (server-side fetch), not streamed
    *  to local disk — a "done" record then means dispatch-accepted, not verified landed. */
   via_manager?: boolean;
+  /** Effective route observed by the local model downloader. Optional for old records. */
+  download_route?: "direct" | "proxied";
   /** The writing session's per-process owner nonce (PERSIST_OWNER). Two sessions
    *  running the same logical download share an `id` but differ here, so a sibling
    *  check can distinguish them. Absent on pre-fix records. */

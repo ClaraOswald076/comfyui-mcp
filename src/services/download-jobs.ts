@@ -30,6 +30,7 @@ import {
 import type { ListedBeforeBaseline } from "./model-resolver.js";
 import type { DownloadAuth } from "./download-auth.js";
 import type { ResumeDiagnostic } from "./download-resume-diag.js";
+import type { DownloadRoute } from "./download-proxy.js";
 import { ModelError } from "../utils/errors.js";
 import {
   readDownloadProgress,
@@ -98,6 +99,8 @@ export interface DownloadJob {
    *  download_model action:"status" renders it as "dispatched (not verified here)" so it isn't
    *  mistaken for a validated local completion. */
   viaManager?: boolean;
+  /** Network route observed by the local download fetcher. Manager jobs do not set this. */
+  downloadRoute?: DownloadRoute;
   /** Lines produced by post-download work (trigger words, sidecar paths,
    *  not-a-model warnings). These used to be returned inline by the tool; once a
    *  download outlives its tool call they have to survive somewhere the agent
@@ -712,6 +715,15 @@ export async function startDownloadJob(
         // onLanded: fires the moment the local file is renamed into place → commit done
         // synchronously, closing the rename→return window.
         commitDone,
+        (route) => {
+          // A redirect may move between a direct bypass and a proxy. Keep the
+          // conservative answer: once any hop used the proxy, status says proxied.
+          const effective = route === "proxied" ? "proxied" : (job.downloadRoute ?? "direct");
+          if (effective !== job.downloadRoute) {
+            job.downloadRoute = effective;
+            persistJobRecord(job);
+          }
+        },
       );
       // Local paths already committed done via onLanded at the rename. The remote Manager
       // dispatch has no local rename, so commit done here when it returns (dispatch
@@ -967,6 +979,7 @@ function persistJobRecord(job: DownloadJob): boolean {
     dest_key: job.destKey,
     req_key: job.reqKey,
     via_manager: job.viaManager,
+    download_route: job.downloadRoute,
     resume: job.resume,
     live_visible: job.live_visible,
     verify_note: job.verify_note,
@@ -997,6 +1010,7 @@ function jobFromPersisted(rec: PersistedDownloadJob): DownloadJob {
     destKey: rec.dest_key,
     reqKey: rec.req_key,
     viaManager: rec.via_manager,
+    downloadRoute: rec.download_route,
     resume: rec.resume as ResumeDiagnostic | undefined,
     live_visible: rec.live_visible,
     verify_note: rec.verify_note,
