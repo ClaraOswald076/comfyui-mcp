@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.85] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- honor proven frontend-only UI nodes
+- narrow empty UI conversion refusal
+- refuse empty UI-to-API conversion (#2125)
+
+
 ## [0.52.84] - 2026-08-23
 
 ### MCP
