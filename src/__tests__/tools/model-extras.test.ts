@@ -252,6 +252,7 @@ describe('download_model action:"download_civitai"', () => {
       expect.any(AbortSignal), // per-download abort signal threaded from the job's controller (#515)
       expect.any(Function), // onTrayId callback — aligns the job trayId with the tray row id (#515)
       expect.any(Function), // onLanded callback — commits done synchronously at the destination rename (#515)
+      expect.any(Function), // onDownloadRoute callback — records the download-only network route
     );
     expect(res.isError).toBeFalsy();
     expect(res.content[0].text).toContain("Cool Model");
@@ -280,6 +281,7 @@ describe('download_model action:"download_civitai"', () => {
       expect.any(AbortSignal), // per-download abort signal threaded from the job's controller (#515)
       expect.any(Function), // onTrayId callback — aligns the job trayId with the tray row id (#515)
       expect.any(Function), // onLanded callback — commits done synchronously at the destination rename (#515)
+      expect.any(Function), // onDownloadRoute callback — records the download-only network route
     );
     expect(res.isError).toBeFalsy();
   });
@@ -322,6 +324,7 @@ describe('download_model action:"download_civitai"', () => {
       expect.any(AbortSignal), // per-download abort signal threaded from the job's controller (#515)
       expect.any(Function), // onTrayId callback — aligns the job trayId with the tray row id (#515)
       expect.any(Function), // onLanded callback — commits done synchronously at the destination rename (#515)
+      expect.any(Function), // onDownloadRoute callback — records the download-only network route
     );
   });
 
@@ -349,6 +352,7 @@ describe('download_model action:"download_civitai"', () => {
       expect.any(AbortSignal), // per-download abort signal threaded from the job's controller (#515)
       expect.any(Function), // onTrayId callback — aligns the job trayId with the tray row id (#515)
       expect.any(Function), // onLanded callback — commits done synchronously at the destination rename (#515)
+      expect.any(Function), // onDownloadRoute callback — records the download-only network route
     );
   });
 
