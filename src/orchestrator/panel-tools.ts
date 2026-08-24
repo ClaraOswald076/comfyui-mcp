@@ -6645,11 +6645,6 @@ function formatRunRejection(payload: { error?: unknown; node_errors?: unknown })
  * overrides the flag-based rule and #213 does not regress: that reply had no
  * prompt id. The same asymmetry the retry guard already relies on.
  */
-function acceptedPromptId(parsed: Record<string, unknown> | null): string | null {
-  const pid = parsed?.prompt_id;
-  return typeof pid === "string" && pid.trim() !== "" ? pid.trim() : null;
-}
-
 /**
  * EVERY prompt id a graph_run reply minted, first one first (#949).
  *
@@ -6661,6 +6656,8 @@ function acceptedPromptId(parsed: Record<string, unknown> | null): string | null
  *
  * Deduped and order-preserving: `prompt_id` normally repeats the first entry of
  * `prompt_ids`, and a duplicate would open two tickets for one render.
+ * The Panel's scoped-run uncertainty receipt uses `queued_prompt_ids` for the
+ * subset it did confirm (#2143); those are receipts too and must be ticketed.
  */
 export function acceptedPromptIds(parsed: Record<string, unknown> | null): string[] {
   const out: string[] = [];
@@ -6672,7 +6669,23 @@ export function acceptedPromptIds(parsed: Record<string, unknown> | null): strin
   add(parsed?.prompt_id);
   const many = parsed?.prompt_ids;
   if (Array.isArray(many)) for (const v of many) add(v);
+  const queued = parsed?.queued_prompt_ids;
+  if (Array.isArray(queued)) for (const v of queued) add(v);
   return out;
+}
+
+function acceptedPromptId(parsed: Record<string, unknown> | null): string | null {
+  return acceptedPromptIds(parsed)[0] ?? null;
+}
+
+/**
+ * The Panel's explicit scoped-run uncertainty contract (#2143). This is a
+ * normal, parseable receipt rather than a transport failure: the Panel knows
+ * that one or more requests left the tab but cannot prove whether ComfyUI
+ * accepted them. Do not reinterpret its `error` field as a refusal.
+ */
+function isPanelQueueUncertainty(parsed: Record<string, unknown> | null): boolean {
+  return parsed?.queued_unknown === true;
 }
 
 function detectRunRejection(res: ToolResult): ToolResult | null {
@@ -6682,6 +6695,12 @@ function detectRunRejection(res: ToolResult): ToolResult | null {
 
   const parsed = parseToolResultJson(res);
   if (!parsed) return null; // unparseable non-error reply — don't regress a success
+
+  // #2143 — `queued_unknown` is an explicit Panel receipt, not the ComfyUI
+  // rejection channel. Its `error` field explains the timeout and its
+  // `retry_guidance` tells the caller how to settle it; keep the receipt intact
+  // and never redispatch from here.
+  if (isPanelQueueUncertainty(parsed)) return null;
 
   const topError = parsed.error;
   const nodeErrors = parsed.node_errors;
@@ -6800,7 +6819,7 @@ function isRetryableRunToNodeStampRace(res: ToolResult, rejection: ToolResult): 
   const parsed = parseToolResultJson(res);
   if (!parsed) return false; // unreadable reply — an unknown, not a clean queue
   if (parsed.queued === true) return false; // observed queue evidence vetoes prose
-  if (typeof parsed.prompt_id === "string" && parsed.prompt_id.trim() !== "") return false;
+  if (acceptedPromptIds(parsed).length > 0) return false; // any receipt vetoes retry
   const text = toolResultText(rejection);
   return (
     /workflow graph CHANGED after the run was queued/i.test(text) &&
@@ -13257,6 +13276,27 @@ function queueRunReceiptNote(promptId: string): string {
   );
 }
 
+/**
+ * #2143 — a normal Panel timeout receipt is neither a confirmed queue nor a
+ * refusal. Keep its retry guidance in the original JSON and add only the
+ * local fact that this handler did not dispatch a second run.
+ */
+function panelQueueUncertaintyNote(queuedPromptIds: readonly string[]): string {
+  if (queuedPromptIds.length > 0) {
+    return (
+      `\n\n[UNCERTAIN] The Panel confirmed these prompt id(s) left its queue path: ` +
+      `${queuedPromptIds.join(", ")}. Completion tickets were opened for them. ` +
+      `Any remaining request(s) are still uncertain; follow the Panel's retry_guidance above ` +
+      `before retrying. No second panel_run was dispatched.`
+    );
+  }
+  return (
+    `\n\n[UNCERTAIN] The Panel could not determine whether this run entered ComfyUI's queue. ` +
+    `This is not a confirmed refusal, and no completion ticket can be opened without a prompt id. ` +
+    `Follow the Panel's retry_guidance above before retrying. No second panel_run was dispatched.`
+  );
+}
+
 async function pollLateAskReply(
   bridge: PanelToolCtx["bridge"],
   askId: string,
@@ -16025,7 +16065,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // "does NOT match any run you queued … its origin is UNDETERMINED" — for
         // runs the agent had just queued itself. Ticket all of them.
         const queuedIds = acceptedPromptIds(runReply);
-        const queuedId = queuedIds[0];
+        const panelQueueUncertain = isPanelQueueUncertainty(runReply);
         // #944: a run ComfyUI accepted while dropping some outputs reaches here
         // (a minted prompt id outranks the rejection signals). Say which outputs
         // were dropped, or the caller waits for files that will never be written.
@@ -16047,8 +16087,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               `and this dispatch stacked a duplicate.`
             : "";
         // markSelfQueued with NO id still stamps the recent-self-queue timestamp,
-        // so the id-less case must still call it exactly once (#559).
-        if (queuedIds.length === 0) QueueMonitor.markSelfQueued(null);
+        // so both the id-less genuine queue and the Panel's explicit uncertainty
+        // receipt must call it exactly once (#559/#2143). The latter must not be
+        // mistaken for a definite queue, but it is still unsafe to immediately
+        // redispatch a request that the Panel says left its tab.
+        if (queuedIds.length === 0 || panelQueueUncertain) QueueMonitor.markSelfQueued(null);
         for (const id of queuedIds) QueueMonitor.markSelfQueued(id);
         // #468 — open a run ticket so the render's completion can be CORRELATED
         // to this exact call by prompt id. This is what lets the orchestrator
@@ -16071,7 +16114,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // actually be correlated back.
         const ticketedPromptIds: string[] = [];
         const correlatable =
-          queuedIds.length === 0
+          panelQueueUncertain && queuedIds.length === 0
+            ? false
+            : queuedIds.length === 0
             ? RunCompletions.openRun(undefined, ticketOpts)
             : queuedIds.map((id) => {
                 const opened = RunCompletions.openRun(id, ticketOpts);
@@ -16132,7 +16177,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           queuedIds.length === 1
             ? ""
             : ` (this run queued ${queuedIds.length} prompts, so the check is the queue as a whole; get_history settles the outcome of any that are no longer in flight)`;
-        const note = correlatable
+        const note = panelQueueUncertain
+          ? panelQueueUncertaintyNote(ticketedPromptIds)
+          : correlatable
           ? "\n\n[IMPORTANT] You will be notified automatically with the output image(s)/video when the render finishes — do NOT poll queue (action:\"list\"), get_history, or get_image (action:\"list_outputs\"). Just end your turn now and wait for the result to be delivered to you." +
             `\n[FALLBACK] That notification is journaled and replayed if an agent is not there to take it, and the orchestrator will fill one in from ComfyUI itself — its execution event or its history record — if the panel never reports the finish. But it cannot be GUARANTEED, so do not wait forever on it. If nothing has arrived LONG after this render should have finished (roughly twice the time you expect it to take), make ONE check with ${fallbackCheck} instead of idling indefinitely${fallbackTail}. One check, not a loop — and not before then.`
           : "\n\n[IMPORTANT] The run was queued, but the panel reported NO prompt id for it, so a completion event CANNOT be correlated back to this run — its outcome will be reported to you as UNDETERMINED. Do NOT simply idle and wait indefinitely: end your turn, and if nothing arrives, confirm the outcome with get_history (action:\"list\") before acting on it.";
