@@ -6051,6 +6051,8 @@ const QUERY_GRAPH_MAX_CHARS_CEILING = 60000;
 const DETAIL_WIDGET_MAX_CHARS_DEFAULT = 2048;
 const DETAIL_WIDGET_MAX_CHARS_CEILING = 32768;
 
+const QUERY_GRAPH_WIDGET_MAX_CHARS_NOTE = "widget_max_chars_note";
+
 /** The panel's own clamp for graph_query's budget, mirrored so the figure this module
  *  reports and enforces is the one the panel was actually working to. */
 function clampQueryGraphMaxChars(v: unknown): number {
@@ -6059,6 +6061,55 @@ function clampQueryGraphMaxChars(v: unknown): number {
   return Math.min(
     Math.max(Math.floor(n), QUERY_GRAPH_MAX_CHARS_FLOOR),
     QUERY_GRAPH_MAX_CHARS_CEILING,
+  );
+}
+
+/**
+ * `widget_max_chars` is deliberately a pinpoint-only escape hatch. Keep the
+ * precondition at the MCP seam as well as in the Panel serializer: older Panel
+ * builds silently ignored the argument, and broad reads must never accidentally
+ * trade away the query's token bound for one large widget.
+ */
+function widgetMaxCharsRequest(args: Record<string, unknown>): {
+  value?: number;
+  note?: string;
+} {
+  const requested = args.widget_max_chars;
+  if (typeof requested !== "number") return {};
+  if (args.fields !== "detail") {
+    return {
+      note:
+        `widget_max_chars=${requested} was not applied: it is accepted only with ` +
+        `fields:"detail" and exactly one explicit ids entry; this query used ` +
+        `${args.fields === undefined ? "an omitted fields projection" : `fields:"${String(args.fields)}"`}. ` +
+        `The default ${DETAIL_WIDGET_MAX_CHARS_DEFAULT}-char per-widget cap remains in force.`,
+    };
+  }
+  if (!Array.isArray(args.ids) || args.ids.length !== 1) {
+    return {
+      note:
+        `widget_max_chars=${requested} was not applied: it is accepted only with ` +
+        `fields:"detail" and exactly one explicit ids entry; this query supplied ` +
+        `${Array.isArray(args.ids) ? `${args.ids.length} ids` : "no explicit ids"}. ` +
+        `The default ${DETAIL_WIDGET_MAX_CHARS_DEFAULT}-char per-widget cap remains in force.`,
+    };
+  }
+  return { value: requested };
+}
+
+/** A legacy Panel can accept the command but still serialize at its old cap. */
+function legacyWidgetMaxCharsNote(res: ToolResult, requested: unknown): string | undefined {
+  if (typeof requested !== "number" || requested <= DETAIL_WIDGET_MAX_CHARS_DEFAULT) return undefined;
+  const text = res.content
+    .filter((block) => block.type === "text")
+    .map((block) => (block.type === "text" ? block.text : ""))
+    .join("\n");
+  if (!/2048-char per-widget cap/.test(text)) return undefined;
+  return (
+    `widget_max_chars=${requested} was not applied: the connected Panel returned its ` +
+    `default ${DETAIL_WIDGET_MAX_CHARS_DEFAULT}-char per-widget cap. Update the Panel ` +
+    `to a build that supports graph_query.widget_max_chars, then retry this exact ` +
+    `detail read; the query result below is otherwise unchanged.`
   );
 }
 
@@ -6077,6 +6128,7 @@ const QUERY_GRAPH_RIDER_KEYS = [
  *  (independent gate P0). `max_chars` is re-set unconditionally just below. */
 const QUERY_GRAPH_OWNED_KEYS: ReadonlySet<string> = new Set([
   "max_chars",
+  QUERY_GRAPH_WIDGET_MAX_CHARS_NOTE,
   "groups_membership_omitted",
   "groups_omitted",
   "rails_omitted",
@@ -6121,7 +6173,11 @@ function groupIndexEntry(g: unknown): unknown {
  * than silently ignored — `max_chars` bounds characters, and calling image bytes
  * characters would be its own false figure.
  */
-function fitQueryGraphReply(res: ToolResult, requested: unknown): ToolResult {
+function fitQueryGraphReply(
+  res: ToolResult,
+  requested: unknown,
+  widgetMaxCharsNote?: string,
+): ToolResult {
   const payload = parseToolResultJson(res);
   if (!payload) return res;
   const idx = res.content.findIndex((c) => c.type === "text");
@@ -6171,6 +6227,7 @@ function fitQueryGraphReply(res: ToolResult, requested: unknown): ToolResult {
   // trustworthy, and a caller who learns to distrust it will ignore the real ones. This
   // accounting is the sole author of these fields, so it is also their sole source.
   answer.max_chars = budget;
+  if (widgetMaxCharsNote) answer[QUERY_GRAPH_WIDGET_MAX_CHARS_NOTE] = widgetMaxCharsNote;
 
   const groups = Array.isArray(riders.groups) ? (riders.groups as unknown[]) : null;
   const hasGroups = !!groups && groups.length > 0;
@@ -14213,7 +14270,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
   const defs: PanelToolDef[] = [
     def(
       "panel_query_graph",
-      "FILTER or TRAVERSE a SUBSET of the live canvas, for when you ALREADY KNOW what you're looking for. NOT for 'show me the canvas' or any whole-graph overview — call panel_graph_outline FIRST for that. NOT get_workflow's query action (that queries a saved file or JSON you provide, not the live canvas). Filters, traverses, projects and aggregates over the workflow the user is CURRENTLY VIEWING without dumping the whole graph (replaces the old panel_get_graph full-JSON dump; output is TOKEN-BOUNDED with an explicit truncation marker, so a big graph can never flood your context). Combine: `types` (node type contains any), `title` (contains), `where` widget predicates ANDed ('cfg>7', 'steps<=20', 'sampler_name=euler', 'text~sunset' — ops = != >= <= > < ~contains), `ids` (exact nodes — THE way to read ONE node's exact slot/widget detail: {ids:[42], fields:'detail'}), `upstream_of`/`downstream_of` + `depth` (dependency traversal: upstream = what FEEDS that node, downstream = what CONSUMES it; seed at depth 0), `fields` ('compact' one line per node [default], 'ids', 'detail' = the full node summary with slots + connections + mode), `group_by:'type'` (counts only), `limit` (default 40). detail rows include each node's MODE — a 'bypass' node is skipped and a 'mute' node kills everything downstream, so check modes on the path you care about before running (fix with panel_set_node_mode). Every result also carries `groups` (id, title, member node_ids — groups are geometric, trust this list) and, when viewing a SUBGRAPH (after panel_enter_subgraph), `rails` (boundary rail ids/slots). `max_chars` bounds the WHOLE result, those riders included, and the rows you asked for are spent first: on a big graph the riders lose their member ids, then drop out entirely, rather than starving your query — and each says in-band when it did, with the true counts. `widget_max_chars` raises the per-widget cap only for `fields:'detail'`; use it only with exactly one explicit `ids` entry (for example `{ids:[42], fields:'detail', widget_max_chars:8192}`), with a default of 2048 and a maximum of 32768. It does not change compact, ids, or broad reads. Typical flow: panel_graph_outline to orient → panel_query_graph to pinpoint/inspect → edit. Read-only.",
+      "FILTER or TRAVERSE a SUBSET of the live canvas, for when you ALREADY KNOW what you're looking for. NOT for 'show me the canvas' or any whole-graph overview — call panel_graph_outline FIRST for that. NOT get_workflow's query action (that queries a saved file or JSON you provide, not the live canvas). Filters, traverses, projects and aggregates over the workflow the user is CURRENTLY VIEWING without dumping the whole graph (replaces the old panel_get_graph full-JSON dump; output is TOKEN-BOUNDED with an explicit truncation marker, so a big graph can never flood your context). Combine: `types` (node type contains any), `title` (contains), `where` widget predicates ANDed ('cfg>7', 'steps<=20', 'sampler_name=euler', 'text~sunset' — ops = != >= <= > < ~contains), `ids` (exact nodes — THE way to read ONE node's exact slot/widget detail: {ids:[42], fields:'detail'}), `upstream_of`/`downstream_of` + `depth` (dependency traversal: upstream = what FEEDS that node, downstream = what CONSUMES it; seed at depth 0), `fields` ('compact' one line per node [default], 'ids', 'detail' = the full node summary with slots + connections + mode), `group_by:'type'` (counts only), `limit` (default 40). detail rows include each node's MODE — a 'bypass' node is skipped and a 'mute' node kills everything downstream, so check modes on the path you care about before running (fix with panel_set_node_mode). Every result also carries `groups` (id, title, member node_ids — groups are geometric, trust this list) and, when viewing a SUBGRAPH (after panel_enter_subgraph), `rails` (boundary rail ids/slots). `max_chars` bounds the WHOLE result, those riders included, and the rows you asked for are spent first: on a big graph the riders lose their member ids, then drop out entirely, rather than starving your query — and each says in-band when it did, with the true counts. `widget_max_chars` raises the per-widget cap only for `fields:'detail'`; use it only with exactly one explicit `ids` entry (for example `{ids:[42], fields:'detail', widget_max_chars:8192}`), with a default of 2048 and a maximum of 32768. If supplied without those preconditions, it is not sent and the result says why; a legacy Panel that still returns the default cap is named in the result. It does not change compact, ids, or broad reads. Typical flow: panel_graph_outline to orient → panel_query_graph to pinpoint/inspect → edit. Read-only.",
       {
         types: z.array(z.string()).optional().describe("Node type contains ANY of these (case-insensitive)."),
         title: z.string().optional().describe("Node title contains this."),
@@ -14269,9 +14326,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       // The panel bounds `text`; the `groups`/`rails` riders were never in that
       // accounting, so on a large graph the reply could be many times the budget it
       // announced. Nothing is shed while the whole reply fits.
-      async (args: A, ctx) =>
-        fitQueryGraphReply(
-          await ctx.call({
+      async (args: A, ctx) => {
+        const widgetMaxChars = widgetMaxCharsRequest(args);
+        const panelReply = await ctx.call({
             cmd: "graph_query",
             types: args.types,
             title: args.title,
@@ -14284,10 +14341,16 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             group_by: args.group_by,
             limit: args.limit,
             max_chars: args.max_chars,
-            widget_max_chars: args.widget_max_chars,
-          }),
+            ...(widgetMaxChars.value === undefined
+              ? {}
+              : { widget_max_chars: widgetMaxChars.value }),
+          });
+        return fitQueryGraphReply(
+          panelReply,
           args.max_chars,
-        ),
+          widgetMaxChars.note ?? legacyWidgetMaxCharsNote(panelReply, widgetMaxChars.value),
+        );
+      },
     ),
     def(
       "panel_graph_outline",
