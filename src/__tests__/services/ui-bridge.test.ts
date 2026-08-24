@@ -892,6 +892,38 @@ describe("UiBridge (multi-tab)", () => {
     a2.close();
   });
 
+  it("resumes nodes_search as a read with a fresh dispatch RID (#2145)", async () => {
+    const a1 = await connectPanel("tab-2145");
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    const frames: Array<Record<string, unknown>> = [];
+    a1.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString()) as Record<string, unknown>;
+      if (msg.cmd === "nodes_search") frames.push(msg);
+    });
+
+    const promise = bridge.send(
+      { cmd: "nodes_search", query: "kjnodes", limit: 5 },
+      { tabId: "tab-2145", timeoutMs: 5000 },
+    );
+    await waitFor(() => expect(frames).toHaveLength(1));
+    a1.close();
+
+    const a2 = await connectPanel("tab-2145");
+    a2.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString()) as Record<string, unknown>;
+      if (msg.cmd === "nodes_search") {
+        frames.push(msg);
+        a2.send(JSON.stringify({ rid: msg.rid, ok: true, result: { packs: [] } }));
+      }
+    });
+    await expect(promise).resolves.toMatchObject({ packs: [] });
+    expect(frames).toHaveLength(2);
+    expect(frames[1]?.rid).toEqual(expect.any(String));
+    expect(frames[1]?.rid).not.toBe(frames[0]?.rid);
+    expect(frames[1]).toMatchObject({ cmd: "nodes_search", query: "kjnodes", limit: 5 });
+    a2.close();
+  });
+
   it("does NOT extend the caller's deadline when a read resumes (#450)", async () => {
     const a1 = await connectPanel("tab-aaaa-1111");
     await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
@@ -3673,6 +3705,21 @@ describe("defaultBridgeTimeoutMs — tolerant read timeout (#357)", () => {
     // slow /object_info fetch on a large install isn't cut off at the tight 6s.
     expect(BRIDGE_READONLY_CMDS.has("refresh_nodes")).toBe(true);
     expect(defaultBridgeTimeoutMs("refresh_nodes")).toBe(BRIDGE_READ_DEFAULT_TIMEOUT_MS);
+  });
+
+  it("classifies nodes_search as a READ without a mutation warning (#2145)", async () => {
+    expect(BRIDGE_READONLY_CMDS.has("nodes_search")).toBe(true);
+    const sock = await connectPanel("tab-2145-timeout");
+    const err = await bridge
+      .send(
+        { cmd: "nodes_search", query: "kjnodes" },
+        { tabId: "tab-2145-timeout", timeoutMs: 40 },
+      )
+      .then(() => null)
+      .catch((value: unknown) => value as Error);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).not.toMatch(/MUTATES|double-apply/i);
+    sock.close();
   });
 
   it("graph_query is tolerant and STRICTLY longer than the old flat 6s default (#357)", () => {
