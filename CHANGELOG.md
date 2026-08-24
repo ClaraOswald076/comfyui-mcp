@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.98] - 2026-08-24
+
+### MCP
+
+#### Fixed
+- Align bundled Krea2 workflows with the current RBG Smart Seed Variance schema (#2193)
+
 ## [0.52.97] - 2026-08-24
 
 ### MCP
