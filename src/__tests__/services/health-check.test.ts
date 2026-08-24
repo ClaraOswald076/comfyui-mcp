@@ -90,6 +90,7 @@ describe("runHealthCheck", () => {
     await expect(
       runHealthCheck({ modelCategories: ["checkpoints"] }),
     ).rejects.toThrow(/ComfyUI unreachable/);
+    expect(getSystemStats).toHaveBeenCalledWith({ diagnosticContext: "health" });
   });
 });
 

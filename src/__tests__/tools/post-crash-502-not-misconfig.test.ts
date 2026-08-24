@@ -19,10 +19,20 @@ vi.mock("../../config.js", () => ({
   isRemoteMode: () => true,
 }));
 
+// getEnvironmentAction reaches the live-interpreter seam while building its
+// running-instance report. Keep this production-path regression independent of
+// the machine running the test; the network behavior remains real and is driven
+// by the fetch stub below.
+vi.mock("../../services/live-interpreter.js", async () => ({
+  ...(await vi.importActual("../../services/live-interpreter.js")),
+  resolveLiveInterpreter: () => undefined,
+}));
+
 import { resetClient } from "../../comfyui/client.js";
 import { resetComfyApiRootValidated } from "../../comfyui/json-guard.js";
 import { registerDiagnosticsTools } from "../../tools/diagnostics.js";
 import { registerSystemStatsTools } from "../../tools/system-stats.js";
+import { getEnvironmentAction } from "../../tools/workspace-env.js";
 
 type ToolResult = { content: Array<{ type: string; text: string }>; isError?: boolean };
 type ToolHandler = (args: Record<string, unknown>) => Promise<ToolResult>;
@@ -54,6 +64,12 @@ function statsOk(): Response {
     }),
     { status: 200, headers: { "content-type": "application/json" } },
   );
+}
+
+function undiciFailure(code: string, detail: string): Error {
+  const cause = new Error(detail);
+  (cause as { code?: string }).code = code;
+  return new TypeError("fetch failed", { cause });
 }
 
 /** Route /system_stats to JSON while healthy; everything else is the post-crash 502. */
@@ -126,5 +142,44 @@ describe("post-CUDA-crash empty 502 is an outage, not a base-URL misconfig (#167
       expect(text).toContain("/system_stats");
       expect(text).toContain("not newly misconfigured");
     }
+  });
+
+  it('get_system_stats (action:"health") preserves transport details without a circular retry', async () => {
+    global.fetch = vi.fn().mockRejectedValue(
+      undiciFailure("ECONNREFUSED", "connect ECONNREFUSED remote.example:8188"),
+    ) as unknown as typeof fetch;
+
+    const out = await getHandler("get_system_stats", registerSystemStatsTools)({ action: "health" });
+    expect(out.isError).toBe(true);
+    const payload = JSON.parse(out.content[0].text) as { error: string; message: string };
+    expect(payload.error).toBe("CONNECTION_ERROR");
+    expect(payload.message).toContain("ECONNREFUSED");
+    expect(payload.message).toContain("http://remote.example:8188/system_stats");
+    expect(payload.message).toContain('install_comfyui (action:"environment")');
+    expect(payload.message).toContain("independent readiness probe");
+    expect(payload.message).not.toContain('get_system_stats (action:"health")');
+  });
+
+  it('health failure -> environment probe keeps nested error text non-recursive (#2188)', async () => {
+    global.fetch = vi.fn().mockRejectedValue(
+      undiciFailure("ECONNREFUSED", "connect ECONNREFUSED remote.example:8188"),
+    ) as unknown as typeof fetch;
+
+    const health = await getHandler("get_system_stats", registerSystemStatsTools)({ action: "health" });
+    const healthPayload = JSON.parse(health.content[0].text) as { message: string };
+    expect(healthPayload.message).toContain('install_comfyui (action:"environment")');
+
+    const environment = await getEnvironmentAction();
+    expect(environment.isError).not.toBe(true);
+    const environmentPayload = JSON.parse(environment.content[0].text) as {
+      running_instance: { reachable: boolean; error?: string };
+    };
+    const nested = environmentPayload.running_instance.error ?? "";
+    expect(environmentPayload.running_instance.reachable).toBe(false);
+    expect(nested).toContain("ECONNREFUSED");
+    expect(nested).toContain("http://remote.example:8188/system_stats");
+    expect(nested).toContain("COMFYUI_AUTH_*");
+    expect(nested).not.toContain('install_comfyui (action:"environment")');
+    expect(nested).not.toContain('get_system_stats (action:"health")');
   });
 });
