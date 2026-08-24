@@ -20,7 +20,11 @@
 
 import { ComfyUIError } from "../utils/errors.js";
 import { config, getComfyUIAuthHeaders, getComfyUIBaseUrl } from "../config.js";
-import { comfyuiFetch, targetOf } from "./fetch.js";
+import {
+  comfyuiFetch,
+  targetOf,
+  type ComfyFetchDiagnosticContext,
+} from "./fetch.js";
 
 /** What answered instead of the ComfyUI JSON API. */
 export type NonJsonKind =
@@ -1289,9 +1293,10 @@ export async function fetchComfyJson<T = unknown>(
     init?: RequestInit;
     expectShape?: (v: unknown) => boolean;
     shapeHint?: string;
+    diagnosticContext?: ComfyFetchDiagnosticContext;
   } = {},
 ): Promise<T> {
-  const res = await comfyuiFetch(url, opts.init ?? {});
+  const res = await comfyuiFetch(url, opts.init ?? {}, opts.diagnosticContext);
   return readComfyJson<T>(res, {
     url,
     expectShape: opts.expectShape,
