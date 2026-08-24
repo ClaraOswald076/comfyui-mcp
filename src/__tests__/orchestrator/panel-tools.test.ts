@@ -1831,15 +1831,62 @@ describe("panel-tools: panel_query_graph detail widget budget (#1681)", () => {
   it("forwards a valid detail-only opt-in without changing other graph args", async () => {
     const { ctx, calls } = makeFakeCtx();
     await defByName("panel_query_graph").handler(
-      { ids: [42], fields: "detail", widget_max_chars: 8192 },
+      { ids: [42], fields: "detail", widget_max_chars: 32768 },
       ctx,
     );
     expect(calls[0]).toMatchObject({
       cmd: "graph_query",
       ids: [42],
       fields: "detail",
-      widget_max_chars: 8192,
+      widget_max_chars: 32768,
     });
+  });
+
+  it.each([
+    [{ ids: [42], fields: "compact" }, /fields:"detail"/],
+    [{ ids: [42, 43], fields: "detail" }, /exactly one explicit ids entry.*2 ids/],
+    [{ fields: "detail" }, /no explicit ids/],
+  ] as const)("does not forward a raised cap when its precondition is not met", async (args, reason) => {
+    const { ctx, calls } = makeFakeCtx();
+    const result = await defByName("panel_query_graph").handler(
+      { ...args, widget_max_chars: 8192 },
+      ctx,
+    );
+    expect(Object.hasOwn(calls[0], "widget_max_chars")).toBe(false);
+    expect(calls[0].widget_max_chars).toBeUndefined();
+    const payload = JSON.parse((result.content[0] as { text: string }).text) as Record<string, unknown>;
+    expect(payload.widget_max_chars_note).toEqual(expect.stringMatching(reason));
+  });
+
+  it("names a legacy Panel that accepts but ignores the raised cap", async () => {
+    const { ctx, calls } = makeFakeCtx();
+    ctx.call = async (cmd) => {
+      calls.push(cmd);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              total: 1,
+              candidates: 1,
+              matched: 1,
+              shown: 1,
+              truncated: false,
+              text:
+                '1 match(es)\\n{"id":42,"widgets":{"prompt":"x…(+2912 chars cut at the 2048-char per-widget cap, which `max_chars` does not raise)"}}',
+            }),
+          },
+        ],
+      };
+    };
+    const result = await defByName("panel_query_graph").handler(
+      { ids: [42], fields: "detail", widget_max_chars: 8192 },
+      ctx,
+    );
+    expect(calls[0].widget_max_chars).toBe(8192);
+    const payload = JSON.parse((result.content[0] as { text: string }).text) as Record<string, unknown>;
+    expect(payload.widget_max_chars_note).toEqual(expect.stringContaining("connected Panel"));
+    expect(payload.widget_max_chars_note).toEqual(expect.stringContaining("graph_query.widget_max_chars"));
   });
 
   it("preserves the default/no-argument graph query behavior", async () => {
