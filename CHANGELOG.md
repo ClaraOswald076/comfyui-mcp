@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.89] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- explain ignored widget detail caps
+
+
 ## [0.52.88] - 2026-08-23
 
 ### MCP
