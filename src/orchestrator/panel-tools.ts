@@ -3386,9 +3386,18 @@ function isMidCommandDisconnectResult(res: ToolResult): boolean {
   );
 }
 
-/** A `graph_run` we wrote and then lost the reply for — timeout or disconnect. */
-function isUnackedGraphRunResult(res: ToolResult): boolean {
-  return isReplyTimeoutResult(res) || isMidCommandDisconnectResult(res);
+/** A `graph_run` whose queue receipt still needs reconciliation. */
+function isUnackedGraphRunResult(res: ToolResult, allowPanelQueueUnknown = false): boolean {
+  if (isReplyTimeoutResult(res) || isMidCommandDisconnectResult(res)) return true;
+  // #1728 — Panel can answer normally with queued_unknown while its scoped
+  // dispatch still has an in-flight /prompt request. Only enter the existing
+  // queue grace when NO prompt id was returned; a partial receipt already has
+  // tickets for its known ids and must not be guessed into a different id. The
+  // caller gates this new inference to panel_run's scoped form; full-graph
+  // uncertainty keeps its existing retry guidance.
+  if (!allowPanelQueueUnknown) return false;
+  const parsed = parseToolResultJson(res);
+  return isPanelQueueUncertainty(parsed) && acceptedPromptIds(parsed).length === 0;
 }
 
 /**
@@ -13522,7 +13531,7 @@ function runLateAckGraceMs(): number {
 /**
  * Wait, bounded, for evidence that a `graph_run` we stopped waiting for still
  * queued — and hand back the reply it would have produced on time (#1175,
- * panel#1524).
+ * panel#1524, panel#1728).
  *
  * Two receipts, in this order:
  *
@@ -13536,7 +13545,8 @@ function runLateAckGraceMs(): number {
  *
  * Returns null when there is nothing to reconcile. The negatives are deliberate:
  *
- *  - NOT an unacked post-write (timeout or disconnect) ⇒ nothing to wait for.
+ *  - NOT an unacked post-write (timeout or disconnect), or the Panel's explicit
+ *    id-less queued_unknown receipt (#1728) ⇒ nothing to wait for.
  *    Gated on the bridge's own typed marks, never on message text: an acked
  *    panel error can quote our timeout/OUTCOME UNKNOWN sentence verbatim
  *    (#1468 round 2), and the difference is whether the tab answered, which
@@ -13568,12 +13578,23 @@ async function reconcileLateRunAck(
   res: ToolResult,
   rid: string | undefined,
   preRunningPromptId?: string | null,
-): Promise<{ result: unknown; lateByMs: number; via: "ack" | "queue" } | null> {
-  if (!isUnackedGraphRunResult(res)) return null;
-  const fromQueue = (): { result: unknown; lateByMs: number; via: "queue" } | null => {
+  allowPanelQueueUnknown = false,
+): Promise<{ result: unknown; lateByMs: number; via: "ack" | "queue" | "queue-uncertain" } | null> {
+  if (!isUnackedGraphRunResult(res, allowPanelQueueUnknown)) return null;
+  const fromQueue = (): {
+    result: unknown;
+    lateByMs: number;
+    via: "queue" | "queue-uncertain";
+  } | null => {
     const promptId = promptAppearedAfterDispatch(preRunningPromptId);
     if (!promptId) return null;
-    return { result: { queued: true, prompt_id: promptId }, lateByMs: 0, via: "queue" };
+    return {
+      result: { queued: true, prompt_id: promptId },
+      lateByMs: 0,
+      via: isPanelQueueUncertainty(parseToolResultJson(res))
+        ? "queue-uncertain"
+        : "queue",
+    };
   };
   const bridge = ctx.bridge;
   const canPeek =
@@ -13628,6 +13649,18 @@ function queueRunReceiptNote(promptId: string): string {
     `prompt when this command was dispatched. Treating that as this run's receipt (queued:true). ` +
     `Nothing was dispatched a second time. Do NOT re-run: a second panel_run would bill/queue ` +
     `another render behind the one already running.`
+  );
+}
+
+/** #1728 — the Panel answered with queued_unknown, then its late prompt became
+ * visible to the watchdog. That is a bounded receipt, not a second dispatch. */
+function panelQueueUncertainReceiptNote(promptId: string): string {
+  return (
+    `\n\n[RECOVERED] The Panel returned queued_unknown before its scoped dispatch ` +
+    `reported a prompt id, but ComfyUI's queue now contains prompt ${promptId} — which was not ` +
+    `running when this command was dispatched. Treating that observation as this run's receipt ` +
+    `(queued:true) and opening its completion ticket. Nothing was dispatched a second time. ` +
+    `Do NOT re-run: a second panel_run could queue a duplicate render.`
   );
 }
 
@@ -16268,17 +16301,25 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // guidance. Rebuilding the reply here (rather than describing it) is what
         // makes that possible — `ok()` is exactly what ctx.call would have produced.
         const reconcileRun = async (): Promise<void> => {
-          const recovered = await reconcileLateRunAck(ctx, res, runRid, pre.runningPromptId);
+          const recovered = await reconcileLateRunAck(
+            ctx,
+            res,
+            runRid,
+            pre.runningPromptId,
+            typeof args.to_node_id === "number",
+          );
           if (!recovered) return;
           res = ok(recovered.result);
+          const promptId =
+            typeof (recovered.result as { prompt_id?: unknown }).prompt_id === "string"
+              ? (recovered.result as { prompt_id: string }).prompt_id
+              : "?";
           lateAckNote =
-            recovered.via === "queue"
-              ? queueRunReceiptNote(
-                  typeof (recovered.result as { prompt_id?: unknown }).prompt_id === "string"
-                    ? (recovered.result as { prompt_id: string }).prompt_id
-                    : "?",
-                )
-              : lateRunAckNote(recovered.lateByMs);
+            recovered.via === "queue-uncertain"
+              ? panelQueueUncertainReceiptNote(promptId)
+              : recovered.via === "queue"
+                ? queueRunReceiptNote(promptId)
+                : lateRunAckNote(recovered.lateByMs);
         };
         await reconcileRun();
         // Derive the verdict from the AUTHORITATIVE reply, not a bare `queued`
