@@ -3661,12 +3661,18 @@ describe("tabServerOrigin (server-observed handshake Origin — #509 spoof gate)
     s.close();
   });
 
-  it("normalizes to scheme://host:port — any path is stripped (Origin carries none)", async () => {
-    // Even if a client sends a path-bearing value, the stored origin is authority-only, so
-    // a path-mounted boot base is fail-closed (never falsely matched) downstream.
-    const s = await connectWithOrigin("tab-origin-3", "http://127.0.0.1:8188/comfy");
+  it.each([
+    "http://127.0.0.1:8188/comfy",
+    "http://127.0.0.1:8188/",
+    "http://127.0.0.1:8188?token=secret",
+    "http://user:pass@127.0.0.1:8188",
+    "ws://127.0.0.1:8188",
+  ])("rejects a non-origin handshake value %s", async (origin) => {
+    // A tokenless local client can write the HTTP header, so syntax normalization
+    // must not turn a path/query/userinfo/unsupported scheme into origin data.
+    const s = await connectWithOrigin("tab-origin-3", origin);
     await waitFor(() => expect(bridge.canReach("tab-origin-3")).toBe(true));
-    expect(bridge.tabServerOrigin("tab-origin-3")).toBe("http://127.0.0.1:8188");
+    expect(bridge.tabServerOrigin("tab-origin-3")).toBeUndefined();
     s.close();
   });
 });
@@ -5425,11 +5431,22 @@ describe("UiBridge (late MUTATION outcome — #694)", () => {
 // callback the orchestrator installs, and this is what it asks for.
 describe("UiBridge.connectedServerOrigins (#952)", () => {
   /** A panel socket carrying a SERVER-OBSERVED handshake Origin, like a browser. */
-  function connectWithOrigin(tabId: string, origin?: string): Promise<WebSocket> {
+  function connectWithOrigin(
+    tabId: string,
+    origin?: string,
+    claimedOrigin: string | undefined = origin,
+  ): Promise<WebSocket> {
     return new Promise((resolve, reject) => {
       const sock = new WebSocket(`ws://127.0.0.1:${port}`, origin ? { origin } : {});
       sock.on("open", () => {
-        sock.send(JSON.stringify({ type: "hello", tab_id: tabId, title: tabId }));
+        sock.send(
+          JSON.stringify({
+            type: "hello",
+            tab_id: tabId,
+            title: tabId,
+            ...(claimedOrigin ? { comfyui_url: claimedOrigin } : {}),
+          }),
+        );
         resolve(sock);
       });
       sock.on("error", reject);
@@ -5475,6 +5492,18 @@ describe("UiBridge.connectedServerOrigins (#952)", () => {
 
   it("is empty with nothing connected, and never throws", () => {
     expect(bridge.connectedServerOrigins()).toEqual([]);
+  });
+
+  it("keeps a forged tokenless local handshake origin diagnostic-only", async () => {
+    const forged = await connectWithOrigin("forged-local", "http://127.0.0.1:8188");
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+
+    // The observed header and matching hello claim are both forgeable by this
+    // non-browser WebSocket client. It may remain diagnostic data, but no
+    // UiBridge API exposes it as a direct MCP fallback authorization.
+    expect(bridge.connectedServerOrigins()).toEqual(["http://127.0.0.1:8188"]);
+    expect("connectedSafePanelOrigins" in bridge).toBe(false);
+    forged.close();
   });
 });
 

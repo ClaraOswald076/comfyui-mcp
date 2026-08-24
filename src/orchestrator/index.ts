@@ -98,8 +98,18 @@ import {
 } from "./turn-origins.js";
 import { listSessions, loadTranscript } from "./history.js";
 import { uploadImageHttp, resetClient } from "../comfyui/client.js";
-import { setConnectedPanelOrigins } from "../comfyui/fetch.js";
+import {
+  setConnectedPanelFallbackOrigins,
+  setConnectedPanelOrigins,
+} from "../comfyui/fetch.js";
 import { publishConnectedPanelOrigins } from "../services/panel-origin-channel.js";
+import {
+  startPanelImageRelayServer,
+  verifyPanelImageRelayCapability,
+  type PanelImageRelayResolvedAgent,
+  type PanelImageRelayServer,
+  type PanelImageRelayRequest,
+} from "../services/panel-image-relay.js";
 import { logger } from "../utils/logger.js";
 import { listDownloadJobs } from "../services/download-jobs.js";
 import { completionDisagreesWithRecord, failureDisagreesWithRecord } from "./download-done-guard.js";
@@ -1653,6 +1663,23 @@ export async function runPanelOrchestrator(): Promise<void> {
   const agentKeyFor = (panelTabId: string): string =>
     SHARED_SESSION_SCOPE + AGENT_KEY_SEP + backendForTab(panelTabId);
   const sharedKeyFor = (backend: string): string => SHARED_SESSION_SCOPE + AGENT_KEY_SEP + backend;
+  // #2149 — a child may write to the shared progress directory, so its tab
+  // identity must never come from request JSON. Capabilities are minted here,
+  // injected into the child environment, and resolved only by this process.
+  const panelImageRelaySecrets = new Map<string, string>();
+  const panelImageRelaySecretFor = (agentKey: string): string => {
+    const existing = [...panelImageRelaySecrets.entries()].find(([, key]) => key === agentKey)?.[0];
+    if (existing) return existing;
+    const secret = randomBytes(32).toString("hex");
+    panelImageRelaySecrets.set(secret, agentKey);
+    return secret;
+  };
+  const panelImageRelayAgentFor = (request: PanelImageRelayRequest): PanelImageRelayResolvedAgent | undefined => {
+    for (const [secret, agentKey] of panelImageRelaySecrets) {
+      if (verifyPanelImageRelayCapability(secret, request)) return { agentKey, secret };
+    }
+    return undefined;
+  };
   // The scope/backend halves of a composite key. Neither half contains "::", so
   // split on the LAST separator.
   const panelTabOf = (key: string): string => {
@@ -1663,6 +1690,26 @@ export async function runPanelOrchestrator(): Promise<void> {
     const i = key.lastIndexOf(AGENT_KEY_SEP);
     return i >= 0 ? key.slice(i + AGENT_KEY_SEP.length) : defaultBackend;
   };
+  // #2149 — shared agent keys are not panel tab ids. Resolve through the
+  // bridge's pinned shared-tab mapping before dispatching fetch_image.
+  const scopeToRealTab = (tabId: string): string | undefined =>
+    isScopeAddress(tabId) ? bridge.resolveSharedTabId(tabId) : panelTabOf(tabId);
+  let panelImageRelayServer: PanelImageRelayServer | undefined;
+  let panelImageRelayEndpoint: string | undefined;
+  try {
+    panelImageRelayServer = await startPanelImageRelayServer({
+      bridge,
+      resolvePanelAgent: panelImageRelayAgentFor,
+      resolvePanelTab: scopeToRealTab,
+    });
+    panelImageRelayEndpoint = panelImageRelayServer.endpointUrl;
+  } catch (error) {
+    // No filesystem fallback exists. A failed bind leaves get_image on its
+    // normal headless error path rather than exposing an unsafe channel.
+    logger.warn(
+      `[panel-orchestrator] authenticated panel image relay unavailable: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   // #884 — PER-CONVERSATION TURN ORIGINS: the issue-time workflow stamp
   // (#570's rule at conversation level — a scope mutation carries the uuid its
   // turn was ISSUED for, never re-resolved at dispatch; codex round 1, P0),
@@ -2102,6 +2149,8 @@ export async function runPanelOrchestrator(): Promise<void> {
         // downloads resolved to nobody and the owning conversation stalled).
         // `tabId` here IS the agent key (the scope address the lane binds).
         COMFYUI_MCP_TAB: tabId,
+        COMFYUI_MCP_RELAY_SECRET: panelImageRelaySecretFor(tabId),
+        ...(panelImageRelayEndpoint ? { COMFYUI_MCP_RELAY_URL: panelImageRelayEndpoint } : {}),
         // …and the same key addresses this agent's published identity.
         ...agentIdentityEnv(tabId),
       }),
@@ -2418,6 +2467,8 @@ export async function runPanelOrchestrator(): Promise<void> {
         // child stamps its own COMFYUI_MCP_TAB into each progress row, and the
         // settle path resolves an agent-key-shaped stamp directly.
         ...(agentKey ? { COMFYUI_MCP_TAB: agentKey } : {}),
+        ...(agentKey ? { COMFYUI_MCP_RELAY_SECRET: panelImageRelaySecretFor(agentKey) } : {}),
+        ...(agentKey && panelImageRelayEndpoint ? { COMFYUI_MCP_RELAY_URL: panelImageRelayEndpoint } : {}),
         // Which LLM is driving this agent, for report_issue's stamp (see
         // agentIdentityEnv). Same key, same reason it is keyed by agent.
         ...agentIdentityEnv(agentKey),
@@ -3000,19 +3051,19 @@ export async function runPanelOrchestrator(): Promise<void> {
   // current workflow: re-resolving at dispatch would let a mutation conceived
   // on workflow A silently land on workflow B after a mid-turn switch (codex
   // round 1, P0). A real-tab caller keeps the per-tab stamp.
-  const scopeToRealTab = (tabId: string): string | undefined =>
-    isScopeAddress(tabId) ? bridge.resolveSharedTabId(tabId) : panelTabOf(tabId);
   // #884 P0 (confirming gate) — while a conversation's turn is in flight, its
   // scope-addressed tool calls are PINNED to the tab the turn was issued from;
   // `null` (ambiguous origin) makes the bridge refuse loudly; no entry lets
   // the bridge fall back to active-tab resolution (idle-time probes).
   bridge.setScopeTargetResolver(makeScopeTargetResolver({ tracker: turnOrigins, scopeAgentKeyOf }));
-  // #952 — let a headless `fetch failed` say whether the connected panel is on a
-  // DIFFERENT ComfyUI than COMFYUI_URL. The reporter's readonly tools failed
-  // while every panel tool worked, and nothing in the error connected the two.
-  // SERVER-OBSERVED origins only (tabServerOrigin): the browser sets the
-  // handshake Origin and page JS cannot forge it, unlike hello.comfyui_url.
+  // #2149 — observed tokenless WebSocket origins are diagnostic only. A local
+  // non-browser client can forge both the Origin header and hello claim, so
+  // there is no browser-proven authorization for MCP to make a new /view
+  // request. Keep diagnostics live, but leave the direct-fallback source at
+  // its fail-closed production default until an authenticated panel signal
+  // exists.
   setConnectedPanelOrigins(() => bridge.connectedServerOrigins());
+  setConnectedPanelFallbackOrigins(null);
   // #884 P1 (confirming gate 2) — EXPLICIT recovery from a DEAD or AMBIGUOUS
   // pin, and from those only. The bridge's refusal names
   // panel_set_workflow_target as the way out; this is the ONLY path that
@@ -6681,6 +6732,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     // Tear down the loopback panel HTTP MCP (codex/gemini mode only).
     if (panelMcpHttp) await panelMcpHttp.stop().catch(() => {});
     if (panelConsoleHttp) await panelConsoleHttp.stop().catch(() => {});
+    if (panelImageRelayServer) await panelImageRelayServer.close().catch(() => {});
     secureBridge?.stop();
     await bridge.stop();
     // Only remove the lockfile if it still names us — avoid clobbering a fresh
