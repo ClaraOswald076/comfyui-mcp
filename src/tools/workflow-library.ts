@@ -585,7 +585,33 @@ async function getWorkflowAction(filename: string, format: "ui" | "api"): Promis
           // Backfill node types missing from the bulk /object_info (e.g.
           // controlnet_aux's DWPreprocessor) so the converter doesn't skip them.
           const objectInfo = await backfillObjectInfo(bulk, collectNodeTypes(raw));
-          const { workflow, warnings } = convertUiToApi(raw, objectInfo);
+          const converted = convertUiToApi(raw, objectInfo);
+          const { workflow, warnings } = converted;
+
+          // A non-empty UI graph must never be reported as a successful empty
+          // API graph. That makes a conversion failure look like a valid
+          // dependency-free workflow to callers such as list_packs
+          // (action:"extract_deps") and is especially misleading for large
+          // graphs whose executable nodes were all skipped by schema, UUID or
+          // bypass handling (#2125). Refuse at this production boundary rather
+          // than broadening the converter's schema guesses or changing its
+          // existing fail-closed node semantics.
+          if (raw.nodes.length > 0 && Object.keys(workflow).length === 0) {
+            const missingTypes = [
+              ...new Set((converted.missingNodeTypes ?? []).map((entry) => entry.classType)),
+            ];
+            const missingNote =
+              missingTypes.length > 0
+                ? ` Missing node type(s): ${missingTypes.slice(0, 8).join(", ")}${
+                    missingTypes.length > 8 ? ", …" : ""
+                  }.`
+                : "";
+            throw new ValidationError(
+              `Could NOT convert "${filename}" from UI to API: the saved graph contains ${
+                raw.nodes.length
+              } node(s), but conversion produced no executable API nodes. Refusing to return an empty {} graph because downstream analysis would be misleading.${missingNote} Request format:"ui" to inspect the original graph and its conversion warnings.`,
+            );
+          }
 
           // Return the JSON workflow as the primary/first content block so
           // consumers that read the first text result always receive the graph
