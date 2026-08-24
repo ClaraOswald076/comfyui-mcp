@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.97] - 2026-08-24
+
+### MCP
+
+#### Fixed
+- Preserve route-bound Panel run receipts across reconnects, remounts, timeouts, batches, and duplicate delivery (#1728)
+- Prevent health diagnostics from recursively suggesting the environment-install path (#2188)
+
 ## [0.52.96] - 2026-08-24
 
 ### MCP
