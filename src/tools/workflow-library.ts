@@ -6,6 +6,7 @@ import { getObjectInfo, backfillObjectInfo, comfyApiFetch } from "../comfyui/cli
 import { bodyPrefixOf, describeStatus } from "../comfyui/json-guard.js";
 import { errorToToolResult, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import { getComfyUIBaseUrl } from "../config.js";
 import {
   isUiFormat,
   isApiFormat,
@@ -14,6 +15,7 @@ import {
   collectNodeTypes,
 } from "../services/workflow-converter.js";
 import type { ConversionResult } from "../services/workflow-converter.js";
+import { frontendVirtualTypesFor } from "../services/frontend-virtual-types.js";
 import { sliceWorkflow } from "../services/workflow-slicer.js";
 import {
   queryApiGraph,
@@ -79,7 +81,9 @@ async function loadRawFromSource(
 async function convertUiWorkflow(raw: UiWorkflow): Promise<ConversionResult> {
   const bulk = await getObjectInfo();
   const objectInfo = await backfillObjectInfo(bulk, collectNodeTypes(raw));
-  return convertUiToApi(raw, objectInfo);
+  return convertUiToApi(raw, objectInfo, {
+    frontendVirtualTypes: frontendVirtualTypesFor(getComfyUIBaseUrl()),
+  });
 }
 
 const MAX_CONVERSION_DIAGNOSTICS_CHARS = 12_000;
@@ -857,7 +861,12 @@ async function saveWorkflowAction(
 }
 
 /** Load and convert a workflow from the library (shared by action:"analyze"). */
-async function loadWorkflowApi(filename: string): Promise<{ workflow: WorkflowJSON; warnings: string[] }> {
+async function loadWorkflowApi(filename: string): Promise<{
+  workflow: WorkflowJSON;
+  warnings: string[];
+  /** Defined only for UI input, where zero means a valid empty conversion. */
+  potentiallyExecutableNodeCount?: number;
+}> {
   const encoded = encodeURIComponent(`workflows/${filename}`);
   const res = await comfyApiFetch(`/api/userdata/${encoded}`);
 
@@ -894,11 +903,10 @@ async function analyzeWorkflowAction(
   section: string | undefined,
 ): Promise<TextResult> {
         logger.info(`Analyzing workflow: ${filename} (view=${view})`);
-        const { workflow, warnings } = await loadWorkflowApi(filename);
-        const objectInfo = await getObjectInfo();
-
+        const { workflow, warnings, potentiallyExecutableNodeCount } = await loadWorkflowApi(filename);
         const nodeCount = Object.keys(workflow).length;
-        if (nodeCount === 0) {
+        const validEmptyUiConversion = nodeCount === 0 && potentiallyExecutableNodeCount === 0;
+        if (nodeCount === 0 && !validEmptyUiConversion) {
           throw new ValidationError("Workflow contains no nodes");
         }
 
@@ -911,6 +919,17 @@ async function analyzeWorkflowAction(
             text: `**Conversion warnings (${warnings.length}):**\n${warnings.map((w) => `- ${w}`).join("\n")}`,
           });
         }
+
+        if (validEmptyUiConversion) {
+          content.push({
+            type: "text",
+            text:
+              "Workflow contains no executable API nodes. The saved UI graph is empty or contains only bypassed, muted, or frontend-only nodes.",
+          });
+          return { content };
+        }
+
+        const objectInfo = await getObjectInfo();
 
         if (view === "flat") {
           // Simple mermaid flowchart — good for small workflows

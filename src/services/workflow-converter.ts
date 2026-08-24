@@ -42,6 +42,15 @@ export interface ConversionResult {
   }>;
 }
 
+/**
+ * Runtime facts supplied by a connected frontend. These are deliberately
+ * optional: a headless MCP process without a panel has no proof and must keep
+ * treating unknown node types as potentially executable.
+ */
+export interface UiToApiConversionOptions {
+  frontendVirtualTypes?: ReadonlySet<string>;
+}
+
 interface LinkInfo {
   sourceNodeId: number;
   sourceSlot: number;
@@ -2494,6 +2503,7 @@ export const FRONTEND_ONLY_NODE_TYPES: ReadonlySet<string> = new Set([
 export function convertUiToApi(
   ui: UiWorkflow,
   objectInfo: ObjectInfo,
+  options?: UiToApiConversionOptions,
 ): ConversionResult {
   // Clone (don't mutate the caller's workflow), materialize the node-pack
   // broadcast wiring that isn't in `links` at all (cg-use-everywhere), strip the
@@ -2529,7 +2539,12 @@ export function convertUiToApi(
   }
 
   // Node types that are purely visual/internal and have no API equivalent
-  const SKIP_TYPES = NON_EXECUTING_NODE_TYPES;
+  const provenFrontendOnlyTypes = [...(options?.frontendVirtualTypes ?? [])].filter(
+    (type) =>
+      !WIRING_VIRTUAL_TYPES.has(type) &&
+      !Object.prototype.hasOwnProperty.call(objectInfo, type),
+  );
+  const SKIP_TYPES = new Set([...NON_EXECUTING_NODE_TYPES, ...provenFrontendOnlyTypes]);
 
   // Get/Set node types that need special handling (not in object_info). The SAME
   // set the de-virtualization pre-pass uses — this was a verbatim second copy, and

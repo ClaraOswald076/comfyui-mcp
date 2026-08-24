@@ -103,7 +103,7 @@ describe('get_workflow (action:"get") — JSON before conversion warnings (#494)
     expect(JSON.parse(content[0].text)).toEqual(apiWorkflow);
   });
 
-  it("refuses a non-empty UI graph that converts to an empty API graph (#2125)", async () => {
+  it("accepts a non-empty UI graph when the converter identifies only frontend-only content", async () => {
     const uiWorkflow = {
       // The reported workflow had 164 nodes, including UUID-backed subgraphs
       // and bypassed pipeline branches. Keep that cardinality here so the
@@ -121,7 +121,7 @@ describe('get_workflow (action:"get") — JSON before conversion warnings (#494)
       workflow: {},
       warnings: [],
       missingNodeTypes: [],
-      potentiallyExecutableNodeCount: 1,
+      potentiallyExecutableNodeCount: 0,
     });
 
     const result = await getHandler("get_workflow")({
@@ -130,9 +130,7 @@ describe('get_workflow (action:"get") — JSON before conversion warnings (#494)
       format: "api",
     });
 
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("produced no executable API nodes");
-    expect(result.content[0].text).toContain("Request format");
-    expect(result.content[0].text).not.toBe("{}");
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual({});
   });
 });
