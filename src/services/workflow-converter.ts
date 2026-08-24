@@ -19,6 +19,12 @@ export interface ConversionResult {
   workflow: WorkflowJSON;
   warnings: string[];
   /**
+   * Expanded nodes that the main conversion loop considered executable. A
+   * zero count is meaningful: a UI graph made only of bypassed/muted or
+   * frontend-only nodes legitimately converts to an empty API prompt.
+   */
+  potentiallyExecutableNodeCount: number;
+  /**
    * Nodes DROPPED because their class_type is absent from object_info. Reported
    * structurally so a caller can raise the same authoritative "unknown node type"
    * error the API-format path raises, instead of parsing it back out of the
@@ -2539,6 +2545,18 @@ export function convertUiToApi(
   // written down instead of assumed.
   const GET_SET_TYPES = WIRING_VIRTUAL_TYPES;
 
+  // Keep the production empty-result guard aligned with the exact skip rules
+  // below. Counting after component expansion is important: a UUID-backed
+  // component whose inner graph is entirely bypassed/frontend-only is also a
+  // valid empty executable graph.
+  const potentiallyExecutableNodeCount = expanded.nodes.filter(
+    (node) =>
+      node.mode !== 2 &&
+      node.mode !== 4 &&
+      !SKIP_TYPES.has(node.type) &&
+      !GET_SET_TYPES.has(node.type),
+  ).length;
+
   const nodesById = new Map(expanded.nodes.map((n) => [n.id, n]));
 
   const isGetType = (t: string) => GET_SET_TYPES.has(t) && /get/i.test(t);
@@ -3678,5 +3696,10 @@ export function convertUiToApi(
   // duplicates are pure noise. Distinct nodes/inputs keep their own warnings.
   const dedupedWarnings = [...new Set(warnings)];
 
-  return { workflow, warnings: dedupedWarnings, missingNodeTypes };
+  return {
+    workflow,
+    warnings: dedupedWarnings,
+    missingNodeTypes,
+    potentiallyExecutableNodeCount,
+  };
 }

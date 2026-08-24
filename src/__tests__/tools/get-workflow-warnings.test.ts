@@ -121,6 +121,7 @@ describe('get_workflow (action:"get") — JSON before conversion warnings (#494)
       workflow: {},
       warnings: [],
       missingNodeTypes: [],
+      potentiallyExecutableNodeCount: 1,
     });
 
     const result = await getHandler("get_workflow")({
