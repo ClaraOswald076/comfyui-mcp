@@ -1,11 +1,12 @@
 import { z } from "zod";
 import { readFile } from "node:fs/promises";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { WorkflowJSON } from "../comfyui/types.js";
+import type { UiWorkflow, WorkflowJSON } from "../comfyui/types.js";
 import { getObjectInfo, backfillObjectInfo, comfyApiFetch } from "../comfyui/client.js";
 import { bodyPrefixOf, describeStatus } from "../comfyui/json-guard.js";
 import { errorToToolResult, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import { getComfyUIBaseUrl } from "../config.js";
 import {
   isUiFormat,
   isApiFormat,
@@ -13,6 +14,8 @@ import {
   convertApiToUi,
   collectNodeTypes,
 } from "../services/workflow-converter.js";
+import type { ConversionResult } from "../services/workflow-converter.js";
+import { frontendVirtualTypesFor } from "../services/frontend-virtual-types.js";
 import { sliceWorkflow } from "../services/workflow-slicer.js";
 import {
   queryApiGraph,
@@ -72,6 +75,53 @@ async function loadRawFromSource(
     );
   }
   return await res.json();
+}
+
+/** Keep every saved-workflow UI conversion on the same schema-backed path. */
+async function convertUiWorkflow(raw: UiWorkflow): Promise<ConversionResult> {
+  const bulk = await getObjectInfo();
+  const objectInfo = await backfillObjectInfo(bulk, collectNodeTypes(raw));
+  return convertUiToApi(raw, objectInfo, {
+    frontendVirtualTypes: frontendVirtualTypesFor(getComfyUIBaseUrl()),
+  });
+}
+
+const MAX_CONVERSION_DIAGNOSTICS_CHARS = 12_000;
+
+function formatConversionDiagnostics(warnings: readonly string[]): string {
+  if (warnings.length === 0) return "";
+  const rendered = warnings.map((warning) => `- ${warning}`).join("\n");
+  if (rendered.length <= MAX_CONVERSION_DIAGNOSTICS_CHARS) return rendered;
+  return `${rendered.slice(0, MAX_CONVERSION_DIAGNOSTICS_CHARS)}\n- … conversion diagnostics truncated after ${MAX_CONVERSION_DIAGNOSTICS_CHARS} characters; use action:"strip" for the full bounded report.`;
+}
+
+/**
+ * Fail closed only when the converter saw an executable candidate and lost
+ * all of them. Empty UI graphs and graphs consisting solely of bypassed,
+ * muted, or frontend-only nodes are valid empty executable prompts.
+ */
+function refuseIfExecutableContentWasLost(
+  sourceName: string,
+  raw: UiWorkflow,
+  converted: ConversionResult,
+): void {
+  if (
+    raw.nodes.length === 0 ||
+    Object.keys(converted.workflow).length > 0 ||
+    converted.potentiallyExecutableNodeCount === 0
+  ) {
+    return;
+  }
+
+  const diagnostics = formatConversionDiagnostics(converted.warnings);
+  const diagnosticNote = diagnostics
+    ? ` Conversion diagnostics (${converted.warnings.length}):\n${diagnostics}`
+    : " No conversion diagnostics were emitted; inspect the saved UI graph before retrying.";
+  throw new ValidationError(
+    `Could NOT convert "${sourceName}" from UI to API: the saved graph contains ${
+      raw.nodes.length
+    } node(s), including ${converted.potentiallyExecutableNodeCount} executable candidate(s), but conversion produced no executable API nodes. Refusing to return an empty {} graph because downstream analysis would be misleading.${diagnosticNote} Request format:"ui" to inspect the original graph; action:"strip" uses the same conversion diagnostics.`,
+  );
 }
 
 /**
@@ -581,11 +631,10 @@ async function getWorkflowAction(filename: string, format: "ui" | "api"): Promis
 
         // If API format requested and workflow is in UI format, convert
         if (format === "api" && isUiFormat(raw)) {
-          const bulk = await getObjectInfo();
-          // Backfill node types missing from the bulk /object_info (e.g.
-          // controlnet_aux's DWPreprocessor) so the converter doesn't skip them.
-          const objectInfo = await backfillObjectInfo(bulk, collectNodeTypes(raw));
-          const { workflow, warnings } = convertUiToApi(raw, objectInfo);
+          const converted = await convertUiWorkflow(raw);
+          const { workflow, warnings } = converted;
+
+          refuseIfExecutableContentWasLost(filename, raw, converted);
 
           // Return the JSON workflow as the primary/first content block so
           // consumers that read the first text result always receive the graph
@@ -629,9 +678,9 @@ async function stripWorkflowAction(
           return { content: [{ type: "text", text: JSON.stringify(raw, null, 2) }] };
         }
 
-        const bulk = await getObjectInfo();
-        const objectInfo = await backfillObjectInfo(bulk, collectNodeTypes(raw));
-        const { workflow, warnings } = convertUiToApi(raw, objectInfo);
+        const converted = await convertUiWorkflow(raw);
+        const { workflow, warnings } = converted;
+        refuseIfExecutableContentWasLost(filename ?? path ?? "inline workflow", raw, converted);
 
         const hist: Record<string, number> = {};
         for (const node of Object.values(workflow)) {
@@ -676,10 +725,9 @@ async function queryWorkflowAction(
         let api = raw;
         const notes: string[] = [];
         if (isUiFormat(raw)) {
-          const bulk = await getObjectInfo();
-          const objectInfo = await backfillObjectInfo(bulk, collectNodeTypes(raw));
-          const converted = convertUiToApi(raw, objectInfo);
+          const converted = await convertUiWorkflow(raw);
           api = converted.workflow;
+          refuseIfExecutableContentWasLost(filename ?? path ?? "inline workflow", raw, converted);
           if (converted.warnings.length)
             notes.push(
               `${converted.warnings.length} conversion warning(s) — see get_workflow (action:"strip") for details`,
@@ -813,7 +861,12 @@ async function saveWorkflowAction(
 }
 
 /** Load and convert a workflow from the library (shared by action:"analyze"). */
-async function loadWorkflowApi(filename: string): Promise<{ workflow: WorkflowJSON; warnings: string[] }> {
+async function loadWorkflowApi(filename: string): Promise<{
+  workflow: WorkflowJSON;
+  warnings: string[];
+  /** Defined only for UI input, where zero means a valid empty conversion. */
+  potentiallyExecutableNodeCount?: number;
+}> {
   const encoded = encodeURIComponent(`workflows/${filename}`);
   const res = await comfyApiFetch(`/api/userdata/${encoded}`);
 
@@ -832,10 +885,11 @@ async function loadWorkflowApi(filename: string): Promise<{ workflow: WorkflowJS
   }
 
   const raw = await res.json();
-  const objectInfo = await getObjectInfo();
 
   if (isUiFormat(raw)) {
-    return convertUiToApi(raw, objectInfo);
+    const converted = await convertUiWorkflow(raw);
+    refuseIfExecutableContentWasLost(filename, raw, converted);
+    return converted;
   }
 
   // Already API format
@@ -849,11 +903,10 @@ async function analyzeWorkflowAction(
   section: string | undefined,
 ): Promise<TextResult> {
         logger.info(`Analyzing workflow: ${filename} (view=${view})`);
-        const { workflow, warnings } = await loadWorkflowApi(filename);
-        const objectInfo = await getObjectInfo();
-
+        const { workflow, warnings, potentiallyExecutableNodeCount } = await loadWorkflowApi(filename);
         const nodeCount = Object.keys(workflow).length;
-        if (nodeCount === 0) {
+        const validEmptyUiConversion = nodeCount === 0 && potentiallyExecutableNodeCount === 0;
+        if (nodeCount === 0 && !validEmptyUiConversion) {
           throw new ValidationError("Workflow contains no nodes");
         }
 
@@ -866,6 +919,17 @@ async function analyzeWorkflowAction(
             text: `**Conversion warnings (${warnings.length}):**\n${warnings.map((w) => `- ${w}`).join("\n")}`,
           });
         }
+
+        if (validEmptyUiConversion) {
+          content.push({
+            type: "text",
+            text:
+              "Workflow contains no executable API nodes. The saved UI graph is empty or contains only bypassed, muted, or frontend-only nodes.",
+          });
+          return { content };
+        }
+
+        const objectInfo = await getObjectInfo();
 
         if (view === "flat") {
           // Simple mermaid flowchart — good for small workflows

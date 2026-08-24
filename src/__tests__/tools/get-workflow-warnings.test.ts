@@ -50,7 +50,7 @@ import { registerWorkflowLibraryTools } from "../../tools/workflow-library.js";
 
 type ToolHandler = (
   args: Record<string, unknown>,
-) => Promise<{ content: Array<{ type: string; text: string }> }>;
+) => Promise<{ isError?: boolean; content: Array<{ type: string; text: string }> }>;
 function getHandler(name: string): ToolHandler {
   let handler: ToolHandler | undefined;
   const server = {
@@ -101,5 +101,36 @@ describe('get_workflow (action:"get") — JSON before conversion warnings (#494)
     });
     expect(content).toHaveLength(1);
     expect(JSON.parse(content[0].text)).toEqual(apiWorkflow);
+  });
+
+  it("accepts a non-empty UI graph when the converter identifies only frontend-only content", async () => {
+    const uiWorkflow = {
+      // The reported workflow had 164 nodes, including UUID-backed subgraphs
+      // and bypassed pipeline branches. Keep that cardinality here so the
+      // production guard cannot regress to treating a large source graph as an
+      // empty/absent input.
+      nodes: Array.from({ length: 164 }, (_, index) => ({
+        id: index + 1,
+        type: index % 2 === 0 ? `subgraph-${index}` : "Fast Groups Bypasser (rgthree)",
+        mode: index % 2 === 0 ? 4 : 0,
+      })),
+      links: [],
+    };
+    fetchApiMock.mockResolvedValue({ ok: true, status: 200, json: async () => uiWorkflow });
+    convertUiToApiMock.mockReturnValue({
+      workflow: {},
+      warnings: [],
+      missingNodeTypes: [],
+      potentiallyExecutableNodeCount: 0,
+    });
+
+    const result = await getHandler("get_workflow")({
+      action: "get",
+      filename: "WAN 2.2 Smooth Workflow v6.0.json",
+      format: "api",
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual({});
   });
 });

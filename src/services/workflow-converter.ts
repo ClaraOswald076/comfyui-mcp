@@ -19,6 +19,12 @@ export interface ConversionResult {
   workflow: WorkflowJSON;
   warnings: string[];
   /**
+   * Expanded nodes that the main conversion loop considered executable. A
+   * zero count is meaningful: a UI graph made only of bypassed/muted or
+   * frontend-only nodes legitimately converts to an empty API prompt.
+   */
+  potentiallyExecutableNodeCount: number;
+  /**
    * Nodes DROPPED because their class_type is absent from object_info. Reported
    * structurally so a caller can raise the same authoritative "unknown node type"
    * error the API-format path raises, instead of parsing it back out of the
@@ -34,6 +40,15 @@ export interface ConversionResult {
      *  re-matching the prose. */
     warning: string;
   }>;
+}
+
+/**
+ * Runtime facts supplied by a connected frontend. These are deliberately
+ * optional: a headless MCP process without a panel has no proof and must keep
+ * treating unknown node types as potentially executable.
+ */
+export interface UiToApiConversionOptions {
+  frontendVirtualTypes?: ReadonlySet<string>;
 }
 
 interface LinkInfo {
@@ -2488,6 +2503,7 @@ export const FRONTEND_ONLY_NODE_TYPES: ReadonlySet<string> = new Set([
 export function convertUiToApi(
   ui: UiWorkflow,
   objectInfo: ObjectInfo,
+  options?: UiToApiConversionOptions,
 ): ConversionResult {
   // Clone (don't mutate the caller's workflow), materialize the node-pack
   // broadcast wiring that isn't in `links` at all (cg-use-everywhere), strip the
@@ -2523,7 +2539,12 @@ export function convertUiToApi(
   }
 
   // Node types that are purely visual/internal and have no API equivalent
-  const SKIP_TYPES = NON_EXECUTING_NODE_TYPES;
+  const provenFrontendOnlyTypes = [...(options?.frontendVirtualTypes ?? [])].filter(
+    (type) =>
+      !WIRING_VIRTUAL_TYPES.has(type) &&
+      !Object.prototype.hasOwnProperty.call(objectInfo, type),
+  );
+  const SKIP_TYPES = new Set([...NON_EXECUTING_NODE_TYPES, ...provenFrontendOnlyTypes]);
 
   // Get/Set node types that need special handling (not in object_info). The SAME
   // set the de-virtualization pre-pass uses — this was a verbatim second copy, and
@@ -2538,6 +2559,18 @@ export function convertUiToApi(
   // better than a second copy — it just cannot be proven from outside, so it is
   // written down instead of assumed.
   const GET_SET_TYPES = WIRING_VIRTUAL_TYPES;
+
+  // Keep the production empty-result guard aligned with the exact skip rules
+  // below. Counting after component expansion is important: a UUID-backed
+  // component whose inner graph is entirely bypassed/frontend-only is also a
+  // valid empty executable graph.
+  const potentiallyExecutableNodeCount = expanded.nodes.filter(
+    (node) =>
+      node.mode !== 2 &&
+      node.mode !== 4 &&
+      !SKIP_TYPES.has(node.type) &&
+      !GET_SET_TYPES.has(node.type),
+  ).length;
 
   const nodesById = new Map(expanded.nodes.map((n) => [n.id, n]));
 
@@ -3678,5 +3711,10 @@ export function convertUiToApi(
   // duplicates are pure noise. Distinct nodes/inputs keep their own warnings.
   const dedupedWarnings = [...new Set(warnings)];
 
-  return { workflow, warnings: dedupedWarnings, missingNodeTypes };
+  return {
+    workflow,
+    warnings: dedupedWarnings,
+    missingNodeTypes,
+    potentiallyExecutableNodeCount,
+  };
 }
