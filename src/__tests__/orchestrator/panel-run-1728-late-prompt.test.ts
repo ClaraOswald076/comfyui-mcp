@@ -169,7 +169,16 @@ describe("panel_run late prompt reconciliation (#1728)", () => {
       peekLateRunReceipt: (runRid: string) => {
         if (runRid !== "run-rid-batch-1728") return undefined;
         receiptReads += 1;
-        const promptIds = receiptReads < 2 ? allPromptIds.slice(0, 1) : allPromptIds;
+        // QueueMonitor sees the first prompt before the exact receipt frames
+        // finish arriving. The reconcile must keep the weaker observation as a
+        // candidate while merging the later exact batch, rather than returning
+        // the first id and stranding the rest in the bridge TTL map.
+        const promptIds =
+          receiptReads < 2
+            ? []
+            : receiptReads < 3
+              ? allPromptIds.slice(0, 1)
+              : allPromptIds;
         return { runRid, tabId: "panel-batch-1728", promptIds, lateByMs: 30 };
       },
       takeLateRunReceipt: (runRid: string) => {
@@ -201,9 +210,10 @@ describe("panel_run late prompt reconciliation (#1728)", () => {
     const res = await panelRun().handler({ batch_count: 3, to_node_id: 38 }, ctx);
 
     expect(calls).toBe(1);
-    expect(receiptReads).toBeGreaterThanOrEqual(2);
+    expect(receiptReads).toBeGreaterThanOrEqual(3);
     expect(receiptTaken).toBe(true);
     expect(textOf(res)).toContain('"prompt_ids"');
+    expect(textOf(res)).toContain("exact captured prompt");
     for (const promptId of allPromptIds) {
       expect(RunCompletions.ticketFor(promptId)?.promptId).toBe(promptId);
       const ticket = RunCompletions.ticketFor(promptId);
@@ -273,5 +283,75 @@ describe("panel_run late prompt reconciliation (#1728)", () => {
     });
     expect(frames).toHaveLength(1);
     expect(res.isError).toBeFalsy();
+  });
+
+  it("registers a timeout handoff before returning so a beyond-grace receipt still tickets", async () => {
+    __panelToolsTestHooks.setRunLateAckGraceMs(25);
+    let handoff: ((receipt: { runRid: string; tabId: string; promptIds: string[] }) => void) | null = null;
+    let receipt: { runRid: string; tabId: string; promptIds: string[] } | undefined;
+    const bridge = {
+      send: async () => ({}),
+      canReach: () => true,
+      peekLateRunReceipt: (runRid: string) =>
+        receipt && receipt.runRid === runRid ? { ...receipt, lateByMs: 250 } : undefined,
+      takeLateRunReceipt: (runRid: string) => {
+        if (!receipt || receipt.runRid !== runRid) return undefined;
+        const taken = { ...receipt, lateByMs: 250 };
+        receipt = undefined;
+        return taken;
+      },
+      registerLateRunReceiptHandoff: (_rid: string, _tabId: string, onReceipt: typeof handoff) => {
+        handoff = onReceipt;
+        return () => {
+          handoff = null;
+        };
+      },
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "panel-timeout-1728");
+    ctx.call = async (_cmd, _timeout, observeRid) => {
+      observeRid?.("run-rid-timeout-1728");
+      const result = {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: "Error: Panel tab panel-timeout-1728 did not reply to \"graph_run\" within 20 ms",
+          },
+        ],
+      };
+      return __panelToolsTestHooks.markRunReplyTimeout(result);
+    };
+
+    const res = await panelRun().handler({ to_node_id: 38 }, ctx);
+    expect(res.isError).toBe(true);
+    expect(handoff).toBeTypeOf("function", "the timeout must install the bounded late owner before returning");
+    expect(RunCompletions.ticketFor("prompt-after-timeout-1728")).toBeUndefined();
+
+    receipt = {
+      runRid: "run-rid-timeout-1728",
+      tabId: "panel-timeout-1728",
+      promptIds: ["prompt-after-timeout-1728"],
+    };
+    handoff?.(receipt);
+
+    expect(RunCompletions.ticketFor("prompt-after-timeout-1728")?.promptId).toBe(
+      "prompt-after-timeout-1728",
+    );
+    RunCompletions.record(
+      "panel-timeout-1728",
+      { kind: "executed", prompt_id: "prompt-after-timeout-1728" },
+      undefined,
+    );
+    RunCompletions.record(
+      "panel-timeout-1728",
+      { kind: "executed", prompt_id: "prompt-after-timeout-1728" },
+      undefined,
+    );
+    const frames: unknown[] = [];
+    RunCompletions.deliverPending("panel-timeout-1728", (payload) => {
+      frames.push(payload);
+      return true;
+    });
+    expect(frames).toHaveLength(1);
   });
 });

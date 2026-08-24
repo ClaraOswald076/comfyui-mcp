@@ -1218,6 +1218,15 @@ export const __panelToolsTestHooks = {
   setRunLateAckGraceMs(ms: number | null): void {
     runLateAckGraceMsOverride = ms;
   },
+  /** Mark a synthetic graph_run result as the bridge's authoritative reply timeout. */
+  markRunReplyTimeout(res: ToolResult): ToolResult {
+    Object.defineProperty(res, REPLY_TIMEOUT_RESULT, {
+      value: true,
+      enumerable: false,
+      configurable: true,
+    });
+    return res;
+  },
   /** Shrink the #2078 save-timeout settle grace so a still-dirty follow-up does not wait 5s. */
   setSaveTimeoutSettleGraceMs(ms: number | null): void {
     saveTimeoutSettleGraceMsOverride = ms;
@@ -13602,8 +13611,15 @@ async function reconcileLateRunAck(
   const parsed = parseToolResultJson(res);
   // An exact Panel receipt is safe even when a queued_unknown reply already
   // carried some ids: the bridge event is the producer's own prompt capture,
-  // not a queue guess. The old queue path remains id-less-only below.
-  const receiptEligible = allowPanelQueueUnknown && isPanelQueueUncertainty(parsed);
+  // not a queue guess. Timeout and mid-command disconnect results also need
+  // this exact path: their later receipt is the only authoritative handoff
+  // available after the transport failed. The old queue path remains
+  // id-less-only below.
+  const receiptEligible =
+    Boolean(rid) &&
+    ((allowPanelQueueUnknown && isPanelQueueUncertainty(parsed)) ||
+      isReplyTimeoutResult(res) ||
+      isMidCommandDisconnectResult(res));
   const queueEligible = isUnackedGraphRunResult(res, allowPanelQueueUnknown);
   if (!receiptEligible && !queueEligible) return null;
   const fromQueue = (): {
@@ -16377,6 +16393,51 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         const observeRunRid = (rid: string): void => {
           runRid = rid;
         };
+        const makeRunTicketOpts = () => ({
+          // #884 — the REAL routed tab, captured at dispatch (see runTicketTab):
+          // the panel's `executed` event arrives under that id.
+          tabId: runTicketTab,
+          // #704 — …and WHOSE run it is. Unlike the tab, this owner cannot drift
+          // while a late receipt is being delivered.
+          ...(runTicketConversation !== undefined ? { conversation: runTicketConversation } : {}),
+          ...(typeof args.to_node_id === "number" ? { toNodeId: args.to_node_id } : {}),
+          // #1327 — lets the journal claim a completion that beat its own ticket.
+          dispatchedAt: runDispatchedAt,
+        });
+        let lateReceiptHandoffInstalled = false;
+        const installLateReceiptHandoff = (): void => {
+          const handoffRid = runRid;
+          if (
+            lateReceiptHandoffInstalled ||
+            !handoffRid ||
+            typeof ctx.bridge.registerLateRunReceiptHandoff !== "function"
+          ) {
+            return;
+          }
+          const ticketOpts = makeRunTicketOpts();
+          try {
+            ctx.bridge.registerLateRunReceiptHandoff(handoffRid, runTicketTab, (receipt) => {
+              if (receipt.runRid !== handoffRid || receipt.tabId !== runTicketTab) return;
+              const taken =
+                typeof ctx.bridge.takeLateRunReceipt === "function"
+                  ? ctx.bridge.takeLateRunReceipt(handoffRid)
+                  : undefined;
+              const promptIds = taken?.promptIds ?? receipt.promptIds;
+              const opened: string[] = [];
+              for (const rawId of promptIds) {
+                const id = typeof rawId === "string" ? rawId.trim() : "";
+                if (!id) continue;
+                QueueMonitor.markSelfQueued(id);
+                if (RunCompletions.openRun(id, ticketOpts)) opened.push(id);
+              }
+              if (opened.length) ctx.onRunTicketOpened?.(opened);
+            });
+            lateReceiptHandoffInstalled = true;
+          } catch {
+            // The receipt map remains available to the normal bounded drain;
+            // a handoff installation failure must never redispatch the run.
+          }
+        };
         let lateAckNote = "";
         let res = await ctx.call(runCmd, 20000, observeRunRid);
         // #1175 — fold a late acknowledgement into `res` BEFORE anything reads it,
@@ -16470,6 +16531,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             await reconcileRun();
             rejection = detectRunRejection(res);
           } catch (err) {
+            // A retry timeout/transport failure still has a concrete rid when the
+            // bridge accepted the dispatch. Register the bounded exact handoff
+            // before returning so a later Panel receipt can open its ticket.
+            installLateReceiptHandoff();
             // A bridge/late-receipt failure after ctx.call already returned must not
             // erase the retry's own result (notably its retry_of token). Preserve it
             // verbatim and stop: no further dispatch is justified by a failed local
@@ -16511,6 +16576,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           }
         }
         if (rejection) {
+          // Timeout and transport failures can return before the ordinary ticket
+          // phase. Keep this exact rid owner alive before exposing the error.
+          installLateReceiptHandoff();
           // Disclose the re-issue on the failure path too: the caller must know a SECOND
           // dispatch went out. The disclosure states only what is CERTIFIED — that the
           // FIRST dispatch queued nothing — and leaves the second attempt's outcome to be
@@ -16613,49 +16681,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // to this exact call by prompt id. This is what lets the orchestrator
         // journal an undelivered completion and replay it into the right run
         // instead of losing it while the agent works through a goal.
-        const ticketOpts = {
-          // #884 — the REAL routed tab, captured at dispatch (see runTicketTab):
-          // the panel's `executed` event arrives under that id.
-          tabId: runTicketTab,
-          // #704 — …and WHOSE run it is. The tab is where the completion is
-          // expected FROM; this is the conversation that gets to call it its own,
-          // which is what still holds after the panel reconnects under a new id.
-          ...(runTicketConversation !== undefined ? { conversation: runTicketConversation } : {}),
-          ...(typeof args.to_node_id === "number" ? { toNodeId: args.to_node_id } : {}),
-          // #1327 — lets the journal claim a completion that beat its own ticket.
-          dispatchedAt: runDispatchedAt,
-        };
+        const ticketOpts = makeRunTicketOpts();
         // #1728 — keep an exact, rid-scoped owner alive after the bounded
         // reconcile. A receipt can be delayed by a closed/reconnecting Panel
         // route and arrive after this handler has already returned its
         // queued_unknown recovery. The owner opens only exact prompt tickets;
         // RunCompletions.openRun remains the idempotency fence.
-        if (
-          runRid &&
-          typeof ctx.bridge.registerLateRunReceiptHandoff === "function"
-        ) {
-          try {
-            ctx.bridge.registerLateRunReceiptHandoff(runRid, runTicketTab, (receipt) => {
-              if (receipt.runRid !== runRid || receipt.tabId !== runTicketTab) return;
-              const taken =
-                typeof ctx.bridge.takeLateRunReceipt === "function"
-                  ? ctx.bridge.takeLateRunReceipt(runRid)
-                  : undefined;
-              const promptIds = taken?.promptIds ?? receipt.promptIds;
-              const opened: string[] = [];
-              for (const rawId of promptIds) {
-                const id = typeof rawId === "string" ? rawId.trim() : "";
-                if (!id) continue;
-                QueueMonitor.markSelfQueued(id);
-                if (RunCompletions.openRun(id, ticketOpts)) opened.push(id);
-              }
-              if (opened.length) ctx.onRunTicketOpened?.(opened);
-            });
-          } catch {
-            // The receipt map remains available to the normal bounded drain;
-            // a handoff installation failure must never redispatch the run.
-          }
-        }
+        installLateReceiptHandoff();
         // Every id gets its own ticket. `correlatable` stays the promise the
         // anti-poll note is allowed to make — true only if at least one run can
         // actually be correlated back.

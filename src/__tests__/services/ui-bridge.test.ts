@@ -29,6 +29,7 @@ import {
   makeScopeTargetResolver,
 } from "../../orchestrator/turn-origins.js";
 import { buildPanelToolDefs, makePanelToolCtx } from "../../orchestrator/panel-tools.js";
+import { RunCompletions } from "../../orchestrator/run-completion-journal.js";
 import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
 import {
   __resetPanelBaseCache,
@@ -5593,6 +5594,101 @@ describe("#1728: late panel run receipts", () => {
     );
     await waitFor(() => expect(seen).toEqual([["prompt-after-grace-1728"]]));
     expect(bridge.peekLateRunReceipt("run-rid-1728-handoff")).toBeUndefined();
+    dispose();
+    sock.close();
+  });
+
+  it("does not reopen a ticket or emit a second completion for a duplicate receipt", async () => {
+    RunCompletions.reset();
+    const sock = await connectPanel("tab-1728-duplicate");
+    let callbacks = 0;
+    let opened = 0;
+    const frames: unknown[] = [];
+    const dispose = bridge.registerLateRunReceiptHandoff(
+      "run-rid-1728-duplicate",
+      "tab-1728-duplicate",
+      (receipt) => {
+        callbacks += 1;
+        const taken = bridge.takeLateRunReceipt(receipt.runRid);
+        for (const promptId of taken?.promptIds ?? []) {
+          if (
+            RunCompletions.openRun(promptId, {
+              tabId: "tab-1728-duplicate",
+              dispatchedAt: Date.now(),
+            })
+          ) {
+            opened += 1;
+          }
+        }
+      },
+      1000,
+    );
+    const frame = JSON.stringify({
+      type: "run_receipt",
+      run_rid: "run-rid-1728-duplicate",
+      prompt_id: "prompt-1728-duplicate",
+    });
+    sock.send(frame);
+    sock.send(frame);
+
+    await waitFor(() => expect(callbacks).toBe(1));
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(callbacks).toBe(1);
+    expect(opened).toBe(1, "the duplicate must not reopen the existing journal ticket");
+
+    RunCompletions.record(
+      "tab-1728-duplicate",
+      { kind: "executed", prompt_id: "prompt-1728-duplicate" },
+      undefined,
+    );
+    RunCompletions.record(
+      "tab-1728-duplicate",
+      { kind: "executed", prompt_id: "prompt-1728-duplicate" },
+      undefined,
+    );
+    RunCompletions.deliverPending("tab-1728-duplicate", (payload) => {
+      frames.push(payload);
+      return true;
+    });
+    expect(frames).toHaveLength(1);
+    expect(bridge.peekLateRunReceipt("run-rid-1728-duplicate")).toBeUndefined();
+
+    dispose();
+    sock.close();
+    RunCompletions.reset();
+  });
+
+  it("retries an undelivered receipt identity, but suppresses it after handoff succeeds", async () => {
+    const sock = await connectPanel("tab-1728-duplicate-retry");
+    let callbacks = 0;
+    let opened = 0;
+    const dispose = bridge.registerLateRunReceiptHandoff(
+      "run-rid-1728-duplicate-retry",
+      "tab-1728-duplicate-retry",
+      (receipt) => {
+        callbacks += 1;
+        if (callbacks === 1) throw new Error("temporary handoff failure");
+        const taken = bridge.takeLateRunReceipt(receipt.runRid);
+        for (const promptId of taken?.promptIds ?? []) {
+          if (RunCompletions.openRun(promptId, { tabId: "tab-1728-duplicate-retry", dispatchedAt: Date.now() })) {
+            opened += 1;
+          }
+        }
+      },
+      1000,
+    );
+    const frame = JSON.stringify({
+      type: "run_receipt",
+      run_rid: "run-rid-1728-duplicate-retry",
+      prompt_id: "prompt-1728-duplicate-retry",
+    });
+    sock.send(frame);
+    sock.send(frame);
+
+    await waitFor(() => expect(callbacks).toBe(2));
+    expect(opened).toBe(1);
+    expect(bridge.peekLateRunReceipt("run-rid-1728-duplicate-retry")).toBeUndefined();
+
     dispose();
     sock.close();
   });

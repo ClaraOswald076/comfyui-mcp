@@ -2162,7 +2162,15 @@ export class UiBridge {
   /** Bounded post-reconcile owners for exact receipts that arrive after panel_run returned. */
   private lateRunReceiptHandoffs = new Map<
     string,
-    { tabId: string; expiresAt: number; onReceipt: LateRunReceiptHandoff }
+    {
+      tabId: string;
+      expiresAt: number;
+      onReceipt: LateRunReceiptHandoff;
+      // Panel receipts are at-least-once across reconnect/retry. Keep the
+      // prompt identities already handed to the owner so a duplicate cannot
+      // reopen an existing RunCompletions ticket.
+      deliveredPromptIds: Set<string>;
+    }
   >();
   /**
    * TTL for both maps above.
@@ -4243,20 +4251,41 @@ export class UiBridge {
     this.pruneLateMutations();
     const prior = this.lateRunReceipts.get(runRid);
     if (prior && prior.tabId !== tabId) return;
+    const handoff = this.lateRunReceiptHandoffs.get(runRid);
     const promptIds = prior?.promptIds ?? [];
-    if (!promptIds.includes(promptId)) {
+    const isNewPromptId = !promptIds.includes(promptId);
+    if (
+      handoff &&
+      handoff.expiresAt > Date.now() &&
+      handoff.tabId === tabId &&
+      handoff.deliveredPromptIds.has(promptId)
+    ) {
+      // The owner already consumed this stable prompt identity. Do not even
+      // re-buffer the at-least-once duplicate behind the TTL map.
+      return;
+    }
+    if (isNewPromptId) {
       // A Panel batch is bounded by the same map cardinality as other late
       // receipts; never let a forged control frame create an unbounded list.
       if (promptIds.length >= UiBridge.MAX_LATE_MUTATIONS) return;
       promptIds.push(promptId);
     }
     this.lateRunReceipts.set(runRid, { tabId, promptIds, ts: prior?.ts ?? Date.now() });
-    const handoff = this.lateRunReceiptHandoffs.get(runRid);
-    if (handoff && handoff.expiresAt > Date.now() && handoff.tabId === tabId) {
+    if (
+      handoff &&
+      handoff.expiresAt > Date.now() &&
+      handoff.tabId === tabId &&
+      !handoff.deliveredPromptIds.has(promptId)
+    ) {
       const receipt = this.peekLateRunReceipt(runRid);
       if (receipt) {
         try {
           handoff.onReceipt(receipt);
+          for (const deliveredId of receipt.promptIds) {
+            if (typeof deliveredId === "string" && deliveredId.trim() !== "") {
+              handoff.deliveredPromptIds.add(deliveredId.trim());
+            }
+          }
         } catch {
           // A receipt must remain buffered if its late consumer is transiently
           // unavailable; the owner can still drain it explicitly.
@@ -4284,12 +4313,18 @@ export class UiBridge {
       tabId: tab,
       expiresAt: Date.now() + Math.max(1, ttlMs),
       onReceipt,
+      deliveredPromptIds: new Set<string>(),
     };
     this.lateRunReceiptHandoffs.set(rid, entry);
     const current = this.peekLateRunReceipt(rid);
     if (current && current.tabId === tab) {
       try {
         onReceipt(current);
+        for (const promptId of current.promptIds) {
+          if (typeof promptId === "string" && promptId.trim() !== "") {
+            entry.deliveredPromptIds.add(promptId.trim());
+          }
+        }
       } catch {
         // Keep the map entry for a later frame/explicit drain.
       }
