@@ -1161,7 +1161,11 @@ async function statusAction(args: {
                 : "re-downloading in full";
             resumeNote = `\n    resume: ${diag.outcome} — ${fate} because ${why}; ${next}`;
           }
-          return `${head}${detail}${collisionNote}${staleNote}${resumeNote}\n    from: ${j.url}`;
+          const networkRouteNote =
+            !j.viaManager && j.downloadRoute
+              ? `\n    network: ${j.downloadRoute} (download-only route; ComfyUI API calls are not affected)`
+              : "";
+          return `${head}${detail}${collisionNote}${staleNote}${resumeNote}${networkRouteNote}\n    from: ${j.url}`;
         });
 
         const header =

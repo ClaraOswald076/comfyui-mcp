@@ -183,6 +183,7 @@ error. Architecture and `cloud-client` dispatcher originally contributed by
 <ParamField path="COMFYUI_DOWNLOAD_CACHE_DIR" type="string" default="~/.comfyui-mcp/cache">
   Content-addressed cache for model downloads. Repeat or concurrent downloads of the same URL reuse the cached file; the target model path is materialized via hardlink (falling back to copy).
 </ParamField>
+For model-download proxy routing, set `COMFYUI_DOWNLOAD_PROXY` to an HTTP/HTTPS proxy. This applies only to model-download requests, including redirect probes, payload sniffing, and segmented ranges. When unset, standard `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` settings are honored; on Windows, a static WinINet proxy from Internet Settings is used when environment proxy variables are absent. Loopback hosts stay direct, and ComfyUI API requests are never routed through this setting.
 <ParamField path="COMFYUI_LRU_CACHE_SIZE_GB" type="number" default="0">
   Max size of the download cache in GB. `0` disables eviction; above the limit, least-recently-used cached files are deleted after a download completes.
 </ParamField>

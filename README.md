@@ -610,6 +610,7 @@ npx -y comfyui-mcp@latest --comfyui-url http://localhost:8188 --force-remote
 | `COMFYUI_AUTH_SCHEME` | `Bearer` for `Authorization`, else none | Scheme prefix on the token value (e.g. `Bearer`, `Token`). |
 | `CIVITAI_API_TOKEN` | | CivitAI API token for model downloads |
 | `HUGGINGFACE_TOKEN` | | HuggingFace token for higher API rate limits |
+| `COMFYUI_DOWNLOAD_PROXY` | | Optional HTTP/HTTPS proxy for model-download traffic only; standard proxy environment variables and static Windows WinINet settings are also honored |
 | `GITHUB_TOKEN` | | GitHub token for skill generation (avoids rate limits) |
 | `REGISTRY_ACCESS_TOKEN` | | Comfy Registry API key for `node_pack` (`action: "publish"`) (env-only, never logged) |
 | `COMFYUI_DOWNLOAD_CACHE_DIR` | `~/.comfyui-mcp/cache` | Content-addressed model-download cache (dedup + concurrent coalescing) |

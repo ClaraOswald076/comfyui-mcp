@@ -46,6 +46,12 @@ import {
   supportsCloudDownload,
   type CloudStorageAuth,
 } from "./storage/index.js";
+import {
+  createDownloadFetch,
+  downloadFetch,
+  type DownloadFetch,
+  type DownloadRoute,
+} from "./download-proxy.js";
 
 const DEFAULT_CACHE_DIR = join(homedir(), ".comfyui-mcp", "cache");
 const HASH_CHARS = 32;
@@ -839,6 +845,7 @@ async function sniffPayloadShape(
   modelExt: string,
   authHeaders: Record<string, string> | undefined,
   signal: AbortSignal,
+  fetchImpl: DownloadFetch,
 ): Promise<PayloadSniff> {
   const rangeHeader = { Range: `bytes=0-${PAYLOAD_SNIFF_BYTES - 1}` };
   const hasAuth = !!authHeaders && Object.keys(authHeaders).length > 0;
@@ -849,7 +856,7 @@ async function sniffPayloadShape(
     const sendAuth = hasAuth && !authStripped;
     let res: Response;
     try {
-      res = await fetch(currentUrl, {
+      res = await fetchImpl(currentUrl, {
         // Manual redirects (see CREDENTIAL SAFETY above) — never "follow". Range-limit to
         // the sniff window so a multi-GB model is never pulled.
         redirect: "manual",
@@ -941,6 +948,8 @@ export async function probeRemoteModelPayload(
      *  or the auto HF/CivitAI host-token). The flip test uses them to prove auth-gating;
      *  Manager itself can never receive them. */
     authHeaders?: Record<string, string>;
+    /** Download-only fetch seam; defaults to the proxy-aware route. */
+    fetchImpl?: DownloadFetch;
   },
 ): Promise<RemotePayloadProbe> {
   if (!modelExt || !MODEL_BINARY_EXTS.has(modelExt.toLowerCase())) {
@@ -960,8 +969,9 @@ export async function probeRemoteModelPayload(
     else signal.addEventListener("abort", onCallerAbort, { once: true });
   }
   try {
+    const fetchImpl = opts?.fetchImpl ?? downloadFetch;
     // (1) Unauthenticated probe — what Manager will actually do.
-    const unauth = await sniffPayloadShape(url, modelExt, undefined, controller.signal);
+    const unauth = await sniffPayloadShape(url, modelExt, undefined, controller.signal, fetchImpl);
     if (!unauth.ok) return { verdict: "inconclusive" };
     if (unauth.isModelBinary) return { verdict: "model", status: unauth.status };
 
@@ -976,7 +986,7 @@ export async function probeRemoteModelPayload(
     const clearAuthPage = (unauth.kind === "html" || unauth.kind === "json") && !transient;
     const authHeaders = opts?.authHeaders;
     if (clearAuthPage && authHeaders && Object.keys(authHeaders).length > 0) {
-      const authed = await sniffPayloadShape(url, modelExt, authHeaders, controller.signal);
+      const authed = await sniffPayloadShape(url, modelExt, authHeaders, controller.signal, fetchImpl);
       if (authed.ok && authed.isModelBinary) {
         // The credential turns the SAME url from a clear auth page into a real model →
         // AUTH-GATED, and the credential is what unlocks it. Manager, which can't carry it,
@@ -1034,9 +1044,10 @@ async function fetchOrThrow(
   url: string,
   init: RequestInit,
   logUrl: string,
+  fetchImpl: DownloadFetch,
 ): Promise<Response> {
   try {
-    return await fetch(url, init);
+    return await fetchImpl(url, init);
   } catch (err) {
     const { message, code } = describeFetchError(err);
     throw new ModelError(
@@ -1102,6 +1113,8 @@ export interface DownloadCacheOptions {
    *  `headers`: query auth rides in the URL, and header presence can't
    *  distinguish an override from the config token. */
   callerAuth?: boolean;
+  /** Reports the effective download network route as soon as a physical request starts. */
+  onRoute?: (route: DownloadRoute) => void;
 }
 
 export interface DownloadCacheResult {
@@ -1400,6 +1413,8 @@ async function streamUrlToFile(
    *  to the CivitAI failure hint so it never blames a missing configured token
    *  for a request that carried the caller's own credential. */
   callerAuth = false,
+  /** Download-only fetch route. Defaults to the proxy-aware dispatcher wrapper. */
+  fetchImpl: DownloadFetch = downloadFetch,
 ): Promise<string> {
   // Fail fast if we were cancelled before any bytes moved — no request, no partial.
   if (signal?.aborted) throw new DOMException("The download was cancelled.", "AbortError");
@@ -1661,6 +1676,7 @@ async function streamUrlToFile(
       currentUrl,
       { headers: currentHeaders, redirect: "manual", signal },
       currentUrl === url ? logUrl : redactUrlForLogs(currentUrl),
+      fetchImpl,
     );
     if (res.status < 300 || res.status >= 400) break;
 
@@ -1874,6 +1890,7 @@ async function streamUrlToFile(
         beforeWrite,
         stagedFileIsShared,
         callerAuth,
+        fetchImpl,
       );
     }
   }
@@ -2387,6 +2404,7 @@ async function streamUrlToFile(
         signal,
         logUrl,
         onBytes: noteBytes,
+        fetchImpl,
       };
       let probe: SegmentedProbe | undefined;
       try {
@@ -2458,6 +2476,8 @@ async function downloadIntoCache(
   signal?: AbortSignal,
   /** See DownloadCacheOptions.callerAuth (#1635). */
   callerAuth = false,
+  /** Download-only fetch route. */
+  fetchImpl: DownloadFetch = downloadFetch,
 ): Promise<string> {
   // Representation-aware identity (#467): a same-URL download with different HTTP
   // auth headers OR different cloud (S3/Azure) credentials gets its OWN cache file,
@@ -2951,6 +2971,7 @@ async function downloadIntoCache(
           // same file. Its post-download cleanups must prove ownership.
           true,
           callerAuth,
+          fetchImpl,
         );
         await downloadCacheFs.rename(partial, target);
         await touch(target);
@@ -3353,6 +3374,8 @@ export async function downloadUrlToFile(
   deferErrorRow = false,
   /** See DownloadCacheOptions.callerAuth (#1635). */
   callerAuth = false,
+  /** Download-only fetch route. */
+  fetchImpl: DownloadFetch = downloadFetch,
 ): Promise<void> {
   await streamUrlToFile(
     url,
@@ -3371,6 +3394,7 @@ export async function downloadUrlToFile(
     undefined,
     false,
     callerAuth,
+    fetchImpl,
   );
   // This API's target IS dest (except the fallback, which defers). streamUrlToFile
   // no longer claims "done" itself (#1701).
@@ -3386,6 +3410,7 @@ export async function downloadWithCache(
   // stream into (those carry `.partial`/`.tmp`) — and threaded down so the completed
   // body is checked against what the destination IS (a `.safetensors` etc.).
   const modelExt = extname(options.targetPath);
+  const fetchImpl = createDownloadFetch(options.onRoute);
   try {
     const cachePath = await downloadIntoCache(
       options.url,
@@ -3397,6 +3422,7 @@ export async function downloadWithCache(
       modelExt,
       options.signal,
       options.callerAuth,
+      fetchImpl,
     );
     // CANCEL GUARD (#515): a COALESCED caller (or a CACHE HIT) reaches here without
     // ever streaming — it awaited another job's shared physical download. If THIS
@@ -3499,6 +3525,7 @@ export async function downloadWithCache(
         // failure (#470/#547).
         true,
         options.callerAuth,
+        fetchImpl,
       );
       // PRE-RENAME CANCEL GUARD (#515), mirroring the cache-path materialize guard: a
       // cancel that arrived during the post-stream validation lets the stream return

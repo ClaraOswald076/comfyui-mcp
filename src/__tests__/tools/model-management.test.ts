@@ -130,6 +130,7 @@ describe("download_model tool", () => {
       expect.any(AbortSignal), // per-download abort signal threaded from the job's controller (#515)
       expect.any(Function), // onTrayId callback — aligns the job trayId with the tray row id (#515)
       expect.any(Function), // onLanded callback — commits done synchronously at the destination rename (#515)
+      expect.any(Function), // onDownloadRoute callback — records the download-only network route
     );
     expect(res.isError).toBeFalsy();
   });

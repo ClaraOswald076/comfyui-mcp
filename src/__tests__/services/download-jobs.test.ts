@@ -63,6 +63,7 @@ vi.mock("../../services/model-resolver.js", () => ({
       signal?: AbortSignal,
       onTrayId?: (trayId: string) => void,
       onLanded?: (targetPath: string) => void,
+      _onDownloadRoute?: (route: "direct" | "proxied") => void,
     ) => {
       hoisted.calls += 1;
       hoisted.lastDispatchArg = dispatchToManager;
