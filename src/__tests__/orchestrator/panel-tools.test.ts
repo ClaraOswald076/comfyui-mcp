@@ -2162,12 +2162,14 @@ describe("panel-tools: post-reconnect retry-once (#278/#310/#332/#481)", () => {
   // A bridge that DROPS the first send (the tab was replaced under a new id during a
   // reboot/free_vram/reconnect), then serves the reconnected tab on the retry.
   function droppingBridge() {
+    const attempted: Array<{ cmd: Record<string, unknown>; tabId?: string }> = [];
     const sent: Array<{ cmd: Record<string, unknown>; tabId?: string }> = [];
     let live = new Set(["old-tab"]);
     let dropsLeft = 1;
     const bridge = {
       send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
         const id = opts?.tabId;
+        attempted.push({ cmd, tabId: id });
         if (dropsLeft > 0) {
           dropsLeft--;
           live = new Set(["new-tab"]); // the tab reconnected under a fresh id
@@ -2185,7 +2187,7 @@ describe("panel-tools: post-reconnect retry-once (#278/#310/#332/#481)", () => {
         throw new Error("Multiple panel tabs are connected and none is last active — pass tab_id.");
       },
     } as unknown as PanelToolCtx["bridge"];
-    return { bridge, sent };
+    return { bridge, attempted, sent };
   }
 
   it("idempotent read (graph_get_errors) rebinds and succeeds after a mid-command drop (#310)", async () => {
@@ -2231,6 +2233,28 @@ describe("panel-tools: post-reconnect retry-once (#278/#310/#332/#481)", () => {
     const res = await defByName("panel_list_nodes").handler({}, ctx);
     expect(res.isError).toBeFalsy();
     expect(sent.at(-1)?.tabId).toBe("new-tab");
+  });
+
+  it("panel_search_nodes retries nodes_search once after a reconnect drop (#2145)", async () => {
+    const store = new WorkflowTargetStore();
+    const { bridge, attempted } = droppingBridge();
+    const ctx = makePanelToolCtx(bridge, "old-tab", store);
+    const res = await defByName("panel_search_nodes").handler(
+      { query: "kjnodes", limit: 5 },
+      ctx,
+    );
+
+    expect(res.isError).toBeFalsy();
+    expect(ctx.tabId).toBe("new-tab");
+    expect(attempted).toHaveLength(2);
+    expect(attempted[0]).toMatchObject({
+      tabId: "old-tab",
+      cmd: { cmd: "nodes_search", query: "kjnodes", limit: 5 },
+    });
+    expect(attempted[1]).toMatchObject({
+      tabId: "new-tab",
+      cmd: { cmd: "nodes_search", query: "kjnodes", limit: 5 },
+    });
   });
 
   it("MUTATING edit (graph_add_node) is NOT retried — no double-apply — and errors clearly", async () => {

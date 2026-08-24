@@ -18,6 +18,7 @@ import { z } from "zod";
 import {
   buildPanelToolDefs,
   makePanelToolCtx,
+  RETRY_TOKEN_CMDS,
   RETRY_TOKEN_CMD_BY_TOOL,
   type PanelToolCtx,
   type ToolResult,
@@ -150,6 +151,32 @@ describe("#694 retry token on OUTCOME-UNKNOWN mutating failures", () => {
     const res = await ctx.call({ cmd: "graph_query" });
     expect(res.isError).toBe(true);
     expect(textOf(res)).not.toContain("retry_of");
+  });
+
+  it("#2145 nodes_search retries only reconnect drops and never mints a mutation token", async () => {
+    let attempts = 0;
+    const bridge = {
+      send: async (
+        _cmd: Record<string, unknown>,
+        opts?: { onDispatchedRid?: (rid: string) => void },
+      ) => {
+        attempts++;
+        opts?.onDispatchedRid?.(DISPATCHED_RID);
+        throw replyTimeout("nodes_search");
+      },
+      push: () => 1,
+      canReach: () => true,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: "tab-1", title: "tab-1", connected_at: 0 }],
+      resolveActiveTabId: () => "tab-1",
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "tab-1");
+    const res = await ctx.call({ cmd: "nodes_search", query: "kjnodes" });
+
+    expect(attempts).toBe(1);
+    expect(textOf(res)).not.toMatch(/MUTATES|double-apply|retry_of/i);
+    expect(RETRY_TOKEN_CMDS.has("nodes_search")).toBe(false);
+    expect(Object.values(RETRY_TOKEN_CMD_BY_TOOL)).not.toContain("nodes_search");
   });
 
   it("(e) READS never mint a token — mid-command drop phrasing on graph_outline", async () => {

@@ -1406,6 +1406,7 @@ const RETRY_SAFE_CMDS = new Set<string>([
   "graph_query",
   "get_todo",
   "workflow_list",
+  "nodes_search",
   "nodes_list",
   "nodes_queue_status",
   "node_queue_status",
