@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.87] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- preserve queued-unknown panel receipts and known queued prompt IDs without redispatch
+- retain retry guidance when panel run completion is uncertain
+
 ## [0.52.86] - 2026-08-23
 
 ### MCP
