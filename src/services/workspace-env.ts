@@ -1886,7 +1886,7 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
   let statsArgv: string[] | undefined;
   let statsCwd: string | undefined;
   try {
-    const stats = await getSystemStats();
+    const stats = await getSystemStats({ diagnosticContext: "environment" });
     running.reachable = true;
     running.os = stats.system.os;
     running.python_version = stats.system.python_version;

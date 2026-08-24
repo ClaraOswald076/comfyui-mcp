@@ -156,7 +156,9 @@ export type TargetDriftVerdict = "different" | "same" | "unknown";
 
 /** A caller-specific diagnostic context. Keep this narrow so generic ComfyUI
  * failures retain their existing next-step advice. */
-export type ComfyFetchDiagnosticContext = "get_system_stats_health";
+export type ComfyFetchDiagnosticContext =
+  | "get_system_stats_health"
+  | "install_comfyui_environment";
 
 function classifyTargetDrift(target: string): { verdict: TargetDriftVerdict; text: string } {
   const origins = (() => {
@@ -213,11 +215,12 @@ function classifyTargetDrift(target: string): { verdict: TargetDriftVerdict; tex
  * The health check is therefore RE-AIMED rather than dropped — see the note at
  * the SAME branch for why suppressing it would have been an overclaim.
  *
- * `install_comfyui (action:"environment")` survives in both branches and is NOT
- * described as failing: its `/system_stats` read sits inside a try (see
- * services/workspace-env.ts getEnvironment), so it still reports the resolved
- * target on an unreachable server. Claiming otherwise would be the same
- * overclaim pointed the other way.
+ * The generic and direct-health paths keep `install_comfyui (action:"environment")`
+ * explicit and do NOT describe it as failing: its `/system_stats` read sits
+ * inside a try (see services/workspace-env.ts getEnvironment), so it still
+ * reports the resolved target on an unreachable server. The environment probe
+ * itself uses the separate context below, where naming that action again would
+ * recurse through its stored `running_instance.error`.
  *
  * `budget` is the timeout path's extra option. It stays offered even on a SAME
  * verdict: a connected browser proves something answers that origin, never that
@@ -230,6 +233,29 @@ function nextStepsFor(
   budget: boolean,
   context?: ComfyFetchDiagnosticContext,
 ): string {
+  if (context === "install_comfyui_environment") {
+    if (verdict === "same") {
+      const want = originOf(target) ?? target;
+      return (
+        ` The connected panel is already on ${want}, so the browser can reach this ` +
+        `origin while this process cannot. Check the route or firewall between them, ` +
+        `the server's bound interface, and any COMFYUI_AUTH_* credentials required ` +
+        `from this process.`
+      );
+    }
+    if (verdict === "different") {
+      return (
+        ` Check COMFYUI_URL and point it at the intended server. If this target is ` +
+        `the intended one, check its route or firewall and any COMFYUI_AUTH_* ` +
+        `credentials required from this process.`
+      );
+    }
+    return (
+      ` Check COMFYUI_URL from this process, the route or firewall, and any ` +
+      `COMFYUI_AUTH_* credentials required by the target. The transport details ` +
+      `above are the available readiness evidence.`
+    );
+  }
   if (context === "get_system_stats_health") {
     const environment = 'install_comfyui (action:"environment")';
     const independentProbe =

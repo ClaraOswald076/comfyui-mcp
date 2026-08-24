@@ -192,6 +192,24 @@ describe("#2188: health connection advice does not call health again", () => {
     expect(text).toContain("COMFYUI_AUTH_*");
     expect(text).not.toContain('get_system_stats (action:"health")');
   });
+
+  it("keeps Panel-origin and transport evidence in nested environment advice", async () => {
+    setConnectedPanelOrigins(() => ["http://192.168.1.50:8188"]);
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(
+      undiciFailure("ECONNREFUSED", "connect ECONNREFUSED 127.0.0.1:8188"),
+    );
+    const text = await comfyuiFetch(
+      "http://127.0.0.1:8188/system_stats",
+      {},
+      "install_comfyui_environment",
+    ).catch((err) => (err instanceof Error ? err.message : String(err)));
+    expect(text).toContain("http://192.168.1.50:8188");
+    expect(text).toContain("a DIFFERENT address");
+    expect(text).toContain("ECONNREFUSED");
+    expect(text).toContain("COMFYUI_AUTH_*");
+    expect(text).not.toContain('install_comfyui (action:"environment")');
+    expect(text).not.toContain('get_system_stats (action:"health")');
+  });
 });
 
 // #952 follow-on — naming the drift instead of asking the reader to check for it.
