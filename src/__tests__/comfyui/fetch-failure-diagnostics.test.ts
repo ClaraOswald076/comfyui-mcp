@@ -149,6 +149,51 @@ describe("comfyuiFetch names the target it could not reach", () => {
   });
 });
 
+describe("#2188: health connection advice does not call health again", () => {
+  afterEach(() => setConnectedPanelOrigins(null));
+
+  async function healthFailureText(target: string): Promise<string> {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(
+      undiciFailure("ECONNREFUSED", "connect ECONNREFUSED 127.0.0.1:8188"),
+    );
+    try {
+      await comfyuiFetch(target, {}, "get_system_stats_health");
+      throw new Error("expected comfyuiFetch to throw");
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  it("uses the independent environment readiness probe for a dead target", async () => {
+    const target = "http://127.0.0.1:8188/system_stats";
+    const text = await healthFailureText(target);
+    expect(text).toContain("ECONNREFUSED");
+    expect(text).toContain(target);
+    expect(text).toContain('install_comfyui (action:"environment")');
+    expect(text).toContain("independent readiness probe");
+    expect(text).not.toContain('get_system_stats (action:"health")');
+  });
+
+  it("keeps the panel DIFFERENT diagnosis while removing the health loop", async () => {
+    setConnectedPanelOrigins(() => ["http://192.168.1.50:8188"]);
+    const text = await healthFailureText("http://127.0.0.1:8188/system_stats");
+    expect(text).toContain("a DIFFERENT address");
+    expect(text).toContain('install_comfyui (action:"environment")');
+    expect(text).toContain("COMFYUI_URL");
+    expect(text).not.toContain('get_system_stats (action:"health")');
+  });
+
+  it("keeps the SAME-origin route diagnosis while removing the health loop", async () => {
+    setConnectedPanelOrigins(() => ["http://127.0.0.1:8188"]);
+    const text = await healthFailureText("http://127.0.0.1:8188/system_stats");
+    expect(text).toContain("NOT a wrong-address problem");
+    expect(text).toContain("route or firewall");
+    expect(text).toContain('install_comfyui (action:"environment")');
+    expect(text).toContain("COMFYUI_AUTH_*");
+    expect(text).not.toContain('get_system_stats (action:"health")');
+  });
+});
+
 // #952 follow-on — naming the drift instead of asking the reader to check for it.
 //
 // The shipped message said a connected panel "does not imply this address is

@@ -220,7 +220,7 @@ function looksLikeSystemStats(body: unknown): boolean {
  *  call_tool timeout test can shrink only THIS deadline. */
 export const SYSTEM_STATS_TIMEOUT_MS = 15_000;
 
-export async function getSystemStats(): Promise<SystemStats> {
+export async function getSystemStats(options: { diagnosticContext?: "health" } = {}): Promise<SystemStats> {
   if (isCloudMode()) return cloudClient.getSystemStats();
   requireLocalMode("getSystemStats");
   // Fetched directly (not via the client library) so a non-JSON answer can be
@@ -242,6 +242,8 @@ export async function getSystemStats(): Promise<SystemStats> {
         expectShape: looksLikeSystemStats,
         shapeHint:
           "a ComfyUI /system_stats document (it has no `system` object and no `devices` array)",
+        diagnosticContext:
+          options.diagnosticContext === "health" ? "get_system_stats_health" : undefined,
       }),
     );
     // Shape-valid /system_stats is the in-session proof that this base URL is a

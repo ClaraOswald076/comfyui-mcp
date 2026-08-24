@@ -67,7 +67,7 @@ export async function runHealthCheck(
   const lines: string[] = ["## Health Check\n"];
 
   try {
-    const stats = (await getSystemStats()) as unknown as Record<string, any>;
+    const stats = (await getSystemStats({ diagnosticContext: "health" })) as unknown as Record<string, any>;
     const sys = stats.system ?? {};
     const dev = stats.devices?.[0] ?? {};
     const vramTotalGB = dev.vram_total

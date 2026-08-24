@@ -154,6 +154,10 @@ export function describeTargetDrift(target: string): string {
  */
 export type TargetDriftVerdict = "different" | "same" | "unknown";
 
+/** A caller-specific diagnostic context. Keep this narrow so generic ComfyUI
+ * failures retain their existing next-step advice. */
+export type ComfyFetchDiagnosticContext = "get_system_stats_health";
+
 function classifyTargetDrift(target: string): { verdict: TargetDriftVerdict; text: string } {
   const origins = (() => {
     try {
@@ -224,7 +228,39 @@ function nextStepsFor(
   verdict: TargetDriftVerdict,
   target: string,
   budget: boolean,
+  context?: ComfyFetchDiagnosticContext,
 ): string {
+  if (context === "get_system_stats_health") {
+    const environment = 'install_comfyui (action:"environment")';
+    const independentProbe =
+      ` Run ${environment} as an independent readiness probe from this MCP process; ` +
+      `inspect its running_instance.reachable and running_instance.error instead of ` +
+      `repeating this failing request.`;
+    if (verdict === "same") {
+      const want = originOf(target) ?? target;
+      return (
+        independentProbe +
+        ` The connected panel is already on ${want}, so if the probe is unreachable, ` +
+        `fix the route or firewall between this process and that origin. If it is ` +
+        `reachable, keep the transport and any COMFYUI_AUTH_* details above in view; ` +
+        `the browser session may have different access.`
+      );
+    }
+    if (verdict === "different") {
+      return (
+        independentProbe +
+        ` The panel is on a different origin, so point COMFYUI_URL at the server you ` +
+        `meant; if the probe still cannot reach that target, check its route/firewall ` +
+        `and any required COMFYUI_AUTH_* credentials.`
+      );
+    }
+    return (
+      independentProbe +
+      ` If the probe is unreachable, check COMFYUI_URL, the route/firewall, and any ` +
+      `required COMFYUI_AUTH_* credentials; if it is reachable, retry the health ` +
+      `check once while keeping the transport details above.`
+    );
+  }
   if (verdict !== "same") {
     return budget
       ? ` Confirm it is up with get_system_stats (action:"health"), and raise ` +
@@ -327,7 +363,12 @@ export function deliveryDoubt(code: string | undefined, method: string): string 
   );
 }
 
-function describeComfyFetchFailure(err: unknown, target: string, method: string): Error {
+function describeComfyFetchFailure(
+  err: unknown,
+  target: string,
+  method: string,
+  context?: ComfyFetchDiagnosticContext,
+): Error {
   const { message, code } = describeFetchFailure(err);
   // ONE classification, used for both the sentence and the tail it governs
   // (#1896) — two calls would read the channel twice and could, across a
@@ -340,7 +381,7 @@ function describeComfyFetchFailure(err: unknown, target: string, method: string)
       `That is the headless ComfyUI target (COMFYUI_URL); a CONNECTED sidebar panel does not imply this address is reachable, ` +
       `because the panel talks to whichever ComfyUI its browser tab is on.` +
       drift.text +
-      nextStepsFor(drift.verdict, target, false),
+      nextStepsFor(drift.verdict, target, false, context),
     { cause: err },
   );
   if (code) (wrapped as { code?: string }).code = code;
@@ -502,6 +543,7 @@ function describeComfyTimeout(input: string | URL | Request, init: RequestInit):
 export async function comfyuiFetch(
   input: string | URL | Request,
   init: RequestInit = {},
+  context?: ComfyFetchDiagnosticContext,
 ): Promise<Response> {
   const auth = getComfyUIAuthHeaders();
   // A CEILING, not a policy. Callers that know their own budget pass a signal
@@ -530,6 +572,6 @@ export async function comfyuiFetch(
     // its own message, or anything else already says what happened, and
     // replacing that text would be a downgrade.
     if (!isBareFetchFailure(err)) throw err;
-    throw describeComfyFetchFailure(err, targetOf(input), methodOf(input, init));
+    throw describeComfyFetchFailure(err, targetOf(input), methodOf(input, init), context);
   }
 }

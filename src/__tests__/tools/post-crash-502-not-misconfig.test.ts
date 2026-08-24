@@ -56,6 +56,12 @@ function statsOk(): Response {
   );
 }
 
+function undiciFailure(code: string, detail: string): Error {
+  const cause = new Error(detail);
+  (cause as { code?: string }).code = code;
+  return new TypeError("fetch failed", { cause });
+}
+
 /** Route /system_stats to JSON while healthy; everything else is the post-crash 502. */
 function serve(mode: { healthy: boolean }): void {
   global.fetch = vi.fn(async (input: RequestInfo | URL) => {
@@ -126,5 +132,21 @@ describe("post-CUDA-crash empty 502 is an outage, not a base-URL misconfig (#167
       expect(text).toContain("/system_stats");
       expect(text).toContain("not newly misconfigured");
     }
+  });
+
+  it('get_system_stats (action:"health") preserves transport details without a circular retry', async () => {
+    global.fetch = vi.fn().mockRejectedValue(
+      undiciFailure("ECONNREFUSED", "connect ECONNREFUSED remote.example:8188"),
+    ) as unknown as typeof fetch;
+
+    const out = await getHandler("get_system_stats", registerSystemStatsTools)({ action: "health" });
+    expect(out.isError).toBe(true);
+    const payload = JSON.parse(out.content[0].text) as { error: string; message: string };
+    expect(payload.error).toBe("CONNECTION_ERROR");
+    expect(payload.message).toContain("ECONNREFUSED");
+    expect(payload.message).toContain("http://remote.example:8188/system_stats");
+    expect(payload.message).toContain('install_comfyui (action:"environment")');
+    expect(payload.message).toContain("independent readiness probe");
+    expect(payload.message).not.toContain('get_system_stats (action:"health")');
   });
 });
