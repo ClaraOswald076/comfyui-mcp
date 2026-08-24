@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.88] - 2026-08-23
+
+### MCP
+
+#### Fixed
+- classify nodes_search as safe read
+
+
 ## [0.52.87] - 2026-08-23
 
 ### MCP
