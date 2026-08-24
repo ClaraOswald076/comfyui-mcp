@@ -19,6 +19,15 @@ vi.mock("../../config.js", () => ({
   isRemoteMode: () => true,
 }));
 
+// getEnvironmentAction reaches the live-interpreter seam while building its
+// running-instance report. Keep this production-path regression independent of
+// the machine running the test; the network behavior remains real and is driven
+// by the fetch stub below.
+vi.mock("../../services/live-interpreter.js", async () => ({
+  ...(await vi.importActual("../../services/live-interpreter.js")),
+  resolveLiveInterpreter: () => undefined,
+}));
+
 import { resetClient } from "../../comfyui/client.js";
 import { resetComfyApiRootValidated } from "../../comfyui/json-guard.js";
 import { registerDiagnosticsTools } from "../../tools/diagnostics.js";
