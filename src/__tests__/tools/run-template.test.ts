@@ -1,7 +1,8 @@
 import { describe, expect, it, beforeEach, afterAll, vi } from "vitest";
-import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import type { ObjectInfo } from "../../comfyui/types.js";
 
 // Mock template resolution (skills-access) + enqueue + status/history; keep
 // override parsing + modifyWorkflow (set_input) real so we test the actual
@@ -96,7 +97,97 @@ beforeEach(() => {
   enqueueWorkflowMock.mockClear();
   getJobStatusMock.mockReset();
   getHistoryMock.mockReset();
+  getObjectInfoMock.mockReset().mockResolvedValue({});
 });
+
+const KREA_PACKS = [
+  "krea2-txt2img-manual",
+  "krea2-txt2img-json",
+  "krea2-combo",
+] as const;
+
+const RBG_REQUIRED_INPUTS = [
+  "conditioning",
+  "variance_preset",
+  "fine_tune_variance",
+  "model_type",
+  "fade_curve",
+  "noise_injection",
+  "protect_mode",
+  "protect_regions",
+  "direction_shift",
+  "shift_strength",
+  "variance_schedule",
+  "cutoff_step",
+  "total_steps",
+  "cutoff_strength",
+  "seed",
+] as const;
+
+function rbgObjectInfo(withInputOrder: boolean): ObjectInfo {
+  const required = {
+    conditioning: ["CONDITIONING"],
+    variance_preset: [["🌿 Balanced", "⚙️ Custom"]],
+    fine_tune_variance: ["INT", { min: 0, max: 100 }],
+    model_type: [["⚙️ Other", "📸 Krea2 (SingleStream)"]],
+    fade_curve: [["Instant", "Linear"]],
+    noise_injection: [["Beginning Steps", "Ending Steps"]],
+    protect_mode: [["🚫 None", "First Half"]],
+    protect_regions: ["STRING", { default: "" }],
+    direction_shift: [["🚫 None", "🌀 Chaos"]],
+    shift_strength: ["INT", { min: 0, max: 200 }],
+    variance_schedule: [["constant", "decreasing", "step_cutoff", "tiered_release", "hard_lock"]],
+    cutoff_step: ["INT", { min: 0, max: 100 }],
+    total_steps: ["INT", { min: 1, max: 100 }],
+    cutoff_strength: ["FLOAT", { min: 0, max: 1 }],
+    seed: ["INT", { min: 0, max: Number.MAX_SAFE_INTEGER }],
+  };
+  const def = {
+    input: {
+      required,
+      // These current optional fields prove that adding optional schema entries
+      // after seed does not consume the seed-control phantom or shift the row.
+      optional: {
+        target_vibe: ["CONDITIONING"],
+        vibe_blend: ["FLOAT", { min: 0, max: 1 }],
+      },
+    },
+    ...(withInputOrder
+      ? {
+          input_order: {
+            required: [...RBG_REQUIRED_INPUTS],
+            optional: ["target_vibe", "vibe_blend"],
+          },
+        }
+      : {}),
+    output: ["CONDITIONING", "IMAGE"],
+    output_is_list: [false, false],
+    output_name: ["conditioning", "variance_heatmap"],
+    name: "RBG_Smart_Seed_Variance",
+    display_name: "RBG Smart Seed Variance",
+    description: "",
+    category: "RBG Suite/Advanced",
+    output_node: false,
+  };
+  return { RBG_Smart_Seed_Variance: def } as unknown as ObjectInfo;
+}
+
+function activeKreaPackFile(pack: (typeof KREA_PACKS)[number]): {
+  file: string;
+  seed: number;
+} {
+  const graph = JSON.parse(
+    readFileSync(new URL(`../../../packs/${pack}/workflow.json`, import.meta.url), "utf8"),
+  ) as { nodes: Array<{ type: string; mode?: number; widgets_values?: unknown[] }> };
+  const node = graph.nodes.find((candidate) => candidate.type === "RBG_Smart_Seed_Variance");
+  if (!node || !Array.isArray(node.widgets_values)) throw new Error(`${pack} has no RBG node`);
+  node.mode = 0;
+  const seed = node.widgets_values[13];
+  if (typeof seed !== "number") throw new Error(`${pack} RBG seed is not numeric`);
+  const file = join(dir, `${pack}-active.json`);
+  writeFileSync(file, JSON.stringify(graph));
+  return { file, seed };
+}
 
 describe('enqueue_workflow (action:"run_template")', () => {
   it("applies '<nodeId>.<widget>' overrides so the ENQUEUED workflow reflects them", async () => {
@@ -188,6 +279,47 @@ describe('enqueue_workflow (action:"run_template")', () => {
     expect(res.isError).toBeFalsy();
     const enqueued = enqueueWorkflowMock.mock.calls[0][0] as typeof TEMPLATE_GRAPH;
     expect(enqueued["6"].inputs.text).toBe("default prompt");
+  });
+
+  it("maps all Krea2 pack RBG widgets through current schemas, with or without input_order", async () => {
+    const handler = getHandler();
+
+    for (const withInputOrder of [true, false]) {
+      getObjectInfoMock.mockResolvedValue(rbgObjectInfo(withInputOrder));
+      for (const pack of KREA_PACKS) {
+        const { file, seed } = activeKreaPackFile(pack);
+        resolvePackWorkflowFileMock.mockReturnValue(file);
+        enqueueWorkflowMock.mockClear();
+
+        const res = await handler({ action: "run_template", template: pack });
+        expect(res.isError).toBeFalsy();
+        const enqueued = enqueueWorkflowMock.mock.calls.at(-1)?.[0] as Record<
+          string,
+          { class_type: string; inputs: Record<string, unknown> }
+        >;
+        const rbg = Object.values(enqueued).find(
+          (node) => node.class_type === "RBG_Smart_Seed_Variance",
+        );
+        expect(rbg, `${pack} should preserve the active RBG node`).toBeDefined();
+        expect(rbg?.inputs).toMatchObject({
+          variance_preset: "🌿 Balanced",
+          fine_tune_variance: 55,
+          model_type: "⚙️ Other",
+          fade_curve: "Instant",
+          noise_injection: "Beginning Steps",
+          protect_mode: "🚫 None",
+          protect_regions: "🚫 None",
+          direction_shift: "🚫 None",
+          shift_strength: 129,
+          variance_schedule: "constant",
+          cutoff_step: 8,
+          total_steps: 20,
+          cutoff_strength: 0,
+          seed,
+        });
+        expect(rbg?.inputs).not.toHaveProperty("randomize");
+      }
+    }
   });
 
   it("errors with near-matches when the template does not resolve", async () => {
