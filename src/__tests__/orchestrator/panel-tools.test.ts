@@ -1406,6 +1406,33 @@ describe("panel-tools: panel_run verdict is derived from the ComfyUI reply", () 
     expect(textOf(res)).toContain(QUEUED_NOTE);
   });
 
+  it("#2143: tickets the Panel's known queued_prompt_ids and preserves retry guidance", async () => {
+    const reply: ToolResult = {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            queued: true,
+            complete: false,
+            partially_queued: true,
+            queued_prompt_ids: ["p-known-1", "p-known-2"],
+            retry_guidance: "Check the queue before retrying the unresolved request.",
+          }),
+        },
+      ],
+    };
+    const { ctx, calls } = makeRunCtx(reply);
+    const res = await defByName("panel_run").handler({ batch_count: 3, to_node_id: 9 }, ctx);
+
+    expect(res.isError).toBeFalsy();
+    expect(calls).toHaveLength(1);
+    expect(textOf(res)).toContain("Check the queue before retrying the unresolved request.");
+    for (const id of ["p-known-1", "p-known-2"]) {
+      expect(RunCompletions.ticketFor(id), id).toBeDefined();
+      expect(QueueMonitor.attributeRun(id), id).toBe("mine");
+    }
+  });
+
   it("#949: prompt_id repeated inside prompt_ids opens ONE ticket, not two", async () => {
     const reply: ToolResult = {
       content: [
@@ -1440,6 +1467,16 @@ describe("panel-tools: panel_run verdict is derived from the ComfyUI reply", () 
     ]);
     expect(acceptedPromptIds({ prompt_ids: "not-an-array" })).toEqual([]);
     expect(acceptedPromptIds(null)).toEqual([]);
+  });
+
+  it("#2143: prompt_id(s) stay first-class alongside queued_prompt_ids", () => {
+    expect(
+      acceptedPromptIds({
+        prompt_id: "p-first",
+        prompt_ids: ["p-first", "p-second"],
+        queued_prompt_ids: ["p-second", "p-known"],
+      }),
+    ).toEqual(["p-first", "p-second", "p-known"]);
   });
 
   it("#704: the ticket records the CONVERSATION that queued the run, not just the routed tab", async () => {
@@ -1481,6 +1518,35 @@ describe("panel-tools: panel_run verdict is derived from the ComfyUI reply", () 
     expect(text).toContain("UNDETERMINED");
     expect(text).toContain("get_history");
   });
+
+  it("#2143: queued_unknown with no ids is a normal uncertain receipt, not a failure", async () => {
+    const reply: ToolResult = {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            queued_unknown: true,
+            error: "the frontend queue call did not answer within the run budget",
+            indeterminate_count: 1,
+            retry_guidance: "Check the ComfyUI queue before retrying anything.",
+          }),
+        },
+      ],
+    };
+    const { ctx, calls } = makeRunCtx(reply);
+    const res = await defByName("panel_run").handler({ to_node_id: 9 }, ctx);
+
+    // A normal Panel timeout receipt must stay non-error so its explicit retry
+    // guidance survives verbatim. The handler performs no second dispatch and
+    // cannot ticket an unidentifiable completion.
+    expect(res.isError).toBeFalsy();
+    expect(calls).toHaveLength(1);
+    const text = textOf(res);
+    expect(text).toContain("Check the ComfyUI queue before retrying anything.");
+    expect(text).toContain("[UNCERTAIN]");
+    expect(text).not.toContain(QUEUED_NOTE);
+    expect(text).not.toContain("ComfyUI refused to queue");
+  });
 });
 
 describe("panel-tools: detectRunRejection helper", () => {
@@ -1507,6 +1573,15 @@ describe("panel-tools: detectRunRejection helper", () => {
   it("passes an isError reply through verbatim", () => {
     const err: ToolResult = { content: [{ type: "text", text: "Error: boom" }], isError: true };
     expect(detectRunRejection(err)).toBe(err);
+  });
+
+  it("#2143: keeps the explicit queued_unknown receipt out of refusal handling", () => {
+    const reply = jsonReply({
+      queued_unknown: true,
+      error: "the frontend queue call timed out",
+      retry_guidance: "Check the queue before retrying.",
+    });
+    expect(detectRunRejection(reply)).toBeNull();
   });
 
   // #944 — ComfyUI's PARTIAL-validation path: some outputs fail, at least one
@@ -7165,6 +7240,17 @@ describe("panel-tools: panel_run scoped-run stamp-race retry (#772)", () => {
     // failure (unchanged), but the text no longer settles the contradiction it
     // has no way to settle.
     expect(runText(res)).toContain("[UNCERTAIN]");
+  });
+
+  it("a reported queued_prompt_ids receipt also vetoes the retry", async () => {
+    const { ctx, runs } = runCtx([
+      { error: RACE, queued_prompt_ids: ["p-known-race"] },
+      { queued: true },
+    ]);
+    const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(runs).toHaveLength(1);
   });
 
   // #944 END-TO-END. The unit tests above cover the decision; this covers the
