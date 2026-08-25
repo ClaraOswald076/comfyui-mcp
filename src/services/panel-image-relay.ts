@@ -23,6 +23,7 @@ export const PANEL_IMAGE_RELAY_TIMEOUT_MS = 8_000;
 export const PANEL_IMAGE_RELAY_STALE_MS = 15_000;
 export const PANEL_IMAGE_RELAY_MAX_REQUEST_FILE_BYTES = 16 * 1024;
 export const PANEL_IMAGE_RELAY_MAX_RESPONSE_FILE_BYTES = 48 * 1024 * 1024;
+export const PANEL_COMFYUI_READ_MAX_BYTES = 16 * 1024 * 1024;
 export const PANEL_IMAGE_RELAY_MAX_CONCURRENT = 4;
 export const PANEL_IMAGE_RELAY_MAX_REQUESTS_PER_TICK = 4;
 export const PANEL_IMAGE_RELAY_MAX_DIRECTORY_ENTRIES_PER_TICK = 128;
@@ -38,9 +39,11 @@ const RELAY_ID_RE = /^[A-Za-z0-9_-]{16,80}$/;
 const RELAY_CAPABILITY_RE = /^[a-f0-9]{64}$/;
 const RELAY_SECRET_RE = /^[a-f0-9]{64}$/;
 const IMAGE_TYPES = new Set<PanelImageType>(["output", "input", "temp"]);
+const READ_OPERATIONS = new Set<PanelComfyUIReadOperation>(["history", "system_stats", "logs"]);
 const MIME_RE = /^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,62}\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,62}$/;
 
 export type PanelImageType = "output" | "input" | "temp";
+export type PanelComfyUIReadOperation = "history" | "system_stats" | "logs";
 
 export interface PanelImageRelayRequest {
   version: typeof PANEL_IMAGE_RELAY_VERSION;
@@ -53,6 +56,17 @@ export interface PanelImageRelayRequest {
   deadlineAt: number;
 }
 
+export interface PanelComfyUIReadRelayRequest {
+  version: typeof PANEL_IMAGE_RELAY_VERSION;
+  requestId: string;
+  capability: string;
+  operation: PanelComfyUIReadOperation;
+  createdAt: number;
+  deadlineAt: number;
+}
+
+export type PanelRelayRequest = PanelImageRelayRequest | PanelComfyUIReadRelayRequest;
+
 export type PanelImageRelayAuthInput = Pick<
   PanelImageRelayRequest,
   "requestId" | "filename" | "subfolder" | "type" | "createdAt" | "deadlineAt"
@@ -61,6 +75,13 @@ export type PanelImageRelayAuthInput = Pick<
 export interface PanelImageRelaySuccess {
   base64: string;
   mimeType: string;
+  bytes: number;
+}
+
+export interface PanelComfyUIReadSuccess {
+  operation: PanelComfyUIReadOperation;
+  body: string;
+  contentType: string | null;
   bytes: number;
 }
 
@@ -79,17 +100,31 @@ interface PanelImageRelayResponseSuccess extends PanelImageRelaySuccess {
   updated: number;
 }
 
+interface PanelComfyUIReadRelayResponseSuccess extends PanelComfyUIReadSuccess {
+  version: typeof PANEL_IMAGE_RELAY_VERSION;
+  requestId: string;
+  ok: true;
+  updated: number;
+}
+
 type PanelImageRelayResponse =
   | PanelImageRelayResponseSuccess
   | PanelImageRelayResponseFailure;
 
-type PanelImageRelayTransportResponse = PanelImageRelayResponse & { responseMac: string };
+type PanelRelayResponse =
+  | PanelImageRelayResponseSuccess
+  | PanelComfyUIReadRelayResponseSuccess
+  | PanelImageRelayResponseFailure;
+
+type PanelImageRelayTransportResponse = PanelRelayResponse & { responseMac: string };
 
 export interface PanelImageRelayBridge {
   canReach(tabId: string): boolean;
   resolveFailure?: (tabId: string) => "ambiguous" | "unresolved" | undefined;
   send(
-    command: { cmd: "fetch_image"; filename: string; subfolder: string; type: PanelImageType },
+    command:
+      | { cmd: "fetch_image"; filename: string; subfolder: string; type: PanelImageType }
+      | { cmd: "fetch_comfyui_read"; operation: PanelComfyUIReadOperation },
     options: { tabId: string; timeoutMs: number },
   ): Promise<unknown>;
 }
@@ -101,6 +136,18 @@ export class PanelImageRelayError extends Error {
   constructor(message: string, code: string, unavailable = false) {
     super(message);
     this.name = "PanelImageRelayError";
+    this.code = code;
+    this.unavailable = unavailable;
+  }
+}
+
+export class PanelComfyUIReadRelayError extends Error {
+  readonly code: string;
+  readonly unavailable: boolean;
+
+  constructor(message: string, code: string, unavailable = false) {
+    super(message);
+    this.name = "PanelComfyUIReadRelayError";
     this.code = code;
     this.unavailable = unavailable;
   }
@@ -189,6 +236,30 @@ export function verifyPanelImageRelayCapability(
 ): boolean {
   if (!isSafeRelaySecret(secret) || !isSafeRelayCapability(request.capability)) return false;
   const expected = makePanelImageRelayCapability(secret, request);
+  return timingSafeEqual(Buffer.from(request.capability, "hex"), Buffer.from(expected, "hex"));
+}
+
+function readRelayAuthPayload(input: Pick<PanelComfyUIReadRelayRequest, "requestId" | "operation" | "createdAt" | "deadlineAt">): string {
+  return JSON.stringify(["fetch_comfyui_read", input.requestId, input.operation, input.createdAt, input.deadlineAt]);
+}
+
+export function makePanelComfyUIReadRelayCapability(
+  secret: string,
+  input: Pick<PanelComfyUIReadRelayRequest, "requestId" | "operation" | "createdAt" | "deadlineAt">,
+): string {
+  return createHmac("sha256", secret).update(readRelayAuthPayload(input)).digest("hex");
+}
+
+export function verifyPanelComfyUIReadRelayCapability(
+  secret: string,
+  request: PanelComfyUIReadRelayRequest,
+): boolean {
+  if (
+    !isSafeRelaySecret(secret) ||
+    !isSafeRelayCapability(request.capability) ||
+    !READ_OPERATIONS.has(request.operation)
+  ) return false;
+  const expected = makePanelComfyUIReadRelayCapability(secret, request);
   return timingSafeEqual(Buffer.from(request.capability, "hex"), Buffer.from(expected, "hex"));
 }
 
@@ -322,6 +393,33 @@ function validateImagePayload(
   return { base64: record.base64, mimeType: record.mimeType, bytes };
 }
 
+function validateReadPayload(value: unknown): PanelComfyUIReadSuccess | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    !hasOnlyKeys(record, ["operation", "body", "contentType", "bytes"]) ||
+    typeof record.operation !== "string" ||
+    !READ_OPERATIONS.has(record.operation as PanelComfyUIReadOperation) ||
+    typeof record.body !== "string" ||
+    (record.contentType !== null &&
+      (typeof record.contentType !== "string" || !isSafeText(record.contentType, 128)))
+  ) return undefined;
+  const bytes = record.bytes;
+  if (
+    typeof bytes !== "number" ||
+    !Number.isSafeInteger(bytes) ||
+    bytes < 0 ||
+    bytes > PANEL_COMFYUI_READ_MAX_BYTES ||
+    Buffer.byteLength(record.body, "utf8") !== bytes
+  ) return undefined;
+  return {
+    operation: record.operation as PanelComfyUIReadOperation,
+    body: record.body,
+    contentType: record.contentType as string | null,
+    bytes,
+  };
+}
+
 function validateRequest(value: unknown, requestId: string): PanelImageRelayRequest | undefined {
   if (!value || typeof value !== "object") return undefined;
   const record = value as Record<string, unknown>;
@@ -342,6 +440,33 @@ function validateRequest(value: unknown, requestId: string): PanelImageRelayRequ
     deadlineAt - createdAt > PANEL_IMAGE_RELAY_TIMEOUT_MS
   ) return undefined;
   return record as unknown as PanelImageRelayRequest;
+}
+
+function validateReadRequest(value: unknown, requestId: string): PanelComfyUIReadRelayRequest | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  const capability = record.capability;
+  const createdAt = record.createdAt;
+  const deadlineAt = record.deadlineAt;
+  if (
+    !hasOnlyKeys(record, ["version", "requestId", "capability", "operation", "createdAt", "deadlineAt"]) ||
+    record.version !== PANEL_IMAGE_RELAY_VERSION ||
+    record.requestId !== requestId ||
+    !isSafeRelayCapability(capability) ||
+    typeof record.operation !== "string" ||
+    !READ_OPERATIONS.has(record.operation as PanelComfyUIReadOperation) ||
+    typeof createdAt !== "number" ||
+    typeof deadlineAt !== "number" ||
+    !Number.isSafeInteger(createdAt) ||
+    !Number.isSafeInteger(deadlineAt) ||
+    deadlineAt < createdAt ||
+    deadlineAt - createdAt > PANEL_IMAGE_RELAY_TIMEOUT_MS
+  ) return undefined;
+  return record as unknown as PanelComfyUIReadRelayRequest;
+}
+
+function isReadRelayRequest(request: PanelRelayRequest): request is PanelComfyUIReadRelayRequest {
+  return "operation" in request;
 }
 
 function validateResponse(value: unknown, requestId: string): PanelImageRelayResponse {
@@ -409,25 +534,100 @@ function responseFailureMessage(response: PanelImageRelayResponseFailure): never
   );
 }
 
-function responseMacPayload(response: PanelImageRelayResponse): string {
-  return response.ok
-    ? JSON.stringify([
-        response.version,
-        response.requestId,
-        true,
-        response.base64,
-        response.mimeType,
-        response.bytes,
-        response.updated,
-      ])
-    : JSON.stringify([response.version, response.requestId, false, response.error, response.updated]);
+function responseMacPayload(response: PanelRelayResponse): string {
+  if (!response.ok) {
+    return JSON.stringify([response.version, response.requestId, false, response.error, response.updated]);
+  }
+  if ("operation" in response) {
+    return JSON.stringify([
+      response.version,
+      response.requestId,
+      true,
+      response.operation,
+      response.body,
+      response.contentType,
+      response.bytes,
+      response.updated,
+    ]);
+  }
+  return JSON.stringify([
+    response.version,
+    response.requestId,
+    true,
+    response.base64,
+    response.mimeType,
+    response.bytes,
+    response.updated,
+  ]);
 }
 
-function addResponseMac(secret: string, response: PanelImageRelayResponse): PanelImageRelayTransportResponse {
+function addResponseMac(secret: string, response: PanelRelayResponse): PanelImageRelayTransportResponse {
   return {
     ...response,
     responseMac: createHmac("sha256", secret).update(responseMacPayload(response)).digest("hex"),
   };
+}
+
+function validateReadResponse(
+  value: unknown,
+  requestId: string,
+  operation: PanelComfyUIReadOperation,
+): PanelComfyUIReadRelayResponseSuccess | PanelImageRelayResponseFailure {
+  if (!value || typeof value !== "object") {
+    throw new PanelComfyUIReadRelayError("The panel returned a malformed ComfyUI read reply.", "MALFORMED_REPLY");
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    record.version !== PANEL_IMAGE_RELAY_VERSION ||
+    record.requestId !== requestId ||
+    !hasOwn(record, "ok") ||
+    !Number.isSafeInteger(record.updated)
+  ) throw new PanelComfyUIReadRelayError("The panel returned a malformed ComfyUI read reply.", "MALFORMED_REPLY");
+  if (record.ok === false) {
+    if (
+      typeof record.error === "string" &&
+      record.error.length <= 160 &&
+      isSafeText(record.error, 160) &&
+      hasOnlyKeys(record, ["version", "requestId", "ok", "error", "updated"])
+    ) return record as unknown as PanelImageRelayResponseFailure;
+    throw new PanelComfyUIReadRelayError("The panel returned a malformed ComfyUI read reply.", "MALFORMED_REPLY");
+  }
+  const payload = validateReadPayload({
+    operation: record.operation,
+    body: record.body,
+    contentType: record.contentType,
+    bytes: record.bytes,
+  });
+  if (
+    record.ok !== true ||
+    !payload ||
+    payload.operation !== operation ||
+    !hasOnlyKeys(record, ["version", "requestId", "ok", "operation", "body", "contentType", "bytes", "updated"])
+  ) throw new PanelComfyUIReadRelayError("The panel returned a malformed ComfyUI read reply.", "MALFORMED_REPLY");
+  return { ...payload, version: PANEL_IMAGE_RELAY_VERSION, requestId, ok: true, updated: record.updated as number };
+}
+
+function validateReadTransportResponse(
+  value: unknown,
+  requestId: string,
+  secret: string,
+  operation: PanelComfyUIReadOperation,
+): PanelComfyUIReadRelayResponseSuccess | PanelImageRelayResponseFailure {
+  if (!value || typeof value !== "object") {
+    throw new PanelComfyUIReadRelayError("The panel returned a malformed ComfyUI read reply.", "MALFORMED_REPLY");
+  }
+  const record = value as Record<string, unknown>;
+  const responseMac = record.responseMac;
+  if (!isSafeRelayCapability(responseMac) || !hasOwn(record, "responseMac")) {
+    throw new PanelComfyUIReadRelayError("The panel returned an unauthenticated ComfyUI read reply.", "MALFORMED_REPLY");
+  }
+  const { responseMac: ignored, ...unsigned } = record;
+  const response = validateReadResponse(unsigned, requestId, operation);
+  const expected = createHmac("sha256", secret).update(responseMacPayload(response)).digest("hex");
+  if (!timingSafeEqual(Buffer.from(responseMac, "hex"), Buffer.from(expected, "hex"))) {
+    throw new PanelComfyUIReadRelayError("The panel returned an unauthenticated ComfyUI read reply.", "MALFORMED_REPLY");
+  }
+  return response;
 }
 
 function validateTransportResponse(
@@ -510,7 +710,7 @@ async function readHttpResponseBounded(response: Response, maxBytes: number): Pr
   return JSON.parse(Buffer.concat(chunks, total).toString("utf8")) as unknown;
 }
 
-function requestDeadline(request: PanelImageRelayRequest): number {
+function requestDeadline(request: PanelRelayRequest): number {
   return Math.min(request.deadlineAt, request.createdAt + PANEL_IMAGE_RELAY_TIMEOUT_MS);
 }
 
@@ -611,7 +811,7 @@ export interface PanelImageRelayResolvedAgent {
 
 export interface PanelImageRelayServerOptions {
   bridge: PanelImageRelayBridge;
-  resolvePanelAgent: (request: PanelImageRelayRequest) => PanelImageRelayResolvedAgent | undefined;
+  resolvePanelAgent: (request: PanelRelayRequest) => PanelImageRelayResolvedAgent | undefined;
   resolvePanelTab: (agentKey: string) => string | undefined;
 }
 
@@ -659,7 +859,11 @@ export async function startPanelImageRelayServer(
         }
         const rawRecord = raw && typeof raw === "object" ? raw as Record<string, unknown> : undefined;
         const requestId = rawRecord?.requestId;
-        const request = isSafeRelayId(requestId) ? validateRequest(raw, requestId) : undefined;
+        const request = isSafeRelayId(requestId)
+          ? rawRecord && hasOwn(rawRecord, "operation")
+            ? validateReadRequest(raw, requestId)
+            : validateRequest(raw, requestId)
+          : undefined;
         if (!request) {
           writeHttpJson(res, 400, { ok: false, error: "MALFORMED_REQUEST" });
           return;
@@ -671,7 +875,7 @@ export async function startPanelImageRelayServer(
         }
         const now = Date.now();
         const age = now - request.createdAt;
-        let response: PanelImageRelayResponse;
+        let response: PanelRelayResponse;
         if (age < -5_000 || age > PANEL_IMAGE_RELAY_STALE_MS || now >= requestDeadline(request)) {
           response = failureResponse(
             request.requestId,
@@ -693,23 +897,38 @@ export async function startPanelImageRelayServer(
               try {
                 const reply = await withinDeadline(
                   options.bridge.send(
-                    { cmd: "fetch_image", filename: request.filename, subfolder: request.subfolder, type: request.type },
+                    isReadRelayRequest(request)
+                      ? { cmd: "fetch_comfyui_read", operation: request.operation }
+                      : { cmd: "fetch_image", filename: request.filename, subfolder: request.subfolder, type: request.type },
                     { tabId: panelTab, timeoutMs: Math.min(PANEL_IMAGE_RELAY_TIMEOUT_MS, remainingMs) },
                   ),
                   requestDeadline(request),
                 );
                 const replyRecord = reply && typeof reply === "object" ? reply as Record<string, unknown> : undefined;
-                const payload = replyRecord
+                const imagePayload = !isReadRelayRequest(request) && replyRecord
                   ? validateImagePayload({ base64: replyRecord.base64, mimeType: replyRecord.mimeType, bytes: replyRecord.bytes })
                   : undefined;
                 if (Date.now() >= requestDeadline(request)) {
                   response = failureResponse(request.requestId, "TIMEOUT", requestDeadline(request));
+                } else if (isReadRelayRequest(request)) {
+                  const payload = replyRecord ? validateReadPayload(replyRecord) : undefined;
+                  if (!payload || payload.operation !== request.operation) {
+                    response = failureResponse(request.requestId, "MALFORMED_REPLY");
+                  } else {
+                    response = {
+                      version: PANEL_IMAGE_RELAY_VERSION,
+                      requestId: request.requestId,
+                      ok: true,
+                      ...payload,
+                      updated: Date.now(),
+                    };
+                  }
                 } else if (replyRecord?.ok === false && hasOnlyKeys(replyRecord, ["ok", "error"]) && isSafeText(replyRecord.error, 160)) {
                   response = failureResponse(request.requestId, "PANEL_FETCH_FAILED");
-                } else if (!replyRecord || replyRecord.ok !== true || !payload || !hasOnlyKeys(replyRecord, ["ok", "base64", "mimeType", "bytes"])) {
+                } else if (!replyRecord || replyRecord.ok !== true || !imagePayload || !hasOnlyKeys(replyRecord, ["ok", "base64", "mimeType", "bytes"])) {
                   response = failureResponse(request.requestId, "MALFORMED_REPLY");
                 } else {
-                  response = { version: PANEL_IMAGE_RELAY_VERSION, requestId: request.requestId, ok: true, ...payload, updated: Date.now() };
+                  response = { version: PANEL_IMAGE_RELAY_VERSION, requestId: request.requestId, ok: true, ...imagePayload, updated: Date.now() };
                 }
               } catch (error) {
                 const timedOut = error instanceof PanelImageRelayError && error.code === "TIMEOUT";
@@ -832,6 +1051,100 @@ export async function requestPanelImage(
   }
   if (response.ok === false) responseFailureMessage(response);
   return { base64: response.base64, mimeType: response.mimeType, bytes: response.bytes };
+}
+
+/** Child-side production request for one fixed ComfyUI read over the same
+ * authenticated loopback channel as the image relay. */
+export async function requestPanelComfyUIRead(
+  operation: PanelComfyUIReadOperation,
+): Promise<PanelComfyUIReadSuccess | undefined> {
+  if (!READ_OPERATIONS.has(operation)) {
+    throw new PanelComfyUIReadRelayError("The ComfyUI read operation was refused.", "UNSAFE_OPERATION");
+  }
+  const endpoint = relayEndpoint();
+  const secret = process.env.COMFYUI_MCP_RELAY_SECRET;
+  if (!endpoint || !isSafeRelaySecret(secret)) return undefined;
+  const createdAt = Date.now();
+  const request: PanelComfyUIReadRelayRequest = {
+    version: PANEL_IMAGE_RELAY_VERSION,
+    requestId: `${Date.now().toString(36)}-${process.pid.toString(36)}-${randomBytes(8).toString("hex")}`,
+    capability: "",
+    operation,
+    createdAt,
+    deadlineAt: createdAt + PANEL_IMAGE_RELAY_TIMEOUT_MS,
+  };
+  request.capability = makePanelComfyUIReadRelayCapability(secret, request);
+  const body = Buffer.from(JSON.stringify(request), "utf8");
+  if (body.byteLength > PANEL_IMAGE_RELAY_MAX_HTTP_REQUEST_BYTES) {
+    throw new PanelComfyUIReadRelayError("The relay request exceeded its safety limit.", "REQUEST_TOO_LARGE");
+  }
+  let httpResponse: Response;
+  try {
+    httpResponse = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": String(body.byteLength) },
+      body,
+      redirect: "error",
+      signal: AbortSignal.timeout(PANEL_IMAGE_RELAY_TIMEOUT_MS),
+    });
+  } catch (error) {
+    if (error instanceof PanelComfyUIReadRelayError) throw error;
+    if (error instanceof DOMException && error.name === "TimeoutError") {
+      throw new PanelComfyUIReadRelayError("The connected panel read relay timed out.", "TIMEOUT");
+    }
+    throw new PanelComfyUIReadRelayError("The connected panel read relay is unavailable.", "RELAY_UNAVAILABLE", true);
+  }
+  let decoded: unknown;
+  try {
+    decoded = await readHttpResponseBounded(httpResponse, PANEL_IMAGE_RELAY_MAX_HTTP_RESPONSE_BYTES);
+  } catch (error) {
+    if (error instanceof PanelComfyUIReadRelayError) throw error;
+    throw new PanelComfyUIReadRelayError("The panel returned a malformed ComfyUI read reply.", "MALFORMED_REPLY");
+  }
+  if (!httpResponse.ok) {
+    const code = errorCodeFromHttpBody(decoded, httpResponse.status);
+    throw new PanelComfyUIReadRelayError(
+      code === "RELAY_UNAVAILABLE" ? "The connected panel read relay is unavailable." : `The connected panel read relay failed (${code}).`,
+      code,
+      httpResponse.status >= 500,
+    );
+  }
+  const response = validateReadTransportResponse(decoded, request.requestId, secret, operation);
+  const responseAge = Date.now() - response.updated;
+  const authenticatedTimeout = response.ok === false && response.error === "TIMEOUT";
+  if (
+    !authenticatedTimeout &&
+    (response.updated < request.createdAt ||
+      response.updated > request.deadlineAt ||
+      responseAge < -5_000 ||
+      responseAge > PANEL_IMAGE_RELAY_STALE_MS)
+  ) {
+    throw new PanelComfyUIReadRelayError("The panel returned a stale ComfyUI read reply.", "STALE_REPLY");
+  }
+  if (response.ok === false) {
+    const known = new Set([
+      "AMBIGUOUS_REQUESTER",
+      "BACKLOG_FULL",
+      "MALFORMED_REPLY",
+      "NO_LIVE_PANEL",
+      "PANEL_FETCH_FAILED",
+      "STALE_REQUEST",
+      "TIMEOUT",
+    ]);
+    const code = known.has(response.error) ? response.error : "PANEL_FETCH_FAILED";
+    throw new PanelComfyUIReadRelayError(
+      code === "PANEL_FETCH_FAILED"
+        ? "The connected panel could not read ComfyUI."
+        : `The connected panel ComfyUI read relay failed (${code}).`,
+      code,
+    );
+  }
+  return {
+    operation: response.operation,
+    body: response.body,
+    contentType: response.contentType,
+    bytes: response.bytes,
+  };
 }
 
 /** Legacy file-channel request writer, retained for focused/unit coverage only. */

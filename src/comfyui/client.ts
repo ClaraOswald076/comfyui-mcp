@@ -29,8 +29,11 @@ import {
 } from "../services/panel-fallback-target.js";
 import {
   PANEL_IMAGE_RELAY_MAX_BYTES,
+  PanelComfyUIReadRelayError,
   PanelImageRelayError,
+  requestPanelComfyUIRead,
   requestPanelImage,
+  type PanelComfyUIReadSuccess,
 } from "../services/panel-image-relay.js";
 import {
   bodyPrefixOf,
@@ -215,6 +218,31 @@ function looksLikeSystemStats(body: unknown): boolean {
   return (b.system != null && typeof b.system === "object") || Array.isArray(b.devices);
 }
 
+function panelReadResponse(read: PanelComfyUIReadSuccess): Response {
+  const headers = new Headers();
+  if (read.contentType) headers.set("content-type", read.contentType);
+  return new Response(read.body, { status: 200, headers });
+}
+
+/** Ask the authenticated panel only after the configured headless route failed
+ * at the transport layer. No browser origin is selected or contacted here. */
+async function panelReadFallback(
+  operation: "history" | "system_stats" | "logs",
+  primaryError: unknown,
+): Promise<PanelComfyUIReadSuccess | undefined> {
+  try {
+    return await requestPanelComfyUIRead(operation);
+  } catch (error) {
+    if (error instanceof PanelComfyUIReadRelayError && error.unavailable) return undefined;
+    const primary = primaryError instanceof Error ? primaryError.message : String(primaryError);
+    const code = error instanceof PanelComfyUIReadRelayError ? error.code : "RELAY_ERROR";
+    throw new Error(
+      `${primary} The connected panel ComfyUI read fallback failed safely (${code}).`,
+      { cause: error },
+    );
+  }
+}
+
 /** Budget for the /system_stats probe. Short on purpose: this is a liveness
  *  read, and a ComfyUI mid-decode will not answer in time. Exported so the
  *  call_tool timeout test can shrink only THIS deadline. */
@@ -258,6 +286,17 @@ export async function getSystemStats(
     noteComfyApiRootValidated(getComfyUIBaseUrl());
     return stats;
   } catch (err) {
+    if (isComfyTransportFailure(err)) {
+      const relayed = await panelReadFallback("system_stats", err);
+      if (relayed) {
+        return await readComfyJson<SystemStats>(panelReadResponse(relayed), {
+          url: "/system_stats",
+          expectShape: looksLikeSystemStats,
+          shapeHint:
+            "a ComfyUI /system_stats document (it has no `system` object and no `devices` array)",
+        });
+      }
+    }
     if (!isTimeoutAbort(err)) throw err;
     // Structured, not the raw AbortSignal.timeout string: call_tool must
     // settle with a result the caller can act on, not hang and not dump
@@ -960,10 +999,22 @@ export async function getLogs(opts?: GetLogsOptions): Promise<string[]> {
       // titled "Failed to fetch" contradicted its own contents and sent readers
       // to check whether ComfyUI was up when it demonstrably was (#828).
       if (isNonJsonResponseError(err2)) throw err2;
-      const detail = err2 instanceof Error ? err2.message : String(err2);
-      throw new ConnectionError(
-        `Failed to fetch ComfyUI logs after reconnect retry: ${detail}`,
-      );
+      if (isComfyTransportFailure(err) && isComfyTransportFailure(err2)) {
+        const relayed = await panelReadFallback("logs", err2);
+        if (relayed) {
+          text = relayed.body;
+        } else {
+          const detail = err2 instanceof Error ? err2.message : String(err2);
+          throw new ConnectionError(
+            `Failed to fetch ComfyUI logs after reconnect retry: ${detail}`,
+          );
+        }
+      } else {
+        const detail = err2 instanceof Error ? err2.message : String(err2);
+        throw new ConnectionError(
+          `Failed to fetch ComfyUI logs after reconnect retry: ${detail}`,
+        );
+      }
     }
   }
 
@@ -1171,9 +1222,19 @@ export async function getHistory(
   promptId?: string,
 ): Promise<Record<string, HistoryEntry>> {
   if (isCloudMode()) return cloudClient.getHistory(promptId);
-  const client = getClient();
   const path = promptId ? `/history/${promptId}` : "/history";
-  const res = await comfyApiFetch(path);
+  let res: Response;
+  try {
+    res = await comfyApiFetch(path);
+  } catch (err) {
+    // The panel command has one fixed global /history route. A prompt-scoped
+    // request is therefore deliberately not eligible for this fallback.
+    if (!promptId && isComfyTransportFailure(err)) {
+      const relayed = await panelReadFallback("history", err);
+      if (relayed) return await readComfyJson<Record<string, HistoryEntry>>(panelReadResponse(relayed), { url: path });
+    }
+    throw err;
+  }
   // #1149 — this was a bare res.json(), the last unguarded parse on the media
   // read paths. A reporter on a remote H100 got `Unexpected end of JSON input`
   // from get_history and get_image after a completed video render, which
