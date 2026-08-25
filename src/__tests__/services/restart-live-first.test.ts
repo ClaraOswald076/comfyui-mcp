@@ -485,7 +485,10 @@ describe("restart_comfyui — live-first script resolution (#476, #426)", () => 
   winIt(
     "#2252: refuses the same shape when the observed main.py is not a regular file",
     async () => {
-      mockResolveBase.mockReturnValue(undefined);
+      // Keep a separate, valid canonical install available. Without the hard
+      // refusal in resolveLaunchCommand, this fixture would incorrectly pass by
+      // relaunching that install after the observed embedded layout failed.
+      mockResolveBase.mockReturnValue(BASE);
       mockLiveRootFromArgv.mockReturnValue(undefined);
       mockGetSystemStats.mockResolvedValue({
         system: { argv: ["main.py", "--port", "8188"] },
@@ -493,13 +496,15 @@ describe("restart_comfyui — live-first script resolution (#476, #426)", () => 
       mockExistsSync.mockImplementation((p: string) => {
         const s = String(p);
         return (
+          s === ABS_MAIN ||
+          s === ABS_PYTHON ||
           s === EMBEDDED_ROOT ||
           s === EMBEDDED_PYTHON_DIR ||
           s === EMBEDDED_MAIN ||
           s === EMBEDDED_PYTHON
         );
       });
-      mockFindComfyuiPython.mockReturnValue("python");
+      mockFindComfyuiPython.mockReturnValue(ABS_PYTHON);
       mockIsFile.mockImplementation((p: string) => String(p) !== EMBEDDED_MAIN);
       __processControlTestHooks.setLiveCwdResolver(() => undefined);
       mockResolveLiveServerRoot.mockReturnValue({

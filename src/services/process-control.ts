@@ -2122,9 +2122,14 @@ function resolveLaunchCommand(
         info.liveCwd,
         firstUnquoted,
       );
+      // `null` means the observed process proved the exact embedded layout but
+      // its root/interpreter/script failed validation. Do not let that explicit
+      // refusal fall through to the broader canonical anchor below: it could
+      // relaunch a different install after stopping the observed process.
+      if (embeddedAnchor === null) return null;
       const candidatePython =
         embeddedAnchor?.python ??
-        (embeddedAnchor === undefined ? findComfyuiPython(info.liveCwd, argv) : undefined);
+        findComfyuiPython(info.liveCwd, argv);
       const pythonIsAbsolute =
         !!candidatePython &&
         (isAbsolute(candidatePython) || /^[a-zA-Z]:[\\/]/.test(candidatePython));

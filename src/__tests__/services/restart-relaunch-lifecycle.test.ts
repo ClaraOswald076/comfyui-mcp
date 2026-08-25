@@ -871,8 +871,10 @@ describe("restart_comfyui — anchors the observed embedded-python root (#2252)"
     const main = join(root, "main.py");
     mockGetSystemStats.mockResolvedValue({ system: { argv: ["main.py", "--port", "8188"] } });
     mockLivePortThenFree();
-    mockFindComfyuiPython.mockReturnValue(undefined);
-    mockResolveBase.mockReturnValue(undefined);
+    // A valid alternate canonical install proves that an invalid observed
+    // embedded layout cannot fall through to the generic anchor.
+    mockFindComfyuiPython.mockReturnValue(ABS_PYTHON);
+    mockResolveBase.mockReturnValue(BASE);
     mockResolveLiveRoot.mockReturnValue({
       source: "observed-process",
       anchorDir: root,
@@ -880,7 +882,15 @@ describe("restart_comfyui — anchors the observed embedded-python root (#2252)"
     });
     mockExistsSync.mockImplementation((p: string) => {
       const value = String(p);
-      return value === root || value === pythonDir || value === python || value === main;
+      return (
+        value === BASE ||
+        value === ABS_MAIN ||
+        value === ABS_PYTHON ||
+        value === root ||
+        value === pythonDir ||
+        value === python ||
+        value === main
+      );
     });
     mockIsDirectory.mockImplementation(
       (p: string) => String(p) === root || String(p) === `${root}\\python`,
