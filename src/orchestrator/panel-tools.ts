@@ -11729,11 +11729,15 @@ export interface ConfirmOptions {
 export interface PanelToolCtx {
   /** Forward a command to the panel and wrap the reply as a tool result. An
    *  optional observer receives the bridge request id after the frame is written,
-   *  for commands that can later be proven only by a panel-side receipt. */
+   *  for commands that can later be proven only by a panel-side receipt. The
+   *  optional final guard is synchronous: it runs after any mutating reachability
+   *  wait and immediately before the bridge dispatch, and may throw to refuse the
+   *  write. It must not await. */
   call: (
     cmd: Record<string, unknown>,
     timeoutMs?: number,
     onDispatchedRid?: (rid: string) => void,
+    beforeDispatch?: () => void,
   ) => Promise<ToolResult>;
   /** Human-in-the-loop yes/no confirm card. Tri-state (#360): "yes" on an explicit
    *  affirmative, "no" on a decline / no-panel / transport error, "timeout" when the
@@ -12089,6 +12093,7 @@ export function makePanelToolCtx(
     cmd: Record<string, unknown>,
     timeoutMs?: number,
     onDispatchedRid?: (rid: string) => void,
+    beforeDispatch?: () => void,
     // #1560 — reports the error each attempt failed on, so the wrapper below can
     // stamp the bridge's structural marks onto the ToolResult from ONE place. The
     // catch has more than a dozen `fail(...)` exits, each shaping its own message;
@@ -12130,6 +12135,10 @@ export function makePanelToolCtx(
       // so they are dispatched on the bounded budget above instead.
       const blocked = graphCmdBlockedByRunningPrompt(cmd);
       if (blocked) return fail(blocked);
+      // A caller may hold a target/generation fence across the reachability wait.
+      // Run it synchronously in the final gap before sendRouted: an async check here
+      // would reopen the exact retarget window this guard closes.
+      beforeDispatch?.();
       const firstTry = ok(await sendRouted(cmd, timeoutMs, observeRid));
       // panel#1097 — a guard-domain command that SUCCEEDS is the evidence that the
       // switch is over, whichever attempt lands it. Without this an ordinary
@@ -12214,6 +12223,7 @@ export function makePanelToolCtx(
           await awaitReachable();
           ensureReachable(); // rebinds a current-mode session onto the reconnected tab
           holdTab = ctx.tabId;
+          beforeDispatch?.();
           const retried = ok(await sendRouted(cmd, timeoutMs, observeRid));
           // Cleared HERE and nowhere else, and only when the failure this retried
           // was a SWITCH refusal. Clearing on every routed success let an unguarded
@@ -13046,9 +13056,10 @@ export function makePanelToolCtx(
     cmd: Record<string, unknown>,
     timeoutMs?: number,
     onDispatchedRid?: (rid: string) => void,
+    beforeDispatch?: () => void,
   ): Promise<ToolResult> => {
     let failure: unknown;
-    const res = await callOnce(cmd, timeoutMs, onDispatchedRid, (err) => {
+    const res = await callOnce(cmd, timeoutMs, onDispatchedRid, beforeDispatch, (err) => {
       failure = err;
     });
     return carryWorkflowListReadinessMark(
@@ -14976,6 +14987,7 @@ function withRetryToken(d: PanelToolDef): PanelToolDef {
         cmd: Record<string, unknown>,
         timeoutMs?: number,
         onDispatchedRid?: (rid: string) => void,
+        beforeDispatch?: () => void,
       ) =>
         ctx.call(
           // Ask the RETRY MAP's question, not the workflow fence's (codex gate).
@@ -14996,6 +15008,7 @@ function withRetryToken(d: PanelToolDef): PanelToolDef {
             : cmd,
           timeoutMs,
           onDispatchedRid,
+          beforeDispatch,
         );
       const out = await d.handler(args, wrapped);
       // Drained AFTER the handler, deliberately, for two measured reasons.
@@ -21994,12 +22007,14 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
             `No recommendation "${args.recommendation_id}" on the live graph. Call panel_kitchen action:"assess" first. Known: ${recs.map((r) => r.id).join(", ") || "(none)"}`,
           );
         }
-        const result = await applyKitchenRecommendation({
-          rec,
-          confirm: args.confirm === true,
-          applyFlag:
-            rec.change.type === "flag"
-              ? async (flag): Promise<KitchenFlagApplyOutcome> => {
+        let result: Awaited<ReturnType<typeof applyKitchenRecommendation>>;
+        try {
+          result = await applyKitchenRecommendation({
+            rec,
+            confirm: args.confirm === true,
+            applyFlag:
+              rec.change.type === "flag"
+                ? async (flag): Promise<KitchenFlagApplyOutcome> => {
                   if (!panelKitchenTargetStillCurrent(ctx, target)) {
                     return {
                       applied: false,
@@ -22042,35 +22057,66 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
                         "panel_kitchen reports applied:false because the relaunch, target fence, and new serving argv were not all proven.",
                     restart,
                   };
-                }
-              : undefined,
-          applyWidget:
-            rec.change.type === "widget" || rec.change.type === "model_swap"
-              ? async (nodeId, widget, value) => {
+                  }
+                : undefined,
+            applyWidget:
+              rec.change.type === "widget" || rec.change.type === "model_swap"
+                ? async (nodeId, widget, value) => {
                   const write = await ctx.call(
                     { cmd: "graph_set_widget", node_id: nodeId, widget, value },
                     OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+                    undefined,
+                    () => {
+                      if (!panelKitchenTargetStillCurrent(ctx, target)) {
+                        throw new Error(
+                          "Refusing graph_set_widget: the ComfyUI target changed after the reachability wait. No widget mutation was dispatched.",
+                        );
+                      }
+                    },
                   );
                   if (write.isError) {
                     throw new Error(write.content.map((c) => ("text" in c ? c.text : "")).join("\n"));
                   }
                   return parseToolResultJson(write);
-                }
-              : undefined,
-          revertWidget:
-            rec.change.type === "widget" || rec.change.type === "model_swap"
-              ? async (nodeId, widget, value) => {
-                  await ctx.call(
+                  }
+                : undefined,
+            revertWidget:
+              rec.change.type === "widget" || rec.change.type === "model_swap"
+                ? async (nodeId, widget, value) => {
+                  const revert = await ctx.call(
                     { cmd: "graph_set_widget", node_id: nodeId, widget, value },
                     OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+                    undefined,
+                    () => {
+                      if (!panelKitchenTargetStillCurrent(ctx, target)) {
+                        throw new Error(
+                          "Refusing graph_set_widget revert: the ComfyUI target changed after the reachability wait. No widget mutation was dispatched.",
+                        );
+                      }
+                    },
                   );
-                }
-              : undefined,
-        });
+                  if (revert.isError) {
+                    throw new Error(revert.content.map((c) => ("text" in c ? c.text : "")).join("\n"));
+                  }
+                  }
+                : undefined,
+          });
+        } catch (err) {
+          result = {
+            applied: false,
+            recommendation: rec,
+            proof: { status: "failed" },
+            flag_note:
+              `Could not apply the recommendation: ${err instanceof Error ? err.message : String(err)} ` +
+              "No further widget mutation was dispatched and the launch outcome is not confirmed.",
+          };
+        }
         if (!panelKitchenTargetStillCurrent(ctx, target)) {
           return ok({
             ...result,
             applied: false,
+            stale: true,
+            target_stable: false,
             target_fence: target.fence,
             flag_note:
               (result.flag_note ? `${result.flag_note} ` : "") +
@@ -22080,6 +22126,26 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         const fencedResult = { ...result, target_fence: target.fence };
         if (fencedResult.applied && args.skip_proof !== true && rec.change.type !== "flag") {
           const run = await ctx.call({ cmd: "graph_run" });
+          if (!panelKitchenTargetStillCurrent(ctx, target)) {
+            return ok({
+              ...fencedResult,
+              applied: false,
+              stale: true,
+              target_stable: false,
+              proof: {
+                ...fencedResult.proof,
+                status: "stale",
+                summary:
+                  (fencedResult.proof.summary ? `${fencedResult.proof.summary}; ` : "") +
+                  "graph_run was dispatched for the previously fenced target, but the target changed before its result was returned; no success is claimed for the current target.",
+              },
+              run: parseToolResultJson(run),
+              flag_note:
+                "panel_kitchen reports applied:false/stale because the ComfyUI target changed while the proof graph_run was in flight.",
+              target_note:
+                "panel_kitchen reports applied:false/stale because the ComfyUI target changed while the proof graph_run was in flight.",
+            });
+          }
           return ok({
             ...fencedResult,
             proof: {

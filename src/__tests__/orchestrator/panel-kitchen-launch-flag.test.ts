@@ -17,7 +17,9 @@ const kitchenFixture = vi.hoisted(() => ({
     restart: true,
     download: false,
     change: { type: "flag", flag: "--use-ck-attention" },
-  },
+  } as any,
+  raceWidgetDispatch: false,
+  widgetReachabilityArmed: false,
 }));
 
 vi.mock("../../services/workspace-env.js", async (importOriginal) => {
@@ -54,7 +56,10 @@ vi.mock("../../services/kitchen.js", async (importOriginal) => {
   return {
     ...actual,
     gatherKitchenStatus: vi.fn(async () => ({})),
-    assessKitchenGraph: vi.fn(async () => [kitchenFixture.rec]),
+    assessKitchenGraph: vi.fn(async () => {
+      if (kitchenFixture.raceWidgetDispatch) kitchenFixture.widgetReachabilityArmed = true;
+      return [kitchenFixture.rec];
+    }),
   };
 });
 
@@ -72,8 +77,9 @@ function textOf(res: ToolResult): string {
   return res.content.map((c) => ("text" in c ? c.text : "")).join("\n");
 }
 
-function panelKitchenHarness(onGraphQuery?: () => void) {
+function panelKitchenHarness(onGraphQuery?: () => void, onGraphRun?: () => void) {
   const sent: Array<Record<string, unknown>> = [];
+  let widgetReachabilityRetargeted = false;
   const bridge = {
     send: async (cmd: Record<string, unknown>) => {
       sent.push(cmd);
@@ -81,12 +87,20 @@ function panelKitchenHarness(onGraphQuery?: () => void) {
         onGraphQuery?.();
         return { nodes: [] };
       }
+      if (cmd.cmd === "graph_run") onGraphRun?.();
       return {};
     },
     push: () => 1,
-    canReach: () => true,
+    canReach: () => !kitchenFixture.widgetReachabilityArmed || widgetReachabilityRetargeted,
     isHeadless: () => false,
-    tabs: () => [{ tab_id: TAB, title: "wf", connected_at: 0 }],
+    tabs: () => {
+      if (kitchenFixture.widgetReachabilityArmed && !widgetReachabilityRetargeted) {
+        widgetReachabilityRetargeted = true;
+        panelTarget.baseUrl = "http://127.0.0.1:8288";
+        panelTarget.generation = 1;
+      }
+      return [{ tab_id: TAB, title: "wf", connected_at: 0 }];
+    },
     tabOrigin: () => panelTabTarget.baseUrl,
     tabServerOrigin: () => new URL(panelTabTarget.baseUrl).origin,
     tabIsLocal: () => true,
@@ -106,7 +120,34 @@ beforeEach(() => {
   panelTarget.baseUrl = "http://127.0.0.1:8188";
   panelTarget.generation = 0;
   panelTabTarget.baseUrl = "http://127.0.0.1:8188";
+  kitchenFixture.rec = {
+    id: "ck_attention",
+    kind: "ck_attention",
+    why: "INT8 attention is available.",
+    safe: "Restart required; consent-gated.",
+    restart: true,
+    download: false,
+    change: { type: "flag", flag: "--use-ck-attention" },
+  } as any;
+  kitchenFixture.raceWidgetDispatch = false;
+  kitchenFixture.widgetReachabilityArmed = false;
 });
+
+const widgetRecommendation = {
+  id: "fp8_unet_fast:12",
+  kind: "fp8_unet_fast",
+  node_id: "12",
+  why: "The live graph can use the faster FP8 dtype.",
+  safe: "Widget-only change.",
+  restart: false,
+  download: false,
+  change: {
+    type: "widget",
+    widget: "weight_dtype",
+    value: "fp8_e4m3fn_fast",
+    previous: "default",
+  },
+};
 
 describe("panel_kitchen flag apply (#2277)", () => {
   it("reports applied only when the owned relaunch and serving argv prove the flag", async () => {
@@ -220,5 +261,45 @@ describe("panel_kitchen flag apply (#2277)", () => {
     expect(body.applied).toBe(false);
     expect(body.needs_confirm).toBe(true);
     expect(restartMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses widget dispatch when retargeting occurs during reachability wait", async () => {
+    kitchenFixture.rec = widgetRecommendation as any;
+    kitchenFixture.raceWidgetDispatch = true;
+    const { ctx, def, sent } = panelKitchenHarness();
+
+    const res = await def.handler(
+      { action: "apply", recommendation_id: widgetRecommendation.id, skip_proof: true } as never,
+      ctx,
+    );
+    const body = JSON.parse(textOf(res));
+
+    expect(body.applied).toBe(false);
+    expect(body.stale).toBe(true);
+    expect(textOf(res)).toMatch(/target changed/i);
+    expect(sent.some((cmd) => cmd.cmd === "graph_query")).toBe(true);
+    expect(sent.some((cmd) => cmd.cmd === "graph_set_widget")).toBe(false);
+  });
+
+  it("returns applied:false/stale when retargeting occurs during post-apply graph_run", async () => {
+    kitchenFixture.rec = widgetRecommendation as any;
+    const { ctx, def, sent } = panelKitchenHarness(undefined, () => {
+      panelTarget.baseUrl = "http://127.0.0.1:8288";
+      panelTarget.generation = 1;
+    });
+
+    const res = await def.handler(
+      { action: "apply", recommendation_id: widgetRecommendation.id } as never,
+      ctx,
+    );
+    const body = JSON.parse(textOf(res));
+
+    expect(body.applied).toBe(false);
+    expect(body.stale).toBe(true);
+    expect(body.target_stable).toBe(false);
+    expect(body.proof.status).toBe("stale");
+    expect(textOf(res)).toMatch(/proof graph_run was in flight/i);
+    expect(sent.some((cmd) => cmd.cmd === "graph_set_widget")).toBe(true);
+    expect(sent.some((cmd) => cmd.cmd === "graph_run")).toBe(true);
   });
 });

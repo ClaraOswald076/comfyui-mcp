@@ -142,7 +142,7 @@ export interface KitchenApplyResult {
   revert_reason?: string;
   recommendation: KitchenRecommendation;
   proof: {
-    status: "proven" | "not_run" | "queued" | "reverted" | "failed";
+    status: "proven" | "not_run" | "queued" | "reverted" | "failed" | "stale";
     before?: ProofSample;
     after?: ProofSample;
     summary?: string;

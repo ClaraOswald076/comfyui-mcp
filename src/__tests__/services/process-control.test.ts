@@ -770,7 +770,15 @@ describe("process-control restart relaunch preflight (#368/#370)", () => {
 
   it("appends a confirmed flag only to a proven local relaunch and retains it for later starts (#2277)", async () => {
     const flag = "--use-ck-attention";
-    const currentArgv = ["/fake/ComfyUI/main.py", "--port", "8188"];
+    // The relaunch preflight intentionally applies the host's absolute-path rules.
+    // Keep this production-path fixture valid on both POSIX and Windows; using the
+    // POSIX spelling on Windows makes the safety refusal fire before stop, which
+    // hides the flag-persistence behavior this test is meant to prove.
+    const installRoot = process.platform === "win32" ? "C:\\fake\\ComfyUI" : "/fake/ComfyUI";
+    const mainScript = join(installRoot, "main.py");
+    mockConfig.comfyuiPath = installRoot;
+    mockFindComfyuiPython.mockReturnValue(join(installRoot, "python_embeded", "python.exe"));
+    const currentArgv = [mainScript, "--port", "8188"];
     const augmentedArgv = [...currentArgv, flag];
     let killed = false;
     let statsCalls = 0;
@@ -801,7 +809,7 @@ describe("process-control restart relaunch preflight (#368/#370)", () => {
     expect(restarted.serving_argv).toEqual(augmentedArgv);
     expect(mockSpawn).toHaveBeenCalledWith(
       expect.any(String),
-      expect.arrayContaining(["/fake/ComfyUI/main.py", flag]),
+      expect.arrayContaining([mainScript, flag]),
       expect.any(Object),
     );
 
