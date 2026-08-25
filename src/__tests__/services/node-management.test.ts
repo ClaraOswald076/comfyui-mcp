@@ -99,6 +99,8 @@ const fsCtl = vi.hoisted(() => ({
   removed: [] as string[],
   /** Make removal fail, so the leftover has to be disclosed rather than swallowed. */
   rmThrows: false,
+  /** Simulate a local .disabled rename without touching the fake filesystem. */
+  renameSync: undefined as ((from: string, to: string) => void) | undefined,
 }));
 vi.mock("node:fs", async (importOriginal) => {
   const real = await importOriginal<typeof import("node:fs")>();
@@ -111,6 +113,10 @@ vi.mock("node:fs", async (importOriginal) => {
       fsCtl.removed.push(String(path));
       if (fsCtl.rmThrows) throw new Error("EPERM: removal refused");
       return (real.rmSync as (p: unknown, o?: unknown) => unknown)(path, options);
+    }),
+    renameSync: vi.fn((from: unknown, to: unknown) => {
+      if (fsCtl.renameSync) return fsCtl.renameSync(String(from), String(to));
+      return (real.renameSync as (a: unknown, b: unknown) => unknown)(from, to);
     }),
     readdirSync: vi.fn((path: unknown, options?: unknown) =>
       fsCtl.readdirSync
@@ -338,6 +344,7 @@ describe("node-management service", () => {
     fsCtl.readdirSync = undefined;
     fsCtl.removed = [];
     fsCtl.rmThrows = false;
+    fsCtl.renameSync = undefined;
     fsCtl.readFileSync = undefined;
     savedDefault.value = undefined;
     config.comfyuiPath = "/fake/comfy";
@@ -2398,6 +2405,86 @@ describe("node-management service", () => {
       const res = await enableCustomNode({ id: "my-pack" });
       expect(taskOf(calls, "enable").params).toMatchObject({ cnr_id: "my-pack" });
       expect(res.message).toMatch(/Enabled "my-pack"/);
+    });
+
+    it("#2247 enables Manager via comfy-cli before its disabled HTTP precheck", async () => {
+      let enabled = false;
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes")
+          ? [dirEnt(enabled ? "ComfyUI-Manager" : "ComfyUI-Manager.disabled")]
+          : [];
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (args.includes("enable")) enabled = true;
+        return cliEnvelope({ message: "enabled" });
+      }) as never);
+      const fetchMock = vi.fn(async () => {
+        throw new Error("Manager HTTP must not be consulted before local enable");
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const res = await enableCustomNode({ id: "ComfyUI-Manager", useCmCli: true });
+
+      expect(res.mechanism).toBe("comfy-cli");
+      expect(res.message).toMatch(/verified on disk/);
+      expect(mockedExec.mock.calls.some(([, args]) => (args as string[]).includes("enable"))).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("#2247 falls back to a validated filesystem rename when Manager and comfy-cli are unavailable", async () => {
+      let enabled = false;
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes")
+          ? [dirEnt(enabled ? "ComfyUI-Manager" : "ComfyUI-Manager.disabled")]
+          : [];
+      fsCtl.renameSync = (from, to) => {
+        expect(from).toContain("ComfyUI-Manager.disabled");
+        expect(to).toContain("ComfyUI-Manager");
+        enabled = true;
+      };
+      mockedExists.mockImplementation((p: unknown) => {
+        const normalized = String(p).replace(/\\/g, "/").toLowerCase();
+        return !normalized.includes("/.venv/") && !/(^|\/)comfy(?:\.exe|\.cmd|\.bat)?$/.test(normalized);
+      });
+      const { calls } = stubFetch({ installedBody: {}, managerQueueStatus: "absent" });
+
+      const res = await enableCustomNode({ id: "ComfyUI-Manager", useCmCli: true });
+
+      expect(res.mechanism).toBe("filesystem");
+      expect(res.message).toMatch(/verified on disk/);
+      expect(calls.some((c) => c.url.includes("/queue/task"))).toBe(false);
+      expect(mockedExec).not.toHaveBeenCalled();
+    });
+
+    it("#2247 refuses traversal-shaped local enable ids before CLI or filesystem mutation", async () => {
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes")
+          ? [dirEnt("ComfyUI-Manager.disabled")]
+          : [];
+      const err = await enableCustomNode({
+        id: "../ComfyUI-Manager",
+        useCmCli: true,
+      }).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(ValidationError);
+      expect(String(err)).toMatch(/path separators/);
+      expect(mockedExec).not.toHaveBeenCalled();
+      expect(fsCtl.renameSync).toBeUndefined();
+    });
+
+    it("#2247 refuses an active/.disabled duplicate instead of choosing a directory", async () => {
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes")
+          ? [dirEnt("ComfyUI-Manager"), dirEnt("ComfyUI-Manager.disabled")]
+          : [];
+
+      const err = await enableCustomNode({ id: "ComfyUI-Manager", useCmCli: true }).catch(
+        (e: unknown) => e,
+      );
+
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect(String(err)).toMatch(/both .*ComfyUI-Manager.*ComfyUI-Manager\.disabled/);
+      expect(mockedExec).not.toHaveBeenCalled();
+      expect(fsCtl.renameSync).toBeUndefined();
     });
 
     it("uninstall refuses a pack that resolves nowhere — NOTHING is queued", async () => {
