@@ -142,13 +142,20 @@ export interface KitchenApplyResult {
   revert_reason?: string;
   recommendation: KitchenRecommendation;
   proof: {
-    status: "proven" | "not_run" | "queued" | "reverted" | "failed";
+    status: "proven" | "not_run" | "queued" | "reverted" | "failed" | "stale";
     before?: ProofSample;
     after?: ProofSample;
     summary?: string;
   };
   flag_note?: string;
+  restart?: unknown;
   previous?: unknown;
+}
+
+export interface KitchenFlagApplyOutcome {
+  applied: boolean;
+  note: string;
+  restart?: unknown;
 }
 
 export interface KitchenLogParse {
@@ -1005,6 +1012,7 @@ export function formatProofSummary(before: ProofSample, after: ProofSample, rec:
 export async function applyKitchenRecommendation(opts: {
   rec: KitchenRecommendation;
   confirm?: boolean;
+  applyFlag?: (flag: string) => Promise<KitchenFlagApplyOutcome>;
   applyWidget?: (nodeId: string, widget: string, value: string) => Promise<unknown>;
   revertWidget?: (nodeId: string, widget: string, value: string) => Promise<unknown>;
   runProof?: (phase: "before" | "after") => Promise<ProofSample>;
@@ -1021,14 +1029,45 @@ export async function applyKitchenRecommendation(opts: {
   }
 
   if (rec.change.type === "flag") {
-    // restart_comfyui replays the previous argv; this process does not inject flags.
+    const flag = rec.change.flag;
+    if (!flag) {
+      return {
+        applied: false,
+        recommendation: rec,
+        proof: { status: "failed" },
+        flag_note: "This flag recommendation is malformed: it has no launch flag.",
+      };
+    }
+    if (opts.applyFlag) {
+      try {
+        const outcome = await opts.applyFlag(flag);
+        return {
+          applied: outcome.applied,
+          recommendation: rec,
+          proof: { status: "not_run" },
+          flag_note: outcome.note,
+          restart: outcome.restart,
+        };
+      } catch (err) {
+        return {
+          applied: false,
+          recommendation: rec,
+          proof: { status: "failed" },
+          flag_note:
+            `Could not apply ${flag}: ${err instanceof Error ? err.message : String(err)} ` +
+            "The launch outcome is not confirmed; verify ComfyUI's current launch arguments before retrying.",
+        };
+      }
+    }
+    // restart_comfyui replays the previous argv; without a bound flag mutator this
+    // process does not inject flags and must not claim that it did.
     return {
       applied: false,
       needs_confirm: false,
       recommendation: rec,
       proof: { status: "not_run" },
       flag_note:
-        `Add ${rec.change.flag} to the ComfyUI launch line, then restart_comfyui / panel_restart_comfyui. ` +
+        `Add ${flag} to the ComfyUI launch line, then restart_comfyui / panel_restart_comfyui. ` +
         `Those tools replay the previous argv and do not compose a new one — applying the flag here would claim a restart that did not change argv.`,
     };
   }

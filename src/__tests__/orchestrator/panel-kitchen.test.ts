@@ -21,6 +21,7 @@ import {
 } from "../../orchestrator/panel-tools.js";
 import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
 import { resetKitchenHintSession } from "../../services/kitchen.js";
+import { getComfyUIBaseUrl } from "../../config.js";
 
 const TAB = "wf:workflows/a.json";
 
@@ -40,6 +41,9 @@ function panelKitchenHarness(graphQueryReply: unknown) {
     canReach: () => true,
     isHeadless: () => false,
     tabs: () => [{ tab_id: TAB, title: "wf", connected_at: 0 }],
+    tabOrigin: () => getComfyUIBaseUrl(),
+    tabServerOrigin: () => getComfyUIBaseUrl(),
+    tabIsLocal: () => true,
     resolveActiveTabId: () => TAB,
     tabCanMutateGraph: () => true,
     tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
@@ -156,6 +160,9 @@ describe("panel_kitchen", () => {
       canReach: () => true,
       isHeadless: () => false,
       tabs: () => [{ tab_id: TAB, title: "wf", connected_at: 0 }],
+      tabOrigin: () => getComfyUIBaseUrl(),
+      tabServerOrigin: () => getComfyUIBaseUrl(),
+      tabIsLocal: () => true,
       resolveActiveTabId: () => TAB,
       tabCanMutateGraph: () => true,
       tabGraphMutationCapability: () => ({ known: true, canMutate: true }),

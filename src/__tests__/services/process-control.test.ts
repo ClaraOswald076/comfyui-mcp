@@ -6,6 +6,12 @@ import { waitFor } from "../helpers/wait-for.js";
 const mockConfig = vi.hoisted(() => ({
   resolvedPort: 8188,
   comfyuiPath: "/fake/ComfyUI" as string | undefined,
+  comfyuiRestartCommand: undefined as string | undefined,
+}));
+
+const mockTarget = vi.hoisted(() => ({
+  baseUrl: "http://127.0.0.1:8188",
+  generation: 0,
 }));
 
 // #742: the two classifications the preflight now distinguishes. `remote` is
@@ -21,10 +27,10 @@ const mockResetClient = vi.hoisted(() => vi.fn());
 
 vi.mock("../../config.js", () => ({
   config: mockConfig,
-  getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
+  getComfyUIBaseUrl: () => mockTarget.baseUrl,
   getComfyUIAuthHeaders: () => ({}),
   // #848 instance fence — a stable target here; the retarget case has its own test.
-  getComfyuiTargetGeneration: () => 0,
+  getComfyuiTargetGeneration: () => mockTarget.generation,
   isRemoteMode: () => mockLocality.remote,
   targetIsOnThisMachine: () => mockLocality.onThisMachine,
 }));
@@ -165,8 +171,8 @@ function mockNoPortProcess(): void {
   });
 }
 
-function mockFetchOk(ok: boolean): Mock {
-  const fetchMock = vi.fn(async () => ({ ok }) as Response);
+function mockFetchOk(ok: boolean, body?: unknown): Mock {
+  const fetchMock = vi.fn(async () => ({ ok, json: async () => body }) as Response);
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
 }
@@ -195,6 +201,9 @@ beforeEach(() => {
   delete process.env.COMFYUI_STARTUP_CHECK_MAX_TRIES;
   mockConfig.resolvedPort = 8188;
   mockConfig.comfyuiPath = "/fake/ComfyUI";
+  mockConfig.comfyuiRestartCommand = undefined;
+  mockTarget.baseUrl = "http://127.0.0.1:8188";
+  mockTarget.generation = 0;
   mockFindComfyuiPython.mockReturnValue("/fake/ComfyUI/python_embeded/python.exe");
   mockExistsSync.mockImplementation(() => true);
   mockStatSync.mockImplementation(() => ({ isDirectory: () => true }));
@@ -755,6 +764,147 @@ describe("process-control restart relaunch preflight (#368/#370)", () => {
     expect(
       fetchMock.mock.calls.some(([u]) => String(u).includes("/manager/reboot")),
     ).toBe(true);
+
+    killSpy.mockRestore();
+  });
+
+  it("appends a confirmed flag only to a proven local relaunch and retains it for later starts (#2277)", async () => {
+    const flag = "--use-ck-attention";
+    // The relaunch preflight intentionally applies the host's absolute-path rules.
+    // Keep this production-path fixture valid on both POSIX and Windows; using the
+    // POSIX spelling on Windows makes the safety refusal fire before stop, which
+    // hides the flag-persistence behavior this test is meant to prove.
+    const installRoot = process.platform === "win32" ? "C:\\fake\\ComfyUI" : "/fake/ComfyUI";
+    const mainScript = join(installRoot, "main.py");
+    mockConfig.comfyuiPath = installRoot;
+    mockFindComfyuiPython.mockReturnValue(join(installRoot, "python_embeded", "python.exe"));
+    const currentArgv = [mainScript, "--port", "8188"];
+    const augmentedArgv = [...currentArgv, flag];
+    let killed = false;
+    let statsCalls = 0;
+    mockExecSync.mockImplementation((cmd: string) => {
+      // Relaunch uses taskkill on native Windows and kill -9 on POSIX hosts;
+      // model either path so the fixture tests port release rather than shell
+      // selection or runner emulation details.
+      if (/\btaskkill\b/i.test(String(cmd)) || /\bkill\s+-9\b/i.test(String(cmd))) {
+        killed = true;
+        return "";
+      }
+      if (cmd.includes("netstat")) {
+        return killed ? "" : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      }
+      if (cmd.includes("lsof")) {
+        if (killed) throw noListener();
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    mockGetSystemStats.mockImplementation(async () => ({
+      system: { argv: statsCalls++ < 2 ? currentArgv : augmentedArgv },
+    }));
+    mockSpawnedChildren();
+    mockFetchOk(true, { system: { argv: augmentedArgv } });
+
+    const restarted = await restartComfyUI({ additionalFlags: [flag] });
+
+    expect(restarted.stopped).toBe(true);
+    expect(restarted.started).toBe(true);
+    expect(restarted.serving_argv).toEqual(augmentedArgv);
+    expect(mockSpawn).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.arrayContaining([mainScript, flag]),
+      expect.any(Object),
+    );
+
+    // The committed restart's launch recipe is persistent within the process:
+    // a later explicit start reuses the augmented argv instead of dropping the flag.
+    const laterStart = await startComfyUI();
+    expect(laterStart.started).toBe(true);
+    expect(mockSpawn).toHaveBeenCalledTimes(2);
+    expect(mockSpawn.mock.calls[1][1]).toEqual(expect.arrayContaining([flag]));
+  });
+
+  it("refuses before killing when the target switches while process evidence is gathered (#2277)", async () => {
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (cmd.includes("netstat"))
+        return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      if (cmd.includes("lsof")) return "p4321\nn127.0.0.1:8188\n";
+      return "";
+    });
+    mockGetSystemStats.mockImplementation(async () => {
+      mockTarget.baseUrl = "http://127.0.0.1:8288";
+      mockTarget.generation = 1;
+      return { system: { argv: ["/fake/ComfyUI/main.py", "--port", "8188"] } };
+    });
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI({ additionalFlags: ["--use-ck-attention"] });
+
+    expect(result.started).toBe(false);
+    expect(result.stopped).toBe(false);
+    expect(result.startup).toBe("not-attempted");
+    expect(result.target_stable).toBe(false);
+    expect(result.message).toMatch(/target changed/i);
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+  });
+
+  it("does not consume an augmented recipe saved for an older target (#2277)", async () => {
+    setLaunchInfo();
+    mockTarget.baseUrl = "http://127.0.0.1:8288";
+    mockTarget.generation = 1;
+
+    const result = await startComfyUI();
+
+    expect(result.started).toBe(false);
+    expect(result.startup).toBe("not-attempted");
+    expect(result.target_stable).toBe(false);
+    expect(result.message).toMatch(/older ComfyUI target/i);
+    expect(mockSpawn).not.toHaveBeenCalled();
+  });
+
+  it("refuses launch-flag mutation for an opaque external launcher without touching it (#2277)", async () => {
+    mockConfig.comfyuiRestartCommand = "docker restart comfyui";
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI({ additionalFlags: ["--use-ck-attention"] });
+
+    expect(result.started).toBe(false);
+    expect(result.stopped).toBe(false);
+    expect(result.startup).toBe("not-attempted");
+    expect(result.message).toMatch(/COMFYUI_RESTART_COMMAND.*opaque external launcher/i);
+    expect(result.message).toMatch(/No launch argument was changed/i);
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it("refuses Desktop launch-flag mutation and leaves Manager, process, and launcher settings untouched (#2277)", async () => {
+    mockLivePortNoKill();
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: [
+          "C:\\Users\\x\\AppData\\Local\\Programs\\Comfy Desktop\\resources\\ComfyUI\\main.py",
+          "--port",
+          "8188",
+        ],
+      },
+    });
+    installLiveDesktopSupervisor();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+    const fetchMock = mockFetchOk(true);
+
+    const result = await restartComfyUI({ additionalFlags: ["--use-ck-attention"] });
+
+    expect(result.started).toBe(false);
+    expect(result.stopped).toBe(false);
+    expect(result.startup).toBe("not-attempted");
+    expect(result.message).toMatch(/ComfyUI Desktop owns the saved launch settings/i);
+    expect(result.message).toMatch(/fully quit and relaunch the Desktop app/i);
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/manager/reboot"))).toBe(false);
 
     killSpy.mockRestore();
   });

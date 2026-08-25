@@ -89,10 +89,21 @@ import {
 // Types
 // ---------------------------------------------------------------------------
 
+export interface ComfyUITargetFence {
+  /** The exact configured ComfyUI base, including any reverse-proxy path. */
+  baseUrl: string;
+  /** Monotonic target generation; catches A→B→A round trips. */
+  generation: number;
+  /** The local install selected for this target, when process control can see one. */
+  comfyuiPath?: string;
+}
+
 interface ProcessInfo {
   pid: number;
   port: number;
   argv: string[];
+  /** Target identity captured with this process recipe; never reuse it after retarget. */
+  targetFence?: ComfyUITargetFence;
   /**
    * The port owner's argv as the OS reports it, captured when the SERVER could not
    * report its own (#767).
@@ -286,6 +297,12 @@ interface StartResult {
   spawn_error?: ChildProcessErrorDetails;
   /** How the relaunch environment was resolved (#776). */
   launch_env?: LaunchEnvInfo;
+  /** The server argv observed after a relaunch, when the endpoint answered. */
+  serving_argv?: string[];
+  /** Target identity this start was fenced to, when available. */
+  target_fence?: ComfyUITargetFence;
+  /** False when the target changed during the start and no success claim is safe. */
+  target_stable?: boolean;
   /**
    * Whether the process now listening on the port is the one WE launched.
    *
@@ -317,6 +334,12 @@ interface RestartResult {
   spawn_error?: ChildProcessErrorDetails;
   /** How the relaunch environment was resolved (#776). */
   launch_env?: LaunchEnvInfo;
+  /** The server argv observed after a relaunch, when the endpoint answered. */
+  serving_argv?: string[];
+  /** Target identity this restart was fenced to, when available. */
+  target_fence?: ComfyUITargetFence;
+  /** False when the target changed during the restart and no success claim is safe. */
+  target_stable?: boolean;
   /**
    * Whether the process now listening on the port is the one WE launched.
    *
@@ -329,6 +352,42 @@ interface RestartResult {
    * it explicitly.
    */
   listener_ownership: ListenerOwnership;
+}
+
+export interface RestartComfyUIOptions {
+  /** Boolean ComfyUI launch flags to append to a proven local relaunch. */
+  additionalFlags?: readonly string[];
+  /** Exact target identity the caller assessed and authorized for this restart. */
+  targetFence?: ComfyUITargetFence;
+}
+
+function currentTargetFence(): ComfyUITargetFence {
+  return {
+    baseUrl: getComfyUIBaseUrl().replace(/\/+$/, ""),
+    generation: getComfyuiTargetGeneration(),
+    comfyuiPath: config.comfyuiPath,
+  };
+}
+
+export function captureComfyUITargetFence(): ComfyUITargetFence {
+  return currentTargetFence();
+}
+
+export function targetFencesEqual(
+  a: ComfyUITargetFence | undefined,
+  b: ComfyUITargetFence | undefined,
+): boolean {
+  return (
+    a != null &&
+    b != null &&
+    a.baseUrl.replace(/\/+$/, "") === b.baseUrl.replace(/\/+$/, "") &&
+    a.generation === b.generation &&
+    a.comfyuiPath === b.comfyuiPath
+  );
+}
+
+export function targetFenceMatchesCurrent(fence: ComfyUITargetFence): boolean {
+  return targetFencesEqual(fence, currentTargetFence());
 }
 
 interface StartupReadinessResult {
@@ -1772,6 +1831,91 @@ function spawnFromProcessInfo(info: ProcessInfo): SpawnedComfyUI | null {
   return { child, launchArgv: [cmd.exe, ...cmd.args], launchLogPath: launchLog?.path };
 }
 
+const ADDITIONAL_LAUNCH_FLAG = /^--[A-Za-z0-9][A-Za-z0-9-]*$/;
+
+function normalizeAdditionalLaunchFlags(
+  flags: readonly string[] | undefined,
+): { flags: string[]; error?: string } {
+  if (flags === undefined) return { flags: [] };
+  if (!Array.isArray(flags)) return { flags: [], error: "the additional launch flags were not an array" };
+  const unique: string[] = [];
+  for (const flag of flags) {
+    if (typeof flag !== "string" || !ADDITIONAL_LAUNCH_FLAG.test(flag)) {
+      return {
+        flags: [],
+        error: `the additional launch flag ${JSON.stringify(flag)} is not a boolean --flag`,
+      };
+    }
+    if (!unique.includes(flag)) unique.push(flag);
+  }
+  return { flags: unique };
+}
+
+/**
+ * Add a flag only to the exact argv that was observed for the process being
+ * restarted. The returned record is a copy: the live-process evidence remains
+ * untouched until the stop has committed, and the augmented record then becomes
+ * the persisted in-process relaunch recipe for manual/automatic future starts.
+ */
+function withAdditionalLaunchFlags(info: ProcessInfo, flags: string[]): ProcessInfo | null {
+  if (flags.length === 0) return info;
+  const observed =
+    info.argv.length > 0 ? info.argv : info.osArgvExact === true ? (info.osArgv ?? []) : [];
+  if (observed.length === 0) return null;
+  const argv = [...observed];
+  for (const flag of flags) {
+    if (!argv.includes(flag)) argv.push(flag);
+  }
+  return info.argv.length > 0 ? { ...info, argv } : { ...info, osArgv: argv };
+}
+
+function launchFlagMutationRefusal(flag: string, reason: string): RestartResult {
+  const targetFence = currentTargetFence();
+  return {
+    stopped: false,
+    started: false,
+    startup: "not-attempted",
+    message:
+      `Refusing to apply ${flag}: ${reason} No launch argument was changed and ComfyUI was not stopped.`,
+    target_fence: targetFence,
+    target_stable: true,
+    listener_ownership: unclassifiedOwnership(),
+  };
+}
+
+function startTargetFenceRefusal(fence: ComfyUITargetFence, reason: string): StartResult {
+  return {
+    started: false,
+    startup: "not-attempted",
+    message:
+      `Refusing to start ComfyUI: ${reason} No process was spawned and the saved launch recipe was not consumed.`,
+    target_fence: fence,
+    target_stable: false,
+    listener_ownership: unclassifiedOwnership(),
+  };
+}
+
+function restartTargetFenceRefusal(
+  fence: ComfyUITargetFence,
+  reason: string,
+  stopped = false,
+  restartHint?: RecoveryHint,
+): RestartResult {
+  return {
+    stopped,
+    started: false,
+    startup: "not-attempted",
+    message:
+      stopped
+        ? `Refusing to restart ComfyUI: ${reason} The old process was stopped, but no launch recipe was consumed for the changed target.`
+        : `Refusing to restart ComfyUI: ${reason} Nothing was stopped and no launch recipe was consumed for the changed target.`,
+    restart_hint: restartHint,
+    target_fence: fence,
+    target_stable: false,
+    listener_ownership: unclassifiedOwnership(),
+  };
+}
+
 /**
  * Turn captured process info into a spawnable (executable, args) pair.
  *
@@ -3124,6 +3268,7 @@ async function acquireProcessInfo(): Promise<{
           pid: desktopPids[0],
           port: config.resolvedPort,
           argv: [],
+          targetFence: currentTargetFence(),
           isDesktopApp: true,
           desktopExePath: findDesktopExeFromCommonPaths(),
           // FOUND BY NAME, NOT BY PORT — nothing ties this shell to the server on
@@ -3381,6 +3526,7 @@ function recoverDesktopProcessFromAncestry(
 
 async function gatherProcessInfo(): Promise<ProcessInfo> {
   const port = config.resolvedPort;
+  const targetFence = currentTargetFence();
 
   // 1. Get argv from /system_stats, BRACKETED by port-owner lookups.
   //
@@ -3546,7 +3692,7 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
     // independently verified, so the ordinary fail-closed error remains intact.
     if (argv.length > 0) {
       const recovered = recoverDesktopProcessFromAncestry(port, argv);
-      if (recovered) return recovered;
+      if (recovered) return { ...recovered, targetFence };
     }
     // Liveness is the reachable SERVER, not only a local PID scan. If
     // /system_stats just answered (argv populated) yet we still can't map the
@@ -3711,6 +3857,7 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
     liveCwd,
     liveEnv,
     startedAt,
+    targetFence,
   };
 }
 
@@ -3780,6 +3927,20 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
         "configured for — and restart_comfyui (action:\"start\") afterwards would consult the NEW target, which may " +
         "not bring this one back. Nothing was killed. Let the target settle, then retry." +
         describeRecovery(retargetHint),
+      has_restart_info: false,
+      restart_hint: retargetHint,
+    };
+  }
+
+  const currentFence = currentTargetFence();
+  if (!info.targetFence || !targetFencesEqual(info.targetFence, currentFence)) {
+    const retargetHint = recoveryHint(info);
+    return {
+      stopped: false,
+      message:
+        "Refusing to stop: the running process is not bound to the exact current ComfyUI target, " +
+        "so killing it could stop another tab's instance and leave its launch recipe stale. " +
+        "Nothing was killed. Let the target settle, then retry.",
       has_restart_info: false,
       restart_hint: retargetHint,
     };
@@ -4013,7 +4174,36 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
 export async function startComfyUI(anchor?: {
   port?: number;
   probeUrl?: string;
+  targetFence?: ComfyUITargetFence;
 }): Promise<StartResult> {
+  const savedInfo = lastProcessInfo;
+  const targetFence = anchor?.targetFence ?? savedInfo?.targetFence ?? currentTargetFence();
+  if (anchor?.targetFence && !targetFenceMatchesCurrent(anchor.targetFence)) {
+    return startTargetFenceRefusal(
+      anchor.targetFence,
+      "the requested target changed before the anchored start began",
+    );
+  }
+  if (savedInfo && !savedInfo.targetFence) {
+    lastProcessInfo = null;
+    return startTargetFenceRefusal(
+      targetFence,
+      "the saved launch recipe has no target identity and cannot be proven to belong to the current instance",
+    );
+  }
+  if (savedInfo?.targetFence && !targetFenceMatchesCurrent(savedInfo.targetFence)) {
+    lastProcessInfo = null;
+    return startTargetFenceRefusal(
+      savedInfo.targetFence,
+      "the saved launch recipe belongs to an older ComfyUI target",
+    );
+  }
+  if (anchor?.targetFence && savedInfo?.targetFence && !targetFencesEqual(anchor.targetFence, savedInfo.targetFence)) {
+    return startTargetFenceRefusal(
+      anchor.targetFence,
+      "the anchored target does not match the saved launch recipe",
+    );
+  }
   // The refusal is for a DIRECT `restart_comfyui (action:"start")`, which has no instance in mind
   // and would otherwise launch a local server while the caller is looking at a
   // remote one. An ANCHORED call is a different question: a restart already
@@ -4057,7 +4247,7 @@ export async function startComfyUI(anchor?: {
     );
   }
 
-  let info = lastProcessInfo;
+  let info = savedInfo;
   if (!info) {
     // No saved info — try to detect and launch the Desktop app
     const desktopExe = findDesktopExeFromCommonPaths();
@@ -4069,6 +4259,7 @@ export async function startComfyUI(anchor?: {
         argv: [],
         isDesktopApp: true,
         desktopExePath: desktopExe,
+        targetFence,
       };
     } else {
       return {
@@ -4079,6 +4270,13 @@ export async function startComfyUI(anchor?: {
         listener_ownership: unclassifiedOwnership(),
       };
     }
+  }
+
+  if (!targetFenceMatchesCurrent(targetFence)) {
+    return startTargetFenceRefusal(
+      targetFence,
+      "the target changed while the launch recipe was being prepared",
+    );
   }
 
   logger.info("Starting ComfyUI...", {
@@ -4150,6 +4348,22 @@ export async function startComfyUI(anchor?: {
     ).then((readiness) => ({ readiness })),
     spawnError.then((error) => ({ spawn_error: error })),
   ]);
+  if (!targetFenceMatchesCurrent(targetFence)) {
+    return {
+      started: false,
+      ready: "readiness" in startupResult ? startupResult.readiness.ready : false,
+      startup: "unconfirmed",
+      readiness: "readiness" in startupResult ? startupResult.readiness : undefined,
+      message:
+        `The ComfyUI target changed while the anchored launch was starting at ${targetFence.baseUrl}. ` +
+        "The target-specific launch result is unconfirmed; no success is claimed for the new target.",
+      target_fence: targetFence,
+      target_stable: false,
+      auto_restart: supervisorResult(info),
+      launch_env: launchEnvInfo(info),
+      listener_ownership: unclassifiedOwnership(),
+    };
+  }
   if ("spawn_error" in startupResult) {
     return {
       started: false,
@@ -4315,9 +4529,36 @@ export async function startComfyUI(anchor?: {
   // port-owner lookup from getting a permanent "cannot tell".
   let servingArgv: string[] | undefined;
   try {
-    servingArgv = (await getSystemStats()).system.argv ?? undefined;
+    if (anchor?.targetFence) {
+      servingArgv = await readServingArgvAtBase(targetFence.baseUrl);
+      // Keep the proof anchored in production, but tolerate test/legacy clients
+      // that expose system_stats only through the configured client. This fallback
+      // is allowed only while the exact target fence is still current; the final
+      // fence check below rejects any concurrent retarget.
+      if (!servingArgv && targetFenceMatchesCurrent(targetFence)) {
+        servingArgv = await readServingArgv();
+      }
+    } else {
+      servingArgv = (await getSystemStats()).system.argv ?? undefined;
+    }
   } catch {
     servingArgv = undefined;
+  }
+  if (!targetFenceMatchesCurrent(targetFence)) {
+    return {
+      started: false,
+      ready: true,
+      startup: "unconfirmed",
+      readiness,
+      message:
+        `The ComfyUI target changed after the anchored launch at ${targetFence.baseUrl} became healthy. ` +
+        "The serving argv was not attributed to the new target, so no success is claimed.",
+      target_fence: targetFence,
+      target_stable: false,
+      auto_restart: supervisorResult(info),
+      launch_env: env,
+      listener_ownership: unclassifiedOwnership(),
+    };
   }
   // Is the healthy listener actually OURS?
   //   • A Desktop launch is UNDECIDABLE by design: we spawn the Electron shell (or
@@ -4428,6 +4669,9 @@ export async function startComfyUI(anchor?: {
     pid: newPid ?? undefined,
     auto_restart: supervisorResult(info),
     launch_env: env,
+    serving_argv: servingArgv,
+    target_fence: targetFence,
+    target_stable: true,
     listener_ownership: ownership,
   };
 }
@@ -5353,8 +5597,28 @@ async function restartViaConfiguredCommand(command: string): Promise<RestartResu
   }
 }
 
-export async function restartComfyUI(): Promise<RestartResult> {
+export async function restartComfyUI(
+  options: RestartComfyUIOptions = {},
+): Promise<RestartResult> {
+  const targetFence = options.targetFence ?? currentTargetFence();
+  if (options.targetFence && !targetFenceMatchesCurrent(options.targetFence)) {
+    return restartTargetFenceRefusal(
+      options.targetFence,
+      "the requested target changed before the restart began",
+    );
+  }
+  const normalizedFlags = normalizeAdditionalLaunchFlags(options.additionalFlags);
+  if (normalizedFlags.error) {
+    return launchFlagMutationRefusal("the requested launch flag", normalizedFlags.error);
+  }
+  const additionalFlags = normalizedFlags.flags;
   if (isRemoteMode()) {
+    if (additionalFlags.length > 0) {
+      return launchFlagMutationRefusal(
+        additionalFlags.join(", "),
+        "the ComfyUI target is remote and this process does not own its launcher; add the flag to the remote launcher's configuration and restart that instance there",
+      );
+    }
     // Remote target: can't process-control it, but a Manager HTTP reboot brings
     // back a self-supervised ComfyUI (e.g. the tunnelled Desktop app).
     return restartViaManagerReboot({ label: "remote" });
@@ -5367,6 +5631,12 @@ export async function restartComfyUI(): Promise<RestartResult> {
   // every inferred path below (including Desktop's), and it needs no live
   // process info, so it also works when the server is too wedged to answer.
   if (config.comfyuiRestartCommand) {
+    if (additionalFlags.length > 0) {
+      return launchFlagMutationRefusal(
+        additionalFlags.join(", "),
+        "COMFYUI_RESTART_COMMAND is an opaque external launcher command that this process cannot safely edit; update that launcher command/configuration to include the flag, then restart it there",
+      );
+    }
     return restartViaConfiguredCommand(config.comfyuiRestartCommand);
   }
   // EZi/CEI can serve the panel through a local helper port while the real
@@ -5375,7 +5645,19 @@ export async function restartComfyUI(): Promise<RestartResult> {
   // corroborate the same explicit backend argv, use Manager against that backend
   // and keep the ordinary process-ownership refusal for every other shape.
   const verifiedProxy = await resolveVerifiedProxyRestartTarget();
+  if (!targetFenceMatchesCurrent(targetFence)) {
+    return restartTargetFenceRefusal(
+      targetFence,
+      "the ComfyUI target changed while restart ownership was being resolved",
+    );
+  }
   if (verifiedProxy) {
+    if (additionalFlags.length > 0) {
+      return launchFlagMutationRefusal(
+        additionalFlags.join(", "),
+        "the ComfyUI process is behind a verified proxy and its launcher is not owned by this process; add the flag to the backend launcher's configuration and restart it there",
+      );
+    }
     return restartViaManagerReboot({
       label: "EZi/CEI-proxied",
       prior: { argv: verifiedProxy.argv, generation: verifiedProxy.generation },
@@ -5389,7 +5671,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
   // that resolution observes can be fenced to the instance it was actually read
   // from. It travels with the argv into the Desktop reboot below; capturing it
   // there instead would leave the read itself outside the fence (codex gate r2).
-  const infoGeneration = getComfyuiTargetGeneration();
+  const infoGeneration = targetFence.generation;
   // …and the ADDRESS of the instance this call is about, captured at the same
   // moment. The stop, the port-free wait and the settle delay are all awaits, and
   // the configured target is mutable across every one of them, so the relaunch is
@@ -5397,14 +5679,15 @@ export async function restartComfyUI(): Promise<RestartResult> {
   // (codex gate round 12 — otherwise the relaunch probes the NEW target's port,
   // finds it occupied, returns "already running", and the instance we killed stays
   // dead).
-  const restartProbeUrl = `${getComfyUIBaseUrl()}/system_stats`;
+  const restartProbeUrl = `${targetFence.baseUrl}/system_stats`;
 
   // Preflight: resolve the RUNNING instance and confirm we can relaunch it
   // BEFORE stopping anything. A restart must be atomic-ish — if the relaunch
   // command can't be built/validated (stale COMFYUI_PATH, unknown Desktop exe),
   // refuse and leave the server up rather than take it down with no way back
   // (issues #368/#370).
-  const { info, diagnostic } = await acquireProcessInfo();
+  const acquired = await acquireProcessInfo();
+  const { info, diagnostic } = acquired;
   if (!info) {
     return {
       stopped: false,
@@ -5415,6 +5698,22 @@ export async function restartComfyUI(): Promise<RestartResult> {
         `No ComfyUI process found on port ${config.resolvedPort} to restart. Is ComfyUI running?`,
       listener_ownership: unclassifiedOwnership(),
     };
+  }
+  if (!targetFenceMatchesCurrent(targetFence)) {
+    return restartTargetFenceRefusal(
+      targetFence,
+      "the ComfyUI target changed while the running instance was being identified",
+      false,
+      recoveryHint(info),
+    );
+  }
+  if (!info.targetFence || !targetFencesEqual(info.targetFence, targetFence)) {
+    return restartTargetFenceRefusal(
+      targetFence,
+      "the running process identity is not bound to the exact target this restart was authorized for",
+      false,
+      recoveryHint(info),
+    );
   }
   // NEVER STOP AN INSTANCE THE REST OF THIS CALL WILL NOT BE ACTING ON (codex gate
   // round 11). `acquireProcessInfo` is awaited, and the target is MUTABLE: a hello
@@ -5432,20 +5731,29 @@ export async function restartComfyUI(): Promise<RestartResult> {
   // final-state comparison. REFUSE, because nothing has been stopped yet — the
   // refuse-before/disclose-after rule this whole path is built on.
   if (getComfyuiTargetGeneration() !== infoGeneration) {
-    return {
-      stopped: false,
-      started: false,
-      startup: "not-attempted",
-      restart_hint: recoveryHint(info),
-      message:
-        "Refusing to restart: the ComfyUI target changed while the running instance was " +
-        "being identified, so the instance that was checked is not provably the one this " +
-        "restart would act on — and a stop is never sent to an instance whose relaunch was " +
-        "not the one verified. Nothing was stopped. Let the target settle, then retry." +
-        describeRecovery(recoveryHint(info)),
-      listener_ownership: unclassifiedOwnership(),
-    };
+    return restartTargetFenceRefusal(
+      targetFence,
+      "the ComfyUI target changed while the running instance was being identified",
+      false,
+      recoveryHint(info),
+    );
   }
+  const launchInfo = withAdditionalLaunchFlags(info, additionalFlags);
+  if (additionalFlags.length > 0) {
+    if (info.isDesktopApp) {
+      return launchFlagMutationRefusal(
+        additionalFlags.join(", "),
+        "ComfyUI Desktop owns the saved launch settings and its supervised restart re-execs the existing process. Add the flag in ComfyUI Desktop's launch settings for this install, then fully quit and relaunch the Desktop app",
+      );
+    }
+    if (!launchInfo) {
+      return launchFlagMutationRefusal(
+        additionalFlags.join(", "),
+        "the running ComfyUI did not expose an exact launch argv that can be safely extended; add the flag through the launcher or console that owns this instance, then restart it there",
+      );
+    }
+  }
+  const relaunchInfo = launchInfo ?? info;
   // A locally-installed ComfyUI **Desktop** instance is Electron-supervised.
   // Killing it (Python backend or Electron shell) and re-spawning the exe does
   // not reliably bring the :PORT listener back (issue #400: stopped:true,
@@ -5497,7 +5805,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
 
   // requireReproducibleEnv: this path KILLS the process and spawns a fresh one, so
   // the launch ENVIRONMENT has to be rebuilt as well as the command (#776).
-  const relaunch = assessRelaunch(info, { requireReproducibleEnv: true });
+  const relaunch = assessRelaunch(relaunchInfo, { requireReproducibleEnv: true });
   if (!relaunch.ok) {
     return {
       stopped: false,
@@ -5535,13 +5843,34 @@ export async function restartComfyUI(): Promise<RestartResult> {
       listener_ownership: unclassifiedOwnership(),
     };
   }
+  if (!targetFenceMatchesCurrent(targetFence)) {
+    return restartTargetFenceRefusal(
+      targetFence,
+      "the ComfyUI target changed after the old instance stopped; the old launch recipe was not replayed",
+      true,
+    );
+  }
   // #742 r4/r5: the stop DID happen — record the dispatch. No session identity
   // exists here, so stamp the shared PROCESS-WIDE slot (never grounds causation
   // on its own; a panel caller stamps its own session token from the result).
-  recordRestartDispatch(getComfyUIBaseUrl(), PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
+  recordRestartDispatch(targetFence.baseUrl, PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
 
   // Brief pause to let OS fully release resources
   await sleep(1000);
+
+  if (!targetFenceMatchesCurrent(targetFence)) {
+    return restartTargetFenceRefusal(
+      targetFence,
+      "the ComfyUI target changed after the old instance stopped; the old launch recipe was not replayed",
+      true,
+    );
+  }
+
+  // `stopComfyUI` records the observed recipe before killing. Replace that
+  // record only after the stop committed, so a failed pre-stop safety check or
+  // failed kill cannot silently turn a live server's current state into a new
+  // launch configuration.
+  lastProcessInfo = relaunchInfo;
 
   // A caveat from the stop must survive into whatever we report: the stop can
   // commit WITHOUT confirming the process exited (every port probe failed after
@@ -5562,6 +5891,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
     startResult = await startComfyUI({
       port: info.port,
       probeUrl: restartProbeUrl,
+      targetFence,
     });
   } catch (err) {
     // DISCLOSE, do not refuse: the stop is not undoable, so the caller needs a
@@ -5632,6 +5962,9 @@ export async function restartComfyUI(): Promise<RestartResult> {
         stopCaveat,
       auto_restart: startResult.auto_restart,
       launch_env: startResult.launch_env,
+      serving_argv: startResult.serving_argv,
+      target_fence: targetFence,
+      target_stable: startResult.target_stable,
       listener_ownership: startResult.listener_ownership,
     };
   }
@@ -5660,12 +5993,22 @@ export async function restartComfyUI(): Promise<RestartResult> {
       auto_restart: startResult.auto_restart,
       spawn_error: startResult.spawn_error,
       launch_env: startResult.launch_env,
+      serving_argv: startResult.serving_argv,
+      target_fence: targetFence,
+      target_stable: startResult.target_stable,
       listener_ownership: startResult.listener_ownership,
     };
   }
 
   // #742 r4/r5: the restart was observed back — clear OUR record (the
   // process-wide slot only; never another session's record).
+  if (!targetFenceMatchesCurrent(targetFence)) {
+    return restartTargetFenceRefusal(
+      targetFence,
+      "the ComfyUI target changed after the relaunch completed; its serving argv was not attributed to the new target",
+      true,
+    );
+  }
   clearRestartDispatch(PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
 
   return {
@@ -5692,6 +6035,9 @@ export async function restartComfyUI(): Promise<RestartResult> {
       stopCaveat,
     auto_restart: startResult.auto_restart,
     launch_env: startResult.launch_env,
+    serving_argv: startResult.serving_argv,
+    target_fence: targetFence,
+    target_stable: startResult.target_stable ?? true,
     listener_ownership: startResult.listener_ownership,
   };
 }
@@ -6003,7 +6349,10 @@ export const __processControlTestHooks = {
     liveCwdResolverOverride = fn;
   },
   setLastProcessInfo(info: ProcessInfo): void {
-    lastProcessInfo = info;
+    lastProcessInfo = {
+      ...info,
+      targetFence: info.targetFence ?? currentTargetFence(),
+    };
   },
   /** Seed/remove a #742 r4/r5 restart-dispatch record directly (fresh/stale/
    *  foreign base) so decline-path causation tests don't run a real restart. */

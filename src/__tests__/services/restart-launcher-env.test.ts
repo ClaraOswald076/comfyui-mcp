@@ -2444,13 +2444,17 @@ n127.0.0.1:8188
       }
       return "";
     });
+    let spawnErrorScheduled = false;
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => {
         relaunched = true;
         // Readiness WINS the race — the spawn error lands later, so ownership must
         // be decided from the missing pid alone.
-        setTimeout(() => children[0]?.emit("error", new Error("spawn EACCES")), 50);
+        if (!spawnErrorScheduled) {
+          spawnErrorScheduled = true;
+          setTimeout(() => children[0]?.emit("error", new Error("spawn EACCES")), 50);
+        }
         return { ok: true } as Response;
       }),
     );
@@ -2932,14 +2936,11 @@ n127.0.0.1:8188
     killSpy.mockRestore();
   });
 
-  it("the relaunch is ANCHORED to the instance that was stopped, not the live target", async () => {
+  it("refuses a stale relaunch recipe after the target moves at the stop", async () => {
     // After the kill, restartComfyUI awaits the port release and a settle delay. A
-    // retarget in that window used to leave the relaunch probing the NEW target's
-    // port: if that port was occupied it returned "already running" WITHOUT
-    // spawning, and the instance just killed stayed dead (codex gate round 12).
-    //
-    // Modelled by pointing the live config at a DIFFERENT, occupied port after the
-    // stop. Anchored, the restart still relaunches and grades the original.
+    // retarget in that window must not replay the old recipe onto the new target.
+    // The committed stop is disclosed, and the caller can retry against the new
+    // target once it has settled.
     usePlainInstall();
     mockLivePortThenFree();
     spawnCapturingChildren();
@@ -2949,9 +2950,8 @@ n127.0.0.1:8188
     );
     const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
     // The retarget lands at the KILL — after the resolve, so the pre-stop fence
-    // (which spans only the resolve) passes and the post-stop window is what is
-    // exercised. Port 9999 is OCCUPIED, which is what makes the un-anchored version
-    // bail out with "already running" instead of relaunching.
+    // passes and the post-stop window is what is exercised. Port 9999 is OCCUPIED,
+    // and the generation/base fence must refuse before replaying A's recipe.
     let killed = false;
     mockExecSync.mockImplementation((cmd: string) => {
       if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
@@ -2979,13 +2979,13 @@ n127.0.0.1:8188
 
     expect(killed).toBe(true);
     expect(mockConfig.resolvedPort).toBe(9999); // the retarget really happened
-    // It RELAUNCHED rather than bailing out on the other target's occupied port…
-    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    // It refuses rather than replaying A's recipe onto the moved target.
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(result.stopped).toBe(true);
+    expect(result.started).toBe(false);
+    expect(result.startup).toBe("not-attempted");
+    expect(result.message).toMatch(/target changed/i);
     expect(result.message).not.toMatch(/already running/i);
-    // …and the readiness verdict is about the anchored instance's URL, not the
-    // config's current one.
-    expect(result.readiness?.probe_url).toBe("http://127.0.0.1:8188/system_stats");
-    expect(result.ready).toBe(true);
 
     killSpy.mockRestore();
   });
