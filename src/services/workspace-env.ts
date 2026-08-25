@@ -991,12 +991,22 @@ export function liveScriptFromArgv(
   const dir = dirname(a);
   if (dir === "." || dir === "") {
     // Bare "main.py" — only resolvable via an absolute cwd.
-    return cwd && isAbsolute(cwd) ? pathResolve(cwd, a) : undefined;
+    return cwd && isAbsolute(cwd) ? realpathIfPresent(pathResolve(cwd, a)) : undefined;
   }
-  if (isAbsolute(dir)) return a;
+  if (isAbsolute(dir)) return realpathIfPresent(a);
   // Relative dir (e.g. "ComfyUI/main.py") — resolve against the server's cwd.
-  if (cwd && isAbsolute(cwd)) return pathResolve(cwd, a);
+  if (cwd && isAbsolute(cwd)) return realpathIfPresent(pathResolve(cwd, a));
   return undefined; // cannot resolve to an absolute dir → UNRESOLVED
+}
+
+/** Resolve a launch script through symlinks when it exists, preserving the
+ * lexical result for the parser's existing missing-path behavior. */
+function realpathIfPresent(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
 }
 
 /**
@@ -1278,7 +1288,9 @@ export function resolveLiveServerRoot(
   },
 ): LiveServerRootResolution {
   const relDir = liveRelDirFromArgv(argv);
-  const fromArgv = liveRootFromArgv(argv, cwd);
+  const lexicalFromArgv = liveRootFromArgv(argv, cwd);
+  const argvScript = liveScriptFromArgv(argv, cwd);
+  const fromArgv = argvScript ? dirname(argvScript) : lexicalFromArgv;
   if (fromArgv) return { root: fromArgv, source: "argv", relDir };
   const remote = opts?.remote ?? isRemoteMode();
   if (remote || relDir === undefined) return { source: "unresolved", relDir };
@@ -1294,21 +1306,28 @@ export function resolveLiveServerRoot(
   }
 
   if (observedLaunchScript) {
-    const root = pathResolve(dirname(observedLaunchScript));
-    if (
-      isAbsolute(observedLaunchScript) &&
-      /(^|[\\/])main\.pyw?$/i.test(observedLaunchScript) &&
-      existsSync(observedLaunchScript) &&
-      hasMainPy(root)
-    ) {
-      return {
-        root,
-        source: "observed-process",
-        relDir,
-        observedPython,
-        observedPid,
-        observedLaunchScript: pathResolve(observedLaunchScript),
-      };
+    let resolvedLaunchScript: string | undefined;
+    try {
+      resolvedLaunchScript = realpathSync(observedLaunchScript);
+    } catch {
+      resolvedLaunchScript = undefined;
+    }
+    if (resolvedLaunchScript) {
+      const root = dirname(resolvedLaunchScript);
+      if (
+        isAbsolute(observedLaunchScript) &&
+        /(^|[\\/])main\.pyw?$/i.test(observedLaunchScript) &&
+        hasMainPy(root)
+      ) {
+        return {
+          root,
+          source: "observed-process",
+          relDir,
+          observedPython,
+          observedPid,
+          observedLaunchScript: resolvedLaunchScript,
+        };
+      }
     }
   }
   if (!observedPython) return { source: "unresolved", relDir };

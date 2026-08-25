@@ -642,10 +642,11 @@ export function commandLineMatchesArgv(
  * server's own argv only reports a bare/relative `main.py`.
  *
  * The command-line identity has already been correlated with `serverArgv` by
- * `observeLiveServerProcess`. Keep the extra extraction narrow: use the first
- * main.py-shaped process argument and require it to agree with the server's
- * positional script token and exist on disk. This is observed launch evidence,
- * not a portable-bundle layout guess.
+ * `observeLiveServerProcess`. Keep the extra extraction narrow: parse the Python
+ * launch position (skipping Python option values), require that positional script
+ * to agree with the server's script token and exist on disk. This is observed
+ * launch evidence, not a portable-bundle layout guess. A flattened macOS `ps`
+ * command line is intentionally not strong enough to supply this evidence.
  */
 function absoluteLaunchScriptFromIdentity(
   identity: ProcessIdentity | undefined,
@@ -653,33 +654,80 @@ function absoluteLaunchScriptFromIdentity(
 ): string | undefined {
   const serverScript = positionalMainScript(serverArgv);
   if (!serverScript) return undefined;
+  if (identity?.argvFidelity === "flattened") return undefined;
 
   const processArgv =
     identity?.argv && identity.argv.length > 0
       ? identity.argv
       : tokenizeCommandLine(identity?.commandLine ?? "");
-  const processScript = processArgv
-    .map((raw) => raw.trim().replace(/^["']+|["']+$/g, ""))
-    .find((arg) => /(^|[\\/])main\.pyw?$/i.test(arg));
+  const processScript = positionalProcessScript(processArgv);
   if (!processScript || !isAbsolute(processScript)) return undefined;
 
-  const serverParts = serverScript
-    .split(/[\\/]/)
-    .filter((part) => part !== "" && part !== ".");
-  const processParts = processScript.split(/[\\/]/).filter(Boolean);
-  const processSuffix = processParts.slice(-serverParts.length);
-  if (
-    serverParts.length === 0 ||
-    processParts.length < serverParts.length ||
-    serverParts.some(
-      (part, index) => part.toLowerCase() !== processSuffix[index]?.toLowerCase(),
-    )
-  ) {
-    return undefined;
-  }
+  if (!sameLaunchScriptShape(processScript, serverScript)) return undefined;
 
   const resolved = pathResolve(processScript);
   return existsSync(resolved) ? resolved : undefined;
+}
+
+/**
+ * Return the actual Python script position, never a later script-shaped option
+ * value. Unknown options fail closed because their arity is not safe to infer.
+ * `-X` and `-W` are the Python options whose separate value can itself end in
+ * `main.py`; those values must be skipped before looking for the script.
+ */
+function positionalProcessScript(argv: string[]): string | undefined {
+  const noValueOptions = new Set([
+    "-B",
+    "-b",
+    "-d",
+    "-E",
+    "-i",
+    "-I",
+    "-O",
+    "-OO",
+    "-P",
+    "-q",
+    "-s",
+    "-S",
+    "-u",
+    "-v",
+    "-V",
+    "-VV",
+    "--help",
+    "--version",
+  ]);
+  for (let index = 1; index < argv.length; index++) {
+    const arg = argv[index]?.trim().replace(/^["']+|["']+$/g, "");
+    if (!arg) continue;
+    if (arg === "--") {
+      const script = argv[index + 1]?.trim().replace(/^["']+|["']+$/g, "");
+      return script && /(^|[\\/])main\.pyw?$/i.test(script) ? script : undefined;
+    }
+    if (!arg.startsWith("-")) {
+      return /(^|[\\/])main\.pyw?$/i.test(arg) ? arg : undefined;
+    }
+    if (arg === "-c" || arg === "-m" || arg === "--command" || arg === "--module") {
+      return undefined;
+    }
+    if (arg === "-X" || arg === "-W" || arg === "--check-hash-based-pycs") index++;
+    else if (!noValueOptions.has(arg) && !/^-[BbdEiIOPqSsuvV]+$/.test(arg)) return undefined;
+  }
+  return undefined;
+}
+
+/** Compare a process's positional script with the server's `sys.argv[0]`. */
+function sameLaunchScriptShape(processScript: string, serverScript: string): boolean {
+  const clean = (value: string): string[] =>
+    value
+      .split(/[\\/]/)
+      .filter((part) => part !== "" && part !== ".");
+  const processParts = clean(processScript);
+  const serverParts = clean(serverScript);
+  if (serverParts.length === 0 || processParts.length < serverParts.length) return false;
+  const suffix = processParts.slice(-serverParts.length);
+  return serverParts.every(
+    (part, index) => part.toLowerCase() === suffix[index]?.toLowerCase(),
+  );
 }
 
 /** The positional launch script in the server's own argv. */

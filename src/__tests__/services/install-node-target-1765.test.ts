@@ -43,6 +43,10 @@ writeFileSync(WORKSPACE_JSON, JSON.stringify({ defaultWorkspace: SAVED_DEFAULT }
 /** A stand-in comfy-cli executable, so the `useCmCli` branch is reachable. */
 const FAKE_COMFY_CLI = join(SANDBOX, "comfy");
 writeFileSync(FAKE_COMFY_CLI, "#!/bin/sh");
+/** A stand-in absolute Python image for the producer-to-clone contract test. */
+const FAKE_PORTABLE_PYTHON = join(SANDBOX, "python_embeded", "python.exe");
+mkdirSync(join(SANDBOX, "python_embeded"), { recursive: true });
+writeFileSync(FAKE_PORTABLE_PYTHON, "");
 
 // ── config: a LOOPBACK target on :8189 (that is LOCAL mode, which is why the
 //    filesystem fallback runs at all), with COMFYUI_PATH unset. ───────────────
@@ -185,6 +189,17 @@ vi.mock("node:child_process", async () => {
 // several installs coexist. Hence this tier, and hence these tests.
 const probe = vi.hoisted(() => ({
   calls: 0,
+  useActualProducer: false,
+  actualPid: 4244,
+  actualIdentity: undefined as
+    | {
+        commandLine?: string;
+        argv?: string[];
+        argvFidelity?: "exact" | "flattened";
+        executablePath?: string;
+        startedAt?: string;
+      }
+    | undefined,
   /** What the OS says is running on the port; undefined = nothing observable. */
   result: undefined as { python?: string; pid: number; launchScript?: string } | undefined,
 }));
@@ -192,8 +207,15 @@ vi.mock("../../services/live-interpreter.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../services/live-interpreter.js")>();
   return {
     ...actual,
-    observeLiveServerProcess: () => {
+    observeLiveServerProcess: (opts: Parameters<typeof actual.observeLiveServerProcess>[0]) => {
       probe.calls += 1;
+      if (probe.useActualProducer) {
+        return actual.observeLiveServerProcess({
+          ...opts,
+          findPid: () => probe.actualPid,
+          readIdentity: () => probe.actualIdentity,
+        });
+      }
       return probe.result;
     },
   };
@@ -236,6 +258,8 @@ beforeEach(() => {
   git.calls = [];
   http.calls = [];
   probe.calls = 0;
+  probe.useActualProducer = false;
+  probe.actualIdentity = undefined;
   probe.result = undefined;
   live.onStats = undefined;
   http.mode = "refuse-enqueue";
@@ -408,12 +432,19 @@ describe("#1765 — install_custom_node must not write into an install this sess
   });
 
   it("uses the correlated absolute launch script for a portable bare-main.py process", async () => {
-    // The portable interpreter is a sibling of the actual ComfyUI checkout, so
-    // the existing interpreter-as-anchor tier intentionally cannot identify this
-    // root. The OS process command line has already correlated the absolute script
-    // with this server; that direct evidence is sufficient for the clone target.
+    // Drive the real OS-process producer, not a hand-authored LiveServerProcess:
+    // the portable interpreter is a sibling of the actual ComfyUI checkout, so
+    // only the producer's correlated absolute launch script can identify this root.
     live.argv = ["main.py", "--port", "8189"];
-    probe.result = { pid: 4244, launchScript: join(CONNECTED, "main.py") };
+    probe.useActualProducer = true;
+    const script = join(CONNECTED, "main.py");
+    probe.actualIdentity = {
+      commandLine: `${FAKE_PORTABLE_PYTHON} -s "${script}" --port 8189`,
+      argv: [FAKE_PORTABLE_PYTHON, "-s", script, "--port", "8189"],
+      argvFidelity: "exact",
+      executablePath: FAKE_PORTABLE_PYTHON,
+      startedAt: "t1",
+    };
 
     const { ok, error } = await install({ id: REPO, source: "git" });
 
