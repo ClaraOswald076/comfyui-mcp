@@ -226,12 +226,13 @@ export async function installPanelLauncher(
 
     const previous = readPanelLauncherConfig(home);
     const token = previous?.token ?? randomBytes(32).toString("base64url");
-    // Preserve the generation of a live broker so reinstall does not disable
-    // the process that already owns the answering port. A port-0/unfinished
-    // install gets a new generation, which invalidates its delayed fallback.
-    const installId = previous?.port && previous.install_id
-      ? previous.install_id
-      : randomBytes(24).toString("base64url");
+    const previousLive = previous?.port
+      ? (await queryPanelLauncher(home) as { running?: boolean })
+      : { running: false };
+    // Preserve the generation only for a broker that positively answers the
+    // recorded port. A stale nonzero port and a port-0/unfinished install get a
+    // new generation, invalidating any delayed fallback from that install.
+    const installId = previousLive.running ? previous?.install_id : randomBytes(24).toString("base64url");
     const brokerId = previous?.broker_id ?? randomBytes(24).toString("base64url");
     const brokerExecutable = nodePath;
     let needsFallbackBroker = false;
@@ -303,7 +304,7 @@ export async function installPanelLauncher(
         host: "127.0.0.1",
         port: previous?.port ?? 0,
         token,
-        install_id: installId,
+        ...(installId ? { install_id: installId } : {}),
         broker_id: brokerId,
         broker_executable: brokerExecutable,
         // The running broker's pid is the broker's to publish, not this install's
