@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.107] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- anchor Windows embedded-python ComfyUI restarts to the observed install root (#2252)
+
 ## [0.52.106] - 2026-08-25
 
 ### MCP
