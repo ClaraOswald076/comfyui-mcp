@@ -783,7 +783,10 @@ describe("process-control restart relaunch preflight (#368/#370)", () => {
     let killed = false;
     let statsCalls = 0;
     mockExecSync.mockImplementation((cmd: string) => {
-      if (/taskkill/i.test(String(cmd))) {
+      // Relaunch uses taskkill on native Windows and kill -9 on POSIX hosts;
+      // model either path so the fixture tests port release rather than shell
+      // selection or runner emulation details.
+      if (/\btaskkill\b/i.test(String(cmd)) || /\bkill\s+-9\b/i.test(String(cmd))) {
         killed = true;
         return "";
       }
