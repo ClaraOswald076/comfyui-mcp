@@ -26,7 +26,7 @@
 // should be added here as tier 0 — it works for remote servers too.
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, readlinkSync } from "node:fs";
+import { existsSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve as pathResolve } from "node:path";
 import { platform } from "node:os";
 import { findPidByPort } from "./port-owner.js";
@@ -637,6 +637,123 @@ export function commandLineMatchesArgv(
   });
 }
 
+/**
+ * Recover an absolute launch-script path from the OS process record when the
+ * server's own argv only reports a bare/relative `main.py`.
+ *
+ * The command-line identity has already been correlated with `serverArgv` by
+ * `observeLiveServerProcess`. Keep the extra extraction narrow: parse the Python
+ * launch position (skipping Python option values), require that positional script
+ * to agree with the server's script token and exist on disk. This is observed
+ * launch evidence, not a portable-bundle layout guess. A flattened macOS `ps`
+ * command line is intentionally not strong enough to supply this evidence.
+ */
+type LaunchScriptEvidence = {
+  path?: string;
+  /** A correlated script token was present, but it could not be proven usable. */
+  invalid: boolean;
+};
+
+function absoluteLaunchScriptFromIdentity(
+  identity: ProcessIdentity | undefined,
+  serverArgv: string[] | undefined,
+): LaunchScriptEvidence {
+  const serverScript = positionalMainScript(serverArgv);
+  if (!serverScript) return { invalid: false };
+  if (identity?.argvFidelity === "flattened") return { invalid: false };
+
+  const processArgv =
+    identity?.argv && identity.argv.length > 0
+      ? identity.argv
+      : tokenizeCommandLine(identity?.commandLine ?? "");
+  const processScript = positionalProcessScript(processArgv);
+  if (!processScript || !isAbsolute(processScript)) return { invalid: false };
+
+  if (!sameLaunchScriptShape(processScript, serverScript)) return { invalid: false };
+
+  try {
+    const resolved = realpathSync(pathResolve(processScript));
+    return statSync(resolved).isFile() ? { path: resolved, invalid: false } : { invalid: true };
+  } catch {
+    // This was an explicit, correlated launch-script claim. Do not turn an
+    // unreadable/missing/non-file entry into permission to anchor on python.
+    return { invalid: true };
+  }
+}
+
+/**
+ * Return the actual Python script position, never a later script-shaped option
+ * value. Unknown options fail closed because their arity is not safe to infer.
+ * `-X` and `-W` are the Python options whose separate value can itself end in
+ * `main.py`; those values must be skipped before looking for the script.
+ */
+function positionalProcessScript(argv: string[]): string | undefined {
+  const noValueOptions = new Set([
+    "-B",
+    "-b",
+    "-d",
+    "-E",
+    "-i",
+    "-I",
+    "-O",
+    "-OO",
+    "-P",
+    "-q",
+    "-s",
+    "-S",
+    "-u",
+    "-v",
+    "-V",
+    "-VV",
+    "--help",
+    "--version",
+  ]);
+  for (let index = 1; index < argv.length; index++) {
+    const arg = argv[index]?.trim().replace(/^["']+|["']+$/g, "");
+    if (!arg) continue;
+    if (arg === "--") {
+      const script = argv[index + 1]?.trim().replace(/^["']+|["']+$/g, "");
+      return script && /(^|[\\/])main\.pyw?$/i.test(script) ? script : undefined;
+    }
+    if (!arg.startsWith("-")) {
+      return /(^|[\\/])main\.pyw?$/i.test(arg) ? arg : undefined;
+    }
+    if (arg === "-c" || arg === "-m" || arg === "--command" || arg === "--module") {
+      return undefined;
+    }
+    if (arg === "-X" || arg === "-W" || arg === "--check-hash-based-pycs") index++;
+    else if (!noValueOptions.has(arg) && !/^-[BbdEiIOPqSsuvV]+$/.test(arg)) return undefined;
+  }
+  return undefined;
+}
+
+/** Compare a process's positional script with the server's `sys.argv[0]`. */
+function sameLaunchScriptShape(processScript: string, serverScript: string): boolean {
+  const clean = (value: string): string[] =>
+    value
+      .split(/[\\/]/)
+      .filter((part) => part !== "" && part !== ".");
+  const processParts = clean(processScript);
+  const serverParts = clean(serverScript);
+  if (serverParts.length === 0 || processParts.length < serverParts.length) return false;
+  const suffix = processParts.slice(-serverParts.length);
+  return serverParts.every(
+    (part, index) => part.toLowerCase() === suffix[index]?.toLowerCase(),
+  );
+}
+
+/** The positional launch script in the server's own argv. */
+function positionalMainScript(argv: string[] | undefined): string | undefined {
+  if (!Array.isArray(argv)) return undefined;
+  for (const raw of argv) {
+    if (typeof raw !== "string") continue;
+    const arg = raw.trim().replace(/^["']+|["']+$/g, "");
+    if (arg.startsWith("-")) return undefined;
+    if (/(^|[\\/])main\.pyw?$/i.test(arg)) return arg;
+  }
+  return undefined;
+}
+
 // ---------------------------------------------------------------------------
 // The resolver
 // ---------------------------------------------------------------------------
@@ -691,6 +808,19 @@ export interface LiveServerProcess {
    * simply fails it, so this reading can add a resolution but never redirect one.
    */
   image?: string;
+  /**
+   * An absolute `main.py`/`main.pyw` path observed in the correlated process
+   * command line. Unlike `image`, this identifies the script's actual checkout
+   * directly and is useful when a portable bundle's interpreter is a sibling
+   * of the ComfyUI directory and the server reports only bare `main.py`.
+   */
+  launchScript?: string;
+  /**
+   * A correlated launch-script path was present but could not be proven to be
+   * a regular file. This is a veto, not an absence of evidence: callers must
+   * not replace it with an interpreter-based root anchor.
+   */
+  launchScriptInvalid?: boolean;
 }
 
 /**
@@ -752,6 +882,12 @@ export function observeLiveServerProcess(opts: ResolveOptions): LiveServerProces
     rawImage && isAbsolute(rawImage) && existsSync(rawImage)
       ? pathResolve(rawImage)
       : undefined;
+  const launchEvidence = absoluteLaunchScriptFromIdentity(identity, opts.serverArgv);
+  const launchEvidenceFields = launchEvidence.invalid
+    ? { launchScriptInvalid: true as const }
+    : launchEvidence.path
+      ? { launchScript: launchEvidence.path }
+      : {};
 
   // Tier 1 — the process we launched, confirmed by PID *and* start time.
   // The recorded interpreter must be ABSOLUTE: a bare `python` would be
@@ -779,7 +915,13 @@ export function observeLiveServerProcess(opts: ResolveOptions): LiveServerProces
       launchRecord.startedAt === identity.startedAt &&
       corroborated
     ) {
-      return { python: launchRecord.python, source: "launched-by-us", pid, image };
+      const result = {
+        python: launchRecord.python,
+        source: "launched-by-us" as const,
+        pid,
+        image,
+      };
+      return { ...result, ...launchEvidenceFields };
     }
     // Same PID, different (or unreadable) start time → this is NOT our process, or
     // we cannot prove it is. Fall through to tier 2 rather than trust the record.
@@ -815,11 +957,13 @@ export function observeLiveServerProcess(opts: ResolveOptions): LiveServerProces
     ? interpreterFromVenvHints(identity.venvHints, argv0)
     : identity?.venvPython;
   if (fromEnv && isAbsolute(fromEnv) && existsSync(fromEnv)) {
-    return { python: fromEnv, source: "process-table", pid, image };
+    const result = { python: fromEnv, source: "process-table" as const, pid, image };
+    return { ...result, ...launchEvidenceFields };
   }
 
   if (argv0) {
-    return { python: argv0, source: "process-table", pid, image };
+    const result = { python: argv0, source: "process-table" as const, pid, image };
+    return { ...result, ...launchEvidenceFields };
   }
-  return { pid, image };
+  return { pid, image, ...launchEvidenceFields };
 }

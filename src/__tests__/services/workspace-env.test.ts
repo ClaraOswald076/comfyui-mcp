@@ -1,7 +1,8 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, rm, readFile, writeFile, mkdir } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile, mkdir, symlink } from "node:fs/promises";
 import { tmpdir, platform } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { itWithSymlinks } from "../helpers/platform.js";
 
 const IS_WIN = platform() === "win32";
 /** Create a venv interpreter on disk under `root`, returning its absolute path. */
@@ -1699,6 +1700,27 @@ describe("liveScriptFromArgv agrees with liveRootFromArgv on every argv shape", 
   }
 });
 
+itWithSymlinks("realpath-resolves a symlinked absolute launch script for live authorization", async () => {
+  const dir = await tmpDir();
+  try {
+    const realRoot = join(dir, "real-install");
+    const launcherRoot = join(dir, "launcher");
+    const realScript = join(realRoot, "main.py");
+    const launchScript = join(launcherRoot, "main.py");
+    await mkdir(realRoot, { recursive: true });
+    await mkdir(launcherRoot, { recursive: true });
+    await writeFile(realScript, "# real ComfyUI\n", "utf-8");
+    await symlink(realScript, launchScript, "file");
+
+    expect(liveScriptFromArgv([launchScript])).toBe(realScript);
+    const resolved = resolveLiveServerRoot([launchScript]);
+    expect(resolved.source).toBe("argv");
+    expect(resolved.root).toBe(realRoot);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 describe("resolveRootInterpreter (portable + venv layouts)", () => {
   it("finds the install's own .venv interpreter on disk", async () => {
     const root = await tmpDir();
@@ -2270,6 +2292,96 @@ describe("resolveLiveServerRoot (#369)", () => {
       expect(res.source).toBe("observed-process");
       expect(res.root).toBe(serverRoot);
       expect(res.observedPid).toBe(4242);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  itWithSymlinks("realpath-resolves an observed symlinked launch script before authorizing its root", async () => {
+    const dir = await tmpDir();
+    try {
+      const realRoot = join(dir, "real-install");
+      const launcherRoot = join(dir, "launcher");
+      const realScript = join(realRoot, "main.py");
+      const launchScript = join(launcherRoot, "main.py");
+      await mkdir(realRoot, { recursive: true });
+      await mkdir(launcherRoot, { recursive: true });
+      await writeFile(realScript, "# real ComfyUI\n", "utf-8");
+      await symlink(realScript, launchScript, "file");
+      h.mockLiveProcess.mockReturnValue({ pid: 4243, launchScript });
+
+      const resolved = resolveLiveServerRoot(["main.py"], undefined, {});
+      expect(resolved.source).toBe("observed-process");
+      expect(resolved.root).toBe(realRoot);
+      expect(resolved.observedLaunchScript).toBe(realScript);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an observed DIRECTORY named main.py before authorizing its parent", async () => {
+    const dir = await tmpDir();
+    try {
+      const root = join(dir, "directory-main");
+      const script = join(root, "main.py");
+      await mkdir(script, { recursive: true });
+      h.mockLiveProcess.mockReturnValue({ pid: 4244, launchScript: script });
+
+      const resolved = resolveLiveServerRoot(["main.py"], undefined, {});
+      expect(resolved.source).toBe("unresolved");
+      expect(resolved.root).toBeUndefined();
+
+      const argvResolved = resolveLiveServerRoot([script]);
+      expect(argvResolved.source).toBe("unresolved");
+      expect(argvResolved.root).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not fall back to an interpreter after an invalid observed launch script", async () => {
+    const dir = await tmpDir();
+    try {
+      const root = join(dir, "interpreter-fallback");
+      const python = join(root, "python_embeded", IS_WIN ? "python.exe" : "python3");
+      await mkdir(dirname(python), { recursive: true });
+      await writeFile(join(root, "main.py"), "# fallback tree\n", "utf-8");
+      await writeFile(python, "", "utf-8");
+
+      h.mockLiveProcess.mockReturnValue({
+        pid: 4245,
+        python,
+        launchScriptInvalid: true,
+      });
+
+      const resolved = resolveLiveServerRoot(["main.py"], undefined, {});
+      expect(resolved.source).toBe("unresolved");
+      expect(resolved.root).toBeUndefined();
+      expect(resolved.observedPython).toBe(python);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed on an indeterminate observed launch-script path", async () => {
+    const dir = await tmpDir();
+    try {
+      const root = join(dir, "interpreter-fallback");
+      const python = join(root, "python_embeded", IS_WIN ? "python.exe" : "python3");
+      await mkdir(dirname(python), { recursive: true });
+      await writeFile(join(root, "main.py"), "# fallback tree\n", "utf-8");
+      await writeFile(python, "", "utf-8");
+
+      // NUL makes realpathSync throw a non-ENOENT/ENOTDIR argument error. It
+      // must not be converted into a lexical path and then an interpreter root.
+      const indeterminateScript = `${join(dir, "blocked")}\0main.py`;
+      const resolved = resolveLiveServerRoot(
+        ["main.py"],
+        undefined,
+        { observedPython: python, observedLaunchScript: indeterminateScript },
+      );
+      expect(resolved.source).toBe("unresolved");
+      expect(resolved.root).toBeUndefined();
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

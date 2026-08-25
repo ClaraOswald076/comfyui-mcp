@@ -349,6 +349,124 @@ describe("observeLiveServerProcess — the OS image survives a relative argv[0] 
     expect(observeLiveServerProcess(opts)).toEqual({ pid: 5, image: exe });
   });
 
+  it("reports a correlated ABSOLUTE launch script for a bare server argv", async () => {
+    const exe = await makeExe("portable-python.exe");
+    const root = join(dir, "ComfyUI");
+    await mkdir(root, { recursive: true });
+    const script = join(root, "main.py");
+    await writeFile(script, "# ComfyUI\n", "utf-8");
+
+    const res = observeLiveServerProcess({
+      port: 8188,
+      remote: false,
+      serverArgv: ["main.py", "--port", "8188"],
+      findPid: () => 5,
+      readIdentity: () => ({
+        commandLine: `${exe} -s "${script}" --port 8188`,
+        executablePath: exe,
+        startedAt: "t1",
+      }),
+    });
+
+    expect(res).toMatchObject({ pid: 5, image: exe, launchScript: script });
+  });
+
+  it("does not treat a DIRECTORY named main.py as a launch script", async () => {
+    const exe = await makeExe("directory-main-python.exe");
+    const root = join(dir, "directory-main");
+    const script = join(root, "main.py");
+    await mkdir(script, { recursive: true });
+
+    const res = observeLiveServerProcess({
+      port: 8188,
+      remote: false,
+      serverArgv: ["main.py", "--port", "8188"],
+      findPid: () => 5,
+      readIdentity: () => ({
+        commandLine: `${exe} -s "${script}" --port 8188`,
+        argv: [exe, "-s", script, "--port", "8188"],
+        argvFidelity: "exact",
+        executablePath: exe,
+        startedAt: "t1",
+      }),
+    });
+
+    expect(res).toMatchObject({
+      pid: 5,
+      image: exe,
+      python: exe,
+      launchScriptInvalid: true,
+    });
+    expect(res?.launchScript).toBeUndefined();
+  });
+
+  it("uses the positional launch script among multiple main.py-shaped arguments", async () => {
+    const exe = await makeExe("multi-main-python.exe");
+    const actualRoot = join(dir, "actual");
+    const decoyRoot = join(dir, "decoy");
+    await mkdir(actualRoot, { recursive: true });
+    await mkdir(decoyRoot, { recursive: true });
+    const actualScript = join(actualRoot, "main.py");
+    const decoyScript = join(decoyRoot, "main.py");
+    await writeFile(actualScript, "# actual ComfyUI\n", "utf-8");
+    await writeFile(decoyScript, "# option value, not the launch script\n", "utf-8");
+
+    const serverArgv = [
+      "main.py",
+      "--extra-model-paths-config",
+      decoyScript,
+      "--port",
+      "8188",
+    ];
+    const res = observeLiveServerProcess({
+      port: 8188,
+      remote: false,
+      serverArgv,
+      findPid: () => 5,
+      readIdentity: () => ({
+        // The -X value appears before the actual script, and the same decoy
+        // appears later as a script argument. Neither may replace the position
+        // Python actually uses as the launch script.
+        commandLine: `${exe} -X "${decoyScript}" "${actualScript}" --extra-model-paths-config "${decoyScript}" --port 8188`,
+        argv: [
+          exe,
+          "-X",
+          decoyScript,
+          actualScript,
+          "--extra-model-paths-config",
+          decoyScript,
+          "--port",
+          "8188",
+        ],
+        argvFidelity: "exact",
+        executablePath: exe,
+        startedAt: "t1",
+      }),
+    });
+
+    expect(res).toMatchObject({ pid: 5, launchScript: actualScript });
+  });
+
+  it("does not expose an ABSOLUTE launch script when process correlation fails", async () => {
+    const exe = await makeExe("unrelated-python.exe");
+    const script = join(dir, "main.py");
+    await writeFile(script, "# not the connected server\n", "utf-8");
+
+    const res = observeLiveServerProcess({
+      port: 8188,
+      remote: false,
+      serverArgv: ["main.py", "--port", "8188"],
+      findPid: () => 5,
+      readIdentity: () => ({
+        commandLine: `${exe} -s "${script}" --port 8189`,
+        executablePath: exe,
+        startedAt: "t1",
+      }),
+    });
+
+    expect(res).toBeUndefined();
+  });
+
   it("NORMALIZES the image — Windows records it exactly as the launcher wrote it", async () => {
     // Measured: a process launched as `..\python_embeded\python.exe` reports
     // `…\ComfyUI\..\python_embeded\python.exe` — absolute, but not yet a path an
