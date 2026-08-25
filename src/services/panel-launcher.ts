@@ -224,6 +224,7 @@ export async function installPanelLauncher(
     const token = previous?.token ?? randomBytes(32).toString("base64url");
     const brokerId = previous?.broker_id ?? randomBytes(24).toString("base64url");
     const brokerExecutable = nodePath;
+    let needsFallbackBroker = false;
 
   /**
    * Start the broker unless the previous one is still alive.
@@ -246,10 +247,12 @@ export async function installPanelLauncher(
     // on a second install — this function's own config write used to drop the
     // pid — so a duplicate broker was spawned beside a live one (merge-gate P1).
     // The port is what the query actually uses; the pid was never evidence.
+    if (existsSync(paths.teardown) || readPanelLauncherConfig(home)?.token !== token) return;
     if (previous?.port) {
       const live = (await queryPanelLauncher(home)) as { running?: boolean };
       if (live.running) return; // a real broker answered — leave it alone
     }
+    if (existsSync(paths.teardown) || readPanelLauncherConfig(home)?.token !== token) return;
     const child = spawnBroker(nodePath, brokerRunArgs(paths.broker, brokerId), {
       detached: true,
       stdio: "ignore",
@@ -267,11 +270,7 @@ export async function installPanelLauncher(
       };
       if (child.pid) next.pid = child.pid;
       else delete next.pid;
-      // The install holds the shared lock for the entire mutation sequence,
-      // including platform registration below; do not attempt to reacquire it.
-      if (!existsSync(paths.teardown) && readPanelLauncherConfig(home)?.token === token) {
-        writePanelLauncherConfig(next, home);
-      }
+      writeOwnedPanelLauncherConfig(next, home, token);
     }
     child.unref?.();
   };
@@ -421,15 +420,15 @@ export async function installPanelLauncher(
     if (taskRegistered) {
       try {
         run("schtasks.exe", ["/Run", "/TN", PANEL_LAUNCHER_TASK], { stdio: "ignore" });
-        return paths; // the task is registered AND running it worked
+        return { paths, startFallback: null }; // the task is registered AND running it worked
       } catch {
         // Registered but not startable right now (non-interactive session). The
         // autostart is in place for the next logon, so do NOT add a second one —
         // just get a broker up for THIS session.
       }
     }
-    await startBrokerIfIdle();
-    return paths;
+    needsFallbackBroker = true;
+    return { paths, startFallback: startBrokerIfIdle };
   }
 
   if (platform === "darwin") {
@@ -453,7 +452,7 @@ export async function installPanelLauncher(
       // It is normal for the label not to be loaded on first install.
     }
     run("launchctl", ["bootstrap", `gui/${process.getuid?.() ?? 0}`, paths.macPlist], { stdio: "ignore" });
-    return paths;
+    return { paths, startFallback: null };
   }
 
   mkdirSync(dirname(paths.linuxService), { recursive: true });
@@ -477,14 +476,15 @@ export async function installPanelLauncher(
         `Exec="${nodePath}" "${paths.broker}" run --broker-id=${brokerId}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n`,
       "utf8",
     );
-    await startBrokerIfIdle();
+    needsFallbackBroker = true;
   }
-    return paths;
+    return { paths, startFallback: needsFallbackBroker ? startBrokerIfIdle : null };
   });
   if (locked === null) {
     throw new Error("Could not acquire the panel launcher lock for install");
   }
-  return locked;
+  if (locked.startFallback) await locked.startFallback();
+  return locked.paths;
 }
 
 export type UninstallLauncherOptions = Pick<
@@ -1293,24 +1293,31 @@ export async function startPanelLauncherBroker(
         if (!fromRecovery && lastLaunchAt && now() - lastLaunchAt < 90_000) {
           return { already_running: false, started: false, start_in_progress: true };
         }
-        // Keep this as the last synchronous ownership check before spawn. Once
-        // this JS turn calls spawn, uninstall cannot interleave within it.
-        if (!brokerConfigStillOwned()) {
-          return { already_running: false, started: false, disabled: true };
+        // Serialize the final ownership check with spawn. Uninstall cannot
+        // remove the tombstone/config between this check and the OS process
+        // creation, including when a test seam or platform shim re-enters JS.
+        const launched = withPanelLauncherLock(home, () => {
+          if (!brokerConfigStillOwned()) {
+            return { already_running: false, started: false, disabled: true };
+          }
+          lastLaunchAt = now();
+          try {
+            const started = launchPersistentMcp(process.platform, process.env, spawnBroker);
+            launch = started;
+            watchLaunch(started);
+          } catch (error) {
+            // Treat a spawn refusal like an immediate child failure: surface the
+            // current request's error, but let the bounded supervisor make a few
+            // delayed recovery attempts instead of hot-looping on every panel poll.
+            scheduleRecovery(null);
+            throw error;
+          }
+          return { already_running: false, started: true };
+        });
+        if (launched === null) {
+          return { already_running: false, started: false, start_in_progress: true };
         }
-        lastLaunchAt = now();
-        try {
-          const started = launchPersistentMcp(process.platform, process.env, spawnBroker);
-          launch = started;
-          watchLaunch(started);
-        } catch (error) {
-          // Treat a spawn refusal like an immediate child failure: surface the
-          // current request's error, but let the bounded supervisor make a few
-          // delayed recovery attempts instead of hot-looping on every panel poll.
-          scheduleRecovery(null);
-          throw error;
-        }
-        return { already_running: false, started: true };
+        return launched;
       };
       const pending = brokerConfigStillOwned()
         ? probe().then(afterProbe)

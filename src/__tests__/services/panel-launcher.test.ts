@@ -77,6 +77,25 @@ describe("panel launcher install", () => {
     expect(existsSync(`${paths.lock}.reclaim`)).toBe(false);
   });
 
+  it("releases the install lock before starting a fallback broker", async () => {
+    const { home, source } = fixture();
+    let lockHeldAtSpawn = false;
+    const paths = panelLauncherPaths(home);
+    await installPanelLauncher({
+      home,
+      platform: "linux",
+      brokerSource: source,
+      exec: (() => {
+        throw new Error("no systemd user session");
+      }) as never,
+      spawnImpl: (() => {
+        lockHeldAtSpawn = existsSync(paths.lock);
+        return { unref() {} };
+      }) as never,
+    });
+    expect(lockHeldAtSpawn).toBe(false);
+  });
+
   it("falls back to a Startup autostart when the scheduled task is DENIED", async () => {
     // The failure this covers is not hypothetical: on a machine whose policy or
     // task-store ACL refuses task creation to the user, `schtasks /Create` fails
@@ -754,6 +773,7 @@ describe("panel launcher broker", () => {
     await installPanelLauncher({ home, platform: "linux", brokerSource: source, exec: (() => undefined) as never });
     const children: Array<EventEmitter & { pid?: number; unref: () => void }> = [];
     const spawns: Array<{ file: string; args: readonly string[]; options: Record<string, unknown> }> = [];
+    let launcherLockHeldAtSpawn = false;
     let now = Date.now();
     const server = await startPanelLauncherBroker(home, {
       probeImpl: async () => false,
@@ -761,6 +781,7 @@ describe("panel launcher broker", () => {
       recoveryDelayMs: 10,
       recoveryMaxAttempts: 2,
       spawnImpl: ((file: string, args: readonly string[], options: Record<string, unknown>) => {
+        launcherLockHeldAtSpawn = existsSync(panelLauncherPaths(home).lock);
         const child = Object.assign(new EventEmitter(), { pid: 100 + children.length, unref() {} });
         children.push(child);
         spawns.push({ file, args, options });
@@ -776,6 +797,7 @@ describe("panel launcher broker", () => {
       });
       expect(start.status).toBe(200);
       expect(spawns).toHaveLength(1);
+      expect(launcherLockHeldAtSpawn).toBe(true);
       const command = persistentCommandForPlatform(process.platform);
       expect(spawns[0]).toMatchObject({
         file: command.executable,
