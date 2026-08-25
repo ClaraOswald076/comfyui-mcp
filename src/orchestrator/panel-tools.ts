@@ -18453,9 +18453,16 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 },
                 15000,
               )
-            : ctx.call({ cmd: "workflow_save" }, 15000, (rid) => {
-                saveRid = rid;
-              });
+            : ctx.call(
+                {
+                  cmd: "workflow_save",
+                  ...(args.subfolder !== undefined ? { subfolder: args.subfolder } : {}),
+                },
+                15000,
+                (rid) => {
+                  saveRid = rid;
+                },
+              );
         let res = await saveOnce();
         // #1710 — dest tab + dest nodes, extra still stamped as the save-as SOURCE.
         // Rebind extra to the confirmed dest, then retry the same save once.

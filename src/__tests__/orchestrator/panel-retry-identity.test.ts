@@ -280,11 +280,14 @@ describe("#694 retry_of threading through the tool defs", () => {
     expect("retry_of" in calls[0]).toBe(false);
   });
 
-  it("panel_save_workflow attaches the token on BOTH branches and preserves Save-As subfolder", async () => {
+  it("panel_save_workflow attaches the token and subfolder on BOTH branches", async () => {
     const { ctx, calls } = makeRecordingCtx();
-    await defByName("panel_save_workflow").handler({ retry_of: "tok-a" }, ctx);
     await defByName("panel_save_workflow").handler(
-      { name: "copy", subfolder: "nested/safe", retry_of: "tok-b" },
+      { subfolder: "nested/in-place", retry_of: "tok-a" },
+      ctx,
+    );
+    await defByName("panel_save_workflow").handler(
+      { name: "copy", subfolder: "nested/save-as", retry_of: "tok-b" },
       ctx,
     );
     // Find the save frames by NAME, not by index: #1045 added a `workflow_list`
@@ -293,11 +296,15 @@ describe("#694 retry_of threading through the tool defs", () => {
     // is about which frame CARRIES it, not where it lands in the sequence.
     const save = calls.find((c) => c.cmd === "workflow_save");
     const saveAs = calls.find((c) => c.cmd === "workflow_save_as");
-    expect(save).toMatchObject({ cmd: "workflow_save", retry_of: "tok-a" });
+    expect(save).toMatchObject({
+      cmd: "workflow_save",
+      subfolder: "nested/in-place",
+      retry_of: "tok-a",
+    });
     expect(saveAs).toMatchObject({
       cmd: "workflow_save_as",
       name: "copy",
-      subfolder: "nested/safe",
+      subfolder: "nested/save-as",
       retry_of: "tok-b",
     });
     // …and the probe itself must never carry a caller's retry token.
@@ -306,7 +313,7 @@ describe("#694 retry_of threading through the tool defs", () => {
     }
   });
 
-  it("subfolder is optional, rejects unknown keys, and never changes in-place workflow_save", async () => {
+  it("subfolder is optional, rejects unknown keys, and preserves omission/bare-name behavior", async () => {
     const def = defByName("panel_save_workflow");
     const schema = strictPanelSchema(def.schema);
     expect(schema.parse({})).toEqual({});
@@ -318,7 +325,14 @@ describe("#694 retry_of threading through the tool defs", () => {
 
     const { ctx, calls } = makeRecordingCtx();
     await def.handler({ subfolder: "nested/safe" }, ctx);
-    expect(calls.find((c) => c.cmd === "workflow_save")).toEqual({ cmd: "workflow_save" });
+    expect(calls.find((c) => c.cmd === "workflow_save")).toEqual({
+      cmd: "workflow_save",
+      subfolder: "nested/safe",
+    });
+
+    await def.handler({}, ctx);
+    const omittedSave = calls.find((c, index) => c.cmd === "workflow_save" && index > 0);
+    expect(omittedSave).toEqual({ cmd: "workflow_save" });
 
     await def.handler({ name: "bare-name" }, ctx);
     const bareSaveAs = calls.find((c) => c.cmd === "workflow_save_as" && c.name === "bare-name");
