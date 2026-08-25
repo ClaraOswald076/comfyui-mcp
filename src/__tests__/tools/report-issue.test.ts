@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach, afterAll } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { normalizeRepo, buildIssueUrl, isOurRepo, submitAndPoll, registerReportIssueTools, REPORT_UA, WORKER_MAX_BODY_LEN } from "./report-issue.js";
+import { normalizeRepo, buildIssueUrl, isOurRepo, submitAndPoll, registerReportIssueTools, REPORT_UA, WORKER_MAX_BODY_LEN } from "../../tools/report-issue.js";
 
 const noSleep = async () => {};
 
@@ -19,7 +19,6 @@ function getReportIssueHandler(): ToolHandler {
       handler = h;
     },
   };
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   registerReportIssueTools(fakeServer as any);
   if (!handler) throw new Error("report_issue handler not registered");
   return handler;
