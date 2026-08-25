@@ -2152,6 +2152,8 @@ export interface PanelActionResult {
   action: "install" | "update" | "reinstall";
   result: NodeOpResult;
   restartRequired: boolean;
+  /** True when ComfyUI-Manager reserved the update for the next startup. */
+  staged?: boolean;
   message: string;
   /** update only — installed version read from disk BEFORE the op (if known). */
   previousVersion?: string;
@@ -6151,6 +6153,7 @@ async function runPanelActionCore(
           action: "update",
           result: { ...result, message },
           restartRequired: true,
+          staged: true,
           message,
           previousVersion,
           installedVersion: post.version,

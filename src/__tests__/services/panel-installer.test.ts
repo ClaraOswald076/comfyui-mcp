@@ -742,6 +742,7 @@ describe("runPanelAction", () => {
     expect(r.message).toMatch(/STAGED, not failed/);
     expect(r.message).toMatch(/RESTART ComfyUI/);
     expect(r.restartRequired).toBe(true);
+    expect(r.staged).toBe(true);
     // The misreport that cost the reporter four attempts and a reinstall path.
     expect(r.message).not.toMatch(/did NOT apply/);
     expect(r.message).not.toMatch(/silent no-op/);

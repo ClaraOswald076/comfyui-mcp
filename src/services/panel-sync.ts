@@ -798,6 +798,8 @@ export interface PanelSyncResult {
    * intended one. Only ever set when `synced` is true.
    */
   verifiedVersion?: string;
+  /** True when Manager staged the update for the next ComfyUI startup. */
+  staged?: boolean;
   /** Highest panel version this orchestrator build needs. */
   requiredPanelVersion: string;
   /**
@@ -887,9 +889,10 @@ export async function reassessPanelAfterSyncFailure(
  *    mutation. In particular `pinned-warn` returns the warning and stops; this
  *    is a policy refusal, not an error.
  *  - `sync` delegates to `runPanelAction`, which THROWS unless the pack provably
- *    moved on disk (#639) and no shadow copy is serving (#641). That throw
- *    propagates: a verification failure is an explicit failure, never a
- *    downgraded "sync completed with warnings".
+ *    moved on disk (#639) and no shadow copy is serving (#641), or Manager
+ *    explicitly staged the update for the next startup (#1133). A staged
+ *    update is returned as pending, not as `synced: true`, because its bytes
+ *    have not moved on disk yet.
  *  - On success the installed version is RE-READ from disk and reported. If the
  *    re-read cannot confirm a version, we throw rather than claim a version we
  *    did not observe.
@@ -986,6 +989,25 @@ export async function performPanelSync(
           `".comfyui-agent-panel.bak-*". NOT reporting a completed sync — re-run ` +
           `${describeInstallPanelAction("status", "a re-check on the ComfyUI host")} once custom_nodes is readable.`,
       );
+    }
+
+    // #639 recurrence: a Manager-success response can be a legitimate staged
+    // update (#1133), leaving the old version on disk until the next startup.
+    // That is safe to report as pending — and must retain restartRequired — but
+    // it is not a completed sync and must not publish the unchanged version as
+    // `verifiedVersion`. The installer marks this path explicitly so a same-
+    // version nightly git movement cannot be confused with staging.
+    if (result.staged) {
+      assertPinnedTarget(pinnedDeps, "sync", "before reporting a staged update");
+      return {
+        synced: false,
+        staged: true,
+        decision: "sync",
+        previousVersion: result.previousVersion ?? before.installedVersion,
+        requiredPanelVersion: assessment.requiredPanelVersion,
+        restartRequired: true,
+        message: result.message,
+      };
     }
 
     // Tri-state: `null` when the landed version can't be compared at all.
