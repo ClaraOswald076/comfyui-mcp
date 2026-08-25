@@ -578,6 +578,121 @@ describe("panel-tools: panel_set_widget V3 dynamic-combo sub-widgets (#2299)", (
     expect(cmds).toEqual(["graph_query", "graph_set_widget"]);
   });
 
+  // ---- the over-refusal controls -------------------------------------------
+  //
+  // Every control above varies the PARENT type, so none of them can see a
+  // refusal that fires on the parent alone. These vary the CHILD under a proven
+  // COMFY_DYNAMICCOMBO_V3 parent — the Nano Banana 2 shape already fixtured in
+  // src/__tests__/services/api-nodes.test.ts, whose model.aspect_ratio /
+  // model.resolution / model.thinking_level children are COMBO and REQUIRED
+  // (api-nodes.ts: the server 400s with required_input_missing without them).
+  // Refusing those would strand a required input behind a remedy that does not
+  // exist for it — a STRING output does not reach a COMBO input.
+
+  const nanoBanana2Detail = {
+    nodes: [
+      {
+        id: 31,
+        type: "GeminiNanoBanana2V2",
+        widgets: {
+          model: "Nano Banana 2 (Gemini 3.1 Flash Image)",
+          "model.aspect_ratio": "auto",
+          "model.resolution": "1K",
+          "model.thinking_level": "MINIMAL",
+        },
+        inputs: [
+          { name: "model", type: "COMFY_DYNAMICCOMBO_V3" },
+          { name: "model.aspect_ratio", type: "COMBO" },
+          { name: "model.resolution", type: "COMBO" },
+          { name: "model.thinking_level", type: "COMBO" },
+        ],
+      },
+    ],
+  };
+
+  it("keeps a COMBO child of a V3 dynamic combo writable (Nano Banana 2 model.resolution)", async () => {
+    const { res, cmds } = await run(nanoBanana2Detail, {
+      node_id: 31,
+      widget: "model.resolution",
+      value: "4K",
+    });
+    expect(res.isError).toBeUndefined();
+    expect(cmds).toEqual(["graph_query", "graph_set_widget"]);
+  });
+
+  it("keeps every non-STRING child of the same V3 parent writable", async () => {
+    for (const [widget, value] of [
+      ["model.aspect_ratio", "16:9"],
+      ["model.thinking_level", "HIGH"],
+    ] as Array<[string, string]>) {
+      const { res, cmds } = await run(nanoBanana2Detail, { node_id: 31, widget, value });
+      expect(res.isError, `${widget} must stay writable`).toBeUndefined();
+      expect(cmds).toEqual(["graph_query", "graph_set_widget"]);
+    }
+  });
+
+  it("keeps INT / FLOAT / BOOLEAN children of a V3 parent writable", async () => {
+    const detail = {
+      nodes: [
+        {
+          id: 32,
+          type: "SomeV3ApiNode",
+          widgets: { model: "opt", "model.steps": 20, "model.cfg": 3.5, "model.fast": false },
+          inputs: [
+            { name: "model", type: "COMFY_DYNAMICCOMBO_V3" },
+            { name: "model.steps", type: "INT" },
+            { name: "model.cfg", type: "FLOAT" },
+            { name: "model.fast", type: "BOOLEAN" },
+          ],
+        },
+      ],
+    };
+    for (const [widget, value] of [
+      ["model.steps", 30],
+      ["model.cfg", 7.5],
+      ["model.fast", true],
+    ] as Array<[string, unknown]>) {
+      const { res, cmds } = await run(detail, { node_id: 32, widget, value });
+      expect(res.isError, `${widget} must stay writable`).toBeUndefined();
+      expect(cmds).toEqual(["graph_query", "graph_set_widget"]);
+    }
+  });
+
+  it("falls open when the detail row carries no declared type for the child", async () => {
+    // Present in the widgets map but absent from inputs: the probe cannot PROVE
+    // STRING, so this keeps the setter path rather than broadening the refusal.
+    const { res, cmds } = await run(
+      {
+        nodes: [
+          {
+            id: 33,
+            type: "MinimaxHailuo03TextToVideoNode",
+            widgets: { model: "text-to-video", "model.prompt": "" },
+            inputs: [{ name: "model", type: "COMFY_DYNAMICCOMBO_V3" }],
+          },
+        ],
+      },
+      { node_id: 33, widget: "model.prompt", value: "NEW" },
+    );
+    expect(res.isError).toBeUndefined();
+    expect(cmds).toEqual(["graph_query", "graph_set_widget"]);
+  });
+
+  it("names the proven child type in the refusal, so the STRING remedy always fits", async () => {
+    const { res } = await run(dynamicDetail);
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/is a STRING child/);
+  });
+
+  it("documents that only a STRING child is refused", () => {
+    const description = defByName("panel_set_widget").description;
+    expect(description).toContain("COMFY_DYNAMICCOMBO_V3");
+    expect(description).toContain("PrimitiveStringMultiline");
+    expect(description).toContain("model.prompt");
+    expect(description).toMatch(/STRING child/);
+    expect(description).toContain("model.resolution");
+  });
+
   it("documents the refusal and socket workaround", () => {
     const description = defByName("panel_set_widget").description;
     expect(description).toContain("COMFY_DYNAMICCOMBO_V3");

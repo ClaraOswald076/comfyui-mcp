@@ -6035,6 +6035,27 @@ function parseVerifiedQueriedNodeDetail(
   return { ...identity, inputs: record.inputs, widgets };
 }
 
+/** The ONLY dynamic-combo child type this refuses.
+ *
+ * #2299 measured exactly one reverting child — `model.prompt`, a STRING — and a
+ * STRING child is the only one with a durable escape: it is exposed as a real
+ * input socket, so a PrimitiveStringMultiline link survives the frontend's
+ * re-serialize pass and wins at execution.
+ *
+ * Refusing the parent's whole child set instead would be a capability removal.
+ * `src/services/api-nodes.ts` classifies a v3 dynamic combo's children as
+ * INT | FLOAT | STRING | BOOLEAN | COMBO, and the Nano Banana 2 shape fixtured in
+ * `src/__tests__/services/api-nodes.test.ts` reveals `model.aspect_ratio`,
+ * `model.resolution` and `model.thinking_level` — all COMBO, and all REQUIRED:
+ * the server 400s with `required_input_missing` when a dotted child is absent.
+ * A refusal there would leave a required input with NO route, while naming a
+ * remedy that cannot be carried out (a STRING output does not reach a COMBO
+ * input). No non-STRING child has been measured reverting; if one ever is, it
+ * needs an honest receipt ("written, not confirmed persistent"), not a refusal.
+ *
+ * So: prove STRING, or keep the normal setter path. */
+const DYNAMIC_COMBO_REFUSED_CHILD_TYPE = "STRING";
+
 function dynamicComboSubWidgetRefusal(
   nodeType: string,
   parentInput: string,
@@ -6042,7 +6063,8 @@ function dynamicComboSubWidgetRefusal(
 ): ToolResult {
   return fail(
     `panel_set_widget cannot set dynamic-combo sub-widget "${widget}" on ${nodeType}. ` +
-      `The parent input "${parentInput}" is ${COMFY_DYNAMICCOMBO_V3}; its frontend ` +
+      `The parent input "${parentInput}" is ${COMFY_DYNAMICCOMBO_V3} and "${widget}" is a ` +
+      `${DYNAMIC_COMBO_REFUSED_CHILD_TYPE} child; its frontend ` +
       `serializer can re-materialize the combo and overwrite widget.value after a ` +
       `successful write and immediate readback, so panel_run could queue an empty or ` +
       `stale value. Drive the child input by link instead: add a ` +
@@ -6053,8 +6075,10 @@ function dynamicComboSubWidgetRefusal(
   );
 }
 
-/** Refuse a dotted widget only when the live detail row proves that its prefix
- * is a COMFY_DYNAMICCOMBO_V3 input and the addressed child actually exists.
+/** Refuse a dotted widget only when the live detail row proves BOTH that its
+ * prefix is a COMFY_DYNAMICCOMBO_V3 input and that the addressed child is a
+ * STRING (see {@link DYNAMIC_COMBO_REFUSED_CHILD_TYPE} for why the child type is
+ * load-bearing rather than the parent type alone).
  * Ordinary composite widgets (for example rgthree `lora_1.on`) and ordinary
  * dotted STRING names remain on the normal setter path. An unreadable detail
  * probe is not evidence of a dynamic combo, so it falls through to the panel's
@@ -6080,14 +6104,15 @@ async function refuseDynamicComboSubWidgetWrite(
   if (!detail || !requestedId || detail.id !== requestedId) return null;
 
   const parentInput = widget.slice(0, dot);
+  const childInput = detail.inputs.find(
+    (input) =>
+      input &&
+      typeof input === "object" &&
+      !Array.isArray(input) &&
+      (input as Record<string, unknown>).name === widget,
+  );
   const childExists =
-    detail.inputs.some(
-      (input) =>
-        input &&
-        typeof input === "object" &&
-        !Array.isArray(input) &&
-        (input as Record<string, unknown>).name === widget,
-    ) ||
+    childInput !== undefined ||
     (detail.widgets !== null && Object.prototype.hasOwnProperty.call(detail.widgets, widget));
   if (!childExists) return null;
 
@@ -6099,9 +6124,18 @@ async function refuseDynamicComboSubWidgetWrite(
       (input as Record<string, unknown>).name === parentInput,
   );
   if (!parent || typeof parent !== "object" || Array.isArray(parent)) return null;
-  return (parent as Record<string, unknown>).type === COMFY_DYNAMICCOMBO_V3
-    ? dynamicComboSubWidgetRefusal(detail.type, parentInput, widget)
-    : null;
+  if ((parent as Record<string, unknown>).type !== COMFY_DYNAMICCOMBO_V3) return null;
+
+  // A dynamic-combo parent is not on its own the #2299 shape. Only a child the
+  // probe PROVES is STRING is refused; a COMBO/INT/FLOAT/BOOLEAN child, or one
+  // whose declared type this row does not carry, keeps the normal setter path.
+  const childType =
+    childInput && typeof childInput === "object" && !Array.isArray(childInput)
+      ? (childInput as Record<string, unknown>).type
+      : undefined;
+  if (childType !== DYNAMIC_COMBO_REFUSED_CHILD_TYPE) return null;
+
+  return dynamicComboSubWidgetRefusal(detail.type, parentInput, widget);
 }
 
 /** Refuse the known LC123 regional-canvas prompt widgets. Identity is read
@@ -15228,7 +15262,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     // expose the same actionable workaround.
     description:
       name === "panel_set_widget"
-        ? `${description} Dotted children of a live COMFY_DYNAMICCOMBO_V3 input (for example model.prompt) are refused when the live detail proves that shape: the frontend can reserialize the combo after immediate readback and panel_run may then use an empty/stale child. Drive the corresponding STRING child input with a PrimitiveStringMultiline link instead; set the parent only to choose the combo option.`
+        ? `${description} A dotted STRING child of a live COMFY_DYNAMICCOMBO_V3 input (for example model.prompt) is refused when the live detail proves both halves of that shape (non-STRING children such as Nano Banana 2's model.resolution stay writable): the frontend can reserialize the combo after immediate readback and panel_run may then use an empty/stale child. Drive the corresponding STRING child input with a PrimitiveStringMultiline link instead; set the parent only to choose the combo option.`
         : description,
     schema,
     handler,
