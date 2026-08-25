@@ -271,8 +271,14 @@ export async function installPanelLauncher(
       readPanelLauncherConfig(home)?.install_id !== installId
     ) return;
     if (previous?.port) {
-      const live = (await queryPanelLauncher(home)) as { running?: boolean };
-      if (live.running) return; // a real broker answered — leave it alone
+      const live = (await queryPanelLauncher(home)) as {
+        running?: boolean;
+        broker_id?: unknown;
+        install_id?: unknown;
+      };
+      if (live.running && live.broker_id === brokerId && live.install_id === installId) {
+        return; // the answering broker owns this exact generation
+      }
     }
     if (
       existsSync(paths.teardown) ||
@@ -878,12 +884,13 @@ function writeOwnedPanelLauncherConfig(
     // which is still publishing after that point must not recreate launcher.json.
     if (existsSync(paths.teardown)) return false;
     const current = readPanelLauncherConfig(home);
-    const sameGeneration = current?.install_id === ownership.installId;
+    const sameGeneration = ownership.installId !== undefined
+      ? current?.install_id === ownership.installId
+      : ownership.brokerId === undefined && current?.install_id === undefined;
     const legacyRuntimeMigration =
       ownership.installId === undefined &&
       ownership.brokerId !== undefined &&
-      current?.install_id !== undefined &&
-      current.broker_id === ownership.brokerId;
+      current?.broker_id === ownership.brokerId;
     if (current?.token !== ownership.token || (!sameGeneration && !legacyRuntimeMigration)) return false;
     writePanelLauncherConfig(config, home);
     return true;
@@ -1400,9 +1407,13 @@ export async function startPanelLauncherBroker(
       return;
     }
     if (req.method === "GET" && req.url === "/v1/status") {
+      const latest = readPanelLauncherConfig(home);
+      const effectiveInstallId = brokerConfigStillOwned() ? latest?.install_id : current.install_id;
       jsonResponse(res, 200, {
         ok: true,
         protocol: PANEL_LAUNCHER_PROTOCOL,
+        broker_id: brokerId,
+        ...(effectiveInstallId ? { install_id: effectiveInstallId } : {}),
         orchestrator_running: await probeAnyPanelOrchestrator(),
       });
       return;

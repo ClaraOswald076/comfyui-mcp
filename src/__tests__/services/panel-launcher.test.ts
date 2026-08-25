@@ -206,7 +206,13 @@ describe("panel launcher install", () => {
     const server = createServer((req, res) => {
       const ok = req.headers.authorization === `Bearer ${cfg.token}`;
       res.writeHead(ok ? 200 : 401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok, protocol: 1, orchestrator_running: false }));
+      res.end(JSON.stringify({
+        ok,
+        protocol: 1,
+        broker_id: cfg.broker_id,
+        install_id: cfg.install_id,
+        orchestrator_running: false,
+      }));
     });
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
     const port = (server.address() as { port: number }).port;
@@ -258,7 +264,13 @@ describe("panel launcher install", () => {
     const server = createServer((req, res) => {
       const ok = req.headers.authorization === `Bearer ${cfg.token}`;
       res.writeHead(ok ? 200 : 401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok, protocol: 1, orchestrator_running: false }));
+      res.end(JSON.stringify({
+        ok,
+        protocol: 1,
+        broker_id: cfg.broker_id,
+        install_id: cfg.install_id,
+        orchestrator_running: false,
+      }));
     });
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
     const port = (server.address() as { port: number }).port;
@@ -337,7 +349,13 @@ describe("panel launcher install", () => {
     const server = createServer((req, res) => {
       const ok = req.headers.authorization === `Bearer ${cfg.token}`;
       res.writeHead(ok ? 200 : 401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok, protocol: 1, orchestrator_running: true }));
+      res.end(JSON.stringify({
+        ok,
+        protocol: 1,
+        broker_id: cfg.broker_id,
+        install_id: cfg.install_id,
+        orchestrator_running: true,
+      }));
     });
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
     const port = (server.address() as { port: number }).port;
