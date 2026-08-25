@@ -1,10 +1,12 @@
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   installPanelLauncher,
+  persistentCommandForPlatform,
   panelLauncherPaths,
   readPanelLauncherConfig,
   startPanelLauncherBroker,
@@ -58,6 +60,103 @@ describe("panel launcher install", () => {
     const first = readPanelLauncherConfig(home)?.token;
     await installPanelLauncher({ home, platform: "win32", brokerSource: source, exec });
     expect(readPanelLauncherConfig(home)?.token).toBe(first);
+  });
+
+  it("recovers a crashed stale-lock reclaimer", async () => {
+    const { home, source } = fixture();
+    const paths = panelLauncherPaths(home);
+    mkdirSync(paths.root, { recursive: true });
+    writeFileSync(paths.lock, JSON.stringify({ pid: 2147483647, token: "crashed-owner" }), "utf8");
+    writeFileSync(
+      `${paths.lock}.reclaim`,
+      JSON.stringify({ pid: 2147483647, token: "crashed-reclaimer" }),
+      "utf8",
+    );
+    await installPanelLauncher({ home, platform: "linux", brokerSource: source, exec: (() => undefined) as never });
+    expect(readPanelLauncherConfig(home)).not.toBeNull();
+    expect(existsSync(`${paths.lock}.reclaim`)).toBe(false);
+  });
+
+  it("releases the install lock before starting a fallback broker", async () => {
+    const { home, source } = fixture();
+    let lockHeldAtSpawn = false;
+    const paths = panelLauncherPaths(home);
+    await installPanelLauncher({
+      home,
+      platform: "linux",
+      brokerSource: source,
+      exec: (() => {
+        throw new Error("no systemd user session");
+      }) as never,
+      spawnImpl: (() => {
+        lockHeldAtSpawn = existsSync(paths.lock);
+        return { unref() {} };
+      }) as never,
+    });
+    expect(lockHeldAtSpawn).toBe(false);
+  });
+
+  it("releases the install lock before starting a registered Linux service", async () => {
+    const { home, source } = fixture();
+    const paths = panelLauncherPaths(home);
+    let lockHeldAtStart: boolean | undefined;
+    const calls: Array<readonly string[]> = [];
+    await installPanelLauncher({
+      home,
+      platform: "linux",
+      brokerSource: source,
+      exec: ((_file: string, args: readonly string[]) => {
+        calls.push(args);
+        if (args.includes("start")) lockHeldAtStart = existsSync(paths.lock);
+      }) as never,
+    });
+    expect(lockHeldAtStart).toBe(false);
+    expect(calls).toContainEqual(["--user", "enable", "comfyui-mcp-launcher.service"]);
+    expect(calls).toContainEqual(["--user", "start", "comfyui-mcp-launcher.service"]);
+  });
+
+  it("releases the install lock before running a registered Windows task", async () => {
+    const { home, source } = fixture();
+    const paths = panelLauncherPaths(home);
+    let lockHeldAtRun: boolean | undefined;
+    await installPanelLauncher({
+      home,
+      platform: "win32",
+      brokerSource: source,
+      exec: ((_file: string, args: readonly string[]) => {
+        if (args.includes("/Run")) lockHeldAtRun = existsSync(paths.lock);
+      }) as never,
+    });
+    expect(lockHeldAtRun).toBe(false);
+  });
+
+  it("does not let an old fallback overwrite a later reinstall", async () => {
+    const { home, source } = fixture();
+    await installPanelLauncher({
+      home,
+      platform: "linux",
+      nodePath: "old-node",
+      brokerSource: source,
+      exec: (() => {
+        throw new Error("no systemd user session");
+      }) as never,
+      spawnImpl: (() => {
+        // This synchronous seam models the config state after a reinstall
+        // between the old fallback's spawn and its delayed PID publication.
+        const current = readPanelLauncherConfig(home)!;
+        writeFileSync(
+          panelLauncherPaths(home).config,
+          JSON.stringify({
+            ...current,
+            install_id: "new-install-generation-000000000000000000000000000000",
+            broker_executable: "new-node",
+          }),
+          "utf8",
+        );
+        return { pid: 9911, unref() {} };
+      }) as never,
+    });
+    expect(readPanelLauncherConfig(home)?.broker_executable).toBe("new-node");
   });
 
   it("falls back to a Startup autostart when the scheduled task is DENIED", async () => {
@@ -115,7 +214,12 @@ describe("panel launcher install", () => {
     expect(readFileSync(paths.windowsStartup, "utf8")).toContain(paths.windowsScript);
     // …and the broker starts NOW, or the install "succeeds" while leaving the
     // panel with nothing to talk to until the next logon.
-    expect(spawned).toEqual([[paths.broker, "run"]]);
+    expect(spawned).toEqual([[
+      paths.broker,
+      "run",
+      expect.stringMatching(/^--broker-id=/),
+      expect.stringMatching(/^--install-id=/),
+    ]]);
     // The install must not throw: everything the launcher needs now exists.
     expect(readPanelLauncherConfig(home)?.token.length).toBeGreaterThanOrEqual(32);
   });
@@ -136,7 +240,13 @@ describe("panel launcher install", () => {
     const server = createServer((req, res) => {
       const ok = req.headers.authorization === `Bearer ${cfg.token}`;
       res.writeHead(ok ? 200 : 401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok, protocol: 1, orchestrator_running: false }));
+      res.end(JSON.stringify({
+        ok,
+        protocol: 1,
+        broker_id: cfg.broker_id,
+        install_id: cfg.install_id,
+        orchestrator_running: false,
+      }));
     });
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
     const port = (server.address() as { port: number }).port;
@@ -188,7 +298,13 @@ describe("panel launcher install", () => {
     const server = createServer((req, res) => {
       const ok = req.headers.authorization === `Bearer ${cfg.token}`;
       res.writeHead(ok ? 200 : 401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok, protocol: 1, orchestrator_running: false }));
+      res.end(JSON.stringify({
+        ok,
+        protocol: 1,
+        broker_id: cfg.broker_id,
+        install_id: cfg.install_id,
+        orchestrator_running: false,
+      }));
     });
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
     const port = (server.address() as { port: number }).port;
@@ -201,10 +317,11 @@ describe("panel launcher install", () => {
 
     try {
       spawned.length = 0;
-      await installPanelLauncher({ home, platform: "win32", brokerSource: source, exec: denied, spawnImpl: record });
+      await installPanelLauncher({ home, platform: "win32", nodePath: "new-node", brokerSource: source, exec: denied, spawnImpl: record });
       expect(spawned, "second install spawned a rival broker").toEqual([]);
       // …and the install must not have erased the pid for the NEXT one either.
       expect(readPanelLauncherConfig(home)?.pid).toBe(process.pid);
+      expect(readPanelLauncherConfig(home)?.broker_executable).toBe(cfg.broker_executable);
       spawned.length = 0;
       await installPanelLauncher({ home, platform: "win32", brokerSource: source, exec: denied, spawnImpl: record });
       expect(spawned, "third install spawned a rival broker").toEqual([]);
@@ -239,7 +356,14 @@ describe("panel launcher install", () => {
       }) as never,
     });
     expect(existsSync(paths.windowsStartup)).toBe(false);
-    expect(spawned, "install threw before starting a broker").toEqual([[paths.broker, "run"]]);
+    expect(spawned, "install threw before starting a broker").toEqual([
+      [
+        paths.broker,
+        "run",
+        expect.stringMatching(/^--broker-id=/),
+        expect.stringMatching(/^--install-id=/),
+      ],
+    ]);
   });
 
   it("the PORT is the evidence — a live broker with no pid recorded still counts", async () => {
@@ -259,7 +383,13 @@ describe("panel launcher install", () => {
     const server = createServer((req, res) => {
       const ok = req.headers.authorization === `Bearer ${cfg.token}`;
       res.writeHead(ok ? 200 : 401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok, protocol: 1, orchestrator_running: true }));
+      res.end(JSON.stringify({
+        ok,
+        protocol: 1,
+        broker_id: cfg.broker_id,
+        install_id: cfg.install_id,
+        orchestrator_running: true,
+      }));
     });
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
     const port = (server.address() as { port: number }).port;
@@ -323,7 +453,14 @@ describe("panel launcher install", () => {
     } finally {
       await new Promise<void>((r) => server.close(() => r()));
     }
-    expect(spawned).toEqual([[panelLauncherPaths(home).broker, "run"]]);
+    expect(spawned).toEqual([
+      [
+        panelLauncherPaths(home).broker,
+        "run",
+        expect.stringMatching(/^--broker-id=/),
+        expect.stringMatching(/^--install-id=/),
+      ],
+    ]);
   });
 
   it("a /Create failure with the task ALREADY registered adds no second autostart", async () => {
@@ -386,7 +523,14 @@ describe("panel launcher install", () => {
         return { unref() {} };
       }) as never,
     });
-    expect(spawned).toEqual([[panelLauncherPaths(home).broker, "run"]]);
+    expect(spawned).toEqual([
+      [
+        panelLauncherPaths(home).broker,
+        "run",
+        expect.stringMatching(/^--broker-id=/),
+        expect.stringMatching(/^--install-id=/),
+      ],
+    ]);
   });
 
   it("puts the Startup entry under %APPDATA%, not a manufactured profile path", async () => {
@@ -444,7 +588,12 @@ describe("panel launcher install", () => {
     // The task IS registered — no duplicate autostart.
     expect(existsSync(paths.windowsStartup)).toBe(false);
     // …but this session still needs a broker, since /Run did not give it one.
-    expect(spawned).toEqual([[paths.broker, "run"]]);
+    expect(spawned).toEqual([[
+      paths.broker,
+      "run",
+      expect.stringMatching(/^--broker-id=/),
+      expect.stringMatching(/^--install-id=/),
+    ]]);
   });
 
   it("uninstall removes the Startup fallback, not just the task", async () => {
@@ -465,6 +614,160 @@ describe("panel launcher install", () => {
     expect(existsSync(paths.windowsStartup)).toBe(false);
   });
 
+  it("stops a running Windows Startup fallback broker during uninstall", async () => {
+    const { home, source } = fixture();
+    const calls: Array<{ file: string; args: readonly string[] }> = [];
+    const paths = await installPanelLauncher({
+      home,
+      platform: "win32",
+      brokerSource: source,
+      exec: (() => {
+        throw new Error("denied");
+      }) as never,
+      spawnImpl: (() => ({ pid: 4321, unref() {} })) as never,
+    });
+    const config = readPanelLauncherConfig(home)!;
+    uninstallPanelLauncher({
+      home,
+      platform: "win32",
+      exec: ((_file: string, args: readonly string[]) => {
+        calls.push({ file: _file, args });
+      }) as never,
+      processIdentityImpl: () => ({
+        commandLine: `"${paths.broker}" run --broker-id=${config.broker_id}`,
+        executable: config.broker_executable!,
+      }),
+    });
+    expect(calls).toContainEqual({ file: "taskkill.exe", args: ["/PID", "4321", "/F"] });
+    expect(existsSync(paths.windowsStartup)).toBe(false);
+  });
+
+  it("stops a running Linux XDG fallback broker during uninstall", async () => {
+    const { home, source } = fixture();
+    const killed: Array<{ pid: number; signal?: NodeJS.Signals | number }> = [];
+    const paths = await installPanelLauncher({
+      home,
+      platform: "linux",
+      brokerSource: source,
+      exec: (() => {
+        throw new Error("no systemd user session");
+      }) as never,
+      spawnImpl: (() => ({ pid: 4322, unref() {} })) as never,
+    });
+    const config = readPanelLauncherConfig(home)!;
+    uninstallPanelLauncher({
+      home,
+      platform: "linux",
+      exec: (() => undefined) as never,
+      killImpl: ((pid: number, signal?: NodeJS.Signals | number) => {
+        killed.push({ pid, signal });
+      }) as typeof process.kill,
+      processIdentityImpl: () => ({
+        commandLine: `${paths.broker} run --broker-id=${config.broker_id}`,
+        executable: config.broker_executable!,
+      }),
+    });
+    expect(killed).toEqual([{ pid: 4322, signal: "SIGTERM" }]);
+    expect(existsSync(paths.linuxAutostart)).toBe(false);
+  });
+
+  it("fails closed when the recorded PID identity cannot be read", async () => {
+    const { home, source } = fixture();
+    const calls: string[] = [];
+    const paths = await installPanelLauncher({
+      home,
+      platform: "win32",
+      brokerSource: source,
+      exec: (() => { throw new Error("denied"); }) as never,
+      spawnImpl: (() => ({ pid: 4331, unref() {} })) as never,
+    });
+    uninstallPanelLauncher({
+      home,
+      platform: "win32",
+      exec: ((file: string) => { calls.push(file); }) as never,
+      processIdentityImpl: () => null,
+    });
+    expect(calls).not.toContain("taskkill.exe");
+    expect(existsSync(paths.config)).toBe(false);
+  });
+
+  it("does not kill a non-owned process that reuses the recorded PID", async () => {
+    const { home, source } = fixture();
+    const killed: Array<{ pid: number; signal?: NodeJS.Signals | number }> = [];
+    const paths = await installPanelLauncher({
+      home,
+      platform: "linux",
+      brokerSource: source,
+      exec: (() => { throw new Error("no systemd user session"); }) as never,
+      spawnImpl: (() => ({ pid: 4332, unref() {} })) as never,
+    });
+    const config = readPanelLauncherConfig(home)!;
+    uninstallPanelLauncher({
+      home,
+      platform: "linux",
+      exec: (() => undefined) as never,
+      killImpl: ((pid: number, signal?: NodeJS.Signals | number) => {
+        killed.push({ pid, signal });
+      }) as typeof process.kill,
+      processIdentityImpl: () => ({
+        commandLine: `${paths.broker} run --broker-id=not-${config.broker_id}`,
+        executable: config.broker_executable!,
+      }),
+    });
+    expect(killed).toEqual([]);
+  });
+
+  it("disables recovery after uninstall when no broker PID is available", async () => {
+    const { home, source } = fixture();
+    await installPanelLauncher({
+      home,
+      platform: "linux",
+      brokerSource: source,
+      exec: (() => {
+        throw new Error("no systemd user session");
+      }) as never,
+      spawnImpl: (() => ({ unref() {} })) as never,
+    });
+    const children: Array<EventEmitter & { unref: () => void }> = [];
+    let spawns = 0;
+    const server = await startPanelLauncherBroker(home, {
+      probeImpl: async () => false,
+      recoveryDelayMs: 10,
+      spawnImpl: (() => {
+        spawns += 1;
+        const child = Object.assign(new EventEmitter(), { unref() {} });
+        children.push(child);
+        return child;
+      }) as never,
+    });
+    const config = readPanelLauncherConfig(home)!;
+    const base = `http://127.0.0.1:${config.port}`;
+    try {
+      await fetch(`${base}/v1/ensure-running`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${config.token}` },
+      });
+      expect(spawns).toBe(1);
+      children[0]!.emit("exit", 1);
+
+      // The uninstall removes the config before the delayed recovery can run.
+      // With no PID to kill, the broker may remain until its process exits, but
+      // it must be disabled and must not launch another orchestrator.
+      uninstallPanelLauncher({ home, platform: "linux", exec: (() => undefined) as never });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(spawns).toBe(1);
+
+      const disabled = await fetch(`${base}/v1/ensure-running`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${config.token}` },
+      });
+      expect(disabled.status).toBe(200);
+      expect(await disabled.json()).toMatchObject({ disabled: true, started: false });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it("writes a Linux user service and falls back to XDG autostart", async () => {
     const { home, source } = fixture();
     const paths = await installPanelLauncher({
@@ -482,6 +785,19 @@ describe("panel launcher install", () => {
 });
 
 describe("panel launcher broker", () => {
+  it("requires command-line identity for an installed broker", async () => {
+    const { home, source } = fixture();
+    await installPanelLauncher({ home, platform: "linux", brokerSource: source, exec: (() => undefined) as never });
+    const config = readPanelLauncherConfig(home)!;
+    await expect(startPanelLauncherBroker(home, {
+      enforceCommandIdentity: true,
+      expectedBrokerId: config.broker_id,
+    })).rejects.toThrow("install generation is missing");
+    await expect(startPanelLauncherBroker(home, {
+      enforceCommandIdentity: true,
+    })).rejects.toThrow("broker identity is missing");
+  });
+
   it("binds loopback and rejects requests without the private bearer token", async () => {
     const { home, source } = fixture();
     await installPanelLauncher({
@@ -503,9 +819,195 @@ describe("panel launcher broker", () => {
       const body = await accepted.json() as Record<string, unknown>;
       expect(body).toMatchObject({ ok: true, protocol: 1 });
       expect(body).not.toHaveProperty("token");
+      expect(readPanelLauncherConfig(home)?.broker_id).toMatch(/^[A-Za-z0-9_-]{32,}$/);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+
+  it("does not republish launcher.json when uninstall races broker startup", async () => {
+    const { home, source } = fixture();
+    const paths = await installPanelLauncher({
+      home,
+      platform: "linux",
+      brokerSource: source,
+      exec: (() => undefined) as never,
+    });
+    await expect(
+      startPanelLauncherBroker(home, {
+        beforeConfigWrite: () => uninstallPanelLauncher({
+          home,
+          platform: "linux",
+          exec: (() => undefined) as never,
+        }),
+      }),
+    ).rejects.toThrow("uninstalled while the broker was starting");
+    expect(existsSync(paths.config)).toBe(false);
+    expect(existsSync(paths.teardown)).toBe(true);
+  });
+
+  it("does not spawn from an in-flight probe after uninstall", async () => {
+    const { home, source } = fixture();
+    await installPanelLauncher({
+      home,
+      platform: "linux",
+      brokerSource: source,
+      exec: (() => undefined) as never,
+    });
+    let releaseProbe!: (running: boolean) => void;
+    let probeStarted!: () => void;
+    const probeReady = new Promise<void>((resolve) => { probeStarted = resolve; });
+    const probeResult = new Promise<boolean>((resolve) => { releaseProbe = resolve; });
+    let spawns = 0;
+    const server = await startPanelLauncherBroker(home, {
+      probeImpl: async () => {
+        probeStarted();
+        return probeResult;
+      },
+      spawnImpl: (() => {
+        spawns += 1;
+        return { unref() {} };
+      }) as never,
+    });
+    try {
+      const config = readPanelLauncherConfig(home)!;
+      const request = fetch(`http://127.0.0.1:${config.port}/v1/ensure-running`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${config.token}` },
+      });
+      await probeReady;
+      uninstallPanelLauncher({ home, platform: "linux", exec: (() => undefined) as never });
+      releaseProbe(false);
+      const response = await request;
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ disabled: true, started: false });
+      expect(spawns).toBe(0);
+      expect(existsSync(panelLauncherPaths(home).config)).toBe(false);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("launches headlessly and bounds recovery after child exits", async () => {
+    const { home, source } = fixture();
+    await installPanelLauncher({ home, platform: "linux", brokerSource: source, exec: (() => undefined) as never });
+    const children: Array<EventEmitter & { pid?: number; unref: () => void }> = [];
+    const spawns: Array<{ file: string; args: readonly string[]; options: Record<string, unknown> }> = [];
+    let launcherLockHeldAtSpawn = false;
+    let now = Date.now();
+    const server = await startPanelLauncherBroker(home, {
+      probeImpl: async () => false,
+      now: () => now,
+      recoveryDelayMs: 10,
+      recoveryMaxAttempts: 2,
+      spawnImpl: ((file: string, args: readonly string[], options: Record<string, unknown>) => {
+        launcherLockHeldAtSpawn = existsSync(panelLauncherPaths(home).lock);
+        const child = Object.assign(new EventEmitter(), { pid: 100 + children.length, unref() {} });
+        children.push(child);
+        spawns.push({ file, args, options });
+        return child;
+      }) as never,
+    });
+    try {
+      const config = readPanelLauncherConfig(home)!;
+      const base = `http://127.0.0.1:${config.port}`;
+      const start = await fetch(`${base}/v1/ensure-running`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${config.token}` },
+      });
+      expect(start.status).toBe(200);
+      expect(spawns).toHaveLength(1);
+      expect(launcherLockHeldAtSpawn).toBe(true);
+      const command = persistentCommandForPlatform(process.platform);
+      expect(spawns[0]).toMatchObject({
+        file: command.executable,
+        args: command.args,
+        options: { detached: true, stdio: "ignore", windowsHide: process.platform === "win32" },
+      });
+
+      // A clean exit is the self-update handoff. The broker waits, probes for
+      // the replacement, then starts one only when the bridge is still absent.
+      children[0].emit("exit", 0);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(spawns).toHaveLength(2);
+
+      children[1].emit("exit", 1);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(spawns).toHaveLength(3);
+
+      // A repeatedly broken install cannot become a hot spawn loop.
+      children[2].emit("exit", 1);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(spawns).toHaveLength(3);
+
+      // Even after the ordinary 90-second launch cooldown, a panel request
+      // must honor the same bounded recovery budget as the timer supervisor.
+      now += 90_001;
+      const exhausted = await fetch(`${base}/v1/ensure-running`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${config.token}` },
+      });
+      expect(exhausted.status).toBe(200);
+      expect(await exhausted.json()).toMatchObject({
+        started: false,
+        recovery_exhausted: true,
+      });
+      const stillExhausted = await fetch(`${base}/v1/ensure-running`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${config.token}` },
+      });
+      expect(stillExhausted.status).toBe(200);
+      expect(await stillExhausted.json()).toMatchObject({
+        started: false,
+        recovery_exhausted: true,
+      });
+      expect(spawns).toHaveLength(3);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("does not duplicate the replacement during a clean self-update handoff", async () => {
+    const { home, source } = fixture();
+    await installPanelLauncher({ home, platform: "linux", brokerSource: source, exec: (() => undefined) as never });
+    let running = false;
+    const children: Array<EventEmitter & { pid?: number; unref: () => void }> = [];
+    const server = await startPanelLauncherBroker(home, {
+      probeImpl: async () => running,
+      recoveryDelayMs: 10,
+      spawnImpl: (() => {
+        const child = Object.assign(new EventEmitter(), { pid: 200 + children.length, unref() {} });
+        children.push(child);
+        return child;
+      }) as never,
+    });
+    try {
+      const config = readPanelLauncherConfig(home)!;
+      await fetch(`http://127.0.0.1:${config.port}/v1/ensure-running`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${config.token}` },
+      });
+      expect(children).toHaveLength(1);
+      children[0].emit("exit", 0);
+      running = true; // the self-restarter's replacement won the bridge first
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(children).toHaveLength(1);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
+describe("persistent broker command", () => {
+  it("uses a hidden cmd child on Windows and npx directly on Linux", () => {
+    expect(persistentCommandForPlatform("win32", { ComSpec: "cmd.exe" })).toEqual({
+      executable: "cmd.exe",
+      args: ["/d", "/c", "npx.cmd -y comfyui-mcp@latest connect"],
+    });
+    expect(persistentCommandForPlatform("linux")).toEqual({
+      executable: "npx",
+      args: ["-y", "comfyui-mcp@latest", "connect"],
+    });
   });
 });
 

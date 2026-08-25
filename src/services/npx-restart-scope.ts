@@ -19,6 +19,8 @@
  * actionable and is not.
  */
 
+const PACKAGE_NAME = "comfyui-mcp";
+
 /**
  * The npx-mode note. `latest` is the version the registry advertises.
  *
@@ -40,9 +42,11 @@ export function npxUpdateNote(latest: string): string {
     `If currentVersion is unchanged the new build is NOT running, but that alone ` +
     `does not say why — a restart that never reached this process, a deliberate ` +
     `version pin, and npx's execution cache serving an older copy all look identical ` +
-    `from here. If you did restart this process and meant to be on the latest, ` +
-    `relaunch once with an explicit comfyui-mcp@latest: that overrides both a pin ` +
-    `and a cached copy, which is what makes it the check worth running (note that ` +
-    `npm cache clean does NOT clear npx's execution cache — a different cache).`
+      `from here. If you did restart this process and meant to be on the latest, ` +
+      `relaunch once with an explicit comfyui-mcp@latest: that overrides both a pin ` +
+      `and a cached copy, which is what makes it the check worth running (note that ` +
+      `npm cache clean does NOT clear npx's execution cache — a different cache).` +
+      ` To escape @latest re-resolution churn, pin a global install instead: ` +
+      `npm i -g ${PACKAGE_NAME}@${latest}, then run ${PACKAGE_NAME} connect.`
   );
 }

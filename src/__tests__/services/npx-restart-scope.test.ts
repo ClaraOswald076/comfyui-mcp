@@ -77,6 +77,12 @@ describe("#1471 the note names the restart that works", () => {
     expect(note).toMatch(/comfyui-mcp@latest/);
   });
 
+  it("offers a pinned global install to escape @latest churn", () => {
+    expect(note).toContain("npm i -g comfyui-mcp@0.51.16");
+    expect(note).toContain("comfyui-mcp connect");
+    expect(note).toMatch(/escape @latest re-resolution churn/i);
+  });
+
   it("names the check, and refuses to over-read its result", () => {
     // The check is real evidence but NOT a diagnosis: an unchanged version cannot
     // distinguish "the restart never reached this process" from "npx relaunched and
