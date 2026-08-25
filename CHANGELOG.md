@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.112] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- resolve connected portable ComfyUI roots safely for git fallback installs (#2261)
+
 ## [0.52.111] - 2026-08-25
 
 ### MCP
