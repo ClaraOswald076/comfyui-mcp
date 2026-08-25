@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.118] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- classify semicolon-form panel transport send failures for reload recovery without replaying the turn (#2286)
+
 ## [0.52.117] - 2026-08-25
 
 ### MCP
