@@ -612,36 +612,72 @@ function stopOwnedPanelLauncherBroker(
 
 function withPanelLauncherLock<T>(home: string, fn: () => T): T | null {
   const paths = panelLauncherPaths(home);
+  const reclaimPath = `${paths.lock}.reclaim`;
   mkdirSync(paths.root, { recursive: true });
   for (let attempt = 0; attempt < 200; attempt += 1) {
-    let fd: number;
     const lockToken = randomBytes(16).toString("hex");
+    let fd: number | undefined;
+    let reclaimFd: number | undefined;
     try {
       fd = openSync(paths.lock, "wx", 0o600);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      let deadOwner = false;
       try {
         const owner = JSON.parse(readFileSync(paths.lock, "utf8")) as { pid?: unknown };
-        const pid = owner.pid;
         if (
-          Number.isInteger(pid) &&
-          Number(pid) > 0 &&
-          Number(pid) <= 0x7fffffff
+          Number.isInteger(owner.pid) &&
+          Number(owner.pid) > 0 &&
+          Number(owner.pid) <= 0x7fffffff
         ) {
           try {
-            process.kill(Number(pid), 0);
+            process.kill(Number(owner.pid), 0);
           } catch (probeError) {
-            if ((probeError as NodeJS.ErrnoException).code === "ESRCH") {
-              rmSync(paths.lock, { force: true });
-            }
+            deadOwner = (probeError as NodeJS.ErrnoException).code === "ESRCH";
           }
         }
       } catch {
-        // The other process may be in the middle of publishing its owner.
-        // Never remove an unreadable lock: failing closed is safer than
-        // overlapping a paused owner.
+        // The other process may be publishing its owner. Fail closed.
       }
-      continue;
+      if (!deadOwner) continue;
+      try {
+        reclaimFd = openSync(reclaimPath, "wx", 0o600);
+        let stillDead = false;
+        try {
+          const current = JSON.parse(readFileSync(paths.lock, "utf8")) as { pid?: unknown };
+          if (
+            Number.isInteger(current.pid) &&
+            Number(current.pid) > 0 &&
+            Number(current.pid) <= 0x7fffffff
+          ) {
+            try {
+              process.kill(Number(current.pid), 0);
+            } catch (probeError) {
+              stillDead = (probeError as NodeJS.ErrnoException).code === "ESRCH";
+            }
+          }
+        } catch {
+          // An incomplete or replaced lock is never reclaimed.
+        }
+        if (stillDead) {
+          rmSync(paths.lock, { force: true });
+          try {
+            fd = openSync(paths.lock, "wx", 0o600);
+          } catch {
+            fd = undefined;
+          }
+        }
+      } catch {
+        // Another reclaimer owns the auxiliary lock, or the lock changed.
+      }
+      if (fd === undefined) {
+        if (reclaimFd !== undefined) {
+          closeSync(reclaimFd);
+          reclaimFd = undefined;
+          rmSync(reclaimPath, { force: true });
+        }
+        continue;
+      }
     }
     writeFileSync(paths.lock, JSON.stringify({ pid: process.pid, token: lockToken }), {
       encoding: "utf8",
@@ -657,6 +693,10 @@ function withPanelLauncherLock<T>(home: string, fn: () => T): T | null {
       } catch {
         // The lock was already removed or became unreadable; do not remove a
         // replacement lock owned by another process.
+      }
+      if (reclaimFd !== undefined) {
+        closeSync(reclaimFd);
+        rmSync(reclaimPath, { force: true });
       }
     }
   }
