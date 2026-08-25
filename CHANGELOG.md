@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.106] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- preserve animated GIF/APNG/WebP media bytes and report unobserved frame advancement (#2248)
+
 ## [0.52.105] - 2026-08-25
 
 ### MCP
