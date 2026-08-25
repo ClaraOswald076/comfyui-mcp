@@ -39,6 +39,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
   comfyuiEnvFilePath,
+  freshEnvValue,
   freshSecretValue,
   freshSecretValues,
   isShellProvided,
@@ -2262,6 +2263,13 @@ export function removeAgentSecret(key: string): SecretRemoveOutcome {
  */
 export function buildComfyuiMcpEnv(base: Record<string, string>): Record<string, string> {
   const secrets = loadComfyuiSecretEnv();
+  // The orchestrator constructs the child env instead of inheriting it. Read
+  // this non-secret configuration value from the same canonical env file as the
+  // rest of the process, so a path added after the orchestrator booted reaches a
+  // panel_reload respawn even when it was never present in the parent's env.
+  // download-cache.ts remains authoritative for path normalization and its
+  // existing volume/containment checks; this forwards the raw configured value.
+  const downloadCacheDir = freshEnvValue("COMFYUI_DOWNLOAD_CACHE_DIR");
   // Which of the injected credentials does the canonical FILE own? Those must be
   // marked so the child treats its inherited copy as file-derived and a later
   // rotate/revoke supersedes it (codex gate, round 1, finding 1). Only a
@@ -2288,6 +2296,9 @@ export function buildComfyuiMcpEnv(base: Record<string, string>): Record<string,
     // writer and reader the same file by construction. Not a secret: a path.
     ...(process.env.COMFYUI_MCP_ENV_FILE
       ? { COMFYUI_MCP_ENV_FILE: process.env.COMFYUI_MCP_ENV_FILE }
+      : {}),
+    ...(downloadCacheDir !== undefined
+      ? { COMFYUI_DOWNLOAD_CACHE_DIR: downloadCacheDir }
       : {}),
     // #873 — THE OPERATOR'S TOOL-SURFACE POLICY, forwarded HERE because this is the one
     // function BOTH comfyui spawn lanes share.

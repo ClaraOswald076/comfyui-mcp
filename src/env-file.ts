@@ -151,6 +151,22 @@ export function resetEnvFileProvenanceForTests(): void {
   fileDerivedKeys.clear();
 }
 
+function freshValueFromParsed(key: string, parsed: Record<string, string> | null): string | undefined {
+  const envValue = process.env[key];
+  if (typeof envValue === "string" && envValue.trim() && !fileDerivedKeys.has(key)) {
+    return envValue;
+  }
+  if (parsed) {
+    const fileValue = parsed[key];
+    if (typeof fileValue === "string" && fileValue.trim()) return fileValue;
+    // A readable file without the key means a file-derived boot value is stale,
+    // not that the old value should be resurrected.
+    if (fileDerivedKeys.has(key)) return undefined;
+  }
+  if (typeof envValue === "string" && envValue.trim()) return envValue;
+  return undefined;
+}
+
 /**
  * Resolve a credential NOW, in precedence order:
  *   1. a REAL environment variable (shell / spawn env) — the escape hatch wins;
@@ -179,18 +195,18 @@ export function freshSecretValue(...keys: string[]): string | undefined {
   // variable still outranks the file.
   const parsed = parseEnvFile();
   for (const k of keys) {
-    const envValue = process.env[k];
-    if (typeof envValue === "string" && envValue.trim() && !fileDerivedKeys.has(k)) return envValue;
-    if (parsed) {
-      const fileValue = parsed[k];
-      if (typeof fileValue === "string" && fileValue.trim()) return fileValue;
-      // The file is readable and does not carry this alias, so a value seeded
-      // from the file at boot is stale — it must not resurrect the credential.
-      if (fileDerivedKeys.has(k)) continue;
-    }
-    if (typeof envValue === "string" && envValue.trim()) return envValue;
+    const value = freshValueFromParsed(k, parsed);
+    if (value !== undefined) return value;
   }
   return undefined;
+}
+
+/** Resolve one non-aliased environment value at access time. The same
+ * real-environment vs canonical-file precedence applies to configuration values
+ * that are not credentials, while a file-derived boot value is still superseded
+ * by a later readable file change. Never logs the value. */
+export function freshEnvValue(key: string): string | undefined {
+  return freshValueFromParsed(key, parseEnvFile());
 }
 
 /** Whether a credential resolves to SOMETHING right now — presence only, so
@@ -215,22 +231,8 @@ export function freshSecretValues(keys: readonly string[]): Record<string, strin
   const parsed = parseEnvFile();
   const out: Record<string, string> = {};
   for (const k of keys) {
-    const envValue = process.env[k];
-    if (typeof envValue === "string" && envValue.trim() && !fileDerivedKeys.has(k)) {
-      out[k] = envValue;
-      continue;
-    }
-    if (parsed) {
-      const fileValue = parsed[k];
-      if (typeof fileValue === "string" && fileValue.trim()) {
-        out[k] = fileValue;
-        continue;
-      }
-      // Readable file without the key: it is genuinely unset, so a stale
-      // boot-seeded value must not resurrect it.
-      if (fileDerivedKeys.has(k)) continue;
-    }
-    if (typeof envValue === "string" && envValue.trim()) out[k] = envValue;
+    const value = freshValueFromParsed(k, parsed);
+    if (value !== undefined) out[k] = value;
   }
   return out;
 }
