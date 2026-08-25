@@ -64,6 +64,11 @@ import {
 } from "../services/manifest-partial.js";
 import { searchPanelNodes } from "../services/manager-node-search.js";
 import { isPanelAnsweredError } from "../services/panel-answered.js";
+import {
+  readWorkflowListReadiness,
+  workflowListReadinessOf,
+  type WorkflowListReadinessRefusal,
+} from "../services/panel-workflow-readiness.js";
 import { isPreExecutorRefusal } from "../services/panel-refusal.js";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { parse as parseYaml } from "yaml";
@@ -3497,6 +3502,34 @@ function carryPanelAnsweredMark(err: unknown, res: ToolResult): ToolResult {
     configurable: true,
   });
   return res;
+}
+
+/** #1785 — preserve the Panel's typed workflow-list readiness refusal across the
+ * bridge-to-ToolResult conversion. The refusal is an explicit answer, not a
+ * silent read failure, and its distinction controls whether a concurrent
+ * re-hello may be treated as successful healing. */
+const WORKFLOW_LIST_READINESS_RESULT = Symbol("panel.workflowListReadinessResult");
+
+function carryWorkflowListReadinessMark(err: unknown, res: ToolResult): ToolResult {
+  if (res?.isError !== true) return res;
+  const refusal = workflowListReadinessOf(err);
+  if (!refusal) return res;
+  Object.defineProperty(res, WORKFLOW_LIST_READINESS_RESULT, {
+    value: refusal,
+    enumerable: false,
+    configurable: true,
+  });
+  return res;
+}
+
+function workflowListReadinessResultOf(
+  res: ToolResult,
+): WorkflowListReadinessRefusal | null {
+  if (res?.isError !== true) return null;
+  const refusal = (res as Record<symbol, unknown>)[WORKFLOW_LIST_READINESS_RESULT];
+  return refusal && typeof refusal === "object"
+    ? readWorkflowListReadiness(refusal)
+    : null;
 }
 
 /** True only for a ToolResult `ctx.call` produced from an error the BRIDGE minted
@@ -8359,6 +8392,16 @@ export type WorkflowFenceRebind =
     }
   /** The panel did not answer, or its reply was not readable. Unknown, not "fine". */
   | { status: "unreadable"; before: FenceRead; detail: string }
+  /** #1785 — the Panel answered that workflow_list itself was not ready. This
+   * is stronger than an unreadable transport failure and weaker than a
+   * successful readiness/list proof: a concurrent re-hello may not turn it
+   * into `healed_by_panel`. */
+  | {
+      status: "readiness_refused";
+      before: FenceRead;
+      detail: string;
+      readiness: WorkflowListReadinessRefusal;
+    }
   /** The panel answered, but no usable identity could be adopted from it. TWO
    *  different facts with different remedies, so they are discriminated rather
    *  than bucketed: `no_uuid` = this panel build exposes no workflow identity at
@@ -8964,6 +9007,17 @@ async function rebindWorkflowFence(
       const res = await ctx.call({ cmd: "workflow_list" }, 6000);
       syncFenceToCurrentTab();
       if (res?.isError) {
+        const readiness = workflowListReadinessResultOf(res);
+        if (readiness) {
+          return {
+            done: {
+              status: "readiness_refused",
+              before,
+              detail: toolResultText(res),
+              readiness,
+            },
+          };
+        }
         return { done: await unreadableOrHealed(ctx, before, toolResultText(res)) };
       }
       parsed = parseToolResultJson(res);
@@ -9486,6 +9540,18 @@ function describeFenceRebind(
           `\n\nWHAT TO DO: call this again — a second attempt is safe and settles it. If it ` +
           `keeps throwing: ${RELOAD_TAB_REMEDY}` +
           `\n\nUNDERLYING CAUSE: ${r.detail}`,
+      };
+    case "readiness_refused":
+      return {
+        binding: "not_recovered",
+        note:
+          ` The panel ANSWERED the workflow_list probe with its typed reconnect-readiness ` +
+          `refusal (${r.readiness.code}): the probe was not run, changed no workflow target, ` +
+          `and the live workflow identity was not ready within the panel's bounded window. ` +
+          `A concurrent re-hello or fence change is not a successful workflow_list proof, so ` +
+          `this call did NOT restore graph binding. Retry after the panel reports readiness, or ` +
+          `use panel_open_workflow(<path>) to explicitly re-establish the tab.` +
+          `\n\nUNDERLYING CAUSE (quoted verbatim): ${r.detail}`,
       };
     case "unreadable":
       // ALWAYS not_recovered, with or without a prior fence (codex gate). The read
@@ -12933,7 +12999,10 @@ export function makePanelToolCtx(
     const res = await callOnce(cmd, timeoutMs, onDispatchedRid, (err) => {
       failure = err;
     });
-    return carryMidCommandDisconnectMark(failure, carryPanelAnsweredMark(failure, res));
+    return carryWorkflowListReadinessMark(
+      failure,
+      carryMidCommandDisconnectMark(failure, carryPanelAnsweredMark(failure, res)),
+    );
   };
   // Human-in-the-loop confirmation for a DESTRUCTIVE op: render a yes/no card in
   // the panel and block on the user's pick. Returns false on decline, timeout, or

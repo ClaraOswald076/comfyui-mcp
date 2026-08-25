@@ -21,6 +21,11 @@ import { resolveLocale, trFor, type Locale } from "../i18n/index.js";
 import { logger } from "../utils/logger.js";
 import { attachPanelAnswered, inheritPanelAnswered } from "./panel-answered.js";
 import { attachPanelRefusal, hasOwnField, readPanelRefusal } from "./panel-refusal.js";
+import {
+  attachWorkflowListReadiness,
+  inheritWorkflowListReadiness,
+  readWorkflowListReadiness,
+} from "./panel-workflow-readiness.js";
 import { midCommandDisconnectMessage } from "./mid-command-remedy.js";
 import {
   describePanelUpdateRecovery,
@@ -3231,7 +3236,17 @@ export class UiBridge {
           const refusal = hasOwnField(msg, "refusal")
             ? readPanelRefusal((msg as { refusal?: unknown }).refusal)
             : null;
-          p.reject(refusal ? attachPanelRefusal(err, refusal) : err);
+          const workflowListReadiness =
+            p.cmd === "workflow_list" && hasOwnField(msg, "workflow_list_readiness")
+              ? readWorkflowListReadiness(
+                  (msg as { workflow_list_readiness?: unknown }).workflow_list_readiness,
+                )
+              : null;
+          let rejected = refusal ? attachPanelRefusal(err, refusal) : err;
+          if (workflowListReadiness) {
+            rejected = attachWorkflowListReadiness(rejected, workflowListReadiness);
+          }
+          p.reject(rejected);
         }
         return;
       }
@@ -5671,7 +5686,8 @@ export class UiBridge {
       // label a talking panel silent and send its user to hard-refresh a healthy
       // tab. PROPAGATED from the source error, never re-derived from the
       // replacement's wording.
-      ctx.reject(friendly ? inheritPanelAnswered(err, friendly) : err);
+      const mapped = friendly ? inheritPanelAnswered(err, friendly) : err;
+      ctx.reject(inheritWorkflowListReadiness(err, mapped));
     };
     const timer = setTimeout(() => {
       this.pending.delete(rid);
