@@ -10,7 +10,7 @@ import {
 import { collectToolCatalog, registerFullTools } from "./tools/index.js";
 import { registerCompactTools } from "./tools/compact.js";
 import { tryInstallRetiredNameRedirect } from "./tools/retired-redirect.js";
-import { logger } from "./utils/logger.js";
+import { configurePersistentLogFile, logger } from "./utils/logger.js";
 import { readPackageVersion } from "./utils/package-version.js";
 import { JobWatcher } from "./services/job-watcher.js";
 import { parseCliArgs, validateConnectUrl, exportExplicitToolMode, type ToolMode } from "./transport/cli.js";
@@ -28,6 +28,7 @@ import {
 } from "./services/advertised-origin.js";
 import { banner, labelRows, numberedSteps } from "./i18n/terminal-layout.js";
 import { STDIO_HANDSHAKE_INSTRUCTIONS } from "./handshake-instructions.js";
+import { orchestratorLogPath } from "./services/orchestrator-log.js";
 
 /** A RunPod proxy can only reach a listener exposed beyond loopback. */
 function advertisedOriginForBind(host: string, port: number): string | undefined {
@@ -524,6 +525,17 @@ async function main() {
   // Standalone background orchestrator: owns the UI bridge and drives the panel
   // with autonomous Agent SDK sessions. Not an MCP server — it never returns.
   if (cli.panelOrchestrator) {
+    // The panel orchestrator is commonly launched from a disposable terminal (and
+    // the panel broker intentionally detaches that terminal). Mirror its existing
+    // stderr logger to a bounded file before URL validation or dynamic imports, so
+    // every connect-mode lifecycle and exit path leaves evidence on disk.
+    const logPath = orchestratorLogPath();
+    if (configurePersistentLogFile(logPath)) {
+      logger.info(`[panel-orchestrator] persistent log enabled at ${logPath}`);
+    } else {
+      logger.warn(`[panel-orchestrator] could not open persistent log at ${logPath}`);
+    }
+
     // `connect <comfyui-url>`: drive a (possibly REMOTE) ComfyUI from an agent on
     // THIS machine. Export the URL as COMFYUI_URL so the orchestrator and the
     // comfyui MCP it spawns target that server — the same remote-URL mechanism the
