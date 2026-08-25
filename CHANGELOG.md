@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.109] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- apply the canonical download cache directory on panel reload (#2255)
+- use portable git checkout arguments for custom-node installs (#2259)
+
 ## [0.52.108] - 2026-08-25
 
 ### MCP
