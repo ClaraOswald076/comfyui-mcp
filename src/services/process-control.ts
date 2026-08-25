@@ -157,10 +157,12 @@ interface ProcessInfo {
   desktopExePath?: string;
   /**
    * The live ComfyUI process's working directory, captured at gather-time while
-   * the process is still ALIVE (a known-good moment). Used to resolve a RELATIVE
-   * launch script (`python main.py`) to an absolute path so relaunch works
-   * regardless of the orchestrator's own cwd — and, crucially, still resolves
-   * after the stop kills the pid (when `/proc/<pid>/cwd` is gone) (#535).
+   * the process is still ALIVE (a known-good moment). This may come from the
+   * server's own `/system_stats` report, `/proc/<pid>/cwd`, or the bounded
+   * process-observation fallback. Used to resolve a RELATIVE launch script
+   * (`python main.py`) to an absolute path so relaunch works regardless of the
+   * orchestrator's own cwd — and, crucially, still resolves after the stop kills
+   * the pid (when `/proc/<pid>/cwd` is gone) (#535/#2260).
    */
   liveCwd?: string;
   /**
@@ -1859,6 +1861,20 @@ function resolveLiveProcessCwd(pid: number): string | undefined {
 }
 
 /**
+ * `/system_stats` reports the server's actual working directory on recent
+ * ComfyUI builds. Accept only an absolute path: a relative value would be
+ * relative to this MCP process after the old server is stopped, which is the
+ * exact ambiguity the restart preflight refuses to guess through (#2260).
+ * Windows drive and UNC paths are recognized even when a cross-platform test
+ * harness is exercising the parser on a POSIX host.
+ */
+function reportedServerCwd(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const cwd = raw.trim();
+  return cwd && isAbsolutePath(cwd) ? cwd : undefined;
+}
+
+/**
  * The live process's working directory, reconstructed from the OS process
  * observation rather than from procfs (#535) — the Windows path, where
  * `/proc/<pid>/cwd` does not exist.
@@ -3006,6 +3022,7 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
   };
 
   let argv: string[] = [];
+  let serverCwd: string | undefined;
   let pid: number | null = null;
   let ownerStartedAt: string | undefined;
   let bracketed = false;
@@ -3026,8 +3043,10 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
       try {
         const stats = await getSystemStats();
         argv = stats.system.argv ?? [];
+        serverCwd = reportedServerCwd(stats.system.cwd);
       } catch {
         argv = [];
+        serverCwd = undefined;
         logger.warn("Could not fetch system_stats — will rely on PID detection");
       }
       const after = observeOwner();
@@ -3156,7 +3175,9 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
   // interpreter lives in.
   const liveCwd = desktop
     ? undefined
-    : (resolveLiveProcessCwd(pid) ?? observedLiveCwd(pid, argv, ownerStartedAt));
+    : (resolveLiveProcessCwd(pid) ??
+      serverCwd ??
+      observedLiveCwd(pid, argv, ownerStartedAt));
   // Same live-only window for the ENVIRONMENT (#776): read it now, while the pid
   // is guaranteed alive, so a relaunch can reproduce the launcher environment the
   // server was actually started with instead of substituting the orchestrator's.

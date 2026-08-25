@@ -187,6 +187,13 @@ const EMBEDDED_ROOT = resolve("ComfyUI_embedded");
 const EMBEDDED_MAIN = join(EMBEDDED_ROOT, "main.py");
 const EMBEDDED_PYTHON_DIR = join(EMBEDDED_ROOT, "python");
 const EMBEDDED_PYTHON = join(EMBEDDED_ROOT, "python", "python.exe");
+// #2260: the stock Windows portable bundle keeps its embedded interpreter beside
+// the inner ComfyUI checkout. The launcher may `cd ComfyUI` before invoking bare
+// `main.py`, so the server cwd is the only direct anchor for that script.
+const PORTABLE_BUNDLE_ROOT = resolve("ComfyUI_windows_portable");
+const PORTABLE_SERVER_ROOT = join(PORTABLE_BUNDLE_ROOT, "ComfyUI");
+const PORTABLE_MAIN = join(PORTABLE_SERVER_ROOT, "main.py");
+const PORTABLE_PYTHON = join(PORTABLE_BUNDLE_ROOT, "python_embeded", "python.exe");
 
 const ORIGINAL_ENV = { ...process.env };
 
@@ -477,6 +484,94 @@ describe("restart_comfyui — live-first script resolution (#476, #426)", () => 
       expect(exe).toBe(EMBEDDED_PYTHON);
       expect(args[0]).toBe(EMBEDDED_MAIN);
       expect((opts as { cwd?: string }).cwd).toBe(EMBEDDED_ROOT);
+
+      killSpy.mockRestore();
+    },
+  );
+
+  winIt(
+    "#2260: anchors bare main.py from the stock portable server cwd",
+    async () => {
+      // The stock bundle is <bundle>\\python_embeded\\python.exe plus
+      // <bundle>\\ComfyUI\\main.py. Its launcher can enter the inner checkout
+      // before invoking bare main.py, which the shared live-root resolver
+      // deliberately cannot infer from the sibling interpreter alone.
+      mockResolveBase.mockReturnValue(undefined);
+      mockLiveRootFromArgv.mockReturnValue(undefined);
+      mockGetSystemStats.mockResolvedValue({
+        system: {
+          argv: ["main.py", "--port", "8188"],
+          cwd: PORTABLE_SERVER_ROOT,
+        },
+      });
+      mockExistsSync.mockImplementation((p: string) => {
+        const value = String(p);
+        return value === PORTABLE_MAIN || value === PORTABLE_PYTHON;
+      });
+      mockFindComfyuiPython.mockReturnValue(PORTABLE_PYTHON);
+      __processControlTestHooks.setLiveCwdResolver(() => undefined);
+      mockResolveLiveServerRoot.mockReturnValue({ source: "unresolved" });
+      __processControlTestHooks.setProcessIdentityResolver(() => ({
+        startedAt: "stable-stamp",
+        commandLine: `"${PORTABLE_PYTHON}" main.py --port 8188`,
+        argv: [PORTABLE_PYTHON, "main.py", "--port", "8188"],
+        argvFidelity: "exact",
+      }));
+      mockLivePortThenFree();
+      mockSpawn.mockImplementation(() => new FakeChild());
+      vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true }) as Response));
+      const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+      const result = await restartComfyUI();
+
+      expect(result.message).not.toMatch(/refusing to restart/i);
+      expect(result.stopped).toBe(true);
+      expect(result.started).toBe(true);
+      expect(mockFindComfyuiPython).toHaveBeenCalledWith(
+        PORTABLE_SERVER_ROOT,
+        ["main.py", "--port", "8188"],
+      );
+      const [exe, args, opts] = mockSpawn.mock.calls[0];
+      expect(exe).toBe(PORTABLE_PYTHON);
+      expect(args[0]).toBe(PORTABLE_MAIN);
+      expect((opts as { cwd?: string }).cwd).toBe(PORTABLE_SERVER_ROOT);
+
+      killSpy.mockRestore();
+    },
+  );
+
+  winIt(
+    "#2260: keeps refusing the sibling-interpreter layout without an absolute reported cwd",
+    async () => {
+      mockResolveBase.mockReturnValue(undefined);
+      mockLiveRootFromArgv.mockReturnValue(undefined);
+      mockGetSystemStats.mockResolvedValue({
+        // A relative cwd is no safer than no cwd after the old process is
+        // stopped: it would be interpreted relative to the MCP process.
+        system: { argv: ["main.py", "--port", "8188"], cwd: "ComfyUI" },
+      });
+      mockExistsSync.mockImplementation((p: string) => {
+        const value = String(p);
+        return value === PORTABLE_MAIN || value === PORTABLE_PYTHON;
+      });
+      mockFindComfyuiPython.mockReturnValue(PORTABLE_PYTHON);
+      mockResolveLiveServerRoot.mockReturnValue({ source: "unresolved" });
+      __processControlTestHooks.setProcessIdentityResolver(() => ({
+        startedAt: "stable-stamp",
+        commandLine: `"${PORTABLE_PYTHON}" main.py --port 8188`,
+        argv: [PORTABLE_PYTHON, "main.py", "--port", "8188"],
+        argvFidelity: "exact",
+      }));
+      mockLivePortThenFree();
+      const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+      const result = await restartComfyUI();
+
+      expect(result.message).toMatch(/refusing to restart/i);
+      expect(result.stopped).toBe(false);
+      expect(result.started).toBe(false);
+      expect(mockSpawn).not.toHaveBeenCalled();
+      expect(killSpy).not.toHaveBeenCalled();
 
       killSpy.mockRestore();
     },
