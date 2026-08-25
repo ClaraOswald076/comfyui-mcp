@@ -21628,6 +21628,10 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
             // "viewRef" for a ComfyUI reference whose media kind only the
             // client's own classifier decides.
             kind: typeof r.kind === "string" ? r.kind : "(unknown)",
+            // The animated-media diagnostic may only claim bytes were
+            // dispatched when this exact item carried the data URL. A
+            // filename-only viewRef is not proof that this process sent bytes.
+            inline: typeof r.dataUrl === "string",
           })) satisfies DispatchedMediaItem[],
         );
         // Why an item the caller passed as a PATH came back described as a

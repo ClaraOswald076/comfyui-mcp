@@ -27,13 +27,15 @@ function makeCtx(): { ctx: PanelToolCtx; calls: Forwarded[] } {
   return { ctx, calls };
 }
 
-async function showMedia(path: string): Promise<{ res: ToolResult; calls: Forwarded[] }> {
+async function showMedia(items: Array<Record<string, unknown>>): Promise<{ res: ToolResult; calls: Forwarded[] }> {
   const def = buildPanelToolDefs().find((d) => d.name === "panel_show_media");
   if (!def) throw new Error("panel_show_media not found");
   const { ctx, calls } = makeCtx();
-  const res = (await def.handler({ items: [{ source: { path } }] }, ctx)) as ToolResult;
+  const res = (await def.handler({ items }, ctx)) as ToolResult;
   return { res, calls };
 }
+
+const textOf = (res: ToolResult): string => res.content.map((c) => ("text" in c ? c.text : "")).join("\n");
 
 const cases = [
   [".gif", "image/gif", Buffer.from("GIF89a\x00animated-frame-data", "binary")],
@@ -56,7 +58,7 @@ describe("#2248 animated image delivery", () => {
     const path = join(root, `animated${ext}`);
     writeFileSync(path, bytes);
 
-    const { res, calls } = await showMedia(path);
+    const { res, calls } = await showMedia([{ source: { path } }]);
     expect(res.isError).toBeFalsy();
 
     const command = calls.find((call) => call.cmd === "show_media");
@@ -64,6 +66,20 @@ describe("#2248 animated image delivery", () => {
     const item = (command!.items as Array<Record<string, unknown>>)[0];
     expect(item.kind).toBe("image");
     expect(item.dataUrl).toBe(`data:${mime};base64,${bytes.toString("base64")}`);
+  });
+
+  it("reports frame uncertainty for inline bytes, not a filename-only viewRef", async () => {
+    const inlinePath = join(root, "inline.gif");
+    writeFileSync(inlinePath, Buffer.from("GIF89a\x00animated-frame-data", "binary"));
+    const inline = await showMedia([{ source: { path: inlinePath } }]);
+    expect(textOf(inline.res)).toContain("Animated GIF/APNG/WebP bytes were dispatched");
+
+    const reference = await showMedia([{ source: { filename: "remote.gif", type: "output" } }]);
+    const command = reference.calls.find((call) => call.cmd === "show_media");
+    const item = (command!.items as Array<Record<string, unknown>>)[0];
+    expect(item.kind).toBe("viewRef");
+    expect(item.dataUrl).toBeUndefined();
+    expect(textOf(reference.res)).not.toContain("Animated GIF/APNG/WebP bytes were dispatched");
   });
 
   it.each([".gif", ".apng", ".webp"])("classifies %s view references as images", (ext) => {

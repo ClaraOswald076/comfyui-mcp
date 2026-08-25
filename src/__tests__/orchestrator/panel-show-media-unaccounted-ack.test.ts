@@ -127,9 +127,9 @@ describe("#2010 an unaccounted reply no longer answers with the client's claim",
 
   it("calls out unobserved animation for GIF/APNG/WebP items", () => {
     const animated = [
-      { filename: "clip.gif", kind: "image" },
-      { filename: "clip.apng", kind: "image" },
-      { filename: "clip.webp", kind: "image" },
+      { filename: "clip.gif", kind: "image", inline: true },
+      { filename: "clip.apng", kind: "image", inline: true },
+      { filename: "clip.webp", kind: "image", inline: true },
     ];
     expect(unaccountedShowMediaNote(animated, readShowMediaAck(MOBILE_REPLY, animated.length))).toMatch(
       /GIF\/APNG\/WebP bytes were dispatched.*frames advanced beyond the first frame/,
