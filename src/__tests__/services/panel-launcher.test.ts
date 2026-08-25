@@ -271,10 +271,11 @@ describe("panel launcher install", () => {
 
     try {
       spawned.length = 0;
-      await installPanelLauncher({ home, platform: "win32", brokerSource: source, exec: denied, spawnImpl: record });
+      await installPanelLauncher({ home, platform: "win32", nodePath: "new-node", brokerSource: source, exec: denied, spawnImpl: record });
       expect(spawned, "second install spawned a rival broker").toEqual([]);
       // …and the install must not have erased the pid for the NEXT one either.
       expect(readPanelLauncherConfig(home)?.pid).toBe(process.pid);
+      expect(readPanelLauncherConfig(home)?.broker_executable).toBe(cfg.broker_executable);
       spawned.length = 0;
       await installPanelLauncher({ home, platform: "win32", brokerSource: source, exec: denied, spawnImpl: record });
       expect(spawned, "third install spawned a rival broker").toEqual([]);
@@ -732,6 +733,19 @@ describe("panel launcher install", () => {
 });
 
 describe("panel launcher broker", () => {
+  it("requires command-line identity for an installed broker", async () => {
+    const { home, source } = fixture();
+    await installPanelLauncher({ home, platform: "linux", brokerSource: source, exec: (() => undefined) as never });
+    const config = readPanelLauncherConfig(home)!;
+    await expect(startPanelLauncherBroker(home, {
+      enforceCommandIdentity: true,
+      expectedBrokerId: config.broker_id,
+    })).rejects.toThrow("install generation is missing");
+    await expect(startPanelLauncherBroker(home, {
+      enforceCommandIdentity: true,
+    })).rejects.toThrow("broker identity is missing");
+  });
+
   it("binds loopback and rejects requests without the private bearer token", async () => {
     const { home, source } = fixture();
     await installPanelLauncher({

@@ -236,7 +236,12 @@ export async function installPanelLauncher(
       ? previous.install_id
       : randomBytes(24).toString("base64url");
     const brokerId = previous?.broker_id ?? randomBytes(24).toString("base64url");
-    const brokerExecutable = nodePath;
+    // Keep the executable evidence paired with a live recorded PID. The
+    // service scripts may adopt the new node path for a future restart, but
+    // uninstall must still identify the currently answering old broker.
+    const brokerExecutable = previousLive.running && previous?.broker_executable
+      ? previous.broker_executable
+      : nodePath;
     let needsFallbackBroker = false;
 
   /**
@@ -1220,6 +1225,8 @@ export type PanelLauncherBrokerOptions = {
   /** Identity supplied by the installed command line; absent for in-process tests/legacy launchers. */
   expectedBrokerId?: string;
   expectedInstallId?: string;
+  /** The installed broker entrypoint requires its command-line identity. */
+  enforceCommandIdentity?: boolean;
 };
 
 export async function startPanelLauncherBroker(
@@ -1236,8 +1243,14 @@ export async function startPanelLauncherBroker(
   // Older installs may not have a marker yet. Persist one as part of this
   // broker's runtime publication so future uninstall can fail closed.
   const brokerId = current.broker_id ?? randomBytes(24).toString("base64url");
+  if (options.enforceCommandIdentity && !options.expectedBrokerId) {
+    throw new Error("Panel launcher broker identity is missing from startup command");
+  }
   if (options.expectedBrokerId !== undefined && brokerId !== options.expectedBrokerId) {
     throw new Error("Panel launcher broker identity changed before startup");
+  }
+  if (options.enforceCommandIdentity && current.install_id !== undefined && !options.expectedInstallId) {
+    throw new Error("Panel launcher install generation is missing from startup command");
   }
   if (options.expectedInstallId !== undefined && current.install_id !== options.expectedInstallId) {
     throw new Error("Panel launcher install generation changed before startup");
@@ -1423,6 +1436,7 @@ export async function startPanelLauncherBroker(
     {
       ...(readPanelLauncherConfig(home) ?? runtimeConfig),
       broker_id: brokerId,
+      broker_executable: process.execPath,
       port: address.port,
       pid: process.pid,
       updated_at: new Date().toISOString(),
@@ -1487,6 +1501,7 @@ if (invokedPath === "broker.mjs" && process.argv[2] === "run") {
   startPanelLauncherBroker(undefined, {
     expectedBrokerId: brokerArg?.slice("--broker-id=".length),
     expectedInstallId: installArg?.slice("--install-id=".length),
+    enforceCommandIdentity: true,
   }).catch((error) => {
     process.stderr.write(`ComfyUI MCP launcher failed: ${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;
