@@ -21249,7 +21249,10 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           caption?: string;
         }>;
 
-        const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
+        // APNG is an image container just like GIF/WebP. Keep the original
+        // bytes in the data URL: the downstream client decides whether it can
+        // advance the animation, while this producer must not flatten it.
+        const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".apng", ".webp"]);
         // #811 — this used to be just {.mp4, .webm}, narrower than what this
         // codebase ALREADY treats as video elsewhere: get_image's
         // action:"list_outputs" documents ".mp4/.webm/.mov/.mkv/.m4v/.avi", and
