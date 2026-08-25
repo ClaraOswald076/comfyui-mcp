@@ -636,11 +636,16 @@ describe("the shipped launcher rescues a real cold start (#1447)", () => {
     "answers the handshake while the install is still running, then serves the real tools",
     async () => {
       const log = join(stubDir, "rescue-log.txt");
-      // A first run: `npm config get cache` names a cache with no _npx, so the
-      // deadline is the floor and does NOT depend on the budget we assume. The
-      // stand-in server cannot answer for 4 s — the reported failure exactly.
+      // A first run: `npm config get cache` names a cache with no _npx.
+      //
+      // The budget here is a GENEROUS 30 s on purpose. If the launcher ignored
+      // the cache answer and used the cached branch, the deadline would be
+      // 12 s, the stand-in server would answer first at 4 s, and the handshake
+      // below would carry version 9.9.9 instead of the sentinel — so this test
+      // fails if the cache probe is ever left dead in production.
+      const started = Date.now();
       const client = launch({
-        MCP_TIMEOUT: "3000",
+        MCP_TIMEOUT: "30000",
         NPM_STUB_CACHE: coldCache,
         FAKE_DELAY_MS: "4000",
         FAKE_LOG: log,
@@ -650,6 +655,8 @@ describe("the shipped launcher rescues a real cold start (#1447)", () => {
       const handshake = (await waitFor(() => parseAll(client.stdout).find((f) => f.id === 1), 12000)) as {
         result: { serverInfo: { version: string }; capabilities: { tools: { listChanged: boolean } } };
       };
+      // …and it beat the server rather than merely differing from it.
+      expect(Date.now() - started).toBeLessThan(3500);
       expect(handshake.result.serverInfo.version).toBe(launcher.INSTALLING_VERSION);
       expect(handshake.result.capabilities.tools.listChanged).toBe(true);
 
