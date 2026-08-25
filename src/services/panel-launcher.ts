@@ -30,6 +30,12 @@ export const DEFAULT_PANEL_BRIDGE_PORT = 9199;
 /** Pre-#2030 default. Logitech G HUB (`lghub_agent`) occupies 9180 on many desktops. */
 export const LEGACY_PANEL_BRIDGE_PORT = 9180;
 
+/** The broker must not hand the orchestrator the broker's own login terminal. */
+export const ORCHESTRATOR_RECOVERY_DELAY_MS = 15_000;
+/** A broken install must not turn the login broker into an unbounded spawn loop. */
+export const ORCHESTRATOR_RECOVERY_MAX_ATTEMPTS = 3;
+export const ORCHESTRATOR_RECOVERY_WINDOW_MS = 5 * 60_000;
+
 export type PanelLauncherConfig = {
   protocol: 1;
   host: "127.0.0.1";
@@ -588,9 +594,52 @@ export async function probeAnyPanelOrchestrator(timeoutMs = 1200): Promise<boole
   return probePanelOrchestrator(LEGACY_PANEL_BRIDGE_PORT, timeoutMs);
 }
 
-export type TerminalLaunch = { process?: ChildProcess; pid?: number; platform: NodeJS.Platform };
+export type TerminalLaunch = {
+  process?: ChildProcess;
+  pid?: number;
+  platform: NodeJS.Platform;
+  interactive?: boolean;
+};
 
 export type TerminalCommand = { executable: string; args: string[] };
+
+/**
+ * Command used by the installed broker. Unlike terminalCommandForPlatform(),
+ * this is deliberately a headless child: the broker is the persistent login
+ * companion, so the orchestrator must not inherit a disposable terminal or its
+ * console-death semantics. `cmd /c` is used on Windows because npx is a .cmd
+ * shim and the scheduled-task/Startup environment does not guarantee a shell.
+ */
+export function persistentCommandForPlatform(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): TerminalCommand {
+  if (platform === "win32") {
+    return {
+      executable: env.ComSpec || "cmd.exe",
+      args: ["/d", "/c", "npx.cmd -y comfyui-mcp@latest connect"],
+    };
+  }
+  return {
+    executable: "npx",
+    args: ["-y", "comfyui-mcp@latest", "connect"],
+  };
+}
+
+export function launchPersistentMcp(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+  spawnImpl: typeof spawn = spawn,
+): TerminalLaunch {
+  const command = persistentCommandForPlatform(platform, env);
+  const child = spawnImpl(command.executable, command.args, {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: platform === "win32",
+  });
+  child.unref?.();
+  return { process: child, pid: child.pid, platform, interactive: false };
+}
 
 export function terminalCommandForPlatform(
   platform: NodeJS.Platform = process.platform,
@@ -633,11 +682,11 @@ export function launchMcpTerminal(platform: NodeJS.Platform = process.platform):
     windowsHide: false,
   });
   child.unref();
-  return { process: child, pid: child.pid, platform };
+  return { process: child, pid: child.pid, platform, interactive: true };
 }
 
 function minimizeOwnedTerminal(launch: TerminalLaunch | null): boolean {
-  if (!launch?.pid || launch.platform !== "win32") return false;
+  if (!launch?.pid || launch.interactive !== true || launch.platform !== "win32") return false;
   try {
     const script =
       `$p=Get-Process -Id ${launch.pid} -ErrorAction SilentlyContinue;` +
@@ -663,24 +712,103 @@ function jsonResponse(res: import("node:http").ServerResponse, status: number, b
   res.end(data);
 }
 
-export async function startPanelLauncherBroker(home: string = homedir()): Promise<Server> {
+export type PanelLauncherBrokerOptions = {
+  /** Test seams; the installed broker calls this with no options. */
+  spawnImpl?: typeof spawn;
+  probeImpl?: () => Promise<boolean>;
+  now?: () => number;
+  recoveryDelayMs?: number;
+  recoveryMaxAttempts?: number;
+};
+
+export async function startPanelLauncherBroker(
+  home: string = homedir(),
+  options: PanelLauncherBrokerOptions = {},
+): Promise<Server> {
   const current = readPanelLauncherConfig(home);
+  const spawnBroker = options.spawnImpl ?? spawn;
+  const probe = options.probeImpl ?? (() => probeAnyPanelOrchestrator());
+  const now = options.now ?? (() => Date.now());
+  const recoveryDelayMs = options.recoveryDelayMs ?? ORCHESTRATOR_RECOVERY_DELAY_MS;
+  const recoveryMaxAttempts = options.recoveryMaxAttempts ?? ORCHESTRATOR_RECOVERY_MAX_ATTEMPTS;
   if (!current) throw new Error("Panel launcher is not installed or its config is invalid");
   let launch: TerminalLaunch | null = null;
   let lastLaunchAt = 0;
+  let recoveryTimer: NodeJS.Timeout | null = null;
+  let recoveryWindowStarted = 0;
+  let recoveryAttempts = 0;
   let starting: Promise<{ already_running: boolean; started: boolean }> | null = null;
-  const ensureRunning = () => {
+
+  const resetRecoveryBudget = () => {
+    recoveryWindowStarted = 0;
+    recoveryAttempts = 0;
+  };
+
+  const scheduleRecovery = (exitCode: number | null) => {
+    if (recoveryTimer) return;
+    const currentTime = now();
+    if (!recoveryWindowStarted || currentTime - recoveryWindowStarted >= ORCHESTRATOR_RECOVERY_WINDOW_MS) {
+      recoveryWindowStarted = currentTime;
+      recoveryAttempts = 0;
+    }
+    if (recoveryAttempts >= recoveryMaxAttempts) return;
+    // A clean exit is the normal self-update handoff. Give the replacement npx
+    // process time to resolve/install and bind before deciding it needs help.
+    const delay = exitCode === 0 ? recoveryDelayMs : Math.min(recoveryDelayMs, 5_000);
+    recoveryTimer = setTimeout(() => {
+      recoveryTimer = null;
+      if (recoveryAttempts >= recoveryMaxAttempts) return;
+      recoveryAttempts += 1;
+      // The failed child is no longer the launch in progress. This retry is
+      // explicitly allowed through the ordinary launch cooldown.
+      lastLaunchAt = 0;
+      void ensureRunning(true).catch(() => {
+        // The next panel request can retry after the normal cooldown. A broker
+        // must never become an unbounded error/spawn loop on a broken install.
+      });
+    }, delay);
+    recoveryTimer.unref?.();
+  };
+
+  const watchLaunch = (started: TerminalLaunch) => {
+    const child = started.process;
+    if (!child) return;
+    const onExit = (exitCode: number | null) => {
+      if (launch?.process !== child) return;
+      launch = null;
+      scheduleRecovery(exitCode);
+    };
+    child.once("exit", onExit);
+    child.once("error", () => onExit(null));
+  };
+
+  const ensureRunning = (fromRecovery = false) => {
     if (!starting) {
-      starting = probeAnyPanelOrchestrator().then((running) => {
+      starting = probe().then((running) => {
         if (running) {
           lastLaunchAt = 0;
+          if (recoveryTimer) {
+            clearTimeout(recoveryTimer);
+            recoveryTimer = null;
+          }
+          resetRecoveryBudget();
           return { already_running: true, started: false };
         }
-        if (lastLaunchAt && Date.now() - lastLaunchAt < 90_000) {
+        if (!fromRecovery && lastLaunchAt && now() - lastLaunchAt < 90_000) {
           return { already_running: false, started: false, start_in_progress: true };
         }
-        launch = launchMcpTerminal();
-        lastLaunchAt = Date.now();
+        lastLaunchAt = now();
+        try {
+          const started = launchPersistentMcp(process.platform, process.env, spawnBroker);
+          launch = started;
+          watchLaunch(started);
+        } catch (error) {
+          // Treat a spawn refusal like an immediate child failure: surface the
+          // current request's error, but let the bounded supervisor make a few
+          // delayed recovery attempts instead of hot-looping on every panel poll.
+          scheduleRecovery(null);
+          throw error;
+        }
         return { already_running: false, started: true };
       }).finally(() => {
         starting = null;

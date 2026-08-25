@@ -1,10 +1,12 @@
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   installPanelLauncher,
+  persistentCommandForPlatform,
   panelLauncherPaths,
   readPanelLauncherConfig,
   startPanelLauncherBroker,
@@ -506,6 +508,100 @@ describe("panel launcher broker", () => {
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+
+  it("launches headlessly and bounds recovery after child exits", async () => {
+    const { home, source } = fixture();
+    await installPanelLauncher({ home, platform: "linux", brokerSource: source, exec: (() => undefined) as never });
+    const children: Array<EventEmitter & { pid?: number; unref: () => void }> = [];
+    const spawns: Array<{ file: string; args: readonly string[]; options: Record<string, unknown> }> = [];
+    const server = await startPanelLauncherBroker(home, {
+      probeImpl: async () => false,
+      recoveryDelayMs: 10,
+      recoveryMaxAttempts: 2,
+      spawnImpl: ((file: string, args: readonly string[], options: Record<string, unknown>) => {
+        const child = Object.assign(new EventEmitter(), { pid: 100 + children.length, unref() {} });
+        children.push(child);
+        spawns.push({ file, args, options });
+        return child;
+      }) as never,
+    });
+    try {
+      const config = readPanelLauncherConfig(home)!;
+      const base = `http://127.0.0.1:${config.port}`;
+      const start = await fetch(`${base}/v1/ensure-running`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${config.token}` },
+      });
+      expect(start.status).toBe(200);
+      expect(spawns).toHaveLength(1);
+      const command = persistentCommandForPlatform(process.platform);
+      expect(spawns[0]).toMatchObject({
+        file: command.executable,
+        args: command.args,
+        options: { detached: true, stdio: "ignore", windowsHide: process.platform === "win32" },
+      });
+
+      // A clean exit is the self-update handoff. The broker waits, probes for
+      // the replacement, then starts one only when the bridge is still absent.
+      children[0].emit("exit", 0);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(spawns).toHaveLength(2);
+
+      children[1].emit("exit", 1);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(spawns).toHaveLength(3);
+
+      // A repeatedly broken install cannot become a hot spawn loop.
+      children[2].emit("exit", 1);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(spawns).toHaveLength(3);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("does not duplicate the replacement during a clean self-update handoff", async () => {
+    const { home, source } = fixture();
+    await installPanelLauncher({ home, platform: "linux", brokerSource: source, exec: (() => undefined) as never });
+    let running = false;
+    const children: Array<EventEmitter & { pid?: number; unref: () => void }> = [];
+    const server = await startPanelLauncherBroker(home, {
+      probeImpl: async () => running,
+      recoveryDelayMs: 10,
+      spawnImpl: (() => {
+        const child = Object.assign(new EventEmitter(), { pid: 200 + children.length, unref() {} });
+        children.push(child);
+        return child;
+      }) as never,
+    });
+    try {
+      const config = readPanelLauncherConfig(home)!;
+      await fetch(`http://127.0.0.1:${config.port}/v1/ensure-running`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${config.token}` },
+      });
+      expect(children).toHaveLength(1);
+      children[0].emit("exit", 0);
+      running = true; // the self-restarter's replacement won the bridge first
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(children).toHaveLength(1);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
+describe("persistent broker command", () => {
+  it("uses a hidden cmd child on Windows and npx directly on Linux", () => {
+    expect(persistentCommandForPlatform("win32", { ComSpec: "cmd.exe" })).toEqual({
+      executable: "cmd.exe",
+      args: ["/d", "/c", "npx.cmd -y comfyui-mcp@latest connect"],
+    });
+    expect(persistentCommandForPlatform("linux")).toEqual({
+      executable: "npx",
+      args: ["-y", "comfyui-mcp@latest", "connect"],
+    });
   });
 });
 
