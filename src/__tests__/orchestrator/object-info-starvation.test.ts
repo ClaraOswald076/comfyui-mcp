@@ -213,8 +213,8 @@ describe("panel_edit_node restores a collapsed zero height before dispatch (#200
   });
 });
 
-describe("panel_set_widget names object_info starvation (#2004)", () => {
-  it("THE REPORTED CASE: keeps the refusal and says this is a timeout, not a missing node", async () => {
+describe("panel_set_widget preserves object_info starvation refusal (#2004, #2274)", () => {
+  it("THE REPORTED CASE: keeps the refusal when refresh recovery is not authoritative", async () => {
     const calls: Forwarded[] = [];
     const ctx: PanelToolCtx = {
       call: async (cmd) => {
@@ -235,11 +235,11 @@ describe("panel_set_widget names object_info starvation (#2004)", () => {
     expect(res.isError).toBe(true);
     const text = textOf(res);
     expect(text).toContain(STARVATION);
-    expect(text).toMatch(/refresh TIMEOUT, not a missing node/i);
-    expect(text).toMatch(/already on the canvas/i);
-    expect(text).toMatch(/Do NOT reinstall a pack/);
-    // The refusal is pre-mutation — do not re-issue a write that will pay the same 15s.
+    expect(text).toMatch(/panel_refresh_nodes did not return an authoritative refreshed:true/i);
+    expect(text).toMatch(/nothing was written/i);
+    // The refusal is pre-mutation — do not re-issue a write without a proven schema.
     expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(1);
+    expect(calls.filter((c) => c.cmd === "refresh_nodes")).toHaveLength(1);
   });
 
   it("an unrelated set_widget refusal is not wrapped as starvation", async () => {

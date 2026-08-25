@@ -5,17 +5,18 @@
 // mutations_ready=true, then panel_add_node("LoadImage"), panel_refresh_nodes,
 // and panel_set_widget all fail because /object_info did not answer inside the
 // panel's fixed 10s/5s shares. The canvas is readable; schema-guarded edits are
-// not. refresh_nodes also CLEARS the last-known schema, so calling it as the
-// recovery makes the next widget write worse — except for #2202's stale-combo
-// timeout, where the panel has already retired that snapshot and a refresh is
-// the safe way to restore it for later unrelated writes.
+// not. panel_add_node still avoids refresh_nodes after a generic budget miss,
+// while #2274 gives panel_set_widget a stricter shared refresh path: it retries
+// only after an authoritative refreshed:true result and otherwise remains refused.
+// #2202's stale-combo timeout continues to use its narrower refresh recovery.
 //
 // These drive the real tool defs. The panel's 5s/10s shares live in the other
-// repo; this process can still (1) retry a before-create/before-write refusal
-// without dispatching refresh_nodes, (2) stop advertising mutations_ready:true
-// once that refusal has been observed, and (3) reserve refresh_nodes for the
-// acknowledged #2202 stale-combo timeout where the panel has already retired
-// its schema snapshot.
+// repo; this process can still (1) retry a before-create refusal without
+// dispatching refresh_nodes, (2) share one bounded authoritative refresh for
+// panel_set_widget's #2274 recovery, (3) stop advertising mutations_ready:true
+// once a schema refusal has been observed, and (4) reserve refresh_nodes for the
+// acknowledged #2202 stale-combo timeout where the panel has already
+// retired its schema snapshot.
 
 import { beforeEach, describe, expect, it } from "vitest";
 
@@ -203,13 +204,14 @@ describe("panel_add_node retries a schema-budget refusal without refresh_nodes (
   });
 });
 
-describe("panel_set_widget retries a schema-budget refusal (#2007)", () => {
+describe("panel_set_widget shares schema refresh recovery (#2007, #2274)", () => {
   it("THE REPORTED CASE: share-timeout write then succeeds on the retry", async () => {
     let writes = 0;
     const { res, calls, text } = await callTool(
       "panel_set_widget",
       { node_id: 12, widget: "text", value: "hello" },
       async (cmd) => {
+        if (cmd.cmd === "refresh_nodes") return { refreshed: true };
         if (cmd.cmd !== "graph_set_widget") return { ok: true };
         writes += 1;
         if (writes === 1) throw new Error(SET_WIDGET_BUDGET);
@@ -219,11 +221,11 @@ describe("panel_set_widget retries a schema-budget refusal (#2007)", () => {
 
     expect(res.isError).toBeFalsy();
     expect(calls.filter((c) => c === "graph_set_widget")).toHaveLength(2);
-    expect(calls).not.toContain("refresh_nodes");
+    expect(calls).toEqual(["graph_set_widget", "refresh_nodes", "graph_set_widget"]);
     expect(text).not.toMatch(/no whole schema/);
   });
 
-  it("retries EXACTLY once and says not to refresh_nodes", async () => {
+  it("refuses when the shared refresh does not return an authoritative schema", async () => {
     const { res, calls, text } = await callTool(
       "panel_set_widget",
       { node_id: 12, widget: "text", value: "hello" },
@@ -234,9 +236,132 @@ describe("panel_set_widget retries a schema-budget refusal (#2007)", () => {
     );
 
     expect(res.isError).toBe(true);
-    expect(calls.filter((c) => c === "graph_set_widget")).toHaveLength(2);
-    expect(text).toMatch(/already retried ONCE/);
-    expect(text).toMatch(/Do NOT call panel_refresh_nodes/);
+    expect(calls).toEqual(["graph_set_widget", "refresh_nodes"]);
+    expect(text).toMatch(/missing or malformed refresh result/);
+    expect(text).toMatch(/nothing was written/i);
+  });
+
+  it("shares an authoritative refresh across concurrent widget callers", async () => {
+    let writes = 0;
+    let resolveRefresh!: (value: unknown) => void;
+    const refresh = new Promise((resolve) => {
+      resolveRefresh = resolve;
+    });
+    const { b, calls } = bridge(async (cmd) => {
+      if (cmd.cmd === "graph_set_widget") {
+        writes += 1;
+        if (writes <= 2) throw new Error(SET_WIDGET_BUDGET);
+        return { ok: true, node_id: 12, widget: "text", previous: "", value: "hello" };
+      }
+      if (cmd.cmd === "refresh_nodes") return refresh;
+      return { ok: true };
+    });
+    const ctx1 = makePanelToolCtx(b, TAB, new WorkflowTargetStore());
+    const ctx2 = makePanelToolCtx(b, TAB, new WorkflowTargetStore());
+    const setWidget = buildPanelToolDefs().find((d) => d.name === "panel_set_widget");
+    if (!setWidget) throw new Error("panel_set_widget is not registered");
+
+    const first = setWidget.handler(
+      { node_id: 12, widget: "text", value: "hello" } as never,
+      ctx1,
+    );
+    const second = setWidget.handler(
+      { node_id: 12, widget: "text", value: "hello" } as never,
+      ctx2,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls.filter((cmd) => cmd === "refresh_nodes")).toHaveLength(1);
+
+    resolveRefresh({ refreshed: true });
+    const results = await Promise.all([first, second]);
+    expect(results.every((result) => !result.isError)).toBe(true);
+    expect(calls.filter((cmd) => cmd === "refresh_nodes")).toHaveLength(1);
+    expect(calls.filter((cmd) => cmd === "graph_set_widget")).toHaveLength(4);
+  });
+
+  it("keeps schema readiness blocked when the post-refresh retry still times out", async () => {
+    const { b } = bridge(async (cmd) => {
+      if (cmd.cmd === "graph_set_widget") throw new Error(SET_WIDGET_BUDGET);
+      if (cmd.cmd === "refresh_nodes") return { refreshed: true };
+      if (cmd.cmd === "graph_outline") {
+        return {
+          outline: "12 LoadImage",
+          node_count: 1,
+          backend_socket: "up",
+          mutations_ready: true,
+        };
+      }
+      return { ok: true };
+    });
+    const ctx = makePanelToolCtx(b, TAB, new WorkflowTargetStore());
+    const defs = buildPanelToolDefs();
+    const setWidget = defs.find((d) => d.name === "panel_set_widget");
+    const outline = defs.find((d) => d.name === "panel_graph_outline");
+    if (!setWidget || !outline) throw new Error("panel schema tools are not registered");
+
+    const refused = await setWidget.handler(
+      { node_id: 12, widget: "text", value: "hello" } as never,
+      ctx,
+    );
+    expect(refused.isError).toBe(true);
+    expect(textOf(refused)).toMatch(/retry still could not/i);
+    expect(parseJson(await outline.handler({} as never, ctx)).mutations_ready).toBe(false);
+  });
+
+  it("joins an explicit panel_refresh_nodes already in flight before retrying", async () => {
+    let writes = 0;
+    let resolveRefresh!: (value: unknown) => void;
+    const refresh = new Promise((resolve) => {
+      resolveRefresh = resolve;
+    });
+    const { b, calls } = bridge(async (cmd) => {
+      if (cmd.cmd === "refresh_nodes") return refresh;
+      if (cmd.cmd === "graph_set_widget") {
+        writes += 1;
+        if (writes === 1) throw new Error(SET_WIDGET_BUDGET);
+        return { ok: true, node_id: 12, widget: "text", previous: "", value: "hello" };
+      }
+      return { ok: true };
+    });
+    const ctx = makePanelToolCtx(b, TAB, new WorkflowTargetStore());
+    const defs = buildPanelToolDefs();
+    const refreshNodes = defs.find((d) => d.name === "panel_refresh_nodes");
+    const setWidget = defs.find((d) => d.name === "panel_set_widget");
+    if (!refreshNodes || !setWidget) throw new Error("panel schema tools are not registered");
+
+    const refreshCall = refreshNodes.handler({} as never, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const writeCall = setWidget.handler(
+      { node_id: 12, widget: "text", value: "hello" } as never,
+      ctx,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls.filter((cmd) => cmd === "refresh_nodes")).toHaveLength(1);
+
+    resolveRefresh({ refreshed: true });
+    const [refreshResult, writeResult] = await Promise.all([refreshCall, writeCall]);
+    expect(refreshResult.isError).toBeFalsy();
+    expect(writeResult.isError).toBeFalsy();
+    expect(calls).toEqual(["refresh_nodes", "graph_set_widget", "graph_set_widget"]);
+  });
+
+  it("keeps the write refused when the shared refresh acknowledgement times out", async () => {
+    const { res, calls, text } = await callTool(
+      "panel_set_widget",
+      { node_id: 12, widget: "text", value: "hello" },
+      async (cmd) => {
+        if (cmd.cmd === "graph_set_widget") throw new Error(SET_WIDGET_BUDGET);
+        if (cmd.cmd === "refresh_nodes") {
+          throw new Error('Panel tab wf did not reply to "refresh_nodes" within 90000 ms');
+        }
+        return { ok: true };
+      },
+    );
+
+    expect(res.isError).toBe(true);
+    expect(calls).toEqual(["graph_set_widget", "refresh_nodes"]);
+    expect(text).toMatch(/refresh acknowledgement timed out/i);
+    expect(text).toMatch(/nothing was written/i);
   });
 
   it("#2202 restores schema after a stale-combo refresh timeout before an unrelated write", async () => {
@@ -292,6 +417,9 @@ describe("panel_set_widget retries a schema-budget refusal (#2007)", () => {
   it("records a starvation refusal so the next outline does not advertise readiness", async () => {
     const { b } = bridge(async (cmd) => {
       if (cmd.cmd === "graph_set_widget") throw new Error(SET_WIDGET_STARVATION);
+      if (cmd.cmd === "refresh_nodes") {
+        return { refreshed: false, reason: "refresh_still_running" };
+      }
       if (cmd.cmd === "graph_outline") {
         return {
           outline: "12 OpenAICompatibleLLM",
@@ -313,7 +441,7 @@ describe("panel_set_widget retries a schema-budget refusal (#2007)", () => {
       ctx,
     );
     expect(refused.isError).toBe(true);
-    expect(textOf(refused)).toMatch(/refresh TIMEOUT, not a missing node/i);
+    expect(textOf(refused)).toMatch(/refresh.*still running/i);
 
     const next = parseJson(await outline.handler({} as never, ctx));
     expect(next.mutations_ready).toBe(false);

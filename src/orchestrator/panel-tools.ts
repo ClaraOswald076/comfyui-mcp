@@ -4971,36 +4971,6 @@ function isObjectInfoUnavailableRefusal(res: ToolResult): boolean {
   );
 }
 
-/**
- * #2004 — panel_set_widget refused an installed backend node because both
- * whole-schema routes exhausted their budget. Matched on the panel's own
- * wording (assertTypeAgainstFreshBackend / objectInfoOracleFailureNote) so a
- * miss costs a missing hint and a false positive costs an extra paragraph.
- * Used ONLY to APPEND advice to a refusal the panel already made — never to
- * authorize a write, and never to consult COMFYUI_URL (#1359).
- */
-function isObjectInfoStarvationRefusal(res: ToolResult): boolean {
-  if (!res.isError) return false;
-  const text = textOfToolResult(res);
-  return (
-    /no usable \/object_info schema was obtained/i.test(text) &&
-    (/Tried \d+ routes:/i.test(text) ||
-      (/api\.getNodeDefs\(\) did not answer/i.test(text) &&
-        /GET \/object_info did not answer/i.test(text)))
-  );
-}
-
-function objectInfoStarvationNote(): string {
-  return (
-    `\n\nThis is a live /object_info refresh TIMEOUT, not a missing node. ` +
-    `The write was refused before it mutated anything because the schema routes ` +
-    `exhausted their budget. The node is already on the canvas, so this type is in use. ` +
-    `Do NOT reinstall a pack. Retry panel_set_widget in a moment; if it keeps happening, ` +
-    `the tab's whole-schema snapshot was never populated — wait for a successful ` +
-    `panel_refresh_nodes, or reload the ComfyUI tab.`
-  );
-}
-
 /** #2004 — the panel's 13s save budget fired while the userdata write was still in flight. */
 function isWorkflowSaveBudgetTimeout(res: ToolResult): boolean {
   if (!res.isError) return false;
@@ -5137,6 +5107,83 @@ function isObjectInfoBudgetRefusal(res: ToolResult): boolean {
     /no usable \/?object_info|no whole (?:\/object_info|schema)|object_info_fetch_failed|did not answer within its \d+ms share|exceeded \d+ms share/i.test(
       textOfToolResult(res),
     )
+  );
+}
+
+/**
+ * #2274 — share one authoritative node-definition refresh per live panel tab.
+ *
+ * A schema-guarded widget write can time out its own /object_info routes while a
+ * refresh started by another panel command is still registering definitions. Starting
+ * one refresh per waiting write recreates the same stampede and makes every caller
+ * refuse before the already-useful refresh can land. The promise is keyed to the live
+ * tab incarnation, so a reconnect cannot let an old refresh authorize a new tab.
+ *
+ * The refresh is only a coordination primitive. Callers must still require the panel's
+ * explicit `refreshed:true` result before retrying a write; a timeout, malformed reply,
+ * `refresh_still_running`, or any other non-authoritative result remains fail-closed.
+ */
+const panelSchemaRefreshes = new Map<
+  string,
+  { token: object; promise: Promise<ToolResult> }
+>();
+
+function sharedPanelSchemaRefresh(ctx: PanelToolCtx): Promise<ToolResult> {
+  const key = panelSchemaKey(ctx);
+  const existing = panelSchemaRefreshes.get(key);
+  if (existing) return existing.promise;
+
+  const token = {};
+  // Yield before dispatch so the map is installed before even a synchronously-throwing
+  // bridge stub can settle this promise and run its cleanup.
+  const promise = (async () => {
+    await Promise.resolve();
+    try {
+      return await ctx.call({ cmd: "refresh_nodes" }, OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS);
+    } catch (err) {
+      return fail(err);
+    } finally {
+      if (panelSchemaRefreshes.get(key)?.token === token) panelSchemaRefreshes.delete(key);
+    }
+  })();
+  panelSchemaRefreshes.set(key, { token, promise });
+  return promise;
+}
+
+function panelSchemaRefreshSucceeded(res: ToolResult): boolean {
+  if (res.isError) return false;
+  return parseToolResultJson(res)?.refreshed === true;
+}
+
+function objectInfoWidgetRefreshNote(
+  refresh: ToolResult,
+  retryAfterRefresh = false,
+): string {
+  const payload = parseToolResultJson(refresh);
+  const stillRunning =
+    payload?.reason === "refresh_still_running" ||
+    /refresh_still_running|still running/i.test(textOfToolResult(refresh));
+  const timedOut = isReplyTimeoutResult(refresh) || /did not reply .*refresh_nodes/i.test(textOfToolResult(refresh));
+  if (retryAfterRefresh) {
+    return (
+      `\n\nThe authoritative panel_refresh_nodes completed, but the retry still could not ` +
+      `obtain a usable /object_info schema. Nothing was written; the value and node ` +
+      `validation refusal remain fail-closed. Retry after the panel settles, and do not ` +
+      `repeat the write if the node definition is genuinely missing or invalid.`
+    );
+  }
+  if (stillRunning || timedOut) {
+    return (
+      `\n\nThe widget write was refused before mutation because the authoritative node-definition ` +
+      `refresh did not settle inside its bounded window (${stillRunning ? "it is still running" : "the refresh acknowledgement timed out"}). ` +
+      `No usable schema was proven and nothing was written. Retry after that refresh settles.`
+    );
+  }
+  return (
+    `\n\nThe widget write was refused before mutation because panel_refresh_nodes did not ` +
+    `return an authoritative refreshed:true result (${payload?.reason ?? "missing or malformed refresh result"}). ` +
+    `No usable /object_info schema was proven and nothing was written; refusing to retry ` +
+    `the value against an unknown or stale definition.`
   );
 }
 
@@ -16154,14 +16201,6 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           markPanelSchemaReady(panelSchemaKey(ctx));
           return persistUnpromotedControlAfterGenerate(first, ctx, args.node_id);
         }
-        // #2004 — both whole-schema routes timed out. The panel refused BEFORE
-        // mutating, so this is not outcome-unknown. Name the timeout rather than
-        // leaving "cannot verify the node type" as "the type is missing".
-        if (isObjectInfoStarvationRefusal(first)) {
-          markPanelSchemaBlocked(panelSchemaKey(ctx));
-          return appendToolResultText(first, objectInfoStarvationNote());
-        }
-
         // #2202 — stale-combo recovery may have retired the panel's last usable
         // whole-schema snapshot before its bounded refresh wait abandoned. The
         // panel refused before writing, so dispatching its idempotent,
@@ -16273,18 +16312,30 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           return explainAmbiguousPromotedWidgetRefusal(first, args, ctx);
         }
 
+        // #2274 — a whole-schema budget refusal can be caused by a refresh already
+        // registering definitions for this tab. Share one bounded refresh, and retry
+        // the exact write only after the panel authoritatively reports refreshed:true.
+        // This preserves the before-write refusal for a still-running/failed/malformed
+        // refresh, and avoids the N independent refresh paths that made a burst of
+        // otherwise-valid writes all refuse together.
         if (isObjectInfoBudgetRefusal(first)) {
-          // #2007 — same schema-budget refusal as panel_add_node, same
-          // before-write fail-closed, same "do not refresh_nodes" recovery.
-          markPanelSchemaBlocked(panelSchemaKey(ctx));
+          const schemaKey = panelSchemaKey(ctx);
+          markPanelSchemaBlocked(schemaKey);
+          const refreshed = await sharedPanelSchemaRefresh(ctx);
+          if (!panelSchemaRefreshSucceeded(refreshed)) {
+            return appendToolResultText(first, objectInfoWidgetRefreshNote(refreshed));
+          }
+          markPanelSchemaReady(schemaKey);
           const retried = await write(args.node_id, args.widget as string);
           if (!retried.isError) {
-            markPanelSchemaReady(panelSchemaKey(ctx));
             return persistUnpromotedControlAfterGenerate(retried, ctx, args.node_id);
           }
-          first = isObjectInfoBudgetRefusal(retried)
-            ? appendToolResultText(retried, objectInfoBudgetNote("widget"))
-            : retried;
+          if (isObjectInfoBudgetRefusal(retried)) {
+            markPanelSchemaBlocked(schemaKey);
+            first = appendToolResultText(retried, objectInfoWidgetRefreshNote(refreshed, true));
+          } else {
+            first = retried;
+          }
         }
 
         // #1655 — the panel listed this widget as promoted while refusing it as
@@ -17331,7 +17382,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // Same bounded ack budget as the refresh-before-validate writes (#599): a
         // fresh /object_info on a large install routinely exceeds the 6000 ms
         // default, and this command's WHOLE purpose is to await that fetch.
-        const res = await ctx.call({ cmd: "refresh_nodes" }, OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS);
+        const res = await sharedPanelSchemaRefresh(ctx);
         // #2007 — a failed whole-schema refresh is not a down backend. It is also
         // worse than a no-op: the panel CLEARS the last-known schema at the start
         // of the run, so a timed-out refresh is why the next panel_set_widget
