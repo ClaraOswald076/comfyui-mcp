@@ -20,6 +20,7 @@ import {
   makePanelToolCtx,
   RETRY_TOKEN_CMDS,
   RETRY_TOKEN_CMD_BY_TOOL,
+  strictPanelSchema,
   type PanelToolCtx,
   type ToolResult,
 } from "../../orchestrator/panel-tools.js";
@@ -279,22 +280,63 @@ describe("#694 retry_of threading through the tool defs", () => {
     expect("retry_of" in calls[0]).toBe(false);
   });
 
-  it("panel_save_workflow attaches the token on BOTH the save and save_as branches", async () => {
+  it("panel_save_workflow attaches the token and subfolder on BOTH branches", async () => {
     const { ctx, calls } = makeRecordingCtx();
-    await defByName("panel_save_workflow").handler({ retry_of: "tok-a" }, ctx);
-    await defByName("panel_save_workflow").handler({ name: "copy", retry_of: "tok-b" }, ctx);
+    await defByName("panel_save_workflow").handler(
+      { subfolder: "nested/in-place", retry_of: "tok-a" },
+      ctx,
+    );
+    await defByName("panel_save_workflow").handler(
+      { name: "copy", subfolder: "nested/save-as", retry_of: "tok-b" },
+      ctx,
+    );
     // Find the save frames by NAME, not by index: #1045 added a `workflow_list`
     // fence probe after each save (a Save-As re-points the active workflow, so
     // the session has to re-anchor), which sits between them. The token contract
     // is about which frame CARRIES it, not where it lands in the sequence.
     const save = calls.find((c) => c.cmd === "workflow_save");
     const saveAs = calls.find((c) => c.cmd === "workflow_save_as");
-    expect(save).toMatchObject({ cmd: "workflow_save", retry_of: "tok-a" });
-    expect(saveAs).toMatchObject({ cmd: "workflow_save_as", retry_of: "tok-b" });
+    expect(save).toMatchObject({
+      cmd: "workflow_save",
+      subfolder: "nested/in-place",
+      retry_of: "tok-a",
+    });
+    expect(saveAs).toMatchObject({
+      cmd: "workflow_save_as",
+      name: "copy",
+      subfolder: "nested/save-as",
+      retry_of: "tok-b",
+    });
     // …and the probe itself must never carry a caller's retry token.
     for (const probe of calls.filter((c) => c.cmd === "workflow_list")) {
       expect("retry_of" in probe).toBe(false);
     }
+  });
+
+  it("subfolder is optional, rejects unknown keys, and preserves omission/bare-name behavior", async () => {
+    const def = defByName("panel_save_workflow");
+    const schema = strictPanelSchema(def.schema);
+    expect(schema.parse({})).toEqual({});
+    expect(schema.parse({ name: "copy", subfolder: "nested/safe" })).toEqual({
+      name: "copy",
+      subfolder: "nested/safe",
+    });
+    expect(() => schema.parse({ name: "copy", subfolderr: "nested/safe" })).toThrow(/subfolderr/);
+
+    const { ctx, calls } = makeRecordingCtx();
+    await def.handler({ subfolder: "nested/safe" }, ctx);
+    expect(calls.find((c) => c.cmd === "workflow_save")).toEqual({
+      cmd: "workflow_save",
+      subfolder: "nested/safe",
+    });
+
+    await def.handler({}, ctx);
+    const omittedSave = calls.find((c, index) => c.cmd === "workflow_save" && index > 0);
+    expect(omittedSave).toEqual({ cmd: "workflow_save" });
+
+    await def.handler({ name: "bare-name" }, ctx);
+    const bareSaveAs = calls.find((c) => c.cmd === "workflow_save_as" && c.name === "bare-name");
+    expect(bareSaveAs).toEqual({ cmd: "workflow_save_as", name: "bare-name" });
   });
 
   it("a READ tool never forwards retry_of even when args smuggle one (belt-and-braces gate)", async () => {

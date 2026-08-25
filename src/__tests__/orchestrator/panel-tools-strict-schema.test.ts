@@ -113,6 +113,33 @@ describe("panel-tools #754: strict schemas reject unknown argument keys", () => 
     expect(poisonedText).toContain(BOGUS_KEY);
   });
 
+  it("panel_save_workflow accepts subfolder on both save branches and rejects misspellings", async () => {
+    const inPlace = await client.callTool({
+      name: "panel_save_workflow",
+      arguments: { subfolder: "nested/in-place" },
+    });
+    const inPlaceText = (inPlace.content as Array<{ text?: string }>)?.[0]?.text ?? "";
+    expect(inPlace.isError).not.toBe(true);
+    expect(inPlaceText).toContain('"cmd":"workflow_save"');
+    expect(inPlaceText).toContain('"subfolder":"nested/in-place"');
+
+    const saveAs = await client.callTool({
+      name: "panel_save_workflow",
+      arguments: { name: "copy", subfolder: "nested/save-as" },
+    });
+    const saveAsText = (saveAs.content as Array<{ text?: string }>)?.[0]?.text ?? "";
+    expect(saveAs.isError).not.toBe(true);
+    expect(saveAsText).toContain('"cmd":"workflow_save_as"');
+    expect(saveAsText).toContain('"subfolder":"nested/save-as"');
+
+    const misspelled = await client.callTool({
+      name: "panel_save_workflow",
+      arguments: { subfolderr: "nested/typo" },
+    });
+    expect(misspelled.isError).toBe(true);
+    expect((misspelled.content as Array<{ text?: string }>)?.[0]?.text ?? "").toContain("subfolderr");
+  });
+
   it("WIRING: both registration call sites route through strictPanelSchema, not the raw shape", () => {
     // A green protocol-dispatch test above proves the CURRENT registration works;
     // it says nothing about whether a future edit reverts one of the two call

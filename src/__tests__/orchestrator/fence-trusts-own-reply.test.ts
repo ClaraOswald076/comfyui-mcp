@@ -83,11 +83,16 @@ describe("#814 panel_save_workflow trusts its OWN reply before the round trip", 
       workflow_instance_changed: true,
     };
     const res = await toolNamed("panel_save_workflow").handler(
-      { name: "renamed" },
+      { name: "renamed", subfolder: "nested/save-as" },
       ctxWith(bridgeFor("workflow_save_as", reply)),
     );
 
     expect(res.isError).toBeFalsy();
+    expect(sent[0]).toEqual({
+      cmd: "workflow_save_as",
+      name: "renamed",
+      subfolder: "nested/save-as",
+    });
     expect(fence).toBe(NEW_UUID);
     expect(fence).not.toBe(PRIOR_UUID);
     expect(sent.map((c) => c.cmd)).not.toContain("workflow_list");
@@ -95,8 +100,12 @@ describe("#814 panel_save_workflow trusts its OWN reply before the round trip", 
 
   it("adopts an in-place save's proven uuid too — the reply carries it unconditionally", async () => {
     const reply = { saved: true, workflow: "same", workflow_uuid: NEW_UUID, routing_key: "wf:workflows/same.json" };
-    await toolNamed("panel_save_workflow").handler({}, ctxWith(bridgeFor("workflow_save", reply)));
+    await toolNamed("panel_save_workflow").handler(
+      { subfolder: "nested/in-place" },
+      ctxWith(bridgeFor("workflow_save", reply)),
+    );
 
+    expect(sent[0]).toEqual({ cmd: "workflow_save", subfolder: "nested/in-place" });
     expect(fence).toBe(NEW_UUID);
     expect(sent.map((c) => c.cmd)).not.toContain("workflow_list");
   });

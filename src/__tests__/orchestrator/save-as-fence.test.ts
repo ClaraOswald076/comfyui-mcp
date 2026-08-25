@@ -115,12 +115,42 @@ describe("#1045: a save-as re-anchors the fence", () => {
     expect(textOf(res)).not.toContain("WAS saved");
     expect(textOf(res)).not.toContain("STILL fenced");
   });
+
+  it("forwards a nested Save-As subfolder verbatim before re-anchoring identity", async () => {
+    const res = await saveWorkflow().handler(
+      { name: "new-name", subfolder: "nested/safe" },
+      ctxWith(HEALTHY_LIST),
+    );
+    expect(res.isError).toBeFalsy();
+    expect(sent[0]).toEqual({
+      cmd: "workflow_save_as",
+      name: "new-name",
+      subfolder: "nested/safe",
+    });
+    expect(sent.map((c) => c.cmd)).toEqual(["workflow_save_as", "workflow_list"]);
+    expect(stamps).toEqual([NEW_UUID]);
+  });
+
+  it("forwards an in-place subfolder verbatim before re-anchoring identity", async () => {
+    const res = await saveWorkflow().handler(
+      { subfolder: "nested/in-place" },
+      ctxWith(HEALTHY_LIST),
+    );
+    expect(res.isError).toBeFalsy();
+    expect(sent[0]).toEqual({
+      cmd: "workflow_save",
+      subfolder: "nested/in-place",
+    });
+    expect(sent.map((c) => c.cmd)).toEqual(["workflow_save", "workflow_list"]);
+    expect(stamps).toEqual([NEW_UUID]);
+  });
+
   // An IN-PLACE save (no name) re-anchors too. Its identity normally follows the
   // workflow across the save, so this usually re-derives the same value and
   // changes nothing — but "normally" is exactly what failed in #1045, and one
   // round trip is cheap against a session that would otherwise be unusable.
   it("re-anchors after an in-place save as well", async () => {
-    const { bridge, sent } = (() => {
+    const { bridge, sent: commandNames } = (() => {
       const s2: string[] = [];
       const b = bridgeFor(HEALTHY_LIST);
       const orig = (b as unknown as { send: (c: Record<string, unknown>) => Promise<unknown> }).send;
@@ -132,8 +162,9 @@ describe("#1045: a save-as re-anchors the fence", () => {
     })();
     const ctx = makePanelToolCtx(bridge, "tab-1");
     await saveWorkflow().handler({}, ctx);
-    expect(sent).toContain("workflow_save");
-    expect(sent).toContain("workflow_list");
+    expect(commandNames[0]).toBe("workflow_save");
+    expect(sent[0]).toEqual({ cmd: "workflow_save" });
+    expect(commandNames).toContain("workflow_list");
   });
 
 });
