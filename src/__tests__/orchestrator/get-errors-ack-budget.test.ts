@@ -26,7 +26,7 @@
 // The margin has to come from the ORCHESTRATOR. The panel's 18 s bound must stay where it
 // is: it is what keeps a current panel safe in front of an older orchestrator still using
 // the 20 s default. So `graph_get_errors` joins the #599 refresh-ack cohort — the same
-// bounded 30 s budget `graph_set_widget`, `graph_add_node`, `graph_remove_widget`,
+// bounded 90 s budget `graph_set_widget`, `graph_add_node`, `graph_remove_widget`,
 // `graph_get_object_info` and `refresh_nodes` already forward for the same reason.
 //
 // The property under test is the CALL SITE. A shared constant that nothing passes still
@@ -43,7 +43,7 @@ const PANEL_TOOLS_TS = fileURLToPath(new URL("../../orchestrator/panel-tools.ts"
 /** The #599 bounded refresh-ack budget (OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS). Duplicated as
  *  a literal on purpose: if the constant moves, these tests force the relationship to the
  *  panel's own budget to be re-examined rather than silently re-broken. */
-const REFRESH_ACK_MS = 30_000;
+const REFRESH_ACK_MS = 90_000;
 
 /** GET_ERRORS_TOTAL_BUDGET_MS in the PANEL repo (web/js/lib/get-errors-budget.js) — the
  *  wall clock one graph_get_errors call may spend on elective server waits alone, before
@@ -101,7 +101,7 @@ describe("panel_get_errors ack budget (#1493)", () => {
   it("stays BOUNDED, so a genuinely frozen tab still fails", async () => {
     const { timeoutMs } = await forwardedAckMs("panel_get_errors");
     expect(Number.isFinite(timeoutMs!)).toBe(true);
-    expect(timeoutMs!).toBeLessThanOrEqual(60_000);
+    expect(timeoutMs!).toBeLessThanOrEqual(90_000);
   });
 
   it("uses the SAME bound as the #599 siblings, so the cohort cannot drift apart", async () => {

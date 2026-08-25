@@ -1282,13 +1282,19 @@ function sleep(ms: number): Promise<void> {
 // in progress. Give these a larger BOUNDED ack budget so a slow-but-valid refresh
 // is not mistaken for a dead tab — still capped (never Infinity) so a genuinely
 // frozen/backgrounded tab fails in bounded time instead of hanging forever.
-const OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS = 30_000;
+// #2242 — a full /object_info refresh can legitimately outlive the old 30 s relay
+// window. The panel may have already delivered graph_add_node and continue applying
+// it after that window, so a later caller-supplied add can create a duplicate. Keep
+// the timeout finite, but leave enough room for the panel's bounded refresh/add path
+// to compose and acknowledge one mutation before the bridge declares the outcome
+// unknown.
+const OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS = 90_000;
 
 /** #1973 — the budget for get_errors' ELECTIVE completion follow-ups, deliberately a
  *  fraction of the ack timeout above and NOT the same number.
  *
  *  By the time those follow-ups run, the panel's reply is already in hand. Spending
- *  the full 30 s ack budget on them would make the handler's worst case 30 s + 30 s
+ *  the full 90 s ack budget on them would make the handler's worst case 90 s + 90 s
  *  and put a reply we ALREADY HAVE behind an elective completeness improvement — for
  *  a tool whose entire reason for existing is that an agent staring at red nodes has
  *  no other error surface. #589 is precisely that failure, and the shared panel-side
@@ -1301,7 +1307,7 @@ const OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS = 30_000;
 const GET_ERRORS_COMPLETION_BUDGET_MS = 8_000;
 
 // #1639 — while a ComfyUI prompt is running the frontend main thread often
-// cannot service graph_* at all. Waiting out the 20/30 s ack bound only
+// cannot service graph_* at all. Waiting out the 20/90 s ack bound only
 // surfaces "tab may be backgrounded or frozen" with an unknown mutation
 // outcome. Fail closed BEFORE dispatch for canvas-touching graph commands so
 // the agent gets an explicit QUEUE BUSY instead. `graph_run` is excluded:
@@ -1341,7 +1347,7 @@ const GET_ERRORS_COMPLETION_BUDGET_MS = 8_000;
 // trade #357 and #589 were both regressions of, in a file whose read-timeout policy
 // is "reads get MORE patience, not less, because a false timeout costs an agent its
 // only look at a broken graph". #589 is precisely this: panel_get_errors was given a
-// 30 s budget because the panel's own bound is 18 s. A cap here would re-break it.
+// 90 s budget because the panel's own bound is 18 s. A cap here would re-break it.
 function queueBusySnapshotNote(): string {
   const snap = QueueMonitor.snapshot();
   if (!snap.running) return "";
@@ -15369,7 +15375,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_add_node",
-      "Add a node to the user's OPEN ComfyUI graph by class_type (e.g. 'KSampler', 'CheckpointLoaderSimple'). The user sees it appear live; Ctrl+Z undoes it. Returns the created node's id, slots, and default widget values. Frontend-only virtual types are addable too: 'Note' and 'MarkdownNote' — the supported way to ANNOTATE a workflow with on-canvas instructions (add the node, then put the text in its 'text' widget via panel_set_widget) — plus 'Reroute' and 'PrimitiveNode'. These are LiteGraph-native and never appear in the backend node registry, so they legitimately bypass the backend class_type check. ComfyUI-LoRA-Manager's 'Lora Loader (LoraManager)' (and other AUTOCOMPLETE_TEXT_* nodes) cannot be added: the pack is healthy, but the add-node guard cannot see its Vue autocomplete widget. Use 'LoRA Text Loader (LoraManager)' — same outputs, lora_syntax is a STRING — or core LoraLoader; reload/retry will not clear it. A 'no installed node outputs' refusal for a custom link type (SEEDVR2_DIT, SEEDVR2_VAE, DICT, …) after sibling producer nodes were just added (ConvertAny2Dict on the canvas while DictGetNode is refused) is the guard looking at a single-class /object_info, not the live graph; retry/refresh will not clear it — copy the node from another workflow (panel_copy_nodes / panel_paste_nodes) or reload the tab. ADD NODES ONE AT A TIME, not as a parallel batch: each add carries a fresh /object_info payload and those register SERIALLY, so N concurrent adds become N sequential refresh cycles. On a large install that outruns the 30s per-command deadline and the later adds time out WHILE STILL QUEUED — they then apply when their turn arrives, leaving nodes you were told had failed (panel#767). Sequential adds each get the refresh to themselves and stay well inside the deadline.",
+      "Add a node to the user's OPEN ComfyUI graph by class_type (e.g. 'KSampler', 'CheckpointLoaderSimple'). The user sees it appear live; Ctrl+Z undoes it. Returns the created node's id, slots, and default widget values. Frontend-only virtual types are addable too: 'Note' and 'MarkdownNote' — the supported way to ANNOTATE a workflow with on-canvas instructions (add the node, then put the text in its 'text' widget via panel_set_widget) — plus 'Reroute' and 'PrimitiveNode'. These are LiteGraph-native and never appear in the backend node registry, so they legitimately bypass the backend class_type check. ComfyUI-LoRA-Manager's 'Lora Loader (LoraManager)' (and other AUTOCOMPLETE_TEXT_* nodes) cannot be added: the pack is healthy, but the add-node guard cannot see its Vue autocomplete widget. Use 'LoRA Text Loader (LoraManager)' — same outputs, lora_syntax is a STRING — or core LoraLoader; reload/retry will not clear it. A 'no installed node outputs' refusal for a custom link type (SEEDVR2_DIT, SEEDVR2_VAE, DICT, …) after sibling producer nodes were just added (ConvertAny2Dict on the canvas while DictGetNode is refused) is the guard looking at a single-class /object_info, not the live graph; retry/refresh will not clear it — copy the node from another workflow (panel_copy_nodes / panel_paste_nodes) or reload the tab. ADD NODES ONE AT A TIME, not as a parallel batch: each add carries a fresh /object_info payload and those register SERIALLY, so N concurrent adds become N sequential refresh cycles. On a large install that outruns the 90s per-command deadline and the later adds time out WHILE STILL QUEUED — they then apply when their turn arrives, leaving nodes you were told had failed (panel#767). Sequential adds each get the refresh to themselves and stay well inside the deadline.",
       {
         class_type: z.string().describe("Exact ComfyUI node class_type to create."),
         pos: xy()
@@ -15435,9 +15441,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // handling. `joinMs` never cancels work already in flight; the panel coalescer says
         // so outright ("The run keeps going, registers whatever it fetched"), and its own
         // worked example is a join ending at 20,000 ms plus a run adding ~13,000 ms —
-        // ~33 s against a 30 s relay window, every per-step bound respected. On a large
+        // ~33 s against a 90 s relay window, every per-step bound respected. On a large
         // install the refresh legitimately outlives this ack and then COMPLETES, which is
-        // exactly what the reporter saw: the automatic refresh "failed" at 30 s and an
+        // exactly what the reporter saw: the automatic refresh "failed" at 90 s and an
         // explicit panel_refresh_nodes moments later succeeded immediately.
         //
         // Decided on the BRIDGE-OWNED tag (#1468), never on message text: two codex rounds
@@ -15518,7 +15524,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 `\n\n(Tried to clear this automatically: panel_refresh_nodes was dispatched and did ` +
                 `NOT answer within its window, and the add was then retried ONCE anyway — a refresh ` +
                 `that outruns its ack is NOT cancelled: it keeps running and registers what it ` +
-                `fetched. On a large install it can take ~33s against a 30s window. The retry still ` +
+                `fetched. On a large install it can take ~33s against a 90s window. The retry still ` +
                 `refuses, which means that registration had not landed YET — not that the schema is ` +
                 `stuck. Neither attempt added anything. RETRY the add in a few seconds; that is the ` +
                 `action that clears this. Only if it keeps refusing is the page's registry actually ` +
@@ -17192,7 +17198,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       // default — so the orchestrator widens its own wait to the same bounded budget its
       // refresh-before-validate siblings already use. This read is idempotent, so waiting longer
       // costs a slow reply and never a double-applied write; it stays BOUNDED (never Infinity), so
-      // a genuinely frozen tab still fails, just at 30 s instead of 20 s.
+      // a genuinely frozen tab still fails, just at 90 s instead of 20 s.
       //
       // #1973 — even a reply that BEATS that bound can still be a false-clean 0: the
       // panel gives the live combo scan only the 4 s STEP cap, so a ~77-node graph
