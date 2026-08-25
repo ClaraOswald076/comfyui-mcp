@@ -299,8 +299,7 @@ describe("rescue deadline tracks the CLIENT's budget (#1447)", () => {
   it("reads `npm config get cache` to tell a first run from a warm one", () => {
     const { cachedNpxInstallExists } = launcher;
     const seen: string[] = [];
-    const present = cachedNpxInstallExists("  C:/cache  
-", {
+    const present = cachedNpxInstallExists("  C:/cache  \n", {
       readdir: () => ["8af3af54f44861ce", "other"],
       exists: (p: string) => {
         seen.push(p);
@@ -309,7 +308,9 @@ describe("rescue deadline tracks the CLIENT's budget (#1447)", () => {
     });
     expect(present).toBe(true);
     // It looks under the cache npm named, in _npx, for a real manifest.
-    expect(seen[0].replace(/\/g, "/")).toBe("C:/cache/_npx/8af3af54f44861ce/node_modules/comfyui-mcp/package.json");
+    expect(seen[0].split("\\").join("/")).toBe(
+      "C:/cache/_npx/8af3af54f44861ce/node_modules/comfyui-mcp/package.json",
+    );
 
     // A comfyui-mcp directory with no manifest is the half-deleted state a
     // failed Windows uninstall leaves behind; it is not a runnable install.
