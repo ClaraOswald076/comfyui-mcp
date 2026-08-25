@@ -48,6 +48,12 @@ const MCP_SERVERS = {
 const WORKER_TRANSPORT_FAILURE =
   "Transport send error: WorkerTransport<StreamableHttpClientWorker<...>> error: " +
   "HTTP request failed sending request to http://127.0.0.1:9198/orchestrator%3A%3Acodex";
+// Older Codex/MCP combinations scrubbed the WorkerTransport wrapper and used a
+// semicolon. This is an outer HTTP-MCP client error, not a UiBridge error from
+// inside the panel MCP handler.
+const SCRUBBED_TRANSPORT_FAILURE =
+  "Transport send error; HTTP request failed sending request to " +
+  "http://127.0.0.1:9198/orchestrator::codex";
 
 const noticesOf = (events: AgentEvent[]) =>
   events.filter(
@@ -79,7 +85,9 @@ interface Drive {
   polls: number;
   pollParams: unknown[];
   turnStarts: number;
-  endTurn(kind?: "completed" | "worker-transport" | "worker-transport-retry"): Promise<void>;
+  endTurn(
+    kind?: "completed" | "worker-transport" | "worker-transport-retry" | "scrubbed-transport",
+  ): Promise<void>;
   releaseInterrupt(): void;
   waitForIdle(): Promise<void>;
   finish(): Promise<void>;
@@ -193,13 +201,19 @@ function startDrive(opts: {
       await waitUntil(() => waitingForTurn && starts > 0);
       waitingForTurn = false;
       const turnId = `turn-${starts}`;
-      if (kind === "worker-transport" || kind === "worker-transport-retry") {
+      if (
+        kind === "worker-transport" ||
+        kind === "worker-transport-retry" ||
+        kind === "scrubbed-transport"
+      ) {
         client.notificationHandler?.({
           method: "error",
           params: {
             threadId: "thread-1",
             turnId,
-            error: { message: WORKER_TRANSPORT_FAILURE },
+            error: {
+              message: kind === "scrubbed-transport" ? SCRUBBED_TRANSPORT_FAILURE : WORKER_TRANSPORT_FAILURE,
+            },
             willRetry: kind === "worker-transport-retry",
           },
         });
@@ -264,6 +278,25 @@ describe("Codex mid-session MCP drop reconnects panel tools (#1524)", () => {
     expect(drive.turnStarts).toBe(2);
     expect(noticesOf(drive.events)).toHaveLength(1);
     expect(noticesOf(drive.events)[0].message).toMatch(/reconnect brought it back/);
+  });
+
+  it("recognizes the legacy scrubbed HTTP error without replaying the turn (#2286)", async () => {
+    // This form is emitted by the outer Codex HTTP-MCP client. It never reaches
+    // panel-mcp-http.ts or panel-tools.ts, so recovery must remain a reload/fence,
+    // not an in-handler retry that could replay a mutation.
+    const drive = startDrive({ listings: [PANEL_UP] });
+    await drive.endTurn("scrubbed-transport");
+
+    expect(drive.reloadCalls).toBe(1);
+    expect(drive.turnStarts).toBe(1);
+    const failure = drive.events.find(
+      (e): e is Extract<AgentEvent, { type: "error" }> =>
+        e.type === "error" && !(e as { sessionNotice?: boolean }).sessionNotice,
+    );
+    expect(failure?.outcomeUnknown).toBe(true);
+    expect(failure?.message).toMatch(/did not retry/i);
+
+    await drive.finish();
   });
 
   it("fences a willRetry WorkerTransport turn before local recovery (#1777)", async () => {
