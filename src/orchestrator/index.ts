@@ -106,9 +106,12 @@ import { publishConnectedPanelOrigins } from "../services/panel-origin-channel.j
 import {
   startPanelImageRelayServer,
   verifyPanelImageRelayCapability,
+  verifyPanelComfyUIReadRelayCapability,
   type PanelImageRelayResolvedAgent,
   type PanelImageRelayServer,
   type PanelImageRelayRequest,
+  type PanelComfyUIReadRelayRequest,
+  type PanelRelayRequest,
 } from "../services/panel-image-relay.js";
 import {
   startPanelTemplateRelayServer,
@@ -1723,9 +1726,13 @@ export async function runPanelOrchestrator(): Promise<void> {
     panelImageRelaySecrets.set(secret, agentKey);
     return secret;
   };
-  const panelImageRelayAgentFor = (request: PanelImageRelayRequest): PanelImageRelayResolvedAgent | undefined => {
+  const panelImageRelayAgentFor = (request: PanelRelayRequest): PanelImageRelayResolvedAgent | undefined => {
     for (const [secret, agentKey] of panelImageRelaySecrets) {
-      if (verifyPanelImageRelayCapability(secret, request)) return { agentKey, secret };
+      if (
+        ("operation" in request
+          ? verifyPanelComfyUIReadRelayCapability(secret, request as PanelComfyUIReadRelayRequest)
+          : verifyPanelImageRelayCapability(secret, request as PanelImageRelayRequest))
+      ) return { agentKey, secret };
     }
     return undefined;
   };
@@ -1747,8 +1754,8 @@ export async function runPanelOrchestrator(): Promise<void> {
     const i = key.lastIndexOf(AGENT_KEY_SEP);
     return i >= 0 ? key.slice(i + AGENT_KEY_SEP.length) : defaultBackend;
   };
-  // #2149 — shared agent keys are not panel tab ids. Resolve through the
-  // bridge's pinned shared-tab mapping before dispatching fetch_image.
+  // #2149/#2283 — shared agent keys are not panel tab ids. Resolve through the
+  // bridge's pinned shared-tab mapping before dispatching authenticated relay commands.
   const scopeToRealTab = (tabId: string): string | undefined =>
     isScopeAddress(tabId) ? bridge.resolveSharedTabId(tabId) : panelTabOf(tabId);
   let panelImageRelayServer: PanelImageRelayServer | undefined;

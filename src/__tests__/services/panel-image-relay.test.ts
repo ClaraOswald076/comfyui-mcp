@@ -5,6 +5,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, truncateSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  PANEL_COMFYUI_READ_MAX_BYTES,
   PANEL_IMAGE_RELAY_MAX_BYTES,
   PANEL_IMAGE_RELAY_MAX_CONCURRENT,
   PANEL_IMAGE_RELAY_MAX_PENDING_REQUESTS,
@@ -17,11 +18,15 @@ import {
   PANEL_IMAGE_RELAY_RESPONSE_PREFIX,
   PANEL_IMAGE_RELAY_STALE_MS,
   makePanelImageRelayCapability,
+  makePanelComfyUIReadRelayCapability,
   processPanelImageRequests,
   requestPanelImageFromFileChannel,
   requestPanelImage,
+  requestPanelComfyUIRead,
   startPanelImageRelayServer,
   verifyPanelImageRelayCapability,
+  verifyPanelComfyUIReadRelayCapability,
+  type PanelComfyUIReadRelayRequest,
   type PanelImageRelayRequest,
 } from "../../services/panel-image-relay.js";
 
@@ -56,6 +61,21 @@ function request(id: string, patch: Partial<PanelImageRelayRequest> = {}): Panel
 
 function requestFile(dir: string, id: string): string {
   return join(dir, `${PANEL_IMAGE_RELAY_REQUEST_PREFIX}${id}.json`);
+}
+
+function readRequest(id: string, operation: PanelComfyUIReadRelayRequest["operation"]): PanelComfyUIReadRelayRequest {
+  const createdAt = Date.now();
+  const value = {
+    version: 1 as const,
+    requestId: id,
+    operation,
+    createdAt,
+    deadlineAt: createdAt + 8_000,
+  };
+  return {
+    ...value,
+    capability: makePanelComfyUIReadRelayCapability(SECRET, value),
+  };
 }
 
 function responseFile(dir: string, id: string): string {
@@ -633,6 +653,84 @@ describe("authenticated loopback panel image relay", () => {
     try {
       const createdAt = Date.now();
       const short = request("short-deadline-123456", { createdAt, deadlineAt: createdAt + 30 });
+      const response = await fetch(server.endpointUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(short),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ ok: false, error: "TIMEOUT", requestId: short.requestId });
+      expect(timeoutMs).toBeGreaterThan(0);
+      expect(timeoutMs).toBeLessThanOrEqual(30);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it.each(["history", "system_stats", "logs"] as const)(
+    "relays the fixed %s ComfyUI read and authenticates/parses its reply",
+    async (operation) => {
+      const seen: Array<{ cmd: string; operation?: string }> = [];
+      const body = operation === "logs" ? "ERROR: render failed\n" : JSON.stringify({ operation });
+      const server = await startPanelImageRelayServer({
+        resolvePanelAgent: (value) =>
+          "operation" in value && verifyPanelComfyUIReadRelayCapability(SECRET, value)
+            ? { agentKey: "orchestrator::claude", secret: SECRET }
+            : undefined,
+        resolvePanelTab: () => "panel-tab",
+        bridge: {
+          canReach: () => true,
+          send: async (command) => {
+            seen.push(command);
+            return {
+              operation,
+              body,
+              contentType: operation === "logs" ? "text/plain" : "application/json",
+              bytes: Buffer.byteLength(body, "utf8"),
+            };
+          },
+        },
+      });
+      try {
+        process.env.COMFYUI_MCP_RELAY_SECRET = SECRET;
+        process.env.COMFYUI_MCP_RELAY_URL = server.endpointUrl;
+        await expect(requestPanelComfyUIRead(operation)).resolves.toEqual({
+          operation,
+          body,
+          contentType: operation === "logs" ? "text/plain" : "application/json",
+          bytes: Buffer.byteLength(body, "utf8"),
+        });
+        expect(seen).toEqual([{ cmd: "fetch_comfyui_read", operation }]);
+        expect(Buffer.byteLength(body, "utf8")).toBeLessThanOrEqual(PANEL_COMFYUI_READ_MAX_BYTES);
+      } finally {
+        await server.close();
+      }
+    },
+  );
+
+  it("applies the read relay deadline to the authenticated bridge command", async () => {
+    let timeoutMs = 0;
+    const server = await startPanelImageRelayServer({
+      resolvePanelAgent: (value) =>
+        "operation" in value && verifyPanelComfyUIReadRelayCapability(SECRET, value)
+          ? { agentKey: "orchestrator::claude", secret: SECRET }
+          : undefined,
+      resolvePanelTab: () => "panel-tab",
+      bridge: {
+        canReach: () => true,
+        send: async (_command, options) => {
+          timeoutMs = options.timeoutMs;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          return { operation: "history", body: "{}", contentType: "application/json", bytes: 2 };
+        },
+      },
+    });
+    try {
+      const createdAt = Date.now();
+      const short = readRequest("short-read-deadline-123", "history");
+      short.createdAt = createdAt;
+      short.deadlineAt = createdAt + 30;
+      short.capability = makePanelComfyUIReadRelayCapability(SECRET, short);
       const response = await fetch(server.endpointUrl, {
         method: "POST",
         headers: { "content-type": "application/json" },

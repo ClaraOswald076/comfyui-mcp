@@ -1112,6 +1112,9 @@ export const BRIDGE_READONLY_CMDS: ReadonlySet<string> = new Set<string>([
   // #2181: Manager queue status only observes install progress; it is safe to
   // re-dispatch after a reconnect and must not report mutation outcome warnings.
   "nodes_queue_status",
+  // #2283: fixed ComfyUI diagnostics reads relayed through the authenticated
+  // panel channel; safe to resume after a bridge reconnect.
+  "fetch_comfyui_read",
   "get_todo",
   // #608: a forced /object_info re-register + combo refresh. It has NO effect on
   // graph content — it only re-registers node defs and rebuilds combo option lists
