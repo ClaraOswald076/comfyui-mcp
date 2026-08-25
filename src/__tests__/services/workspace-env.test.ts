@@ -2339,6 +2339,54 @@ describe("resolveLiveServerRoot (#369)", () => {
     }
   });
 
+  it("does not fall back to an interpreter after an invalid observed launch script", async () => {
+    const dir = await tmpDir();
+    try {
+      const root = join(dir, "interpreter-fallback");
+      const python = join(root, "python_embeded", IS_WIN ? "python.exe" : "python3");
+      await mkdir(dirname(python), { recursive: true });
+      await writeFile(join(root, "main.py"), "# fallback tree\n", "utf-8");
+      await writeFile(python, "", "utf-8");
+
+      h.mockLiveProcess.mockReturnValue({
+        pid: 4245,
+        python,
+        launchScriptInvalid: true,
+      });
+
+      const resolved = resolveLiveServerRoot(["main.py"], undefined, {});
+      expect(resolved.source).toBe("unresolved");
+      expect(resolved.root).toBeUndefined();
+      expect(resolved.observedPython).toBe(python);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed on an indeterminate observed launch-script path", async () => {
+    const dir = await tmpDir();
+    try {
+      const root = join(dir, "interpreter-fallback");
+      const python = join(root, "python_embeded", IS_WIN ? "python.exe" : "python3");
+      await mkdir(dirname(python), { recursive: true });
+      await writeFile(join(root, "main.py"), "# fallback tree\n", "utf-8");
+      await writeFile(python, "", "utf-8");
+
+      // NUL makes realpathSync throw a non-ENOENT/ENOTDIR argument error. It
+      // must not be converted into a lexical path and then an interpreter root.
+      const indeterminateScript = `${join(dir, "blocked")}\0main.py`;
+      const resolved = resolveLiveServerRoot(
+        ["main.py"],
+        undefined,
+        { observedPython: python, observedLaunchScript: indeterminateScript },
+      );
+      expect(resolved.source).toBe("unresolved");
+      expect(resolved.root).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("anchors a BARE main.py on the OS image when that image is inside the install", async () => {
     const dir = await tmpDir();
     try {

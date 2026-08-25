@@ -648,28 +648,36 @@ export function commandLineMatchesArgv(
  * launch evidence, not a portable-bundle layout guess. A flattened macOS `ps`
  * command line is intentionally not strong enough to supply this evidence.
  */
+type LaunchScriptEvidence = {
+  path?: string;
+  /** A correlated script token was present, but it could not be proven usable. */
+  invalid: boolean;
+};
+
 function absoluteLaunchScriptFromIdentity(
   identity: ProcessIdentity | undefined,
   serverArgv: string[] | undefined,
-): string | undefined {
+): LaunchScriptEvidence {
   const serverScript = positionalMainScript(serverArgv);
-  if (!serverScript) return undefined;
-  if (identity?.argvFidelity === "flattened") return undefined;
+  if (!serverScript) return { invalid: false };
+  if (identity?.argvFidelity === "flattened") return { invalid: false };
 
   const processArgv =
     identity?.argv && identity.argv.length > 0
       ? identity.argv
       : tokenizeCommandLine(identity?.commandLine ?? "");
   const processScript = positionalProcessScript(processArgv);
-  if (!processScript || !isAbsolute(processScript)) return undefined;
+  if (!processScript || !isAbsolute(processScript)) return { invalid: false };
 
-  if (!sameLaunchScriptShape(processScript, serverScript)) return undefined;
+  if (!sameLaunchScriptShape(processScript, serverScript)) return { invalid: false };
 
   try {
     const resolved = realpathSync(pathResolve(processScript));
-    return statSync(resolved).isFile() ? resolved : undefined;
+    return statSync(resolved).isFile() ? { path: resolved, invalid: false } : { invalid: true };
   } catch {
-    return undefined;
+    // This was an explicit, correlated launch-script claim. Do not turn an
+    // unreadable/missing/non-file entry into permission to anchor on python.
+    return { invalid: true };
   }
 }
 
@@ -807,6 +815,12 @@ export interface LiveServerProcess {
    * of the ComfyUI directory and the server reports only bare `main.py`.
    */
   launchScript?: string;
+  /**
+   * A correlated launch-script path was present but could not be proven to be
+   * a regular file. This is a veto, not an absence of evidence: callers must
+   * not replace it with an interpreter-based root anchor.
+   */
+  launchScriptInvalid?: boolean;
 }
 
 /**
@@ -868,7 +882,12 @@ export function observeLiveServerProcess(opts: ResolveOptions): LiveServerProces
     rawImage && isAbsolute(rawImage) && existsSync(rawImage)
       ? pathResolve(rawImage)
       : undefined;
-  const launchScript = absoluteLaunchScriptFromIdentity(identity, opts.serverArgv);
+  const launchEvidence = absoluteLaunchScriptFromIdentity(identity, opts.serverArgv);
+  const launchEvidenceFields = launchEvidence.invalid
+    ? { launchScriptInvalid: true as const }
+    : launchEvidence.path
+      ? { launchScript: launchEvidence.path }
+      : {};
 
   // Tier 1 — the process we launched, confirmed by PID *and* start time.
   // The recorded interpreter must be ABSOLUTE: a bare `python` would be
@@ -902,7 +921,7 @@ export function observeLiveServerProcess(opts: ResolveOptions): LiveServerProces
         pid,
         image,
       };
-      return launchScript ? { ...result, launchScript } : result;
+      return { ...result, ...launchEvidenceFields };
     }
     // Same PID, different (or unreadable) start time → this is NOT our process, or
     // we cannot prove it is. Fall through to tier 2 rather than trust the record.
@@ -939,12 +958,12 @@ export function observeLiveServerProcess(opts: ResolveOptions): LiveServerProces
     : identity?.venvPython;
   if (fromEnv && isAbsolute(fromEnv) && existsSync(fromEnv)) {
     const result = { python: fromEnv, source: "process-table" as const, pid, image };
-    return launchScript ? { ...result, launchScript } : result;
+    return { ...result, ...launchEvidenceFields };
   }
 
   if (argv0) {
     const result = { python: argv0, source: "process-table" as const, pid, image };
-    return launchScript ? { ...result, launchScript } : result;
+    return { ...result, ...launchEvidenceFields };
   }
-  return launchScript ? { pid, image, launchScript } : { pid, image };
+  return { pid, image, ...launchEvidenceFields };
 }

@@ -456,15 +456,23 @@ describe("#1765 — install_custom_node must not write into an install this sess
   it("refuses the git fallback when the producer sees a DIRECTORY named main.py", async () => {
     const badRoot = join(SANDBOX, "directory-main");
     const badScript = join(badRoot, "main.py");
+    // Keep the observed interpreter usable and portable-looking. Before the
+    // invalid launch-script veto, this let the resolver authorize this other
+    // regular-main.py tree after rejecting the observed directory.
+    const fallbackRoot = join(SANDBOX, "interpreter-fallback");
+    const fallbackPython = join(fallbackRoot, "python_embeded", "python.exe");
     mkdirSync(badScript, { recursive: true });
+    mkdirSync(join(fallbackRoot, "python_embeded"), { recursive: true });
+    writeFileSync(join(fallbackRoot, "main.py"), "# fallback tree\n");
+    writeFileSync(fallbackPython, "");
     try {
       live.argv = ["main.py", "--port", "8189"];
       probe.useActualProducer = true;
       probe.actualIdentity = {
-        commandLine: `${FAKE_PORTABLE_PYTHON} -s "${badScript}" --port 8189`,
-        argv: [FAKE_PORTABLE_PYTHON, "-s", badScript, "--port", "8189"],
+        commandLine: `${fallbackPython} -s "${badScript}" --port 8189`,
+        argv: [fallbackPython, "-s", badScript, "--port", "8189"],
         argvFidelity: "exact",
-        executablePath: FAKE_PORTABLE_PYTHON,
+        executablePath: fallbackPython,
         startedAt: "t1",
       };
 
@@ -475,6 +483,7 @@ describe("#1765 — install_custom_node must not write into an install this sess
       expect(error).toMatch(/no ComfyUI path is set|local ComfyUI install/i);
     } finally {
       rmSync(badRoot, { recursive: true, force: true });
+      rmSync(fallbackRoot, { recursive: true, force: true });
     }
   });
 

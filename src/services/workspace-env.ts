@@ -986,27 +986,50 @@ export function liveScriptFromArgv(
   argv: string[] | undefined,
   cwd?: string,
 ): string | undefined {
+  return liveScriptResolutionFromArgv(argv, cwd).path;
+}
+
+type PathResolution = {
+  path?: string;
+  indeterminate: boolean;
+};
+
+function liveScriptResolutionFromArgv(
+  argv: string[] | undefined,
+  cwd?: string,
+): PathResolution {
   const a = scriptTokenFromArgv(argv);
-  if (a === undefined) return undefined;
+  if (a === undefined) return { indeterminate: false };
   const dir = dirname(a);
   if (dir === "." || dir === "") {
     // Bare "main.py" — only resolvable via an absolute cwd.
-    return cwd && isAbsolute(cwd) ? realpathIfPresent(pathResolve(cwd, a)) : undefined;
+    return cwd && isAbsolute(cwd)
+      ? realpathIfPresent(pathResolve(cwd, a))
+      : { indeterminate: false };
   }
   if (isAbsolute(dir)) return realpathIfPresent(a);
   // Relative dir (e.g. "ComfyUI/main.py") — resolve against the server's cwd.
   if (cwd && isAbsolute(cwd)) return realpathIfPresent(pathResolve(cwd, a));
-  return undefined; // cannot resolve to an absolute dir → UNRESOLVED
+  return { indeterminate: false }; // cannot resolve to an absolute dir → UNRESOLVED
 }
 
 /** Resolve a launch script through symlinks when it exists, preserving the
- * lexical result for the parser's existing missing-path behavior. */
-function realpathIfPresent(path: string): string {
+ * lexical result for callers that need to report the exact failed path. Errors
+ * other than a missing path are marked indeterminate; authorization callers
+ * must inspect that flag instead of treating the lexical path as evidence. */
+function realpathIfPresent(path: string): PathResolution {
   try {
-    return realpathSync(path);
-  } catch {
-    return path;
+    return { path: realpathSync(path), indeterminate: false };
+  } catch (error) {
+    if (isMissingPathError(error)) return { path, indeterminate: false };
+    return { path, indeterminate: true };
   }
+}
+
+function isMissingPathError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  const code = (error as { code?: unknown }).code;
+  return code === "ENOENT" || code === "ENOTDIR";
 }
 
 /**
@@ -1216,7 +1239,12 @@ function anchorRelDirOnInterpreter(
  */
 function observeLivePython(
   argv: string[] | undefined,
-): { python?: string; pid: number; launchScript?: string } | undefined {
+): {
+  python?: string;
+  pid: number;
+  launchScript?: string;
+  launchScriptInvalid?: boolean;
+} | undefined {
   let statsHost: string | undefined;
   try {
     statsHost = new URL(getComfyUIBaseUrl()).hostname;
@@ -1234,8 +1262,13 @@ function observeLivePython(
     // The PID travels with the interpreter (#535). A caller that is about to STOP
     // a process must be able to confirm the anchor describes that very process
     // and not some other ComfyUI — an interpreter path alone cannot prove it.
-    return live && (binary || live.launchScript)
-      ? { python: binary, pid: live.pid, launchScript: live.launchScript }
+    return live && (binary || live.launchScript || live.launchScriptInvalid)
+      ? {
+          python: binary,
+          pid: live.pid,
+          launchScript: live.launchScript,
+          launchScriptInvalid: live.launchScriptInvalid,
+        }
       : undefined;
   } catch {
     return undefined;
@@ -1283,19 +1316,27 @@ export function resolveLiveServerRoot(
     observedPid?: number;
     /** Absolute launch script from the correlated live process observation. */
     observedLaunchScript?: string;
+    /** Correlated launch script was present but invalid/non-regular. */
+    observedLaunchScriptInvalid?: boolean;
     /** Skip the process-table probe entirely (remote server). Defaults to isRemoteMode(). */
     remote?: boolean;
   },
 ): LiveServerRootResolution {
   const relDir = liveRelDirFromArgv(argv);
   const lexicalFromArgv = liveRootFromArgv(argv, cwd);
-  const argvScript = liveScriptFromArgv(argv, cwd);
+  const argvScriptResolution = liveScriptResolutionFromArgv(argv, cwd);
+  if (argvScriptResolution.indeterminate) return { source: "unresolved", relDir };
+  const argvScript = argvScriptResolution.path;
   const fromArgv = argvScript ? dirname(argvScript) : lexicalFromArgv;
   // Preserve the historical unresolved/missing-path behavior, but never let an
   // existing directory, FIFO, or dangling symlink named main.py vouch for its
   // parent as a live install.
-  if (argvScript && pathEntryExists(argvScript) && !safeFileExists(argvScript)) {
-    return { source: "unresolved", relDir };
+  if (argvScript) {
+    const entry = pathEntryExists(argvScript);
+    if (entry === "indeterminate") return { source: "unresolved", relDir };
+    if (entry === "present" && regularFileState(argvScript) !== "file") {
+      return { source: "unresolved", relDir };
+    }
   }
   if (fromArgv) return { root: fromArgv, source: "argv", relDir };
   const remote = opts?.remote ?? isRemoteMode();
@@ -1304,26 +1345,33 @@ export function resolveLiveServerRoot(
   let observedPython = opts?.observedPython;
   let observedPid = opts?.observedPid;
   let observedLaunchScript = opts?.observedLaunchScript;
-  if (!observedPython && !observedLaunchScript) {
+  let observedLaunchScriptInvalid = opts?.observedLaunchScriptInvalid;
+  if (!observedPython && !observedLaunchScript && !observedLaunchScriptInvalid) {
     const observed = observeLivePython(argv);
     observedPython = observed?.python;
     observedPid = observed?.pid;
     observedLaunchScript = observed?.launchScript;
+    observedLaunchScriptInvalid = observed?.launchScriptInvalid;
+  }
+
+  // A correlated but unusable launch script is explicit contradictory evidence.
+  // It must not be erased by anchoring the same observation on its interpreter.
+  if (observedLaunchScriptInvalid) {
+    return { source: "unresolved", relDir, observedPython, observedPid };
   }
 
   if (observedLaunchScript) {
-    let resolvedLaunchScript: string | undefined;
-    try {
-      resolvedLaunchScript = realpathSync(observedLaunchScript);
-    } catch {
-      resolvedLaunchScript = undefined;
+    const resolvedLaunchScript = realpathIfPresent(observedLaunchScript);
+    if (!resolvedLaunchScript.path || resolvedLaunchScript.indeterminate) {
+      return { source: "unresolved", relDir, observedPython, observedPid };
     }
-    if (resolvedLaunchScript) {
-      const root = dirname(resolvedLaunchScript);
+    if (resolvedLaunchScript.path) {
+      const resolvedPath = resolvedLaunchScript.path;
+      const root = dirname(resolvedPath);
       if (
         isAbsolute(observedLaunchScript) &&
         /(^|[\\/])main\.pyw?$/i.test(observedLaunchScript) &&
-        safeFileExists(resolvedLaunchScript) &&
+        regularFileState(resolvedPath) === "file" &&
         hasMainPy(root)
       ) {
         return {
@@ -1332,10 +1380,13 @@ export function resolveLiveServerRoot(
           relDir,
           observedPython,
           observedPid,
-          observedLaunchScript: resolvedLaunchScript,
+          observedLaunchScript: resolvedPath,
         };
       }
     }
+    // An explicit observed script that did not authorize its root is not a
+    // reason to fall through to an interpreter anchor from another tree.
+    return { source: "unresolved", relDir, observedPython, observedPid };
   }
   if (!observedPython) return { source: "unresolved", relDir };
 
@@ -1394,23 +1445,31 @@ function hasMainPy(dir: string): boolean {
 
 /** Does the path resolve to a regular file? `statSync` follows symlinks, so a
  * symlink to a directory or a dangling/non-file entry cannot vouch for a root. */
-function safeFileExists(path: string): boolean {
-  if (/^\\\\/.test(path)) return false;
+type RegularFileState = "file" | "not-file" | "indeterminate";
+
+function regularFileState(path: string): RegularFileState {
+  if (/^\\\\/.test(path)) return "indeterminate";
   try {
-    return statSync(path).isFile();
-  } catch {
-    return false;
+    return statSync(path).isFile() ? "file" : "not-file";
+  } catch (error) {
+    return isMissingPathError(error) ? "not-file" : "indeterminate";
   }
 }
 
+function safeFileExists(path: string): boolean {
+  return regularFileState(path) === "file";
+}
+
 /** Does the lexical path itself exist, including a dangling symlink? */
-function pathEntryExists(path: string): boolean {
-  if (/^\\\\/.test(path)) return false;
+type PathEntryState = "present" | "missing" | "indeterminate";
+
+function pathEntryExists(path: string): PathEntryState {
+  if (/^\\\\/.test(path)) return "indeterminate";
   try {
     lstatSync(path);
-    return true;
-  } catch {
-    return false;
+    return "present";
+  } catch (error) {
+    return isMissingPathError(error) ? "missing" : "indeterminate";
   }
 }
 

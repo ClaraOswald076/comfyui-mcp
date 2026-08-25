@@ -391,7 +391,12 @@ describe("observeLiveServerProcess — the OS image survives a relative argv[0] 
       }),
     });
 
-    expect(res).toMatchObject({ pid: 5, image: exe });
+    expect(res).toMatchObject({
+      pid: 5,
+      image: exe,
+      python: exe,
+      launchScriptInvalid: true,
+    });
     expect(res?.launchScript).toBeUndefined();
   });
 

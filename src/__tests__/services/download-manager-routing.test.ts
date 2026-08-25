@@ -34,6 +34,11 @@ const hoisted = vi.hoisted(() => ({
 // The live-root routing branch only streams local when the root exists locally.
 vi.mock("node:fs", () => ({
   existsSync: () => hoisted.liveRootExists,
+  // The resolver follows the launch script before checking its regular-file
+  // status. Keep this synthetic absolute path a resolvable regular entry so
+  // the fixture continues to exercise routing, not the real filesystem.
+  realpathSync: (path: string) => path,
+  lstatSync: () => ({}),
   // #2261 — live-root authorization now requires main.py to be a regular file,
   // not merely an existing directory entry. Keep this fixture's root-presence
   // switch authoritative for both checks.
