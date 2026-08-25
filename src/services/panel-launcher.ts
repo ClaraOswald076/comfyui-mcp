@@ -11,6 +11,7 @@ import {
   closeSync,
   copyFileSync,
   existsSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -214,13 +215,15 @@ export async function installPanelLauncher(
   const run = options.exec ?? execFileSync;
   const spawnBroker = options.spawnImpl ?? spawn;
   const paths = panelLauncherPaths(home, roamingAppData(options));
-  mkdirSync(paths.launcherDir, { recursive: true });
-  copyFileSync(source, paths.broker);
 
-  const previous = readPanelLauncherConfig(home);
-  const token = previous?.token ?? randomBytes(32).toString("base64url");
-  const brokerId = previous?.broker_id ?? randomBytes(24).toString("base64url");
-  const brokerExecutable = nodePath;
+  const locked = await withPanelLauncherLock(home, async () => {
+    mkdirSync(paths.launcherDir, { recursive: true });
+    copyFileSync(source, paths.broker);
+
+    const previous = readPanelLauncherConfig(home);
+    const token = previous?.token ?? randomBytes(32).toString("base64url");
+    const brokerId = previous?.broker_id ?? randomBytes(24).toString("base64url");
+    const brokerExecutable = nodePath;
 
   /**
    * Start the broker unless the previous one is still alive.
@@ -264,11 +267,15 @@ export async function installPanelLauncher(
       };
       if (child.pid) next.pid = child.pid;
       else delete next.pid;
-      writeOwnedPanelLauncherConfig(next, home, token);
+      // The install holds the shared lock for the entire mutation sequence,
+      // including platform registration below; do not attempt to reacquire it.
+      if (!existsSync(paths.teardown) && readPanelLauncherConfig(home)?.token === token) {
+        writePanelLauncherConfig(next, home);
+      }
     }
     child.unref?.();
   };
-  const initialPublished = withPanelLauncherLock(home, () => {
+  const initialPublished = (() => {
     // Reinstall is the explicit operation that adopts this launcher root again.
     // Remove the old uninstall tombstone while holding the same lock used by
     // uninstall, so initial config publication cannot cross that teardown.
@@ -292,7 +299,7 @@ export async function installPanelLauncher(
       home,
     );
     return true;
-  });
+  })();
   if (initialPublished === null) {
     throw new Error("Could not acquire the panel launcher lock for install");
   }
@@ -472,7 +479,12 @@ export async function installPanelLauncher(
     );
     await startBrokerIfIdle();
   }
-  return paths;
+    return paths;
+  });
+  if (locked === null) {
+    throw new Error("Could not acquire the panel launcher lock for install");
+  }
+  return locked;
 }
 
 export type UninstallLauncherOptions = Pick<
@@ -617,97 +629,148 @@ function stopOwnedPanelLauncherBroker(
   }
 }
 
-function withPanelLauncherLock<T>(home: string, fn: () => T): T | null {
+type LauncherLockOwner = { pid: number; token: string; started_at?: string };
+
+function launcherProcessStartIdentity(pid: number, platform: NodeJS.Platform): string | null {
+  try {
+    if (platform === "linux") {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const endOfCommand = stat.lastIndexOf(")");
+      const fields = stat.slice(endOfCommand + 2).trim().split(/\s+/);
+      const startTicks = fields[19]; // field 22, after the command and state fields
+      const bootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+      return startTicks && bootId ? `${bootId}:${startTicks}` : null;
+    }
+    if (platform === "win32") {
+      const script =
+        `$p=Get-CimInstance Win32_Process -Filter \"ProcessId = ${pid}\";` +
+        `if($p){$p.CreationDate.ToUniversalTime().ToString(\"o\")}`;
+      return String(
+        execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+          encoding: "utf8",
+          timeout: 2_000,
+          windowsHide: true,
+          stdio: ["ignore", "pipe", "ignore"],
+        }),
+      ).trim() || null;
+    }
+    return String(
+      execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
+        encoding: "utf8",
+        timeout: 2_000,
+        stdio: ["ignore", "pipe", "ignore"],
+      }),
+    ).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+let cachedLauncherProcessStartIdentity: string | null | undefined;
+
+function currentLauncherProcessStartIdentity(): string | null {
+  if (cachedLauncherProcessStartIdentity === undefined) {
+    cachedLauncherProcessStartIdentity = launcherProcessStartIdentity(process.pid, process.platform);
+  }
+  return cachedLauncherProcessStartIdentity;
+}
+
+function readLauncherLockOwner(path: string): LauncherLockOwner | null {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    if (
+      !Number.isInteger(parsed.pid) ||
+      Number(parsed.pid) <= 0 ||
+      Number(parsed.pid) > 0x7fffffff ||
+      typeof parsed.token !== "string"
+    ) return null;
+    return {
+      pid: Number(parsed.pid),
+      token: parsed.token,
+      ...(typeof parsed.started_at === "string" ? { started_at: parsed.started_at } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function launcherLockOwnerIsDead(path: string): boolean {
+  const owner = readLauncherLockOwner(path);
+  if (!owner) return false;
+  try {
+    process.kill(owner.pid, 0);
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
+  }
+  // A live PID is not enough: the original process may have died and the OS
+  // may have recycled that number. If the platform cannot expose a start
+  // identity, fail closed and leave the lock for manual recovery.
+  if (!owner.started_at) return false;
+  const current = launcherProcessStartIdentity(owner.pid, process.platform);
+  return current !== null && current !== owner.started_at;
+}
+
+/**
+ * Publish a complete owner record before making the lock name visible. A
+ * process crash cannot leave an ownerless main/reclaim lock between exclusive
+ * create and metadata publication: the completed temp file is linked into the
+ * well-known name atomically, then held open until release.
+ */
+function tryCreateOwnedLauncherLock(path: string, owner: LauncherLockOwner): number | null {
+  const tempPath = `${path}.${owner.token}.tmp`;
+  let linked = false;
+  try {
+    writeFileSync(tempPath, JSON.stringify(owner), { encoding: "utf8", mode: 0o600 });
+    try {
+      linkSync(tempPath, path);
+      linked = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return null;
+      throw error;
+    }
+    return openSync(path, "r");
+  } catch (error) {
+    if (linked) rmSync(path, { force: true });
+    throw error;
+  } finally {
+    rmSync(tempPath, { force: true });
+  }
+}
+
+function withPanelLauncherLock<T>(home: string, fn: () => T): T | null;
+function withPanelLauncherLock<T>(home: string, fn: () => Promise<T>): Promise<T> | null;
+function withPanelLauncherLock<T>(home: string, fn: () => T | Promise<T>): T | Promise<T> | null {
   const paths = panelLauncherPaths(home);
   const reclaimPath = `${paths.lock}.reclaim`;
   mkdirSync(paths.root, { recursive: true });
+  const startedAt = currentLauncherProcessStartIdentity();
   for (let attempt = 0; attempt < 200; attempt += 1) {
     const lockToken = randomBytes(16).toString("hex");
+    const owner = { pid: process.pid, token: lockToken, ...(startedAt ? { started_at: startedAt } : {}) };
     let fd: number | undefined;
     let reclaimFd: number | undefined;
     let reclaimToken: string | undefined;
-    try {
-      fd = openSync(paths.lock, "wx", 0o600);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      let deadOwner = false;
-      try {
-        const owner = JSON.parse(readFileSync(paths.lock, "utf8")) as { pid?: unknown };
-        if (
-          Number.isInteger(owner.pid) &&
-          Number(owner.pid) > 0 &&
-          Number(owner.pid) <= 0x7fffffff
-        ) {
-          try {
-            process.kill(Number(owner.pid), 0);
-          } catch (probeError) {
-            deadOwner = (probeError as NodeJS.ErrnoException).code === "ESRCH";
-          }
-        }
-      } catch {
-        // The other process may be publishing its owner. Fail closed.
-      }
-      if (!deadOwner) continue;
+    fd = tryCreateOwnedLauncherLock(paths.lock, owner) ?? undefined;
+    if (fd === undefined) {
+      if (!launcherLockOwnerIsDead(paths.lock)) continue;
       try {
         reclaimToken = randomBytes(16).toString("hex");
-        try {
-          reclaimFd = openSync(reclaimPath, "wx", 0o600);
-        } catch (reclaimError) {
-          if ((reclaimError as NodeJS.ErrnoException).code !== "EEXIST") throw reclaimError;
-          let reclaimOwnerDead = false;
-          try {
-            const reclaimOwner = JSON.parse(readFileSync(reclaimPath, "utf8")) as {
-              pid?: unknown;
-            };
-            if (
-              Number.isInteger(reclaimOwner.pid) &&
-              Number(reclaimOwner.pid) > 0 &&
-              Number(reclaimOwner.pid) <= 0x7fffffff
-            ) {
-              try {
-                process.kill(Number(reclaimOwner.pid), 0);
-              } catch (probeError) {
-                reclaimOwnerDead = (probeError as NodeJS.ErrnoException).code === "ESRCH";
-              }
-            }
-          } catch {
-            // An incomplete reclaim lock is never reclaimed.
-          }
-          if (reclaimOwnerDead) rmSync(reclaimPath, { force: true });
+        reclaimFd = tryCreateOwnedLauncherLock(reclaimPath, {
+          pid: process.pid,
+          token: reclaimToken,
+          ...(startedAt ? { started_at: startedAt } : {}),
+        }) ?? undefined;
+        if (reclaimFd === undefined) {
+          if (launcherLockOwnerIsDead(reclaimPath)) rmSync(reclaimPath, { force: true });
         }
         if (reclaimFd === undefined) continue;
         // The auxiliary lock is itself a crash-recoverable owner lock. A
         // process which dies between acquiring it and releasing it must not
         // strand every later stale-main-lock recovery forever.
-        writeFileSync(
-          reclaimPath,
-          JSON.stringify({ pid: process.pid, token: reclaimToken }),
-          { encoding: "utf8", mode: 0o600 },
-        );
-        let stillDead = false;
-        try {
-          const current = JSON.parse(readFileSync(paths.lock, "utf8")) as { pid?: unknown };
-          if (
-            Number.isInteger(current.pid) &&
-            Number(current.pid) > 0 &&
-            Number(current.pid) <= 0x7fffffff
-          ) {
-            try {
-              process.kill(Number(current.pid), 0);
-            } catch (probeError) {
-              stillDead = (probeError as NodeJS.ErrnoException).code === "ESRCH";
-            }
-          }
-        } catch {
-          // An incomplete or replaced lock is never reclaimed.
-        }
+        const stillDead = launcherLockOwnerIsDead(paths.lock);
         if (stillDead) {
           rmSync(paths.lock, { force: true });
-          try {
-            fd = openSync(paths.lock, "wx", 0o600);
-          } catch {
-            fd = undefined;
-          }
+          fd = tryCreateOwnedLauncherLock(paths.lock, owner) ?? undefined;
         }
       } catch {
         // Another live reclaimer owns the auxiliary lock, or the lock changed.
@@ -728,14 +791,12 @@ function withPanelLauncherLock<T>(home: string, fn: () => T): T | null {
         continue;
       }
     }
-    writeFileSync(paths.lock, JSON.stringify({ pid: process.pid, token: lockToken }), {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    try {
-      return fn();
-    } finally {
-      closeSync(fd);
+    const lockFd = fd;
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      closeSync(lockFd);
       try {
         const owner = JSON.parse(readFileSync(paths.lock, "utf8")) as { token?: unknown };
         if (owner.token === lockToken) rmSync(paths.lock, { force: true });
@@ -755,6 +816,17 @@ function withPanelLauncherLock<T>(home: string, fn: () => T): T | null {
           // remove a replacement owned by another reclaimer.
         }
       }
+    };
+    try {
+      const result = fn();
+      if (result && typeof (result as unknown as { then?: unknown }).then === "function") {
+        return Promise.resolve(result as T | PromiseLike<T>).finally(release);
+      }
+      release();
+      return result as T;
+    } catch (error) {
+      release();
+      throw error;
     }
   }
   return null;
