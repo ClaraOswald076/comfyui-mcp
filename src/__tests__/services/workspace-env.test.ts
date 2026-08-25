@@ -2319,6 +2319,26 @@ describe("resolveLiveServerRoot (#369)", () => {
     }
   });
 
+  it("refuses an observed DIRECTORY named main.py before authorizing its parent", async () => {
+    const dir = await tmpDir();
+    try {
+      const root = join(dir, "directory-main");
+      const script = join(root, "main.py");
+      await mkdir(script, { recursive: true });
+      h.mockLiveProcess.mockReturnValue({ pid: 4244, launchScript: script });
+
+      const resolved = resolveLiveServerRoot(["main.py"], undefined, {});
+      expect(resolved.source).toBe("unresolved");
+      expect(resolved.root).toBeUndefined();
+
+      const argvResolved = resolveLiveServerRoot([script]);
+      expect(argvResolved.source).toBe("unresolved");
+      expect(argvResolved.root).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("anchors a BARE main.py on the OS image when that image is inside the install", async () => {
     const dir = await tmpDir();
     try {

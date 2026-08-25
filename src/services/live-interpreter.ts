@@ -26,7 +26,7 @@
 // should be added here as tier 0 — it works for remote servers too.
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, readlinkSync } from "node:fs";
+import { existsSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve as pathResolve } from "node:path";
 import { platform } from "node:os";
 import { findPidByPort } from "./port-owner.js";
@@ -665,8 +665,12 @@ function absoluteLaunchScriptFromIdentity(
 
   if (!sameLaunchScriptShape(processScript, serverScript)) return undefined;
 
-  const resolved = pathResolve(processScript);
-  return existsSync(resolved) ? resolved : undefined;
+  try {
+    const resolved = realpathSync(pathResolve(processScript));
+    return statSync(resolved).isFile() ? resolved : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

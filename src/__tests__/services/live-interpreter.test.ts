@@ -371,6 +371,30 @@ describe("observeLiveServerProcess — the OS image survives a relative argv[0] 
     expect(res).toMatchObject({ pid: 5, image: exe, launchScript: script });
   });
 
+  it("does not treat a DIRECTORY named main.py as a launch script", async () => {
+    const exe = await makeExe("directory-main-python.exe");
+    const root = join(dir, "directory-main");
+    const script = join(root, "main.py");
+    await mkdir(script, { recursive: true });
+
+    const res = observeLiveServerProcess({
+      port: 8188,
+      remote: false,
+      serverArgv: ["main.py", "--port", "8188"],
+      findPid: () => 5,
+      readIdentity: () => ({
+        commandLine: `${exe} -s "${script}" --port 8188`,
+        argv: [exe, "-s", script, "--port", "8188"],
+        argvFidelity: "exact",
+        executablePath: exe,
+        startedAt: "t1",
+      }),
+    });
+
+    expect(res).toMatchObject({ pid: 5, image: exe });
+    expect(res?.launchScript).toBeUndefined();
+  });
+
   it("uses the positional launch script among multiple main.py-shaped arguments", async () => {
     const exe = await makeExe("multi-main-python.exe");
     const actualRoot = join(dir, "actual");

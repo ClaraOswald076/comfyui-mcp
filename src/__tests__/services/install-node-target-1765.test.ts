@@ -453,6 +453,31 @@ describe("#1765 — install_custom_node must not write into an install this sess
     expect(clonedInto()).toBe(join(CONNECTED, PACK_DIR));
   });
 
+  it("refuses the git fallback when the producer sees a DIRECTORY named main.py", async () => {
+    const badRoot = join(SANDBOX, "directory-main");
+    const badScript = join(badRoot, "main.py");
+    mkdirSync(badScript, { recursive: true });
+    try {
+      live.argv = ["main.py", "--port", "8189"];
+      probe.useActualProducer = true;
+      probe.actualIdentity = {
+        commandLine: `${FAKE_PORTABLE_PYTHON} -s "${badScript}" --port 8189`,
+        argv: [FAKE_PORTABLE_PYTHON, "-s", badScript, "--port", "8189"],
+        argvFidelity: "exact",
+        executablePath: FAKE_PORTABLE_PYTHON,
+        startedAt: "t1",
+      };
+
+      const { ok, error } = await install({ id: REPO, source: "git" });
+
+      expect(ok).toBeUndefined();
+      expect(clonedInto()).toBeUndefined();
+      expect(error).toMatch(/no ComfyUI path is set|local ComfyUI install/i);
+    } finally {
+      rmSync(badRoot, { recursive: true, force: true });
+    }
+  });
+
   it("fails closed when the relative main.py cannot be anchored", async () => {
     // Relative script, and the OS observation yields no interpreter (a remote
     // proxy, a permissions failure, an unreadable process table). No live root

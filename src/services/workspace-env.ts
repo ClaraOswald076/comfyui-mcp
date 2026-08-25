@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve as pathResolve, sep } from "node:path";
@@ -1291,6 +1291,12 @@ export function resolveLiveServerRoot(
   const lexicalFromArgv = liveRootFromArgv(argv, cwd);
   const argvScript = liveScriptFromArgv(argv, cwd);
   const fromArgv = argvScript ? dirname(argvScript) : lexicalFromArgv;
+  // Preserve the historical unresolved/missing-path behavior, but never let an
+  // existing directory, FIFO, or dangling symlink named main.py vouch for its
+  // parent as a live install.
+  if (argvScript && pathEntryExists(argvScript) && !safeFileExists(argvScript)) {
+    return { source: "unresolved", relDir };
+  }
   if (fromArgv) return { root: fromArgv, source: "argv", relDir };
   const remote = opts?.remote ?? isRemoteMode();
   if (remote || relDir === undefined) return { source: "unresolved", relDir };
@@ -1317,6 +1323,7 @@ export function resolveLiveServerRoot(
       if (
         isAbsolute(observedLaunchScript) &&
         /(^|[\\/])main\.pyw?$/i.test(observedLaunchScript) &&
+        safeFileExists(resolvedLaunchScript) &&
         hasMainPy(root)
       ) {
         return {
@@ -1382,7 +1389,29 @@ function safeExists(p: string): boolean {
 
 /** Does this directory hold a ComfyUI entrypoint (`main.py`/`main.pyw`)? */
 function hasMainPy(dir: string): boolean {
-  return safeExists(join(dir, "main.py")) || safeExists(join(dir, "main.pyw"));
+  return safeFileExists(join(dir, "main.py")) || safeFileExists(join(dir, "main.pyw"));
+}
+
+/** Does the path resolve to a regular file? `statSync` follows symlinks, so a
+ * symlink to a directory or a dangling/non-file entry cannot vouch for a root. */
+function safeFileExists(path: string): boolean {
+  if (/^\\\\/.test(path)) return false;
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** Does the lexical path itself exist, including a dangling symlink? */
+function pathEntryExists(path: string): boolean {
+  if (/^\\\\/.test(path)) return false;
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
