@@ -43,7 +43,7 @@
     },
     {
       "path": "orchestrator/index.ts",
-      "lines": 6980
+      "lines": 7009
     },
     {
       "path": "orchestrator/ollama-backend.ts",
@@ -59,7 +59,7 @@
     },
     {
       "path": "orchestrator/panel-tools.ts",
-      "lines": 22350
+      "lines": 22367
     },
     {
       "path": "orchestrator/qwen-backend.ts",
