@@ -451,17 +451,31 @@ export async function installPanelLauncher(
       }
     }
     if (taskRegistered) {
-      try {
-        run("schtasks.exe", ["/Run", "/TN", PANEL_LAUNCHER_TASK], { stdio: "ignore" });
-        return { paths, startFallback: null }; // the task is registered AND running it worked
-      } catch {
-        // Registered but not startable right now (non-interactive session). The
-        // autostart is in place for the next logon, so do NOT add a second one —
-        // just get a broker up for THIS session.
-      }
+      return {
+        paths,
+        startFallback: null,
+        // The task may need the launcher lock when its broker starts and
+        // publishes its runtime state. Starting it while install still owns
+        // that lock made the broker exit after its bounded reacquire timeout.
+        startAfterInstall: async () => {
+          if (
+            existsSync(paths.teardown) ||
+            readPanelLauncherConfig(home)?.token !== token ||
+            readPanelLauncherConfig(home)?.install_id !== installId
+          ) return;
+          try {
+            run("schtasks.exe", ["/Run", "/TN", PANEL_LAUNCHER_TASK], { stdio: "ignore" });
+          } catch {
+            // Registered but not startable right now (non-interactive session).
+            // The autostart is in place for the next logon, so do NOT add a
+            // second one — just get a broker up for THIS session.
+            await startBrokerIfIdle();
+          }
+        },
+      }; // the task is registered AND will be started after the lock is released
     }
     needsFallbackBroker = true;
-    return { paths, startFallback: startBrokerIfIdle };
+    return { paths, startFallback: startBrokerIfIdle, startAfterInstall: null };
   }
 
   if (platform === "darwin") {
@@ -484,8 +498,20 @@ export async function installPanelLauncher(
     } catch {
       // It is normal for the label not to be loaded on first install.
     }
-    run("launchctl", ["bootstrap", `gui/${process.getuid?.() ?? 0}`, paths.macPlist], { stdio: "ignore" });
-    return { paths, startFallback: null };
+    return {
+      paths,
+      startFallback: null,
+      // Keep launchctl outside the installer lock. The launched broker must be
+      // able to reacquire that lock before it publishes its runtime config.
+      startAfterInstall: () => {
+        if (
+          existsSync(paths.teardown) ||
+          readPanelLauncherConfig(home)?.token !== token ||
+          readPanelLauncherConfig(home)?.install_id !== installId
+        ) return;
+        run("launchctl", ["bootstrap", `gui/${process.getuid?.() ?? 0}`, paths.macPlist], { stdio: "ignore" });
+      },
+    };
   }
 
   mkdirSync(dirname(paths.linuxService), { recursive: true });
@@ -496,12 +522,7 @@ export async function installPanelLauncher(
       `[Install]\nWantedBy=default.target\n`,
     "utf8",
   );
-  try {
-    run("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" });
-    run("systemctl", ["--user", "enable", "--now", "comfyui-mcp-launcher.service"], {
-      stdio: "ignore",
-    });
-  } catch {
+  const writeLinuxAutostart = (): void => {
     mkdirSync(dirname(paths.linuxAutostart), { recursive: true });
     writeFileSync(
       paths.linuxAutostart,
@@ -509,13 +530,54 @@ export async function installPanelLauncher(
         `Exec="${nodePath}" "${paths.broker}" run --broker-id=${brokerId} --install-id=${installId}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n`,
       "utf8",
     );
+  };
+  try {
+    run("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" });
+    run("systemctl", ["--user", "enable", "comfyui-mcp-launcher.service"], {
+      stdio: "ignore",
+    });
+  } catch {
+    writeLinuxAutostart();
     needsFallbackBroker = true;
   }
-    return { paths, startFallback: needsFallbackBroker ? startBrokerIfIdle : null };
+  return {
+    paths,
+    startFallback: needsFallbackBroker ? startBrokerIfIdle : null,
+    // `enable --now` used to start the broker while the installer still held
+    // the shared lock. Register under the lock, then start after it is released.
+    startAfterInstall: needsFallbackBroker
+      ? null
+      : async () => {
+          if (
+            existsSync(paths.teardown) ||
+            readPanelLauncherConfig(home)?.token !== token ||
+            readPanelLauncherConfig(home)?.install_id !== installId
+          ) return;
+          try {
+            run("systemctl", ["--user", "start", "comfyui-mcp-launcher.service"], { stdio: "ignore" });
+          } catch {
+            // A registered service that cannot start now still needs a
+            // per-user fallback and a broker for this session. Reacquire the
+            // lock only for the fallback artifact write; the broker itself is
+            // launched after that lock is released.
+            await withPanelLauncherLock(home, () => {
+              if (
+                existsSync(paths.teardown) ||
+                readPanelLauncherConfig(home)?.token !== token ||
+                readPanelLauncherConfig(home)?.install_id !== installId
+              ) return false;
+              writeLinuxAutostart();
+              return true;
+            });
+            await startBrokerIfIdle();
+          }
+        },
+  };
   });
   if (locked === null) {
     throw new Error("Could not acquire the panel launcher lock for install");
   }
+  if (locked.startAfterInstall) await locked.startAfterInstall();
   if (locked.startFallback) await locked.startFallback();
   return locked.paths;
 }

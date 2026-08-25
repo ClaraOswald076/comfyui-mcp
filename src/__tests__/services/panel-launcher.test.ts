@@ -96,6 +96,40 @@ describe("panel launcher install", () => {
     expect(lockHeldAtSpawn).toBe(false);
   });
 
+  it("releases the install lock before starting a registered Linux service", async () => {
+    const { home, source } = fixture();
+    const paths = panelLauncherPaths(home);
+    let lockHeldAtStart: boolean | undefined;
+    const calls: Array<readonly string[]> = [];
+    await installPanelLauncher({
+      home,
+      platform: "linux",
+      brokerSource: source,
+      exec: ((_file: string, args: readonly string[]) => {
+        calls.push(args);
+        if (args.includes("start")) lockHeldAtStart = existsSync(paths.lock);
+      }) as never,
+    });
+    expect(lockHeldAtStart).toBe(false);
+    expect(calls).toContainEqual(["--user", "enable", "comfyui-mcp-launcher.service"]);
+    expect(calls).toContainEqual(["--user", "start", "comfyui-mcp-launcher.service"]);
+  });
+
+  it("releases the install lock before running a registered Windows task", async () => {
+    const { home, source } = fixture();
+    const paths = panelLauncherPaths(home);
+    let lockHeldAtRun: boolean | undefined;
+    await installPanelLauncher({
+      home,
+      platform: "win32",
+      brokerSource: source,
+      exec: ((_file: string, args: readonly string[]) => {
+        if (args.includes("/Run")) lockHeldAtRun = existsSync(paths.lock);
+      }) as never,
+    });
+    expect(lockHeldAtRun).toBe(false);
+  });
+
   it("does not let an old fallback overwrite a later reinstall", async () => {
     const { home, source } = fixture();
     await installPanelLauncher({
