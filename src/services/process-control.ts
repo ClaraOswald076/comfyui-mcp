@@ -496,6 +496,38 @@ function findDesktopAppPids(): number[] {
   return pids;
 }
 
+/**
+ * Find Python processes that may be the Desktop server when the port-owner
+ * lookup is unavailable. This is only a candidate list: every candidate is
+ * re-read through the process identity reader and must still pass the exact
+ * command and authenticated-ancestry checks below.
+ */
+function findPythonProcessPids(): number[] {
+  const pids = new Set<number>();
+  const names = IS_WIN ? ["python.exe", "pythonw.exe"] : ["python", "python3", "pythonw"];
+  for (const name of names) {
+    try {
+      const out = IS_WIN
+        ? execSync(`tasklist /FI "IMAGENAME eq ${name}" /FO CSV /NH`, {
+            encoding: "utf-8",
+            timeout: 5000,
+          })
+        : execSync(`pgrep -x "${name}"`, {
+            encoding: "utf-8",
+            timeout: 5000,
+          });
+      for (const line of String(out).split(/\r?\n/)) {
+        const match = IS_WIN ? line.match(/^"[^"]+","(\d+)"/) : line.match(/^\s*(\d+)\s*$/);
+        const pid = match ? Number.parseInt(match[1], 10) : NaN;
+        if (Number.isInteger(pid) && pid > 0) pids.add(pid);
+      }
+    } catch {
+      // A missing process-list query is unknown evidence, not an empty tree.
+    }
+  }
+  return [...pids];
+}
+
 function killProcessTree(pid: number): void {
   try {
     if (IS_WIN) {
@@ -652,6 +684,100 @@ function isDesktopApp(argv: string[]): boolean {
     joined.includes("comfy desktop") ||
     joined.includes("@comfyorgcomfyui-electron")
   );
+}
+
+/**
+ * Is this the narrow server command shape that can be recovered from Desktop?
+ * The Desktop markers alone are not enough: an arbitrary Python helper launched
+ * from the Desktop install must not become a restart target.
+ */
+function isDesktopServerArgv(argv: string[]): boolean {
+  const script = argv[0]?.trim().replace(/^['"]+|['"]+$/g, "") ?? "";
+  const basename = script.split(/[\\/]/).pop()?.toLowerCase();
+  return basename === "main.py" && isDesktopApp(argv);
+}
+
+function normalizedWindowsToken(token: string): string {
+  return token.trim().replace(/^['"]+|['"]+$/g, "").replace(/\\/g, "/").toLowerCase();
+}
+
+/**
+ * Match the server's argv to an OS process command without the permissive
+ * substring semantics used for ordinary corroboration. The OS argv is exact on
+ * Windows; requiring equal lengths rejects an injected extra command or flag.
+ * A relative server script may correspond to the absolute script the process
+ * table reports, but every other token must agree exactly.
+ */
+function exactDesktopServerCommand(
+  identity: ProcessIdentity,
+  serverArgv: string[],
+): boolean {
+  if (
+    identity.argvFidelity !== "exact" ||
+    !identity.commandLine ||
+    !identity.argv ||
+    identity.argv.length < 2
+  ) {
+    return false;
+  }
+  const observed = identity.argv.slice(1);
+  if (observed.length !== serverArgv.length) return false;
+  return observed.every((token, index) => {
+    const actual = normalizedWindowsToken(token);
+    const expected = normalizedWindowsToken(serverArgv[index] ?? "");
+    if (actual === expected) return true;
+    // Only the script token may be relative in sys.argv. The process table's
+    // absolute spelling still has to end at that exact script name.
+    if (index !== 0 || expected.includes("/") || /^[a-z]:/.test(expected)) return false;
+    return actual.endsWith(`/${expected}`);
+  });
+}
+
+function isVerifiedExecutablePath(path: string | undefined): path is string {
+  return Boolean(path && /^(?:[a-z]:[\\/]|\\\\|\/)/i.test(path));
+}
+
+function isAuthenticatedPython(identity: ProcessIdentity): boolean {
+  const executable = identity.executablePath;
+  if (!executable) return false;
+  // A bare image name is only a claim. The recovery path needs the OS-reported
+  // executable location so an unrelated launcher cannot masquerade as the
+  // Python process that Desktop owns.
+  if (!isVerifiedExecutablePath(executable)) return false;
+  const basename = executable.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
+  return /^python(?:w)?(?:\d+(?:\.\d+)*)?(?:\.exe)?$/.test(basename);
+}
+
+function directDesktopPythonAncestry(
+  pid: number,
+  knownPids: ReadonlySet<number>,
+  readParent: (pid: number) => number | undefined,
+  readIdentity: (pid: number) => ProcessIdentity | undefined,
+): { desktopPid: number; desktopIdentity: ProcessIdentity } | "unavailable" | undefined {
+  // The issue's accepted shape is specifically Desktop.exe -> python.exe ->
+  // server python.exe. Do not walk through an arbitrary wrapper and turn a
+  // merely shared Desktop ancestor into restart authority.
+  const pythonPid = readParent(pid);
+  if (pythonPid == null) return "unavailable";
+  if (pythonPid <= 1 || pythonPid === pid) return undefined;
+  const python = readIdentity(pythonPid);
+  if (!python || !python.startedAt) return "unavailable";
+  if (!isAuthenticatedPython(python)) return undefined;
+
+  const desktopPid = readParent(pythonPid);
+  if (desktopPid == null) return "unavailable";
+  if (desktopPid <= 1 || desktopPid === pythonPid) return undefined;
+  if (!knownPids.has(desktopPid)) return undefined;
+  const desktop = readIdentity(desktopPid);
+  if (
+    !desktop ||
+    !desktop.startedAt ||
+    !isVerifiedExecutablePath(desktop.executablePath)
+  ) {
+    return "unavailable";
+  }
+  if (!isDesktopSupervisorProcess(desktop)) return undefined;
+  return { desktopPid, desktopIdentity: desktop };
 }
 
 /**
@@ -2963,6 +3089,101 @@ async function reconfirmAnsweringServer(
   return ownerNow === pid ? "confirmed" : "changed";
 }
 
+/**
+ * Recover a Desktop backend when the listener cannot be mapped to a PID.
+ *
+ * This is deliberately narrower than the old "find a Desktop process by name"
+ * fallback. The server has to have supplied a Desktop-shaped `sys.argv`; the OS
+ * process table has to expose one exact, spawn-faithful Python command with the
+ * same arguments; its direct parent has to be Python and that process's direct
+ * parent has to be a name-discovered Desktop PID; and the normal supervision
+ * classifier must authenticate every causality link. Missing or ambiguous evidence
+ * returns undefined so the caller keeps its existing refusal.
+ */
+function recoverDesktopProcessFromAncestry(
+  port: number,
+  serverArgv: string[],
+): ProcessInfo | undefined {
+  if (!isDesktopServerArgv(serverArgv)) return undefined;
+
+  const desktopPids = new Set(findDesktopAppPids());
+  if (desktopPids.size === 0) return undefined;
+
+  const identities = new Map<number, ProcessIdentity | undefined>();
+  const readIdentity = (pid: number): ProcessIdentity | undefined => {
+    if (!identities.has(pid)) identities.set(pid, resolveProcessIdentity(pid));
+    return identities.get(pid);
+  };
+  const readParent = (pid: number): number | undefined => {
+    // The normal reader and the test seam both represent the same OS fact. Use
+    // the seam when installed, otherwise retain the identity snapshot in the
+    // cache so one recovery decision does not mix process generations.
+    if (parentPidResolverOverride) return readParentPid(pid);
+    return readIdentity(pid)?.parentPid;
+  };
+
+  const matches: Array<{
+    pid: number;
+    identity: ProcessIdentity;
+    desktopPid: number;
+    desktopIdentity: ProcessIdentity;
+  }> = [];
+  let evidenceUnavailable = false;
+  for (const pid of findPythonProcessPids()) {
+    const identity = readIdentity(pid);
+    if (!identity) {
+      evidenceUnavailable = true;
+      continue;
+    }
+    if (!identity.startedAt) continue;
+    if (!isAuthenticatedPython(identity)) continue;
+    if (!exactDesktopServerCommand(identity, serverArgv)) continue;
+    const ancestry = directDesktopPythonAncestry(
+      pid,
+      desktopPids,
+      readParent,
+      readIdentity,
+    );
+    if (ancestry === "unavailable") {
+      evidenceUnavailable = true;
+      continue;
+    }
+    if (!ancestry) continue;
+
+    const { verdict } = classifyDesktopSupervision({
+      pid,
+      readParentPid: readParent,
+      readIdentity,
+      processExists,
+      isSupervisorProcess: isDesktopSupervisorProcess,
+    });
+    if (verdict === "supervised") {
+      matches.push({ pid, identity, ...ancestry });
+    } else if (verdict === "unconfirmed") {
+      evidenceUnavailable = true;
+    }
+  }
+
+  // Two identical H3 launches under Desktop are not distinguishable once the
+  // port table is unavailable. Choosing one would turn ambiguity into authority.
+  if (evidenceUnavailable || matches.length !== 1) return undefined;
+  const match = matches[0];
+  if (!match) return undefined;
+
+  return {
+    pid: match.pid,
+    port,
+    argv: [...serverArgv],
+    osArgv: match.identity.argv,
+    osArgvExact: match.identity.argvFidelity === "exact",
+    osCommandLine: match.identity.commandLine,
+    observedInterpreter: observedInterpreterFromIdentity(match.identity),
+    isDesktopApp: true,
+    desktopExePath: match.desktopIdentity.executablePath,
+    startedAt: match.identity.startedAt,
+  };
+}
+
 async function gatherProcessInfo(): Promise<ProcessInfo> {
   const port = config.resolvedPort;
 
@@ -3122,6 +3343,16 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
     throw err;
   }
   if (!pid) {
+    // A broken Windows listener can leave the server alive and still answering
+    // through an already-established panel connection, while every port-owner
+    // lookup returns unknown. Bind that server through the authenticated
+    // Desktop→Python ancestry instead of treating a Desktop name scan as proof.
+    // The recovery helper returns nothing unless the command and ancestry are
+    // independently verified, so the ordinary fail-closed error remains intact.
+    if (argv.length > 0) {
+      const recovered = recoverDesktopProcessFromAncestry(port, argv);
+      if (recovered) return recovered;
+    }
     // Liveness is the reachable SERVER, not only a local PID scan. If
     // /system_stats just answered (argv populated) yet we still can't map the
     // listening socket to a PID, say so precisely instead of claiming the

@@ -33,7 +33,7 @@ import {
   compareStartTimes,
   unclassifiedSupervision,
 } from "../../services/listener-ownership.js";
-import { tokenizeCommandLine } from "../../services/live-interpreter.js";
+import { tokenizeCommandLine, type ProcessIdentity } from "../../services/live-interpreter.js";
 
 /** `lsof -V` STATING that nothing is listening (see restart-live-first.test.ts). */
 function noListener(): Error {
@@ -973,6 +973,196 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
     mockGetSystemStats.mockResolvedValue({ system: { argv: DESKTOP_ARGV } });
     mockLivePortThenFree();
   }
+
+  const DESKTOP_ROOT_PID = 18752;
+  const DESKTOP_PYTHON_PID = 26628;
+  const DESKTOP_SERVER_PID = 27264;
+  const DESKTOP_SERVER_OS_ARGV = [
+    "C:\\Users\\u\\ComfyUI\\.venv\\Scripts\\python.exe",
+    ...DESKTOP_ARGV,
+  ];
+
+  function desktopListenerFailure(
+    identities: Record<number, ProcessIdentity | undefined>,
+    pythonPids = [DESKTOP_PYTHON_PID, DESKTOP_SERVER_PID],
+  ): void {
+    mockGetSystemStats.mockResolvedValue({ system: { argv: DESKTOP_ARGV } });
+    mockExecSync.mockImplementation((cmd: string) => {
+      const c = String(cmd);
+      if (/netstat|lsof/i.test(c)) throw new Error("listener unavailable");
+      if (/tasklist.*Comfy(?:UI| Desktop)\.exe|pgrep -f/i.test(c)) {
+        return '"Comfy Desktop.exe","18752","Console","1","206,248 K"';
+      }
+      if (/tasklist.*python|pgrep -x/i.test(c)) {
+        return /tasklist/i.test(c)
+          ? pythonPids.map((pid) => `"python.exe","${pid}","Console","1","20,000 K"`).join("\n")
+          : `${pythonPids.join("\n")}\n`;
+      }
+      return "";
+    });
+    __processControlTestHooks.setProcessIdentityResolver((pid) => identities[pid]);
+    __processControlTestHooks.setParentPidResolver((pid) => identities[pid]?.parentPid);
+    __processControlTestHooks.setProcessExistsProbe(() => true);
+  }
+
+  function verifiedDesktopTree(
+    serverArgv = DESKTOP_SERVER_OS_ARGV,
+  ): Record<number, ProcessIdentity> {
+    return {
+      [DESKTOP_ROOT_PID]: {
+        executablePath: "C:\\Program Files\\Comfy Desktop\\Comfy Desktop.exe",
+        commandLine: '"C:\\Program Files\\Comfy Desktop\\Comfy Desktop.exe"',
+        argv: ["C:\\Program Files\\Comfy Desktop\\Comfy Desktop.exe"],
+        argvFidelity: "exact",
+        startedAt: "1000",
+        parentPid: 1,
+      },
+      [DESKTOP_PYTHON_PID]: {
+        executablePath: "C:\\Users\\u\\ComfyUI\\.venv\\Scripts\\python.exe",
+        commandLine: '"C:\\Users\\u\\ComfyUI\\.venv\\Scripts\\python.exe" -m desktop_server',
+        argv: [
+          "C:\\Users\\u\\ComfyUI\\.venv\\Scripts\\python.exe",
+          "-m",
+          "desktop_server",
+        ],
+        argvFidelity: "exact",
+        startedAt: "2000",
+        parentPid: DESKTOP_ROOT_PID,
+      },
+      [DESKTOP_SERVER_PID]: {
+        executablePath: "C:\\Users\\u\\ComfyUI\\.venv\\Scripts\\python.exe",
+        commandLine: `"${serverArgv[0]}" ${serverArgv.slice(1).join(" ")}`,
+        argv: [...serverArgv],
+        argvFidelity: "exact",
+        startedAt: "3000",
+        parentPid: DESKTOP_PYTHON_PID,
+      },
+    };
+  }
+
+  function healthyFetch(): void {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ system: {} }), { status: 200 })),
+    );
+  }
+
+  it("recovers a Desktop backend from its verified Python ancestry when the listener lookup fails (#2265)", async () => {
+    desktopListenerFailure(verifiedDesktopTree());
+    healthyFetch();
+
+    const result = await restartComfyUI();
+
+    expect(result.message).not.toMatch(/refusing to restart/i);
+    expect(result.message).not.toMatch(/could not be identified/i);
+    expect(result.listener_ownership).toBe("unconfirmed");
+    expect(globalThis.fetch).toHaveBeenCalled();
+    expect(killWasIssued()).toBe(false);
+  });
+
+  it("refuses a Desktop descendant whose OS command has an extra or mismatched argument", async () => {
+    const wrongArgv = [...DESKTOP_SERVER_OS_ARGV, "--wrong-command"];
+    desktopListenerFailure(verifiedDesktopTree(wrongArgv));
+    healthyFetch();
+
+    const result = await restartComfyUI();
+
+    expect(result.message).toMatch(/could not be mapped|could not be identified|reachable/i);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(killWasIssued()).toBe(false);
+  });
+
+  it("refuses a matching Python command when its ancestry does not reach the Desktop PID", async () => {
+    const identities = verifiedDesktopTree();
+    identities[DESKTOP_PYTHON_PID] = {
+      ...identities[DESKTOP_PYTHON_PID],
+      parentPid: 31000,
+    };
+    identities[31000] = {
+      executablePath: "C:\\Tools\\launcher.exe",
+      commandLine: '"C:\\Tools\\launcher.exe"',
+      argv: ["C:\\Tools\\launcher.exe"],
+      argvFidelity: "exact",
+      startedAt: "500",
+      parentPid: 1,
+    };
+    desktopListenerFailure(identities);
+    healthyFetch();
+
+    const result = await restartComfyUI();
+
+    expect(result.message).toMatch(/could not be mapped|could not be identified|reachable/i);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(killWasIssued()).toBe(false);
+  });
+
+  it("refuses a server Python process separated from Desktop by an unrelated wrapper", async () => {
+    const identities = verifiedDesktopTree();
+    identities[DESKTOP_SERVER_PID] = {
+      ...identities[DESKTOP_SERVER_PID],
+      parentPid: 31000,
+    };
+    identities[31000] = {
+      executablePath: "C:\\Tools\\launcher.exe",
+      commandLine: '"C:\\Tools\\launcher.exe"',
+      argv: ["C:\\Tools\\launcher.exe"],
+      argvFidelity: "exact",
+      startedAt: "2500",
+      parentPid: DESKTOP_ROOT_PID,
+    };
+    desktopListenerFailure(identities);
+    healthyFetch();
+
+    const result = await restartComfyUI();
+
+    expect(result.message).toMatch(/could not be mapped|could not be identified|reachable/i);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(killWasIssued()).toBe(false);
+  });
+
+  it("refuses a Python candidate whose executable path is not OS-verifiable", async () => {
+    const identities = verifiedDesktopTree();
+    identities[DESKTOP_SERVER_PID] = {
+      ...identities[DESKTOP_SERVER_PID],
+      executablePath: "python.exe",
+    };
+    desktopListenerFailure(identities);
+    healthyFetch();
+
+    const result = await restartComfyUI();
+
+    expect(result.message).toMatch(/could not be mapped|could not be identified|reachable/i);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(killWasIssued()).toBe(false);
+  });
+
+  it("refuses when the ancestry evidence is unavailable or ambiguous", async () => {
+    const unavailable = verifiedDesktopTree();
+    delete unavailable[DESKTOP_PYTHON_PID];
+    desktopListenerFailure(unavailable);
+    healthyFetch();
+
+    const unavailableResult = await restartComfyUI();
+    expect(unavailableResult.message).toMatch(/could not be mapped|could not be identified|reachable/i);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+
+    vi.clearAllMocks();
+    __processControlTestHooks.reset();
+    const ambiguous = verifiedDesktopTree();
+    const secondServerPid = 27265;
+    ambiguous[secondServerPid] = {
+      ...ambiguous[DESKTOP_SERVER_PID],
+      startedAt: "3001",
+      parentPid: DESKTOP_PYTHON_PID,
+    };
+    desktopListenerFailure(ambiguous, [DESKTOP_PYTHON_PID, DESKTOP_SERVER_PID, secondServerPid]);
+    healthyFetch();
+
+    const ambiguousResult = await restartComfyUI();
+    expect(ambiguousResult.message).toMatch(/could not be mapped|could not be identified|reachable/i);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(killWasIssued()).toBe(false);
+  });
 
   it("REFUSES before any reboot when the Desktop supervisor has gone", async () => {
     // #814 exactly: two backends off one install, the shell that spawned the bound
