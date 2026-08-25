@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.104] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- keep the persistent panel launcher alive across service-start lock races (#2161)
+
 ## [0.52.103] - 2026-08-25
 
 ### MCP
