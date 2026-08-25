@@ -34,6 +34,10 @@ const hoisted = vi.hoisted(() => ({
 // The live-root routing branch only streams local when the root exists locally.
 vi.mock("node:fs", () => ({
   existsSync: () => hoisted.liveRootExists,
+  // #2261 — live-root authorization now requires main.py to be a regular file,
+  // not merely an existing directory entry. Keep this fixture's root-presence
+  // switch authoritative for both checks.
+  statSync: () => ({ isFile: () => hoisted.liveRootExists }),
 }));
 
 // isRemoteMode is the first gate; keep every other real config export.
