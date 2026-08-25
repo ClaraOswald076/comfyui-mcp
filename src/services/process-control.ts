@@ -829,38 +829,59 @@ function hasExactProcessIdentity(identity: ProcessIdentity | undefined): identit
 }
 
 /**
- * The executable path is useful only when it agrees with the OS command's first
- * token. A basename or absolute-path shape alone is not authentication: an
- * unrelated `python.exe`/`Comfy Desktop.exe` can live at either.
+ * The process reader exposes two different Python paths on Windows/Linux for a
+ * venv: `executablePath` is the base interpreter image, while argv[0] is the venv
+ * interpreter that owns the server's site-packages. Either path alone is not
+ * enough; the pair must have the shape the reader documents, and the server's
+ * exact H3 command must tie the venv path to the ComfyUI install.
  */
+function isPythonInterpreterPath(path: string | undefined): path is string {
+  if (!isVerifiedExecutablePath(path)) return false;
+  const basename = path.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
+  return /^python(?:w)?(?:\d+(?:\.\d+)*)?(?:\.exe)?$/.test(basename);
+}
+
 function isAuthenticatedPython(
   identity: ProcessIdentity,
   serverArgv?: string[],
 ): boolean {
   const executable = identity.executablePath;
-  if (!hasExactProcessIdentity(identity) || !executable || !isVerifiedExecutablePath(executable)) {
+  const argv0 = identity.argv?.[0];
+  if (
+    !hasExactProcessIdentity(identity) ||
+    !isPythonInterpreterPath(executable) ||
+    !isPythonInterpreterPath(argv0)
+  ) {
     return false;
   }
-  if (!identity.argv?.[0] || !sameRecoveryPath(executable, identity.argv[0])) return false;
-  const basename = executable.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
-  if (!/^python(?:w)?(?:\d+(?:\.\d+)*)?(?:\.exe)?$/.test(basename)) return false;
+
+  // A normal process has the same path in both fields. A venv process is the
+  // documented exception: the kernel image resolves to base Python, while
+  // argv[0] remains the venv trampoline. Do not accept arbitrary two-Python
+  // paths; only that one-way base -> venv relationship is reader-proven.
+  const samePath = sameRecoveryPath(executable, argv0);
+  if (!samePath && !(isVenvInterpreterPath(argv0) && !isVenvInterpreterPath(executable))) {
+    return false;
+  }
   if (!serverArgv) return true;
 
   // A recovered Desktop server must use a venv interpreter under the same
   // ComfyUI install named by its H3 script. This rejects an arbitrary absolute
   // `C:\\attacker\\venv\\Scripts\\python.exe` even when its basename is valid.
+  if (!isVenvInterpreterPath(argv0)) return false;
   const script = normalizeRecoveryPath(serverArgv[0] ?? "");
-  const pythonPath = normalizeRecoveryPath(executable);
+  const pythonPath = normalizeRecoveryPath(argv0);
   const comfySegment = IS_WIN ? "comfyui" : "ComfyUI";
   const scriptSegments = script.split("/").filter(Boolean);
   const pythonSegments = pythonPath.split("/").filter(Boolean);
   const scriptRootIndex = scriptSegments.lastIndexOf(comfySegment);
   const pythonRootIndex = pythonSegments.lastIndexOf(comfySegment);
   if (scriptRootIndex < 0 || pythonRootIndex < 0) return false;
-  if (!isVenvInterpreterPath(executable)) return false;
   if (isAbsoluteRecoveryPath(serverArgv[0] ?? "")) {
-    const expectedRoot = scriptSegments.slice(0, scriptRootIndex + 1).join("/");
-    if (!pythonPath.startsWith(`${expectedRoot}/`)) return false;
+    const expectedRoot = scriptSegments.slice(0, scriptRootIndex + 1);
+    if (!expectedRoot.every((segment, index) => pythonSegments[index] === segment)) {
+      return false;
+    }
   }
   return true;
 }

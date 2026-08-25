@@ -960,12 +960,19 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
    * Desktop-flavoured `--extra-model-paths-config`, which is what identifies it
    * (captured from the #814 report's own recovery command line).
    */
-  // Keep the production-level recovery fixture in the path dialect of the host
-  // running the test. The recovery path must not accidentally pass because a
-  // POSIX runner accepted Windows separators (or because its process-list parser
-  // happened to parse a Windows CSV row).
   const TEST_IS_WIN = process.platform === "win32";
-  const DESKTOP_ARGV = TEST_IS_WIN
+  // Existing lifecycle fixtures intentionally retain their Windows-shaped
+  // command. The listener-unavailable recovery case gets its own portable
+  // fixture because it exercises platform-specific process readers.
+  const DESKTOP_ARGV = [
+    "ComfyUI\\main.py",
+    "--enable-manager",
+    "--extra-model-paths-config",
+    "C:\\Users\\u\\AppData\\Roaming\\Comfy Desktop\\shared_model_paths.yaml",
+    "--port",
+    "8188",
+  ];
+  const RECOVERY_DESKTOP_ARGV = TEST_IS_WIN
     ? [
         "ComfyUI\\main.py",
         "--enable-manager",
@@ -991,9 +998,15 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
   const DESKTOP_ROOT_PID = 18752;
   const DESKTOP_PYTHON_PID = 26628;
   const DESKTOP_SERVER_PID = 27264;
-  const DESKTOP_SERVER_OS_ARGV = [
-    "C:\\Users\\u\\ComfyUI\\.venv\\Scripts\\python.exe",
-    ...DESKTOP_ARGV,
+  const RECOVERY_SERVER_VENV_PYTHON = TEST_IS_WIN
+    ? "C:\\Users\\u\\ComfyUI\\.venv\\Scripts\\python.exe"
+    : "/Users/u/ComfyUI/.venv/bin/python";
+  const RECOVERY_SERVER_BASE_PYTHON = TEST_IS_WIN
+    ? "C:\\Users\\u\\python_embeded\\python.exe"
+    : "/usr/bin/python3";
+  const RECOVERY_DESKTOP_SERVER_OS_ARGV = [
+    RECOVERY_SERVER_VENV_PYTHON,
+    ...RECOVERY_DESKTOP_ARGV,
   ];
 
   function desktopListenerFailure(
@@ -1002,7 +1015,7 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
     options: { serverArgv?: string[]; processListError?: boolean } = {},
   ): void {
     mockGetSystemStats.mockResolvedValue({
-      system: { argv: options.serverArgv ?? DESKTOP_ARGV },
+      system: { argv: options.serverArgv ?? RECOVERY_DESKTOP_ARGV },
     });
     mockExecSync.mockImplementation((cmd: string) => {
       const c = String(cmd);
@@ -1026,14 +1039,11 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
   }
 
   function verifiedDesktopTree(
-    serverArgv = DESKTOP_SERVER_OS_ARGV,
+    serverArgv = RECOVERY_DESKTOP_SERVER_OS_ARGV,
   ): Record<number, ProcessIdentity> {
     const desktopExe = TEST_IS_WIN
       ? "C:\\Program Files\\Comfy Desktop\\Comfy Desktop.exe"
       : "/Applications/Comfy Desktop.app/Contents/MacOS/Comfy Desktop";
-    const pythonExe = TEST_IS_WIN
-      ? "C:\\Users\\u\\ComfyUI\\.venv\\Scripts\\python.exe"
-      : "/Users/u/ComfyUI/.venv/bin/python";
     return {
       [DESKTOP_ROOT_PID]: {
         executablePath: desktopExe,
@@ -1044,15 +1054,15 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
         parentPid: 1,
       },
       [DESKTOP_PYTHON_PID]: {
-        executablePath: pythonExe,
-        commandLine: `"${pythonExe}" -m desktop_server`,
-        argv: [pythonExe, "-m", "desktop_server"],
+        executablePath: RECOVERY_SERVER_BASE_PYTHON,
+        commandLine: `"${RECOVERY_SERVER_VENV_PYTHON}" -m desktop_server`,
+        argv: [RECOVERY_SERVER_VENV_PYTHON, "-m", "desktop_server"],
         argvFidelity: "exact",
         startedAt: "2000",
         parentPid: DESKTOP_ROOT_PID,
       },
       [DESKTOP_SERVER_PID]: {
-        executablePath: pythonExe,
+        executablePath: RECOVERY_SERVER_BASE_PYTHON,
         commandLine: `"${serverArgv[0]}" ${serverArgv.slice(1).join(" ")}`,
         argv: [...serverArgv],
         argvFidelity: "exact",
@@ -1083,7 +1093,7 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
   });
 
   it("refuses a Desktop descendant whose OS command has an extra or mismatched argument", async () => {
-    const wrongArgv = [...DESKTOP_SERVER_OS_ARGV, "--wrong-command"];
+    const wrongArgv = [...RECOVERY_DESKTOP_SERVER_OS_ARGV, "--wrong-command"];
     desktopListenerFailure(verifiedDesktopTree(wrongArgv));
     healthyFetch();
 
@@ -1098,12 +1108,12 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
     const helperArgv = [
       TEST_IS_WIN ? "tools\\main.py" : "tools/main.py",
       "--extra-model-paths-config",
-      DESKTOP_ARGV[3]!,
+      RECOVERY_DESKTOP_ARGV[3]!,
       "--port",
       "8188",
       "--helper-mode",
     ];
-    desktopListenerFailure(verifiedDesktopTree([DESKTOP_SERVER_OS_ARGV[0]!, ...helperArgv]), [
+    desktopListenerFailure(verifiedDesktopTree([RECOVERY_DESKTOP_SERVER_OS_ARGV[0]!, ...helperArgv]), [
       DESKTOP_PYTHON_PID,
       DESKTOP_SERVER_PID,
     ], { serverArgv: helperArgv });
@@ -1224,8 +1234,8 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
     identities[DESKTOP_SERVER_PID] = {
       ...identities[DESKTOP_SERVER_PID],
       executablePath: serverExecutable,
-      commandLine: `"${serverExecutable}" ${DESKTOP_ARGV.join(" ")}`,
-      argv: [serverExecutable, ...DESKTOP_ARGV],
+      commandLine: `"${serverExecutable}" ${RECOVERY_DESKTOP_ARGV.join(" ")}`,
+      argv: [serverExecutable, ...RECOVERY_DESKTOP_ARGV],
     };
     identities[DESKTOP_ROOT_PID] = {
       ...identities[DESKTOP_ROOT_PID],
@@ -1244,7 +1254,7 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
   });
 
   it("uses exact platform-aware argument matching for the process-table script token", async () => {
-    const observed = [...DESKTOP_SERVER_OS_ARGV];
+    const observed = [...RECOVERY_DESKTOP_SERVER_OS_ARGV];
     observed[1] = TEST_IS_WIN
       ? "C:\\Users\\u\\ComfyUI\\main.py"
       : "/Users/u/ComfyUI/main.py";
