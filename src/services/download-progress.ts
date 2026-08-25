@@ -1173,21 +1173,32 @@ export function listPersistedDownloadJobs(): PersistedDownloadJob[] {
  *  the match exact AND credential-free. Prefers an in-flight ("downloading") match,
  *  then the most recently updated (a niche same-exact-URL-two-destinations case is
  *  inherently ambiguous from a URL alone — the id selector disambiguates it). */
-export function findPersistedDownloadJob(query: { trayId?: string; destKey?: string }): PersistedDownloadJob | null {
-  const { trayId, destKey } = query;
+export function findPersistedDownloadJob(query: {
+  trayId?: string;
+  destKey?: string;
+  target?: string;
+}): PersistedDownloadJob | null {
+  const { trayId, destKey, target } = query;
   if (!trayId && !destKey) return null;
   const matches = listPersistedDownloadJobs().filter(
-    (j) => (trayId && j.trayId === trayId) || (destKey && j.dest_key === destKey),
+    (j) =>
+      ((trayId && j.trayId === trayId) || (destKey && j.dest_key === destKey)) &&
+      (target === undefined || j.target === target),
   );
   if (matches.length === 0) return null;
   // AMBIGUITY GUARD: one URL can legitimately drive TWO jobs to different destinations
   // (they share a trayId), and one auth-free destination can back two different-auth
   // jobs (they share a dest_key). Adopting by URL/destination alone then can't tell them
   // apart — so REFUSE to guess when more than one DISTINCT LIVE job matches; the caller
-  // must use the exact id. Distinctness is (id, trayId). Ambiguity is judged over LIVE
+  // must use the exact id. Distinctness is (id, trayId, target). Ambiguity is judged over LIVE
   // (fresh in-flight) records ONLY: a heartbeat-stale record may still be streaming,
   // but must not block adoption or force a false decline.
-  const distinctKey = (j: PersistedDownloadJob): string => `${j.id}\n${j.trayId}`;
+  const distinctKey = (j: PersistedDownloadJob): string =>
+    `${j.id}\n${j.trayId}\n${j.target ?? ""}`;
+  // A URL/destination lookup without an explicit target cannot safely select
+  // between local, pod, and legacy targetless terminal rows. Keep the same
+  // fail-closed rule used by the in-flight path for the terminal fallback too.
+  if (target === undefined && new Set(matches.map(distinctKey)).size > 1) return null;
   const now = Date.now();
   const live = matches.filter(
     (j) => j.status === "downloading" && now - (j.updated ?? 0) < PERSISTED_INFLIGHT_STALE_MS,

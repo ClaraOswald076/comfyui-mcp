@@ -53,6 +53,7 @@ vi.mock("../../services/model-resolver.js", async () => {
 import { registerModelManagementTools } from "../../tools/model-management.js";
 import { setProgressDir } from "../../services/download-progress.js";
 import * as progressModule from "../../services/download-progress.js";
+import { resetDownloadJobs, startDownloadJob } from "../../services/download-jobs.js";
 import { spawnSync } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -237,6 +238,102 @@ describe("download_model tool", () => {
 });
 
 describe('download_model action:"status"', () => {
+  it("status selects the current target when local and pod records share id and tray", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "model-management-target-select-"));
+    const savedTarget = process.env.COMFYUI_URL;
+    setProgressDir(dir);
+    const id = "status-target-selector";
+    const trayId = "status-target-tray";
+    const base = {
+      id,
+      trayId,
+      progressId: "status-target-progress",
+      url: "https://example.com/status-target.safetensors",
+      target_subfolder: "checkpoints",
+      status: "downloading",
+      started_at: Date.now(),
+    };
+    try {
+      await writeFile(
+        join(dir, `control-job-${id}-local.json`),
+        JSON.stringify({
+          ...base,
+          target: "http://127.0.0.1:8188",
+          owner: "local-session",
+          updated: Date.now(),
+        }),
+      );
+      await writeFile(
+        join(dir, `control-job-${id}-pod.json`),
+        JSON.stringify({
+          ...base,
+          target: "https://pod-3000.proxy.runpod.net",
+          owner: "pod-session",
+          updated: Date.now(),
+        }),
+      );
+
+      const { downloadStatus } = makeServer();
+      process.env.COMFYUI_URL = "http://127.0.0.1:8188";
+      const local = (await downloadStatus({ id, tray_id: trayId })).content[0].text;
+      expect(local).toContain("target: `http://127.0.0.1:8188`");
+      expect(local).not.toContain("target: `https://pod-3000.proxy.runpod.net`");
+
+      process.env.COMFYUI_URL = "https://pod-3000.proxy.runpod.net";
+      const pod = (await downloadStatus({ id, tray_id: trayId })).content[0].text;
+      expect(pod).toContain("target: `https://pod-3000.proxy.runpod.net`");
+      expect(pod).not.toContain("target: `http://127.0.0.1:8188`");
+    } finally {
+      if (savedTarget === undefined) delete process.env.COMFYUI_URL;
+      else process.env.COMFYUI_URL = savedTarget;
+      setProgressDir("");
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("status keeps a live in-memory writer over an older persisted terminal", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "model-management-live-order-"));
+    const savedTarget = process.env.COMFYUI_URL;
+    process.env.COMFYUI_URL = "http://127.0.0.1:8188";
+    setProgressDir(dir);
+    resetDownloadJobs();
+    downloadModelMock.mockReturnValue(new Promise<string>(() => {}));
+    try {
+      const active = await startDownloadJob(
+        "https://example.com/live-order.safetensors",
+        "checkpoints",
+      );
+      await writeFile(
+        join(dir, `control-job-${active.job.id}-older-terminal.json`),
+        JSON.stringify({
+          id: active.job.id,
+          trayId: active.job.trayId,
+          progressId: active.job.progressId,
+          target: "http://127.0.0.1:8188",
+          url: "https://example.com/live-order.safetensors",
+          target_subfolder: "checkpoints",
+          status: "error",
+          error: "HTTP 503 upstream reset",
+          started_at: Date.now() - 60_000,
+          finished_at: Date.now() - 30_000,
+          owner: "older-terminal",
+          updated: Date.now() - 30_000,
+        }),
+      );
+
+      const { downloadStatus } = makeServer();
+      const text = (await downloadStatus({ id: active.job.id })).content[0].text;
+      expect(text).toContain("**downloading**");
+      expect(text).not.toContain("failed: HTTP 503 upstream reset");
+    } finally {
+      resetDownloadJobs();
+      setProgressDir("");
+      if (savedTarget === undefined) delete process.env.COMFYUI_URL;
+      else process.env.COMFYUI_URL = savedTarget;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("surfaces a landed-but-invisible download as a WARNING, not a bare 'landed at' (#369)", async () => {
     downloadModelMock.mockResolvedValueOnce("/stale/models/checkpoints/x.safetensors");
     verifyLandedModelMock.mockResolvedValueOnce({
