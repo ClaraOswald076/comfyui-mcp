@@ -96,6 +96,35 @@ describe("panel launcher install", () => {
     expect(lockHeldAtSpawn).toBe(false);
   });
 
+  it("does not let an old fallback overwrite a later reinstall", async () => {
+    const { home, source } = fixture();
+    await installPanelLauncher({
+      home,
+      platform: "linux",
+      nodePath: "old-node",
+      brokerSource: source,
+      exec: (() => {
+        throw new Error("no systemd user session");
+      }) as never,
+      spawnImpl: (() => {
+        // This synchronous seam models the config state after a reinstall
+        // between the old fallback's spawn and its delayed PID publication.
+        const current = readPanelLauncherConfig(home)!;
+        writeFileSync(
+          panelLauncherPaths(home).config,
+          JSON.stringify({
+            ...current,
+            install_id: "new-install-generation-000000000000000000000000000000",
+            broker_executable: "new-node",
+          }),
+          "utf8",
+        );
+        return { pid: 9911, unref() {} };
+      }) as never,
+    });
+    expect(readPanelLauncherConfig(home)?.broker_executable).toBe("new-node");
+  });
+
   it("falls back to a Startup autostart when the scheduled task is DENIED", async () => {
     // The failure this covers is not hypothetical: on a machine whose policy or
     // task-store ACL refuses task creation to the user, `schtasks /Create` fails

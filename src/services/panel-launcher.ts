@@ -45,6 +45,8 @@ export type PanelLauncherConfig = {
   host: "127.0.0.1";
   port: number;
   token: string;
+  /** Changes when a new install supersedes an unfinished fallback launch. */
+  install_id?: string;
   /** Random command-line marker proving that a recorded pid is our broker. */
   broker_id?: string;
   /** Executable recorded when the autostart command was installed. */
@@ -114,6 +116,8 @@ function isConfig(value: unknown): value is PanelLauncherConfig {
     Number(v.port) <= 65535 &&
     typeof v.token === "string" &&
     v.token.length >= 32 &&
+    (v.install_id === undefined ||
+      (typeof v.install_id === "string" && /^[A-Za-z0-9_-]{32,}$/.test(v.install_id))) &&
     (v.pid === undefined ||
       (Number.isInteger(v.pid) && Number(v.pid) > 0 && Number(v.pid) <= 0x7fffffff)) &&
     (v.broker_id === undefined ||
@@ -222,6 +226,12 @@ export async function installPanelLauncher(
 
     const previous = readPanelLauncherConfig(home);
     const token = previous?.token ?? randomBytes(32).toString("base64url");
+    // Preserve the generation of a live broker so reinstall does not disable
+    // the process that already owns the answering port. A port-0/unfinished
+    // install gets a new generation, which invalidates its delayed fallback.
+    const installId = previous?.port && previous.install_id
+      ? previous.install_id
+      : randomBytes(24).toString("base64url");
     const brokerId = previous?.broker_id ?? randomBytes(24).toString("base64url");
     const brokerExecutable = nodePath;
     let needsFallbackBroker = false;
@@ -247,12 +257,20 @@ export async function installPanelLauncher(
     // on a second install — this function's own config write used to drop the
     // pid — so a duplicate broker was spawned beside a live one (merge-gate P1).
     // The port is what the query actually uses; the pid was never evidence.
-    if (existsSync(paths.teardown) || readPanelLauncherConfig(home)?.token !== token) return;
+    if (
+      existsSync(paths.teardown) ||
+      readPanelLauncherConfig(home)?.token !== token ||
+      readPanelLauncherConfig(home)?.install_id !== installId
+    ) return;
     if (previous?.port) {
       const live = (await queryPanelLauncher(home)) as { running?: boolean };
       if (live.running) return; // a real broker answered — leave it alone
     }
-    if (existsSync(paths.teardown) || readPanelLauncherConfig(home)?.token !== token) return;
+    if (
+      existsSync(paths.teardown) ||
+      readPanelLauncherConfig(home)?.token !== token ||
+      readPanelLauncherConfig(home)?.install_id !== installId
+    ) return;
     const child = spawnBroker(nodePath, brokerRunArgs(paths.broker, brokerId), {
       detached: true,
       stdio: "ignore",
@@ -270,7 +288,7 @@ export async function installPanelLauncher(
       };
       if (child.pid) next.pid = child.pid;
       else delete next.pid;
-      writeOwnedPanelLauncherConfig(next, home, token);
+      writeOwnedPanelLauncherConfig(next, home, { token, installId });
     }
     child.unref?.();
   };
@@ -285,6 +303,7 @@ export async function installPanelLauncher(
         host: "127.0.0.1",
         port: previous?.port ?? 0,
         token,
+        install_id: installId,
         broker_id: brokerId,
         broker_executable: brokerExecutable,
         // The running broker's pid is the broker's to publish, not this install's
@@ -694,7 +713,7 @@ function readLauncherLockOwner(path: string): LauncherLockOwner | null {
   }
 }
 
-function launcherLockOwnerIsDead(path: string): boolean {
+function launcherLockOwnerIsDead(path: string, identityCache?: Map<number, string | null>): boolean {
   const owner = readLauncherLockOwner(path);
   if (!owner) return false;
   try {
@@ -706,7 +725,14 @@ function launcherLockOwnerIsDead(path: string): boolean {
   // may have recycled that number. If the platform cannot expose a start
   // identity, fail closed and leave the lock for manual recovery.
   if (!owner.started_at) return false;
-  const current = launcherProcessStartIdentity(owner.pid, process.platform);
+  if (owner.pid === process.pid && currentLauncherProcessStartIdentity() === owner.started_at) return false;
+  let current: string | null;
+  if (identityCache?.has(owner.pid)) {
+    current = identityCache.get(owner.pid) ?? null;
+  } else {
+    current = launcherProcessStartIdentity(owner.pid, process.platform);
+    identityCache?.set(owner.pid, current);
+  }
   return current !== null && current !== owner.started_at;
 }
 
@@ -744,6 +770,7 @@ function withPanelLauncherLock<T>(home: string, fn: () => T | Promise<T>): T | P
   const reclaimPath = `${paths.lock}.reclaim`;
   mkdirSync(paths.root, { recursive: true });
   const startedAt = currentLauncherProcessStartIdentity();
+  const ownerIdentityCache = new Map<number, string | null>();
   for (let attempt = 0; attempt < 200; attempt += 1) {
     const lockToken = randomBytes(16).toString("hex");
     const owner = { pid: process.pid, token: lockToken, ...(startedAt ? { started_at: startedAt } : {}) };
@@ -752,7 +779,7 @@ function withPanelLauncherLock<T>(home: string, fn: () => T | Promise<T>): T | P
     let reclaimToken: string | undefined;
     fd = tryCreateOwnedLauncherLock(paths.lock, owner) ?? undefined;
     if (fd === undefined) {
-      if (!launcherLockOwnerIsDead(paths.lock)) continue;
+      if (!launcherLockOwnerIsDead(paths.lock, ownerIdentityCache)) continue;
       try {
         reclaimToken = randomBytes(16).toString("hex");
         reclaimFd = tryCreateOwnedLauncherLock(reclaimPath, {
@@ -761,13 +788,13 @@ function withPanelLauncherLock<T>(home: string, fn: () => T | Promise<T>): T | P
           ...(startedAt ? { started_at: startedAt } : {}),
         }) ?? undefined;
         if (reclaimFd === undefined) {
-          if (launcherLockOwnerIsDead(reclaimPath)) rmSync(reclaimPath, { force: true });
+          if (launcherLockOwnerIsDead(reclaimPath, ownerIdentityCache)) rmSync(reclaimPath, { force: true });
         }
         if (reclaimFd === undefined) continue;
         // The auxiliary lock is itself a crash-recoverable owner lock. A
         // process which dies between acquiring it and releasing it must not
         // strand every later stale-main-lock recovery forever.
-        const stillDead = launcherLockOwnerIsDead(paths.lock);
+        const stillDead = launcherLockOwnerIsDead(paths.lock, ownerIdentityCache);
         if (stillDead) {
           rmSync(paths.lock, { force: true });
           fd = tryCreateOwnedLauncherLock(paths.lock, owner) ?? undefined;
@@ -835,14 +862,15 @@ function withPanelLauncherLock<T>(home: string, fn: () => T | Promise<T>): T | P
 function writeOwnedPanelLauncherConfig(
   config: PanelLauncherConfig,
   home: string,
-  ownerToken: string,
+  ownership: { token: string; installId?: string },
 ): boolean {
   return withPanelLauncherLock(home, () => {
     const paths = panelLauncherPaths(home);
     // The tombstone is written before uninstall removes the config. A broker
     // which is still publishing after that point must not recreate launcher.json.
     if (existsSync(paths.teardown)) return false;
-    if (readPanelLauncherConfig(home)?.token !== ownerToken) return false;
+    const current = readPanelLauncherConfig(home);
+    if (current?.token !== ownership.token || current.install_id !== ownership.installId) return false;
     writePanelLauncherConfig(config, home);
     return true;
   }) ?? false;
@@ -1199,7 +1227,8 @@ export async function startPanelLauncherBroker(
   const runtimeConfig = { ...current, broker_id: brokerId };
   const brokerConfigStillOwned = () =>
     !existsSync(panelLauncherPaths(home).teardown) &&
-    readPanelLauncherConfig(home)?.token === current.token;
+    readPanelLauncherConfig(home)?.token === current.token &&
+    readPanelLauncherConfig(home)?.install_id === current.install_id;
   let launch: TerminalLaunch | null = null;
   let lastLaunchAt = 0;
   let recoveryTimer: NodeJS.Timeout | null = null;
@@ -1372,7 +1401,7 @@ export async function startPanelLauncherBroker(
   const published = writeOwnedPanelLauncherConfig(
     { ...runtimeConfig, port: address.port, pid: process.pid, updated_at: new Date().toISOString() },
     home,
-    current.token,
+    { token: current.token, installId: current.install_id },
   );
   if (!published) {
     await new Promise<void>((resolve) => server.close(() => resolve()));
