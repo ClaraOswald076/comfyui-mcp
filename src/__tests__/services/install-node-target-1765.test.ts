@@ -186,7 +186,7 @@ vi.mock("node:child_process", async () => {
 const probe = vi.hoisted(() => ({
   calls: 0,
   /** What the OS says is running on the port; undefined = nothing observable. */
-  result: undefined as { python: string; pid: number } | undefined,
+  result: undefined as { python?: string; pid: number; launchScript?: string } | undefined,
 }));
 vi.mock("../../services/live-interpreter.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../services/live-interpreter.js")>();
@@ -405,6 +405,21 @@ describe("#1765 — install_custom_node must not write into an install this sess
     expect(ok).toMatchObject({ mechanism: "git-clone" });
     expect(clonedInto()).toBe(join(CONNECTED, PACK_DIR));
     expect(probe.calls).toBeGreaterThan(0);
+  });
+
+  it("uses the correlated absolute launch script for a portable bare-main.py process", async () => {
+    // The portable interpreter is a sibling of the actual ComfyUI checkout, so
+    // the existing interpreter-as-anchor tier intentionally cannot identify this
+    // root. The OS process command line has already correlated the absolute script
+    // with this server; that direct evidence is sufficient for the clone target.
+    live.argv = ["main.py", "--port", "8189"];
+    probe.result = { pid: 4244, launchScript: join(CONNECTED, "main.py") };
+
+    const { ok, error } = await install({ id: REPO, source: "git" });
+
+    expect(error).toBeUndefined();
+    expect(ok).toMatchObject({ mechanism: "git-clone" });
+    expect(clonedInto()).toBe(join(CONNECTED, PACK_DIR));
   });
 
   it("fails closed when the relative main.py cannot be anchored", async () => {

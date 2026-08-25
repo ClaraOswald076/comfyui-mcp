@@ -1041,6 +1041,8 @@ export interface LiveServerRootResolution {
    *  relatively and names no probeable file (#1374). Reported so a refusal can name
    *  what WAS seen; it is the anchor input, not a runnable interpreter. */
   observedPython?: string;
+  /** The absolute main.py path observed in the correlated process command line. */
+  observedLaunchScript?: string;
   /**
    * The directory `relDir` was resolved AGAINST to produce `root` — i.e. the
    * working directory the running server must have had for its relative
@@ -1204,7 +1206,7 @@ function anchorRelDirOnInterpreter(
  */
 function observeLivePython(
   argv: string[] | undefined,
-): { python: string; pid: number } | undefined {
+): { python?: string; pid: number; launchScript?: string } | undefined {
   let statsHost: string | undefined;
   try {
     statsHost = new URL(getComfyUIBaseUrl()).hostname;
@@ -1222,7 +1224,9 @@ function observeLivePython(
     // The PID travels with the interpreter (#535). A caller that is about to STOP
     // a process must be able to confirm the anchor describes that very process
     // and not some other ComfyUI — an interpreter path alone cannot prove it.
-    return live && binary ? { python: binary, pid: live.pid } : undefined;
+    return live && (binary || live.launchScript)
+      ? { python: binary, pid: live.pid, launchScript: live.launchScript }
+      : undefined;
   } catch {
     return undefined;
   }
@@ -1246,10 +1250,10 @@ function observeLivePython(
  *     COMFYUI_PATH — a DIFFERENT, stale install — and the model landed where the
  *     running server never reads. So we ask the OS instead: `observeLiveServerProcess`
  *     identifies the process listening on our port (correlated against the server's
- *     own argv, so a proxy can't impersonate it) and reports the binary it runs — its
- *     interpreter, or the OS's own image record when the launcher spelled the
- *     interpreter relatively (#1374); the relative `main.py` dir is re-anchored on
- *     that binary's install tree.
+ *     own argv, so a proxy can't impersonate it) and reports its absolute launch
+ *     script when available, otherwise the binary it runs — its interpreter, or the
+ *     OS's own image record when the launcher spelled the interpreter relatively
+ *     (#1374); the relative `main.py` dir is re-anchored on that evidence.
  *
  * Anything else is `unresolved`. There is deliberately NO layout-guess tier: a
  * COMFYUI_PATH that merely looks plausible is what wrote 4.88 GB into the wrong
@@ -1267,6 +1271,8 @@ export function resolveLiveServerRoot(
     observedPython?: string;
     /** PID the caller-supplied observation belongs to (test seam companion). */
     observedPid?: number;
+    /** Absolute launch script from the correlated live process observation. */
+    observedLaunchScript?: string;
     /** Skip the process-table probe entirely (remote server). Defaults to isRemoteMode(). */
     remote?: boolean;
   },
@@ -1279,10 +1285,31 @@ export function resolveLiveServerRoot(
 
   let observedPython = opts?.observedPython;
   let observedPid = opts?.observedPid;
-  if (!observedPython) {
+  let observedLaunchScript = opts?.observedLaunchScript;
+  if (!observedPython && !observedLaunchScript) {
     const observed = observeLivePython(argv);
     observedPython = observed?.python;
     observedPid = observed?.pid;
+    observedLaunchScript = observed?.launchScript;
+  }
+
+  if (observedLaunchScript) {
+    const root = pathResolve(dirname(observedLaunchScript));
+    if (
+      isAbsolute(observedLaunchScript) &&
+      /(^|[\\/])main\.pyw?$/i.test(observedLaunchScript) &&
+      existsSync(observedLaunchScript) &&
+      hasMainPy(root)
+    ) {
+      return {
+        root,
+        source: "observed-process",
+        relDir,
+        observedPython,
+        observedPid,
+        observedLaunchScript: pathResolve(observedLaunchScript),
+      };
+    }
   }
   if (!observedPython) return { source: "unresolved", relDir };
 
@@ -1294,10 +1321,11 @@ export function resolveLiveServerRoot(
       relDir,
       observedPython,
       observedPid,
+      observedLaunchScript,
       anchorDir: anchored.anchorDir,
     };
   }
-  return { source: "unresolved", relDir, observedPython, observedPid };
+  return { source: "unresolved", relDir, observedPython, observedPid, observedLaunchScript };
 }
 
 /**

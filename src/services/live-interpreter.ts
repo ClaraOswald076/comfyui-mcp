@@ -637,6 +637,63 @@ export function commandLineMatchesArgv(
   });
 }
 
+/**
+ * Recover an absolute launch-script path from the OS process record when the
+ * server's own argv only reports a bare/relative `main.py`.
+ *
+ * The command-line identity has already been correlated with `serverArgv` by
+ * `observeLiveServerProcess`. Keep the extra extraction narrow: use the first
+ * main.py-shaped process argument and require it to agree with the server's
+ * positional script token and exist on disk. This is observed launch evidence,
+ * not a portable-bundle layout guess.
+ */
+function absoluteLaunchScriptFromIdentity(
+  identity: ProcessIdentity | undefined,
+  serverArgv: string[] | undefined,
+): string | undefined {
+  const serverScript = positionalMainScript(serverArgv);
+  if (!serverScript) return undefined;
+
+  const processArgv =
+    identity?.argv && identity.argv.length > 0
+      ? identity.argv
+      : tokenizeCommandLine(identity?.commandLine ?? "");
+  const processScript = processArgv
+    .map((raw) => raw.trim().replace(/^["']+|["']+$/g, ""))
+    .find((arg) => /(^|[\\/])main\.pyw?$/i.test(arg));
+  if (!processScript || !isAbsolute(processScript)) return undefined;
+
+  const serverParts = serverScript
+    .split(/[\\/]/)
+    .filter((part) => part !== "" && part !== ".");
+  const processParts = processScript.split(/[\\/]/).filter(Boolean);
+  const processSuffix = processParts.slice(-serverParts.length);
+  if (
+    serverParts.length === 0 ||
+    processParts.length < serverParts.length ||
+    serverParts.some(
+      (part, index) => part.toLowerCase() !== processSuffix[index]?.toLowerCase(),
+    )
+  ) {
+    return undefined;
+  }
+
+  const resolved = pathResolve(processScript);
+  return existsSync(resolved) ? resolved : undefined;
+}
+
+/** The positional launch script in the server's own argv. */
+function positionalMainScript(argv: string[] | undefined): string | undefined {
+  if (!Array.isArray(argv)) return undefined;
+  for (const raw of argv) {
+    if (typeof raw !== "string") continue;
+    const arg = raw.trim().replace(/^["']+|["']+$/g, "");
+    if (arg.startsWith("-")) return undefined;
+    if (/(^|[\\/])main\.pyw?$/i.test(arg)) return arg;
+  }
+  return undefined;
+}
+
 // ---------------------------------------------------------------------------
 // The resolver
 // ---------------------------------------------------------------------------
@@ -691,6 +748,13 @@ export interface LiveServerProcess {
    * simply fails it, so this reading can add a resolution but never redirect one.
    */
   image?: string;
+  /**
+   * An absolute `main.py`/`main.pyw` path observed in the correlated process
+   * command line. Unlike `image`, this identifies the script's actual checkout
+   * directly and is useful when a portable bundle's interpreter is a sibling
+   * of the ComfyUI directory and the server reports only bare `main.py`.
+   */
+  launchScript?: string;
 }
 
 /**
@@ -752,6 +816,7 @@ export function observeLiveServerProcess(opts: ResolveOptions): LiveServerProces
     rawImage && isAbsolute(rawImage) && existsSync(rawImage)
       ? pathResolve(rawImage)
       : undefined;
+  const launchScript = absoluteLaunchScriptFromIdentity(identity, opts.serverArgv);
 
   // Tier 1 — the process we launched, confirmed by PID *and* start time.
   // The recorded interpreter must be ABSOLUTE: a bare `python` would be
@@ -779,7 +844,13 @@ export function observeLiveServerProcess(opts: ResolveOptions): LiveServerProces
       launchRecord.startedAt === identity.startedAt &&
       corroborated
     ) {
-      return { python: launchRecord.python, source: "launched-by-us", pid, image };
+      const result = {
+        python: launchRecord.python,
+        source: "launched-by-us" as const,
+        pid,
+        image,
+      };
+      return launchScript ? { ...result, launchScript } : result;
     }
     // Same PID, different (or unreadable) start time → this is NOT our process, or
     // we cannot prove it is. Fall through to tier 2 rather than trust the record.
@@ -815,11 +886,13 @@ export function observeLiveServerProcess(opts: ResolveOptions): LiveServerProces
     ? interpreterFromVenvHints(identity.venvHints, argv0)
     : identity?.venvPython;
   if (fromEnv && isAbsolute(fromEnv) && existsSync(fromEnv)) {
-    return { python: fromEnv, source: "process-table", pid, image };
+    const result = { python: fromEnv, source: "process-table" as const, pid, image };
+    return launchScript ? { ...result, launchScript } : result;
   }
 
   if (argv0) {
-    return { python: argv0, source: "process-table", pid, image };
+    const result = { python: argv0, source: "process-table" as const, pid, image };
+    return launchScript ? { ...result, launchScript } : result;
   }
-  return { pid, image };
+  return launchScript ? { pid, image, launchScript } : { pid, image };
 }
