@@ -42,6 +42,7 @@ type Launcher = {
   ) => boolean;
   rescueInitializeResult: (params: unknown) => Frame;
   installingDecision: (msg: unknown) => Decision;
+  npmProbeTimeoutMs: (env?: Record<string, string | undefined>) => number;
   attachColdStartProxy: (opts: {
     clientIn: NodeJS.ReadableStream;
     clientOut: NodeJS.WritableStream;
@@ -49,6 +50,7 @@ type Launcher = {
     childOut: NodeJS.ReadableStream;
     deadlineMs: number;
     onRescue?: () => void;
+    onHandoverFailed?: (error: unknown) => void;
   }) => { phase: () => string; forceRescue: () => void };
   INSTALLING_VERSION: string;
   RESCUE_MIN_MS: number;
@@ -267,8 +269,16 @@ describe("rescue deadline tracks the CLIENT's budget (#1447)", () => {
     for (const bad of ["", "soon", "-1", "0", "NaN", undefined]) {
       expect(cached({ MCP_TIMEOUT: bad })).toBe(DEFAULT_CLIENT_BUDGET_MS * RESCUE_BUDGET_FRACTION);
     }
-    expect(cached({ MCP_TIMEOUT: "100" })).toBe(RESCUE_MIN_MS);
     expect(cached({ MCP_TIMEOUT: "600000" })).toBe(RESCUE_MAX_MS);
+    // Round-2 gate: a floor that can OUTLIVE the budget is not a floor, it is
+    // a way to miss the deadline. At MCP_TIMEOUT=1000 a 1500 ms floor would
+    // have scheduled the rescue after the client had already given up.
+    expect(cached({ MCP_TIMEOUT: "1000" })).toBeLessThan(1000);
+    expect(cached({ MCP_TIMEOUT: "1000" })).toBe(400);
+    for (const budget of [200, 1000, 3000, 10000, 30000]) {
+      expect(cached({ MCP_TIMEOUT: String(budget) })).toBeLessThan(budget);
+    }
+    expect(cached({ MCP_TIMEOUT: "100" })).toBeLessThan(RESCUE_MIN_MS);
     // The measured warm-npx handshake is ~1.2 s (7.0 s once, when npx updated
     // first). The cached deadline must sit well clear of that or it would swap
     // a healthy server's real serverInfo for the stand-in on every launch.
@@ -294,6 +304,33 @@ describe("rescue deadline tracks the CLIENT's budget (#1447)", () => {
     expect(cold({ MCP_TIMEOUT: "2000" })).toBe(2000 * RESCUE_BUDGET_FRACTION);
     // Raising the assumed default must NOT be able to move this branch.
     expect(cold({})).toBeLessThan(DEFAULT_CLIENT_BUDGET_MS * RESCUE_BUDGET_FRACTION);
+  });
+
+  it("bounds the npm probes by the same budget — they run BEFORE the deadline arms", () => {
+    // Round-2 gate: two sequential 5 s probes could eat a 10 s budget whole and
+    // the rescue would never arm. They now run concurrently AND are capped by a
+    // slice of the budget, so probing plus the deadline stays inside it.
+    const { npmProbeTimeoutMs, coldStartDeadlineMs } = launcher;
+    expect(npmProbeTimeoutMs({})).toBe(5000);
+    expect(npmProbeTimeoutMs({ MCP_TIMEOUT: "10000" })).toBe(2000);
+    expect(npmProbeTimeoutMs({ MCP_TIMEOUT: "3000" })).toBe(600);
+    expect(npmProbeTimeoutMs({ MCP_TIMEOUT: "100" })).toBe(300);
+    for (const budget of [3000, 5000, 10000, 30000]) {
+      const env = { MCP_TIMEOUT: String(budget) };
+      const worst = npmProbeTimeoutMs(env) + coldStartDeadlineMs(env, { cachedInstall: false });
+      expect(worst, `probe + cold deadline must fit inside ${budget}ms`).toBeLessThan(budget);
+      const warm = npmProbeTimeoutMs(env) + coldStartDeadlineMs(env, { cachedInstall: true });
+      expect(warm, `probe + cached deadline must fit inside ${budget}ms`).toBeLessThan(budget);
+    }
+  });
+
+  it("launches both npm probes concurrently, not one after the other", () => {
+    // The arithmetic above only holds if the two probes overlap; sequential
+    // probes would each be allowed the full timeout. Promise.all is the shape
+    // that guarantees it, and the timeout is passed in rather than defaulted.
+    const src = readFileSync(LAUNCHER_URL, "utf8");
+    expect(src).toMatch(/await Promise\.all\(\[\s*probeNpm\(\["root", "-g"\], probeTimeout\),/);
+    expect(src).toMatch(/probeNpm\(\["config", "get", "cache"\], probeTimeout\),/);
   });
 
   it("reads `npm config get cache` to tell a first run from a warm one", () => {
@@ -402,11 +439,21 @@ describe("cold-start proxy state machine (#1447)", () => {
     const childOut = new PassThrough();
     const toClient = collectLines(clientOut);
     const toChild = collectLines(childIn);
-    const proxy = launcher.attachColdStartProxy({ clientIn, clientOut, childIn, childOut, deadlineMs });
+    const handoverFailures: unknown[] = [];
+    const proxy = launcher.attachColdStartProxy({
+      clientIn,
+      clientOut,
+      childIn,
+      childOut,
+      deadlineMs,
+      onHandoverFailed: (error) => handoverFailures.push(error),
+    });
     return {
       proxy,
       toClient,
       toChild,
+      handoverFailures,
+      writeClient: (raw: string) => clientIn.write(`${raw}\n`),
       fromClient: (m: Frame) => clientIn.write(`${JSON.stringify(m)}\n`),
       fromChild: (m: Frame) => childOut.write(`${JSON.stringify(m)}\n`),
     };
@@ -497,6 +544,59 @@ describe("cold-start proxy state machine (#1447)", () => {
       result: { tools: { name: string }[] };
     };
     expect(real.result.tools[0].name).toBe("generate_image");
+    expect(r.handoverFailures).toEqual([]);
+  });
+
+  it("arms on an `initialize` whose method name is JSON-ESCAPED", async () => {
+    // Round-2 gate: the arming test used to be a substring match on the text
+    // `"initialize"`. JSON may escape any character in a string, so an escaped
+    // method is the same request to a parser and invisible to that test — and
+    // the rescue would simply never fire for such a client.
+    const r = rig(40);
+    r.writeClient(
+      '{"jsonrpc":"2.0","id":7,"method":"\\u0069nitialize","params":{"protocolVersion":"2025-03-26"}}',
+    );
+    const stand = (await waitFor(() => parseAll(r.toClient)[0])) as {
+      id: number;
+      result: { serverInfo: { version: string }; protocolVersion: string };
+    };
+    expect(stand.id).toBe(7);
+    expect(stand.result.serverInfo.version).toBe(launcher.INSTALLING_VERSION);
+    expect(stand.result.protocolVersion).toBe("2025-03-26");
+  });
+
+  it("a server that ERRORS its handshake after a rescue is not announced as connected", async () => {
+    // Round-2 gate: this path swallowed the error and sent tools/list_changed,
+    // leaving the client holding a success the launcher invented for a server
+    // that had just refused to start. There is no way to retract the handshake,
+    // so the only honest move is to stop.
+    const r = rig(40);
+    r.fromClient(INIT);
+    await waitFor(() => parseAll(r.toClient)[0]);
+    expect(r.proxy.phase()).toBe("installing");
+
+    r.fromChild({ jsonrpc: "2.0", id: 7, error: { code: -32602, message: "unsupported protocol version" } });
+    const failure = (await waitFor(() => r.handoverFailures[0])) as { message: string };
+    expect(failure.message).toMatch(/unsupported protocol version/);
+    expect(r.proxy.phase()).toBe("failed");
+
+    // …and specifically NOT a tools announcement, nor a second answer for id 7.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(parseAll(r.toClient).some((f) => f.method === "notifications/tools/list_changed")).toBe(false);
+    expect(parseAll(r.toClient).filter((f) => f.id === 7)).toHaveLength(1);
+  });
+
+  it("an error the server sends in TIME is the client's to see, untouched", async () => {
+    // The control for the case above: without a rescue the wrapper has no
+    // opinion — the server's own error is its own answer.
+    const r = rig(2000);
+    r.fromClient(INIT);
+    await waitFor(() => (r.toChild.length ? true : undefined));
+    r.fromChild({ jsonrpc: "2.0", id: 7, error: { code: -32602, message: "unsupported protocol version" } });
+    const forwarded = (await waitFor(() => parseAll(r.toClient)[0])) as { error: { message: string } };
+    expect(forwarded.error.message).toBe("unsupported protocol version");
+    expect(r.proxy.phase()).toBe("transparent");
+    expect(r.handoverFailures).toEqual([]);
   });
 });
 

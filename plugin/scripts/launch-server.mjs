@@ -64,8 +64,14 @@ import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { pathToFileURL } from "node:url";
 
-/** `npm root -g` is normally ~100 ms; 5 s bounds a wedged npm without hanging the handshake. */
-const NPM_ROOT_TIMEOUT_MS = 5000;
+/**
+ * An npm probe is normally ~100 ms. These bound a wedged npm: never longer than
+ * the ceiling, and never more than a slice of the client's own budget, because
+ * every millisecond spent probing is a millisecond the rescue deadline no
+ * longer has. See npmProbeTimeoutMs.
+ */
+const NPM_PROBE_CEILING_MS = 5000;
+const NPM_PROBE_FRACTION = 0.2;
 
 /**
  * `npm root -g` stdout → the global install's entry point, or null when the
@@ -133,7 +139,9 @@ export const DEFAULT_CLIENT_BUDGET_MS = 30000;
  * margin to spare, not to shave the deadline.
  */
 export const RESCUE_BUDGET_FRACTION = 0.4;
+/** Nothing cached: rescue this soon, or sooner if the budget is tighter still. */
 export const RESCUE_MIN_MS = 1500;
+/** Something cached: wait at most this long for the real handshake. */
 export const RESCUE_MAX_MS = 12000;
 
 /**
@@ -173,9 +181,9 @@ export function cachedNpxInstallExists(npmCacheStdout, { readdir = readdirSync, 
  * NOTHING CACHED — the reported first run. npm must fetch and unpack the whole
  * tree before a server process exists at all (measured: 15.2 s of npm on a fast
  * link, 818 MB / 170 packages), so waiting cannot pay: there is no server to
- * wait for. The deadline is the floor, and deliberately does NOT depend on the
- * assumed default budget — a client that waits less than we assume must still
- * be rescued in time. This is the branch the gate was right to press on.
+ * wait for. 1.5 s, and deliberately NOT derived from the assumed default budget
+ * — a client that waits less than we assume must still be rescued in time. This
+ * is the branch the round-1 gate was right to press on.
  *
  * SOMETHING CACHED — npx has a tree and is about to exec it. Measured warm-npx
  * handshakes on this machine: 1.2 s, 1.2 s, 1.2 s, and 7.0 s once when npx
@@ -187,14 +195,34 @@ export function cachedNpxInstallExists(npmCacheStdout, { readdir = readdirSync, 
  * MCP_TIMEOUT is that budget and it is VISIBLE to us — verified by measurement:
  * a server launched by `MCP_TIMEOUT=17000 claude …` reads
  * `process.env.MCP_TIMEOUT === "17000"`. So a user who tightens the budget gets
- * rescued sooner, not later.
+ * rescued sooner, not later — and the budget share is a ceiling on BOTH
+ * branches, so no floor of ours can ever schedule the rescue past it.
  */
-export function coldStartDeadlineMs(env = process.env, { cachedInstall = true } = {}) {
+export function clientBudgetMs(env = process.env) {
   const raw = Number(env.MCP_TIMEOUT);
-  const budget = Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_CLIENT_BUDGET_MS;
-  const share = Math.round(budget * RESCUE_BUDGET_FRACTION);
-  if (!cachedInstall) return Math.min(RESCUE_MIN_MS, share);
-  return Math.min(RESCUE_MAX_MS, Math.max(RESCUE_MIN_MS, share));
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_CLIENT_BUDGET_MS;
+}
+
+export function coldStartDeadlineMs(env = process.env, { cachedInstall = true } = {}) {
+  // The share is a hard ceiling in BOTH branches. A floor that could exceed it
+  // was the round-2 gate's finding: at `MCP_TIMEOUT=1000` a 1500 ms floor
+  // scheduled the rescue after the client had already given up, so the floor
+  // has to lose to the budget rather than the other way round.
+  const share = Math.round(clientBudgetMs(env) * RESCUE_BUDGET_FRACTION);
+  return Math.min(cachedInstall ? RESCUE_MAX_MS : RESCUE_MIN_MS, share);
+}
+
+/**
+ * How long the two npm probes get before the launcher gives up on them.
+ *
+ * This is subtracted from the client's budget before the rescue deadline even
+ * starts, so it cannot be a fixed 5 s: the round-2 gate found that two
+ * sequential 5 s probes could consume a 10 s budget entirely and the rescue
+ * would never arm. The probes now run CONCURRENTLY and are bounded by a slice
+ * of the same budget, so probe + deadline together stay well inside it.
+ */
+export function npmProbeTimeoutMs(env = process.env) {
+  return Math.min(NPM_PROBE_CEILING_MS, Math.max(300, Math.round(clientBudgetMs(env) * NPM_PROBE_FRACTION)));
 }
 
 /**
@@ -356,13 +384,25 @@ function writeFrame(dest, source, line) {
  *                  instructions, and nothing below ever ran.
  *   installing   — the deadline won. The wrapper answered `initialize` and is
  *                  holding the connection open with empty lists.
- *   live         — the server's (now redundant) `initialize` response has been
+ *   live         — the server's (now redundant) `initialize` result has been
  *                  swallowed and `tools/list_changed` sent. Pure passthrough.
+ *   failed       — the server answered that same `initialize` with an ERROR.
+ *                  The client is holding a success we sent for it and there is
+ *                  no way to retract it, so the transport is dropped instead of
+ *                  announcing tools that will never exist.
  *
  * Exported and stream-injectable so the tests can drive the REAL state machine
  * rather than a description of it.
  */
-export function attachColdStartProxy({ clientIn, clientOut, childIn, childOut, deadlineMs, onRescue }) {
+export function attachColdStartProxy({
+  clientIn,
+  clientOut,
+  childIn,
+  childOut,
+  deadlineMs,
+  onRescue,
+  onHandoverFailed,
+}) {
   let phase = "opening";
   let initializeId;
   let initializeParams;
@@ -392,7 +432,14 @@ export function attachColdStartProxy({ clientIn, clientOut, childIn, childOut, d
       // opening/transparent/live all forward verbatim. In `opening` we still
       // peek, but only to learn the id we may have to answer for — the line
       // itself goes to the server untouched either way.
-      if (phase === "opening" && initializeId === undefined && line.includes('"initialize"')) {
+      //
+      // Peeking means PARSING, never matching the text `"initialize"`: JSON may
+      // escape any character in a string, so `"initialize"` is the same
+      // method to a parser and invisible to a substring test. The round-2 gate
+      // found that shortcut, and it would have disarmed the rescue entirely for
+      // a client that escapes. It costs nothing to drop — at most a couple of
+      // frames reach here before the handshake settles.
+      if (phase === "opening" && initializeId === undefined) {
         const msg = parseFrame(line);
         if (msg && msg.method === "initialize" && msg.id !== undefined && msg.id !== null) {
           initializeId = msg.id;
@@ -423,9 +470,9 @@ export function attachColdStartProxy({ clientIn, clientOut, childIn, childOut, d
       return;
     }
     // Only the server's answer to the client's `initialize` changes anything,
-    // and a response carries no `method` — so this is the one cheap test that
-    // has to run per frame while we are still waiting.
-    const msg = line.includes('"id"') ? parseFrame(line) : null;
+    // and a response carries no `method`. Parse rather than sniff for `"id"`,
+    // for the same escaping reason as the client side.
+    const msg = parseFrame(line);
     const isInitializeResponse =
       msg && msg.method === undefined && initializeId !== undefined && sameId(msg.id, initializeId);
     if (!isInitializeResponse) {
@@ -433,16 +480,26 @@ export function attachColdStartProxy({ clientIn, clientOut, childIn, childOut, d
       return;
     }
     if (phase === "opening") {
-      // The server won the race. Hand the client its real handshake and never
-      // look at another frame.
+      // The server won the race. Hand the client its real handshake — error or
+      // not, it is the server's own answer — and never look at another frame.
       phase = "transparent";
       disarm();
       writeFrame(clientOut, childOut, line);
       return;
     }
     // phase === "installing": the client already has an `initialize` result for
-    // this id. A second response for the same id is a protocol violation, so
-    // this one is swallowed — and the client is told to re-list instead.
+    // this id, so a second response for the same id cannot be forwarded.
+    if (msg.error) {
+      // …but the server FAILED to initialize. The client is holding a success
+      // we sent on its behalf, and there is no way to retract it — so the
+      // honest move is to stop, loudly, rather than announce tools that will
+      // never exist. Found by the round-2 gate: this path previously emitted
+      // `tools/list_changed` and left the client believing it had connected.
+      phase = "failed";
+      disarm();
+      if (onHandoverFailed) onHandoverFailed(msg.error);
+      return;
+    }
     phase = "live";
     toClient({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
   });
@@ -475,13 +532,13 @@ function sameId(a, b) {
  *  to exactly what the plugin did before this wrapper existed (the npx path),
  *  and for the cache root it degrades to "assume nothing is cached", which
  *  rescues sooner rather than later. */
-function probeNpm(args) {
+function probeNpm(args, timeout = NPM_PROBE_CEILING_MS) {
   const isWin = process.platform === "win32";
   return new Promise((resolve) => {
     execFile(
       isWin ? ["npm", ...args].join(" ") : "npm",
       isWin ? [] : args,
-      { shell: isWin, timeout: NPM_ROOT_TIMEOUT_MS },
+      { shell: isWin, timeout },
       (error, stdout) => resolve(error ? null : stdout),
     );
   });
@@ -536,6 +593,23 @@ function runProxied(spec, deadlineMs) {
             `${deadlineMs}ms (first launch installs ~818MB); answered the MCP handshake on its ` +
             "behalf and will announce its tools when the install completes.",
         ),
+      onHandoverFailed: (error) => {
+        // The client is holding a handshake this wrapper answered, and the
+        // server has now refused its own. Dropping the transport is the only
+        // honest signal left: the client reports a disconnect instead of a
+        // connected server with no tools, and this line is in its server log.
+        console.error(
+          "[comfyui-mcp launcher] the server refused to initialize after the launcher answered " +
+            `the handshake for it: ${JSON.stringify(error)}. Closing the connection rather than ` +
+            "reporting a server that will never have tools.",
+        );
+        try {
+          child.kill();
+        } catch {
+          /* already gone; the exit handler still runs */
+        }
+        process.exitCode = 1;
+      },
     });
   }
   superviseChild(child, spec);
@@ -544,16 +618,23 @@ function runProxied(spec, deadlineMs) {
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
   const extraArgs = process.argv.slice(2);
-  const entry = globalEntry(await probeNpm(["root", "-g"]));
+  // CONCURRENTLY, and bounded by a slice of the client's budget. Sequential
+  // probes could each burn the full timeout and leave nothing for the rescue
+  // (round-2 gate); in parallel the worst case is one probe, not two.
+  const probeTimeout = npmProbeTimeoutMs();
+  const [npmRoot, npmCache] = await Promise.all([
+    probeNpm(["root", "-g"], probeTimeout),
+    probeNpm(["config", "get", "cache"], probeTimeout),
+  ]);
+  const entry = globalEntry(npmRoot);
   // The rescue exists for the npx fallback, which is the only path that can
   // have an install in front of the handshake. A resolved global entry starts
   // a server that is already on disk, so it keeps inherited stdio and this
-  // wrapper stays out of its protocol entirely — and never pays the second
-  // npm probe either.
+  // wrapper stays out of its protocol entirely.
   if (entry) {
     run(serverSpec(entry, extraArgs));
   } else {
-    const cachedInstall = cachedNpxInstallExists(await probeNpm(["config", "get", "cache"]));
+    const cachedInstall = cachedNpxInstallExists(npmCache);
     runProxied(serverSpec(null, extraArgs), coldStartDeadlineMs(process.env, { cachedInstall }));
   }
 }
