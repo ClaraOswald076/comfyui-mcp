@@ -860,6 +860,9 @@ export type DispatchedMediaItem = {
    *  re-derived here: a guess about the media kind is the thing this module is
    *  refusing to make. */
   kind: string;
+  /** True only when the outbound item carried a data URL with the source
+   *  bytes. Omitted/false means the item was sent as a reference. */
+  inline?: boolean;
 };
 
 /** Why a `show_media` reply did or did not establish that its items were
@@ -998,6 +1001,14 @@ export function unaccountedShowMediaNote(
     .map((d) => `  - ${d.filename} (dispatched as ${d.kind})`)
     .join("\n");
   const more = dispatched.length > 8 ? `\n  - …and ${dispatched.length - 8} more` : "";
+  const animatedImages = dispatched.filter(
+    (d) => d.inline === true && /\.(?:gif|apng|webp)$/i.test(d.filename),
+  );
+  const animationCaveat =
+    animatedImages.length > 0
+      ? ` Animated GIF/APNG/WebP bytes were dispatched, but this reply does not say whether ` +
+        `their frames advanced beyond the first frame.`
+      : "";
 
   let what: string;
   if (verdict.reason === "mailboxed") {
@@ -1038,7 +1049,7 @@ export function unaccountedShowMediaNote(
       `The client acknowledged the command but did not report what it rendered — its reply carries no ` +
       `per-item accounting (\`count\`/\`painted\`/\`unrenderable\`), so it did not read the items. ` +
       `The mobile / remote client answers \`{"shown": true}\` to any show_media without looking at them, ` +
-      `and it has no audio player at all.`;
+      `and it has no audio player at all.${animationCaveat}`;
   }
 
   return (

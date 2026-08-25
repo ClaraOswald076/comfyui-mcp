@@ -571,7 +571,7 @@ const SHOW_MEDIA_AUDIO_PAINT_EXTS = new Set([
   ".aac",
 ]);
 const SHOW_MEDIA_VIDEO_PAINT_EXTS = new Set([".mp4", ".webm", ".mov", ".mkv", ".m4v", ".avi"]);
-const SHOW_MEDIA_IMAGE_PAINT_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
+const SHOW_MEDIA_IMAGE_PAINT_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".apng", ".webp"]);
 
 function showMediaFilenameExt(filename: string): string {
   const stem = filename.split("#")[0]!.split("?")[0]!;

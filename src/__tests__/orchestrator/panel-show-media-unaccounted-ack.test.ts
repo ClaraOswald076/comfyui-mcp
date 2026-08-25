@@ -125,6 +125,17 @@ describe("#2010 an unaccounted reply no longer answers with the client's claim",
     expect(d.presented_confirmed).not.toBe(0);
   });
 
+  it("calls out unobserved animation for GIF/APNG/WebP items", () => {
+    const animated = [
+      { filename: "clip.gif", kind: "image", inline: true },
+      { filename: "clip.apng", kind: "image", inline: true },
+      { filename: "clip.webp", kind: "image", inline: true },
+    ];
+    expect(unaccountedShowMediaNote(animated, readShowMediaAck(MOBILE_REPLY, animated.length))).toMatch(
+      /GIF\/APNG\/WebP bytes were dispatched.*frames advanced beyond the first frame/,
+    );
+  });
+
   it("the client's own words are preserved verbatim under client_reply", () => {
     // Kills: dropping client_reply. Deleting what the client said would be its
     // own dishonesty; it is demoted, not discarded.
