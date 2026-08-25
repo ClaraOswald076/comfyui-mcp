@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.117] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- use an authenticated connected-panel fallback for headless history, system stats, and logs reads (#2283)
+
 ## [0.52.116] - 2026-08-25
 
 ### MCP
