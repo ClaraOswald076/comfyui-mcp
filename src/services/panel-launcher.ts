@@ -16,7 +16,6 @@ import {
   readFileSync,
   readlinkSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
@@ -39,7 +38,6 @@ export const ORCHESTRATOR_RECOVERY_DELAY_MS = 15_000;
 /** A broken install must not turn the login broker into an unbounded spawn loop. */
 export const ORCHESTRATOR_RECOVERY_MAX_ATTEMPTS = 3;
 export const ORCHESTRATOR_RECOVERY_WINDOW_MS = 5 * 60_000;
-const PANEL_LAUNCHER_LOCK_STALE_MS = 5 * 60_000;
 
 export type PanelLauncherConfig = {
   protocol: 1;
@@ -548,22 +546,38 @@ function processIdentityOwnsBroker(
   platform: NodeJS.Platform,
 ): boolean {
   if (!identity || !brokerId || !brokerExecutable || !identity.commandLine || !identity.executable) return false;
-  const normalize = (value: string) => {
+  const normalizePath = (value: string) => {
     const path = value.replaceAll("\\", "/");
     return platform === "win32" ? path.toLowerCase() : path;
   };
-  const commandLine = normalize(identity.commandLine);
-  const expectedPath = normalize(brokerPath);
+  const hasToken = (commandLine: string, token: string, caseInsensitive: boolean): boolean => {
+    const normalizedLine = commandLine.replaceAll("\\", "/");
+    const haystack = caseInsensitive ? normalizedLine.toLowerCase() : normalizedLine;
+    const needle = caseInsensitive ? token.toLowerCase() : token;
+    let offset = 0;
+    while (true) {
+      const index = haystack.indexOf(needle, offset);
+      if (index < 0) return false;
+      const before = index === 0 ? "" : haystack[index - 1];
+      const afterIndex = index + needle.length;
+      const after = afterIndex >= haystack.length ? "" : haystack[afterIndex];
+      if ((before === "" || /[\s"']/.test(before)) && (after === "" || /[\s"']/.test(after))) {
+        return true;
+      }
+      offset = afterIndex;
+    }
+  };
+  const commandLine = identity.commandLine;
   // The path and random per-install marker must both be present in the OS
   // observation. A recycled PID or unrelated process cannot satisfy this by
   // merely reusing the numeric pid. If the OS returns a shortened/opaque
   // command line, this deliberately fails closed.
-  if (!commandLine.includes(expectedPath) ||
-    !commandLine.includes(`--broker-id=${normalize(brokerId)}`) ||
-    !/(^|[\s"'])run([\s"']|$)/i.test(identity.commandLine)) {
+  if (!hasToken(commandLine, normalizePath(brokerPath), platform === "win32") ||
+    !hasToken(commandLine, `--broker-id=${brokerId}`, false) ||
+    !hasToken(commandLine, "run", true)) {
     return false;
   }
-  return normalize(identity.executable) === normalize(brokerExecutable);
+  return normalizePath(identity.executable) === normalizePath(brokerExecutable);
 }
 
 function stopOwnedPanelLauncherBroker(
@@ -601,24 +615,49 @@ function withPanelLauncherLock<T>(home: string, fn: () => T): T | null {
   mkdirSync(paths.root, { recursive: true });
   for (let attempt = 0; attempt < 200; attempt += 1) {
     let fd: number;
+    const lockToken = randomBytes(16).toString("hex");
     try {
       fd = openSync(paths.lock, "wx", 0o600);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       try {
-        if (Date.now() - statSync(paths.lock).mtimeMs > PANEL_LAUNCHER_LOCK_STALE_MS) {
-          rmSync(paths.lock, { force: true });
+        const owner = JSON.parse(readFileSync(paths.lock, "utf8")) as { pid?: unknown };
+        const pid = owner.pid;
+        if (
+          Number.isInteger(pid) &&
+          Number(pid) > 0 &&
+          Number(pid) <= 0x7fffffff
+        ) {
+          try {
+            process.kill(Number(pid), 0);
+          } catch (probeError) {
+            if ((probeError as NodeJS.ErrnoException).code === "ESRCH") {
+              rmSync(paths.lock, { force: true });
+            }
+          }
         }
       } catch {
-        // The other process may be in the middle of releasing the lock.
+        // The other process may be in the middle of publishing its owner.
+        // Never remove an unreadable lock: failing closed is safer than
+        // overlapping a paused owner.
       }
       continue;
     }
+    writeFileSync(paths.lock, JSON.stringify({ pid: process.pid, token: lockToken }), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
     try {
       return fn();
     } finally {
       closeSync(fd);
-      rmSync(paths.lock, { force: true });
+      try {
+        const owner = JSON.parse(readFileSync(paths.lock, "utf8")) as { token?: unknown };
+        if (owner.token === lockToken) rmSync(paths.lock, { force: true });
+      } catch {
+        // The lock was already removed or became unreadable; do not remove a
+        // replacement lock owned by another process.
+      }
     }
   }
   return null;
