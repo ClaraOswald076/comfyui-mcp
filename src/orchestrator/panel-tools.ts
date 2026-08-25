@@ -5820,6 +5820,7 @@ const ANIMA_REGIONAL_WIRED_PROMPT_INPUT: Record<string, string> = {
 
 const DASIWA_STACK_WIDGET = "stack_data";
 const DASIWA_LTX2_LORA_LOADER = "DaSiWa_LTX2LoraLoader";
+const COMFY_DYNAMICCOMBO_V3 = "COMFY_DYNAMICCOMBO_V3";
 
 function isAnimaRegionalPromptWidget(widget: string): boolean {
   return ANIMA_REGIONAL_PROMPT_WIDGETS.has(widget);
@@ -5973,6 +5974,134 @@ function animaRegionalPromptRefusal(type: string, widget: string): ToolResult {
       `APPLY / savePrompts() copies the textarea back over widget.value, so a success here would be a lie. ` +
       `${route} Do not retry panel_set_widget on this widget.`,
   );
+}
+
+type QueriedNodeDetail = QueriedNodeIdentity & {
+  inputs: unknown[];
+  widgets: Record<string, unknown> | null;
+};
+
+/** Strictly parse one detail row for the dynamic-combo child gate. A compact
+ * response is intentionally not enough: this guard needs the live input names
+ * and types, not just the node type. */
+function parseVerifiedQueriedNodeDetail(
+  payload: Record<string, unknown> | null,
+): QueriedNodeDetail | null {
+  if (!payload) return null;
+  if (
+    Object.prototype.hasOwnProperty.call(payload, "truncated") &&
+    payload.truncated !== false
+  ) {
+    return null;
+  }
+
+  let row: unknown;
+  if (Object.prototype.hasOwnProperty.call(payload, "nodes")) {
+    if (!Array.isArray(payload.nodes) || payload.nodes.length !== 1) return null;
+    row = payload.nodes[0];
+  } else if (typeof payload.text === "string") {
+    let headerSeen = false;
+    for (const line of payload.text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      if (!headerSeen && /^\d+ match\(es\) of \d+ in scope/.test(trimmed)) {
+        headerSeen = true;
+        continue;
+      }
+      if (!trimmed.startsWith("{")) {
+        // Detail replies may carry a bounded clipping/truncation footer after
+        // the one JSON row. It cannot establish a second node identity.
+        if (row !== undefined) continue;
+        return null;
+      }
+      if (row !== undefined) return null;
+      try {
+        row = JSON.parse(trimmed) as unknown;
+      } catch {
+        return null;
+      }
+      headerSeen = true;
+    }
+  }
+
+  if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+  const record = row as Record<string, unknown>;
+  const identity = parseQueriedNodeIdentityRow(record);
+  if (!identity || !Array.isArray(record.inputs)) return null;
+  const widgets =
+    record.widgets && typeof record.widgets === "object" && !Array.isArray(record.widgets)
+      ? (record.widgets as Record<string, unknown>)
+      : null;
+  return { ...identity, inputs: record.inputs, widgets };
+}
+
+function dynamicComboSubWidgetRefusal(
+  nodeType: string,
+  parentInput: string,
+  widget: string,
+): ToolResult {
+  return fail(
+    `panel_set_widget cannot set dynamic-combo sub-widget "${widget}" on ${nodeType}. ` +
+      `The parent input "${parentInput}" is ${COMFY_DYNAMICCOMBO_V3}; its frontend ` +
+      `serializer can re-materialize the combo and overwrite widget.value after a ` +
+      `successful write and immediate readback, so panel_run could queue an empty or ` +
+      `stale value. Drive the child input by link instead: add a ` +
+      `PrimitiveStringMultiline, set its STRING widget, then panel_connect its ` +
+      `STRING output to this node's "${widget}" input. Set the parent "${parentInput}" ` +
+      `only to choose the combo option. No graph_set_widget was dispatched; do not ` +
+      `retry this dotted child write.`,
+  );
+}
+
+/** Refuse a dotted widget only when the live detail row proves that its prefix
+ * is a COMFY_DYNAMICCOMBO_V3 input and the addressed child actually exists.
+ * Ordinary composite widgets (for example rgthree `lora_1.on`) and ordinary
+ * dotted STRING names remain on the normal setter path. An unreadable detail
+ * probe is not evidence of a dynamic combo, so it falls through to the panel's
+ * existing validation rather than broadening this refusal. */
+async function refuseDynamicComboSubWidgetWrite(
+  ctx: PanelToolCtx,
+  nodeId: unknown,
+  widget: string,
+): Promise<ToolResult | null> {
+  const dot = widget.indexOf(".");
+  if (dot <= 0 || dot === widget.length - 1) return null;
+
+  const probe = await ctx.call({
+    cmd: "graph_query",
+    ids: [nodeId],
+    fields: "detail",
+    limit: 1,
+  });
+  if (probe.isError) return null;
+
+  const detail = parseVerifiedQueriedNodeDetail(parseToolResultJson(probe));
+  const requestedId = canonicalQueriedNodeId(nodeId);
+  if (!detail || !requestedId || detail.id !== requestedId) return null;
+
+  const parentInput = widget.slice(0, dot);
+  const childExists =
+    detail.inputs.some(
+      (input) =>
+        input &&
+        typeof input === "object" &&
+        !Array.isArray(input) &&
+        (input as Record<string, unknown>).name === widget,
+    ) ||
+    (detail.widgets !== null && Object.prototype.hasOwnProperty.call(detail.widgets, widget));
+  if (!childExists) return null;
+
+  const parent = detail.inputs.find(
+    (input) =>
+      input &&
+      typeof input === "object" &&
+      !Array.isArray(input) &&
+      (input as Record<string, unknown>).name === parentInput,
+  );
+  if (!parent || typeof parent !== "object" || Array.isArray(parent)) return null;
+  return (parent as Record<string, unknown>).type === COMFY_DYNAMICCOMBO_V3
+    ? dynamicComboSubWidgetRefusal(detail.type, parentInput, widget)
+    : null;
 }
 
 /** Refuse the known LC123 regional-canvas prompt widgets. Identity is read
@@ -15092,7 +15221,18 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     description: string,
     schema: PanelToolArgSchemas,
     handler: (args: Record<string, unknown>, ctx: PanelToolCtx) => Promise<ToolResult>,
-  ): PanelToolDef => ({ name, description, schema, handler });
+  ): PanelToolDef => ({
+    name,
+    // Keep the long historical setter description readable at its call site;
+    // #2299's dynamic-combo warning is appended here so both registrations
+    // expose the same actionable workaround.
+    description:
+      name === "panel_set_widget"
+        ? `${description} Dotted children of a live COMFY_DYNAMICCOMBO_V3 input (for example model.prompt) are refused when the live detail proves that shape: the frontend can reserialize the combo after immediate readback and panel_run may then use an empty/stale child. Drive the corresponding STRING child input with a PrimitiveStringMultiline link instead; set the parent only to choose the combo option.`
+        : description,
+    schema,
+    handler,
+  });
 
   // Args are validated by zod before the handler runs (both transports parse with
   // the same shape), so handlers read fields off a loosely-typed bag.
@@ -16238,6 +16378,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           args.widget as string,
         );
         if (blocked) return blocked;
+        const dynamicComboBlocked = await refuseDynamicComboSubWidgetWrite(
+          ctx,
+          args.node_id,
+          args.widget as string,
+        );
+        if (dynamicComboBlocked) return dynamicComboBlocked;
         const daSiWaBlocked = await refuseDaSiWaStackWrite(
           ctx,
           args.node_id,

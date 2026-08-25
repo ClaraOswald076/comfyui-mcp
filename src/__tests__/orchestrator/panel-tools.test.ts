@@ -465,6 +465,127 @@ describe("panel-tools: panel_set_widget Anima regional textarea (#1658)", () => 
   });
 });
 
+describe("panel-tools: panel_set_widget V3 dynamic-combo sub-widgets (#2299)", () => {
+  const SET_OK = {
+    set: { node_id: 23, widget: "model.prompt", previous: "", value: "NEW" },
+  };
+
+  const dynamicDetail = {
+    nodes: [
+      {
+        id: 23,
+        type: "MinimaxHailuo03TextToVideoNode",
+        widgets: { model: "text-to-video", "model.prompt": "" },
+        inputs: [
+          { name: "model", type: "COMFY_DYNAMICCOMBO_V3" },
+          { name: "model.prompt", type: "STRING" },
+        ],
+      },
+    ],
+  };
+
+  async function run(
+    detail: unknown,
+    args: Record<string, unknown> = { node_id: 23, widget: "model.prompt", value: "NEW" },
+  ): Promise<{ res: ToolResult; cmds: string[] }> {
+    const cmds: string[] = [];
+    const res = (await defByName("panel_set_widget").handler(args, {
+      call: async (cmd: Record<string, unknown>) => {
+        cmds.push(String(cmd.cmd));
+        if (cmd.cmd === "graph_query") {
+          return { content: [{ type: "text" as const, text: JSON.stringify(detail, null, 2) }] };
+        }
+        return { content: [{ type: "text" as const, text: JSON.stringify(SET_OK, null, 2) }] };
+      },
+    } as unknown as PanelToolCtx)) as ToolResult;
+    return { res, cmds };
+  }
+
+  it("refuses the exact live parent/type/path shape before graph_set_widget", async () => {
+    const { res, cmds } = await run(dynamicDetail);
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/dynamic-combo sub-widget "model\.prompt"/);
+    expect(res.content[0].text).toMatch(/parent input "model" is COMFY_DYNAMICCOMBO_V3/);
+    expect(res.content[0].text).toMatch(/PrimitiveStringMultiline/);
+    expect(res.content[0].text).toMatch(/STRING output/);
+    expect(res.content[0].text).toMatch(/No graph_set_widget was dispatched/);
+    expect(cmds).toEqual(["graph_query"]);
+  });
+
+  it("recognizes the production JSON-lines detail shape", async () => {
+    const detailLine = JSON.stringify(dynamicDetail.nodes[0]);
+    const { res, cmds } = await run({
+      text: `1 match(es) of 1 in scope (graph: 1 nodes)\n${detailLine}`,
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("COMFY_DYNAMICCOMBO_V3");
+    expect(cmds).toEqual(["graph_query"]);
+  });
+
+  it("keeps an ordinary dotted composite widget writable", async () => {
+    const { res, cmds } = await run(
+      {
+        nodes: [
+          {
+            id: 3,
+            type: "PowerLoraLoader",
+            widgets: { lora_1: { lora: "old", on: true } },
+            inputs: [{ name: "lora_1", type: "COMBO" }, { name: "lora_1.on", type: "BOOLEAN" }],
+          },
+        ],
+      },
+      { node_id: 3, widget: "lora_1.on", value: false },
+    );
+    expect(res.isError).toBeUndefined();
+    expect(cmds).toEqual(["graph_query", "graph_set_widget"]);
+  });
+
+  it("keeps an ordinary dotted STRING widget writable", async () => {
+    const { res, cmds } = await run(
+      {
+        nodes: [
+          {
+            id: 4,
+            type: "OrdinaryNode",
+            widgets: { "prompt.foo": "old" },
+            inputs: [{ name: "prompt", type: "STRING" }, { name: "prompt.foo", type: "STRING" }],
+          },
+        ],
+      },
+      { node_id: 4, widget: "prompt.foo", value: "safe" },
+    );
+    expect(res.isError).toBeUndefined();
+    expect(cmds).toEqual(["graph_query", "graph_set_widget"]);
+  });
+
+  it("keeps the V3 parent selector writable", async () => {
+    const { res, cmds } = await run(dynamicDetail, {
+      node_id: 23,
+      widget: "model",
+      value: "text-to-video",
+    });
+    expect(res.isError).toBeUndefined();
+    expect(cmds).toEqual(["graph_set_widget"]);
+  });
+
+  it("does not classify an unresolved dotted path as the known failure", async () => {
+    const { res, cmds } = await run(dynamicDetail, {
+      node_id: 23,
+      widget: "model.typo",
+      value: "safe",
+    });
+    expect(res.isError).toBeUndefined();
+    expect(cmds).toEqual(["graph_query", "graph_set_widget"]);
+  });
+
+  it("documents the refusal and socket workaround", () => {
+    const description = defByName("panel_set_widget").description;
+    expect(description).toContain("COMFY_DYNAMICCOMBO_V3");
+    expect(description).toContain("PrimitiveStringMultiline");
+    expect(description).toContain("model.prompt");
+  });
+});
+
 describe("panel-tools: panel_set_widget DaSiWa stack_data (#2107)", () => {
   const SET_OK = {
     set: { node_id: 2571, widget: "stack_data", previous: "old", value: "NEW" },
