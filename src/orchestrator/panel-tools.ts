@@ -18428,7 +18428,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     def(
       "panel_save_workflow",
       "Save the user's open workflow PROGRAMMATICALLY — no Save/Rename dialog ever pops. With no `name`: saves in place (or auto-names + persists a never-saved workflow). With `name`: if the workflow is ALREADY saved under a different name this is a SAVE-AS — it writes a NEW file and leaves the original untouched on disk (it NEVER renames/moves/destroys the original); for a never-saved workflow it is simply the first save. The result reports what happened: `saved_as`+`copied_from`+`original_on_disk` (a disk-verified check that the original file still exists) for a Save-As copy, or `first_save` for a brand-new workflow. A Save-As onto an EXISTING name is a 409 Conflict (the copy never overwrites) — do NOT pick a third name; panel_rename_workflow can target a closed listed original to free the name, then rename the active copy onto it, then panel_save_workflow() in place. Use this freely (e.g. after building a graph) — it won't interrupt the user.",
-      { name: z.string().optional().describe("Name for the workflow (no .json needed). If the workflow is already saved under a different name, this writes a NEW file (Save-As COPY) and leaves the original in place — it never renames/moves/destroys it. An existing target name 409s; do not invent a third name — use panel_rename_workflow to free the original then rename the active copy onto it. Omit to save in place / auto-name an unsaved workflow.") },
+      {
+        name: z.string().optional().describe("Name for the workflow (no .json needed). If the workflow is already saved under a different name, this writes a NEW file (Save-As COPY) and leaves the original in place — it never renames/moves/destroys it. An existing target name 409s; do not invent a third name — use panel_rename_workflow to free the original then rename the active copy onto it. Omit to save in place / auto-name an unsaved workflow."),
+        subfolder: z.string().optional().describe("Optional Save-As subfolder, passed verbatim to Panel for validation."),
+      },
       async (args: A, ctx) => {
         // #402: await a stable tab binding before dispatching the (mutating) save, so
         // a save issued in the post-restart "Connected: none" window reaches a live
@@ -18442,7 +18445,14 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         let saveRid: string | undefined;
         const saveOnce = () =>
           args.name
-            ? ctx.call({ cmd: "workflow_save_as", name: args.name }, 15000)
+            ? ctx.call(
+                {
+                  cmd: "workflow_save_as",
+                  name: args.name,
+                  ...(args.subfolder !== undefined ? { subfolder: args.subfolder } : {}),
+                },
+                15000,
+              )
             : ctx.call({ cmd: "workflow_save" }, 15000, (rid) => {
                 saveRid = rid;
               });

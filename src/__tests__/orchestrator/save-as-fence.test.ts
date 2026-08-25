@@ -115,6 +115,21 @@ describe("#1045: a save-as re-anchors the fence", () => {
     expect(textOf(res)).not.toContain("WAS saved");
     expect(textOf(res)).not.toContain("STILL fenced");
   });
+
+  it("forwards a nested Save-As subfolder verbatim before re-anchoring identity", async () => {
+    const res = await saveWorkflow().handler(
+      { name: "new-name", subfolder: "nested/safe" },
+      ctxWith(HEALTHY_LIST),
+    );
+    expect(res.isError).toBeFalsy();
+    expect(sent[0]).toEqual({
+      cmd: "workflow_save_as",
+      name: "new-name",
+      subfolder: "nested/safe",
+    });
+    expect(sent.map((c) => c.cmd)).toEqual(["workflow_save_as", "workflow_list"]);
+    expect(stamps).toEqual([NEW_UUID]);
+  });
   // An IN-PLACE save (no name) re-anchors too. Its identity normally follows the
   // workflow across the save, so this usually re-derives the same value and
   // changes nothing — but "normally" is exactly what failed in #1045, and one
