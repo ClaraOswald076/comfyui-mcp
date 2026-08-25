@@ -129,6 +129,7 @@ function writeForeignJobRecord(
     status?: "downloading" | "done" | "error" | "cancelled";
     ageMs?: number;
     pid?: number;
+    target?: string;
   },
 ): void {
   const status = rec.status ?? "downloading";
@@ -146,6 +147,7 @@ function writeForeignJobRecord(
       started_at: Date.now(),
       finished_at: status === "downloading" ? undefined : Date.now(),
       owner: rec.owner,
+      target: rec.target,
       pid: rec.pid,
       updated: Date.now() - (rec.ageMs ?? 0),
     }),
@@ -167,6 +169,7 @@ describe("adoptOrphanedDownloadJobs (#1567 item 3)", () => {
     saved.COMFYUI_MCP_DATA_DIR = process.env.COMFYUI_MCP_DATA_DIR;
     saved.COMFYUI_DOWNLOAD_CACHE_DIR = process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
     saved.HF_ENDPOINT = process.env.HF_ENDPOINT;
+    saved.COMFYUI_URL = process.env.COMFYUI_URL;
     // A mirror endpoint would rewrite the HF URL and change the staged identity the
     // authed-partial case derives — pin it away rather than depend on CI's env.
     delete process.env.HF_ENDPOINT;
@@ -258,6 +261,29 @@ describe("adoptOrphanedDownloadJobs (#1567 item 3)", () => {
     expect(
       JSON.parse(readFileSync(pathJoin(recordDir, `control-job-${id}-${owner}.json`), "utf8")).status,
     ).toBe("downloading");
+  });
+
+  it("does not adopt a pod record while this process targets local ComfyUI", async () => {
+    const id = "orphan-target-mismatch";
+    const owner = "dead-pod-session";
+    process.env.COMFYUI_URL = "http://127.0.0.1:8188";
+    writeForeignJobRecord(recordDir, {
+      id,
+      trayId: downloadIdFor(URL_X),
+      progressId: "prog-pod-mismatch",
+      url: URL_X,
+      owner,
+      target: "https://pod-3000.proxy.runpod.net",
+      ageMs: 10 * 60 * 1000,
+      pid: deadPid(),
+    });
+    stagePartial(URL_X, 8192);
+
+    expect(await adoptOrphanedDownloadJobs()).toEqual([]);
+    expect(hoisted.calls).toEqual([]);
+    expect(() =>
+      readFileSync(pathJoin(recordDir, `control-job-${id}-${owner}.json`), "utf8"),
+    ).not.toThrow();
   });
 
   it("refuses an orphan whose writer process is still ALIVE — another session's live download is never touched", async () => {

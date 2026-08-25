@@ -23,7 +23,11 @@ import type {
   McpSdkServerConfigWithInstance,
 } from "@anthropic-ai/claude-agent-sdk";
 import { logger } from "../utils/logger.js";
-import { COMPLETION_DISAGREEMENT_NOTE, FAILURE_DISAGREEMENT_NOTE } from "./download-done-guard.js";
+import {
+  boundedDownloadError,
+  COMPLETION_DISAGREEMENT_NOTE,
+  FAILURE_DISAGREEMENT_NOTE,
+} from "./download-done-guard.js";
 import { downloadsAtRiskOfRespawn } from "../services/download-jobs.js";
 import { orphanedByDeferredRespawnNote } from "../services/panel-secrets.js";
 import { errorText, promptText } from "./error-text.js";
@@ -894,6 +898,7 @@ export class PanelAgent {
       downloads?: Array<{
         name: string;
         status: string;
+        error?: string;
         supersededByLive?: boolean;
         recordDisagrees?: boolean;
       }>;
@@ -1185,7 +1190,16 @@ export class PanelAgent {
       // dropping the event would be the worse failure.
       const disagrees = dl.some((d) => d.status === "done" && d.recordDisagrees);
       if (disagrees) parts.push(COMPLETION_DISAGREEMENT_NOTE);
-      if (failedDead.length) parts.push(`FAILED: ${failedDead.map((d) => d.name).join(", ")}`);
+      if (failedDead.length) {
+        parts.push(
+          `FAILED: ${failedDead
+            .map((d) => {
+              const detail = boundedDownloadError(d.error);
+              return `${d.name}${detail ? ` (${detail})` : ""}`;
+            })
+            .join(", ")}`,
+        );
+      }
       if (failedRetried.length) {
         parts.push(
           `an EARLIER attempt failed for ${failedRetried.map((d) => d.name).join(", ")}, but a ` +
@@ -3319,6 +3333,7 @@ export class PanelAgentManager {
       downloads?: Array<{
         name: string;
         status: string;
+        error?: string;
         supersededByLive?: boolean;
         recordDisagrees?: boolean;
       }>;

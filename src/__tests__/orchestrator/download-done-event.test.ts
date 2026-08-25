@@ -272,7 +272,8 @@ describe("a failed tray row whose job record is still downloading (#2057)", () =
     manager.injectEvent("tab-2057-mix", {
       kind: "download_done",
       downloads: [
-        { name: "gone.safetensors", status: "error" },
+        { name: "gone.safetensors", status: "error", error: "HTTP 503 upstream reset" },
+        { name: "long-error.safetensors", status: "error", error: "E".repeat(800) },
         { name: "live.safetensors", status: "error", recordDisagrees: true },
       ],
     });
@@ -281,6 +282,10 @@ describe("a failed tray row whose job record is still downloading (#2057)", () =
     const t = backend.turns[1];
     const failedList = /FAILED: ([^;]*)/.exec(t)?.[1] ?? "";
     expect(failedList).toContain("gone.safetensors");
+    expect(failedList).toContain("HTTP 503 upstream reset");
+    expect(failedList).toContain("long-error.safetensors");
+    expect(t).toContain("E".repeat(400));
+    expect(t).not.toContain("E".repeat(401));
     expect(failedList).not.toContain("live.safetensors");
     expect(t).toMatch(/tray reported a failure for live\.safetensors/);
     expect(t).not.toMatch(/NOTHING is claimed to have transferred/);

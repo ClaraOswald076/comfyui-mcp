@@ -36,7 +36,7 @@ import {
   readDownloadProgress,
   listInFlightDownloadProgress,
   persistDownloadJob,
-  readPersistedDownloadJob,
+  currentDownloadTarget,
   listPersistedDownloadJobs,
   findPersistedDownloadJob,
   removePersistedDownloadJobFor,
@@ -65,6 +65,10 @@ export interface DownloadJob {
    *  (falling back to trayId when unset). Never used for URL adoption (that needs the
    *  stable original-URL trayId). */
   progressId?: string;
+  /** Credential-free ComfyUI endpoint this job serves; absent only on legacy records. */
+  target?: string;
+  /** Persisted record owner, retained so reconciliation updates that same file. */
+  owner?: string;
   /** This job's OWN resume decision (#467), reported by its physical download via
    *  a callback and stored here — so download_model action:"status" surfaces exactly this job's
    *  outcome and never a stale/other job's. Absent when no resumable download ran
@@ -77,6 +81,8 @@ export interface DownloadJob {
   /** "cancelled" is a user-requested abort (#515): the stream was aborted, no
    *  false-complete is reported, and the resumable .partial is left on disk. */
   status: "downloading" | "done" | "error" | "cancelled";
+  /** Persisted snapshot time when this view came from the cross-session store. */
+  updated?: number;
   /** Absolute path once the file has landed. */
   path?: string;
   error?: string;
@@ -480,6 +486,7 @@ export async function startDownloadJob(
   // when locally resolvable (two-URLs-one-dest dedup).
   const lookupKeys = destKey ? [reqKey, destKey] : [reqKey];
   const trayId = downloadIdFor(url);
+  const downloadTarget = currentDownloadTarget();
 
   // ADOPT ONLY AN IN-FLIGHT ENTRY (#420 codex round 3, rule 3): a FINISHED entry
   // under any key is treated as absent — it must never shadow a currently-downloading
@@ -547,6 +554,7 @@ export async function startDownloadJob(
       rec.status === "downloading" &&
       nowForAdopt - (rec.updated ?? 0) < PERSISTED_INFLIGHT_STALE_MS &&
       rec.trayId === trayId &&
+      rec.target === downloadTarget &&
       (rec.id === id || (rec.req_key !== undefined && rec.req_key === reqKey)) &&
       // A FRESH HEARTBEAT IS NOT A LIVE WRITER. The heartbeat is written every
       // 15s and only goes stale after 60, so a process that died a moment ago
@@ -592,6 +600,7 @@ export async function startDownloadJob(
   const job: DownloadJob = {
     id,
     trayId,
+    target: downloadTarget,
     url,
     target_subfolder: targetSubfolder,
     filename,
@@ -962,11 +971,12 @@ function finalizeCancelled(job: DownloadJob): void {
  *  URL. No-op outside the panel. Keeps the persisted copy in step with the job.
  *  Returns whether the record was DURABLY replaced (so the heartbeat can retry a
  *  transiently-failing terminal persist). */
-function persistJobRecord(job: DownloadJob): boolean {
+function persistJobRecord(job: DownloadJob, owner = PERSIST_OWNER): boolean {
   return persistDownloadJob({
     id: job.id,
     trayId: job.trayId,
     progressId: job.progressId,
+    target: job.target,
     url: job.url,
     target_subfolder: job.target_subfolder,
     filename: job.filename,
@@ -986,7 +996,33 @@ function persistJobRecord(job: DownloadJob): boolean {
     disk_verified: job.disk_verified,
     verified_root: job.verified_root,
     reclaimed_dead: job.reclaimedDead,
-  });
+  }, owner);
+}
+
+function boundedDownloadJobError(value: string | undefined): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const compact = value.replace(/\s+/g, " ").trim();
+  return compact ? compact.slice(0, 400) : undefined;
+}
+
+/** Turn a stale/frozen in-flight record into the terminal state the tray is reporting. */
+export function reconcileStalledDownloadRecord(job: DownloadJob, error?: string): boolean {
+  if (job.status !== "downloading") return true;
+  const wasPersisted = job.updated !== undefined;
+  job.status = "error";
+  job.error = boundedDownloadJobError(error);
+  job.finished_at = Date.now();
+  job.updated = job.finished_at;
+  // A reconstructed foreign record must be terminalized in its ORIGINAL owner file;
+  // writing a fresh current-owner snapshot leaves the original fresh downloading row
+  // authoritative to status. Legacy persisted records without an owner cannot be safely
+  // reconciled, so callers keep the event explicitly disclosed instead.
+  if (wasPersisted && !job.owner) return false;
+  const durable = persistJobRecord(job, job.owner ?? PERSIST_OWNER);
+  // In non-panel mode the in-memory object is the authoritative status store. In panel
+  // mode a failed persist leaves the old downloading snapshot visible, so the caller must
+  // keep the event explicitly reconciled instead of emitting an unflagged FAILED row.
+  return durable || !persistedRecordsEnabled();
 }
 
 /** Rebuild an in-memory DownloadJob view from a persisted record (#529 adoption
@@ -998,10 +1034,13 @@ function jobFromPersisted(rec: PersistedDownloadJob): DownloadJob {
     id: rec.id,
     trayId: rec.trayId,
     progressId: rec.progressId,
+    target: rec.target,
+    owner: rec.owner,
     url: rec.url,
     target_subfolder: rec.target_subfolder,
     filename: rec.filename,
     status: rec.status,
+    updated: rec.updated,
     path: rec.path,
     error: rec.error,
     started_at: rec.started_at,
@@ -1033,12 +1072,16 @@ function jobFromPersisted(rec: PersistedDownloadJob): DownloadJob {
  *  distinct URLs resolving to the same dest+auth). The id alone can't disambiguate, so
  *  a by-id lookup/cancel must decline rather than silently act on the local one.
  *  Excludes this process's own records (same owner) and heartbeat-stale ones. */
-function hasAmbiguousForeignSibling(id: string, localTrayId: string): boolean {
+function hasAmbiguousForeignSibling(
+  id: string,
+  localTrayId: string,
+  localTarget?: string,
+): boolean {
   const now = Date.now();
   return listPersistedDownloadJobs().some(
     (rec) =>
       rec.id === id &&
-      rec.trayId !== localTrayId &&
+      (rec.trayId !== localTrayId || rec.target !== localTarget) &&
       rec.owner !== PERSIST_OWNER &&
       rec.status === "downloading" &&
       now - (rec.updated ?? 0) < PERSISTED_INFLIGHT_STALE_MS,
@@ -1249,7 +1292,7 @@ export function describePlacement(
 /**
  * Every DISTINCT tracked download that answers to `id`, across this process's
  * registry AND the persisted store, deduped by the TRUE composite identity
- * (id, trayId) — the same key `listDownloadJobs`/`findDownloadJob` already use.
+ * (id, trayId, target) — the same target-aware key `listDownloadJobs` uses.
  *
  * `id` is derived from destination+auth, so two different SOURCE URLs landing on
  * one file deliberately share it (#467 P1-A dedup). That makes `id` a
@@ -1261,7 +1304,7 @@ export function describePlacement(
  * Newest-started first, so a caller printing candidates leads with the live one.
  */
 export function listDownloadJobCandidates(id: string): DownloadJob[] {
-  const keyOf = (j: DownloadJob): string => `${j.id}\n${j.trayId}`;
+  const keyOf = (j: DownloadJob): string => `${j.id}\n${j.trayId}\n${j.target ?? ""}`;
   const byKey = new Map<string, DownloadJob>();
   for (const e of new Set(jobs.values())) {
     if (e.job.id !== id) continue;
@@ -1270,7 +1313,8 @@ export function listDownloadJobCandidates(id: string): DownloadJob[] {
   }
   // `trayId` is a hash of the URL, so it does NOT separate sessions: this
   // session's SETTLED record for a URL and ANOTHER session's still-running
-  // download of the same URL to the same destination collapse to one key. Which
+  // download of the same URL to the same destination collapse to one target-aware
+  // key. Which
   // one is reported matters — showing the local "cancelled" row while a foreign
   // transfer is live would hide a running download behind a stale verdict, and
   // that is worse than the ambiguity this function exists to surface.
@@ -1317,23 +1361,37 @@ export function listDownloadJobCandidates(id: string): DownloadJob[] {
  * Resolve ONE download.
  *
  * `trayId` is the DISAMBIGUATOR (#822): with it the lookup keys on the full
- * composite identity (id, trayId) and can always name exactly one row. Without
+ * composite identity (id, trayId, target) and can name exactly one row when the
+ * current target is known. Without
  * it, an id that denotes more than one download still resolves to nothing —
  * but callers can now distinguish that from "no such download" by asking
  * {@link listDownloadJobCandidates}, which is the difference between an
  * actionable "say which one" and a false "it never existed".
  */
-export function getDownloadJob(id: string, trayId?: string): DownloadJob | undefined {
-  if (trayId) {
-    return listDownloadJobCandidates(id).find((j) => j.trayId === trayId);
-  }
+export function getDownloadJob(id: string, trayId?: string, target?: string): DownloadJob | undefined {
+  const targetSelector = target ?? currentDownloadTarget();
+  const candidates = listDownloadJobCandidates(id).filter(
+    (j) =>
+      (!trayId || j.trayId === trayId) &&
+      (targetSelector === undefined || j.target === targetSelector),
+  );
+  const selectOne = (rows: DownloadJob[]): DownloadJob | undefined => {
+    const identities = new Set(rows.map((j) => `${j.id}\n${j.trayId}\n${j.target ?? ""}`));
+    return identities.size === 1 ? rows[0] : undefined;
+  };
+  if (trayId) return selectOne(candidates);
   // The registry indexes each job under its request key and (when local) its
   // destination key; the public id is one of those, so a direct get resolves it.
   const live = jobs.get(id)?.job;
   // A LIVE in-flight job in THIS process is authoritative (it's actively writing here) —
-  // but decline if a concurrent live FOREIGN session shares the id with a different trayId.
-  if (live && live.status === "downloading") {
-    if (hasAmbiguousForeignSibling(id, live.trayId)) return undefined;
+  // but decline if a concurrent live FOREIGN session shares the id with a different
+  // (trayId, target) identity.
+  if (
+    live &&
+    (targetSelector === undefined || live.target === targetSelector) &&
+    live.status === "downloading"
+  ) {
+    if (hasAmbiguousForeignSibling(id, live.trayId, live.target)) return undefined;
     return live;
   }
   // Otherwise resolve across this session's TERMINAL in-memory record AND the persisted
@@ -1342,9 +1400,28 @@ export function getDownloadJob(id: string, trayId?: string): DownloadJob | undef
   // same id. A cancel/error never lands a file, so it must never mask another session's
   // validated-complete file (cancelled-over-complete), and this holds whether the
   // cancelled/error record is in-memory or persisted.
-  if (live && live.status === "done") return live;
+  if (
+    live &&
+    (targetSelector === undefined || live.target === targetSelector) &&
+    live.status === "done"
+  ) return live;
   const now = Date.now();
-  const matches = listPersistedDownloadJobs().filter((r) => r.id === id);
+  const matches = listPersistedDownloadJobs().filter(
+    (r) => r.id === id && (targetSelector === undefined || r.target === targetSelector),
+  );
+  const freshIdentities = new Set(
+    matches
+      .filter((r) => r.status === "downloading" && now - (r.updated ?? 0) < PERSISTED_INFLIGHT_STALE_MS)
+      .map((r) => `${r.id}\n${r.trayId}\n${r.target ?? ""}`),
+  );
+  const settledIdentities = new Set(
+    matches
+      .filter((r) => r.status !== "downloading")
+      .map((r) => `${r.id}\n${r.trayId}\n${r.target ?? ""}`),
+  );
+  if (freshIdentities.size > 1 || (freshIdentities.size === 0 && settledIdentities.size > 1)) {
+    return undefined;
+  }
   const persistedDone = matches
     .filter((r) => r.status === "done")
     .sort((a, b) => (b.updated ?? 0) - (a.updated ?? 0))[0];
@@ -1356,10 +1433,13 @@ export function getDownloadJob(id: string, trayId?: string): DownloadJob | undef
     (r) => r.status === "downloading" && now - (r.updated ?? 0) < PERSISTED_INFLIGHT_STALE_MS,
   );
   if (foreignLive.length > 0) {
-    if (new Set(foreignLive.map((r) => r.trayId)).size > 1) return undefined; // ambiguous live
+    if (new Set(foreignLive.map((r) => `${r.trayId}\n${r.target ?? ""}`)).size > 1) return undefined; // ambiguous live
     return jobFromPersisted(foreignLive.sort((a, b) => (b.updated ?? 0) - (a.updated ?? 0))[0]);
   }
-  if (live) return live; // this session's terminal (cancelled/error), no DONE to prefer
+  if (
+    live &&
+    (targetSelector === undefined || live.target === targetSelector)
+  ) return live; // this session's terminal (cancelled/error), no DONE to prefer
   const terminal = matches.sort((a, b) => (b.updated ?? 0) - (a.updated ?? 0))[0];
   return terminal ? jobFromPersisted(terminal) : undefined;
 }
@@ -1390,9 +1470,18 @@ export function getDownloadJob(id: string, trayId?: string): DownloadJob | undef
  */
 export function describeUnresolvedDownload(id: string): string | undefined {
   const now = Date.now();
-  const liveInMemory = jobs.get(id)?.job;
+  const targetSelector = currentDownloadTarget();
+  const liveInMemoryCandidate = jobs.get(id)?.job;
+  const liveInMemory =
+    liveInMemoryCandidate &&
+    (targetSelector === undefined || liveInMemoryCandidate.target === targetSelector)
+      ? liveInMemoryCandidate
+      : undefined;
   const inFlight = listPersistedDownloadJobs().filter(
-    (r) => r.id === id && r.status === "downloading",
+    (r) =>
+      r.id === id &&
+      r.status === "downloading" &&
+      (targetSelector === undefined || r.target === targetSelector),
   );
   const livePersisted = inFlight.filter(
     (r) => now - (r.updated ?? 0) < PERSISTED_INFLIGHT_STALE_MS,
@@ -1459,9 +1548,10 @@ export function describeUnresolvedDownload(id: string): string | undefined {
  *  URL matching is EXACT (query included): in-memory by raw url, persisted by the
  *  trayId hash of the full url — so two distinct signed/versioned URLs are never
  *  conflated (the persisted url is credential-redacted and can't be compared safely). */
-export function findDownloadJob(query: { url?: string; destKey?: string }): DownloadJob | undefined {
+export function findDownloadJob(query: { url?: string; destKey?: string; target?: string }): DownloadJob | undefined {
   const trayId = query.url ? downloadIdFor(query.url) : undefined;
   const destKey = query.destKey;
+  const targetSelector = query.target ?? currentDownloadTarget();
   if (!trayId && !destKey) return undefined;
 
   // Gather candidate IN-FLIGHT jobs from BOTH this process's registry AND the cross-
@@ -1470,17 +1560,21 @@ export function findDownloadJob(query: { url?: string; destKey?: string }): Down
   // job for URL→destA plus another session's persisted in-flight job for URL→destB are
   // two DISTINCT jobs for the same URL, and adopting either by URL alone would be a
   // guess — so decline (the caller must use the exact id).
-  // Key candidates by (id, trayId): two distinct URLs to one dest+auth share an id but
+  // Key candidates by (id, trayId, target): two distinct URLs to one dest+auth share an id but
   // differ in trayId (distinct physical downloads), so id alone would wrongly collapse
   // them and mask the ambiguity. A live in-memory copy wins over its persisted snapshot
   // (same id+trayId key).
-  const keyOf = (id: string, tray: string): string => `${id}\n${tray}`;
+  const keyOf = (id: string, tray: string, targetValue?: string): string =>
+    `${id}\n${tray}\n${targetValue ?? ""}`;
   const now = Date.now();
   const inflightByKey = new Map<string, DownloadJob>();
   for (const e of new Set(jobs.values())) {
     if (e.job.status !== "downloading") continue;
-    if ((query.url && e.job.url === query.url) || (destKey && e.job.destKey === destKey)) {
-      inflightByKey.set(keyOf(e.job.id, e.job.trayId), e.job);
+    if (
+      ((query.url && e.job.url === query.url) || (destKey && e.job.destKey === destKey)) &&
+      (targetSelector === undefined || e.job.target === targetSelector)
+    ) {
+      inflightByKey.set(keyOf(e.job.id, e.job.trayId, e.job.target), e.job);
     }
   }
   for (const rec of listPersistedDownloadJobs()) {
@@ -1490,7 +1584,8 @@ export function findDownloadJob(query: { url?: string; destKey?: string }): Down
     if (rec.status !== "downloading" || now - (rec.updated ?? 0) >= PERSISTED_INFLIGHT_STALE_MS) {
       continue;
     }
-    const key = keyOf(rec.id, rec.trayId);
+    if (targetSelector !== undefined && rec.target !== targetSelector) continue;
+    const key = keyOf(rec.id, rec.trayId, rec.target);
     if (inflightByKey.has(key)) continue;
     if ((trayId && rec.trayId === trayId) || (destKey && rec.dest_key === destKey)) {
       inflightByKey.set(key, jobFromPersisted(rec));
@@ -1501,7 +1596,7 @@ export function findDownloadJob(query: { url?: string; destKey?: string }): Down
 
   // No in-flight match anywhere — fall back to a single unambiguous SETTLED persisted
   // record (for status reporting); findPersistedDownloadJob declines if ambiguous.
-  const persisted = findPersistedDownloadJob({ trayId, destKey });
+  const persisted = findPersistedDownloadJob({ trayId, destKey, target: targetSelector });
   return persisted ? jobFromPersisted(persisted) : undefined;
 }
 
@@ -1528,12 +1623,11 @@ export function compareTrayIds(a: string | undefined, b: string | undefined): nu
 
 export function listDownloadJobs(): DownloadJob[] {
   // One Entry is indexed under multiple keys — dedup by identity so a job appears once
-  // regardless of how many keys point at it. Identity is (id, trayId), NOT id alone:
-  // two distinct URLs to one dest+auth share an id but are distinct physical downloads
-  // (different trayId), and both must be listed — download_model action:"status" with no selector
-  // promises EVERY tracked download.
+  // regardless of how many keys point at it. Identity is (id, trayId, target), NOT id alone:
+  // concurrent local and pod transfers can share the first two fields and must remain
+  // separately visible to the tray reconciliation and status action.
   const seen = new Set<Entry>();
-  const keyOf = (j: DownloadJob): string => `${j.id}\n${j.trayId}`;
+  const keyOf = (j: DownloadJob): string => `${j.id}\n${j.trayId}\n${j.target ?? ""}`;
   const byKey = new Map<string, DownloadJob>();
   for (const e of jobs.values()) {
     if (seen.has(e)) continue;
@@ -1544,18 +1638,30 @@ export function listDownloadJobs(): DownloadJob[] {
   }
   // #529: fold in persisted records for jobs THIS session's registry doesn't hold
   // (started before a reconnect), so download_model action:"status" still lists in-flight downloads.
-  // INTEGRITY TRUTH: a validated DONE (file landed) WINS over a cancelled/error record for
-  // the SAME (id, trayId) — whether that other record is a persisted counterpart OR this
-  // session's own in-memory cancelled/error. So a persisted DONE overrides any current
-  // entry that is neither DONE nor a LIVE in-memory download (which stays visible as the
-  // user's active action). The list never shows a cancelled in place of a validated file.
+  // INTEGRITY TRUTH: a LIVE or validated DONE record WINS over a cancelled/error snapshot
+  // for the SAME (id, trayId, target) — whether that other record is persisted or this session's
+  // in-memory terminal entry. A live record must stay visible as the user's active action,
+  // and the list must never replace a validated file with a terminal snapshot.
   for (const rec of listPersistedDownloadJobs()) {
     const job = jobFromPersisted(rec);
     const k = keyOf(job);
     const cur = byKey.get(k);
     if (!cur) {
       byKey.set(k, job);
-    } else if (job.status === "done" && cur.status !== "done" && cur.status !== "downloading") {
+    } else if (
+      (job.status === "downloading" &&
+        job.staleInflight !== true &&
+        cur.status !== "done" &&
+        !(cur.status === "downloading" && cur.staleInflight !== true)) ||
+      // A persisted terminal may replace a stale persisted in-flight snapshot, but
+      // never an active in-memory writer. The latter has no heartbeat `updated` field;
+      // comparing the terminal timestamp against zero made an old terminal shadow the
+      // bytes that are still advancing in this process (#2057 recurrence).
+      (job.status !== "downloading" &&
+        cur.status === "downloading" &&
+        cur.staleInflight === true) ||
+      (job.status === "done" && cur.status !== "done" && cur.status !== "downloading")
+    ) {
       byKey.set(k, job);
     }
   }
@@ -1761,6 +1867,7 @@ export async function adoptOrphanedDownloadJobs(): Promise<OrphanedDownloadAdopt
   if (routeToManager) return adopted;
 
   const now = Date.now();
+  const target = currentDownloadTarget();
   const records = listPersistedDownloadJobs();
   // Ids this pass already re-issued. `records` is a SNAPSHOT taken before the loop,
   // so without this a second dead record for the SAME id (two dead sessions each
@@ -1771,15 +1878,22 @@ export async function adoptOrphanedDownloadJobs(): Promise<OrphanedDownloadAdopt
   const adoptedIds = new Set<string>();
   for (const rec of records) {
     if (rec.status !== "downloading") continue;
+    // Adoption runs in the current target's process. A targetless record cannot
+    // be used to adopt a local/pod transfer when the process has a real target,
+    // and a targetful record must never be adopted by a targetless process.
+    if (rec.target !== target) continue;
     if (!rec.owner || rec.owner === PERSIST_OWNER) continue;
     if (rec.via_manager) continue;
     if (writerProcessGone(rec) !== true) continue;
     if (!rec.url || downloadIdFor(rec.url) !== rec.trayId) continue;
-    if (adoptedIds.has(rec.id)) continue;
+    const identity = `${rec.id}\n${rec.trayId}\n${rec.target ?? ""}`;
+    if (adoptedIds.has(identity)) continue;
     const alreadyAdopted = records.some(
       (other) =>
         other !== rec &&
         other.id === rec.id &&
+        other.trayId === rec.trayId &&
+        other.target === rec.target &&
         other.status === "downloading" &&
         now - (other.updated ?? 0) < PERSISTED_INFLIGHT_STALE_MS,
     );
@@ -1818,7 +1932,7 @@ export async function adoptOrphanedDownloadJobs(): Promise<OrphanedDownloadAdopt
       resumedBytes: partial.bytes,
       staleRecordLeft: reclaim.staleRecordLeft || undefined,
     });
-    adoptedIds.add(rec.id);
+    adoptedIds.add(identity);
   }
   return adopted;
 }
@@ -1871,12 +1985,39 @@ export function cancelDownloadJob(
   status?: DownloadJob["status"];
   job?: DownloadJob;
 } {
+  const targetSelector = currentDownloadTarget();
   if (trayId) {
+    const trayCandidates = listDownloadJobCandidates(id).filter(
+      (j) =>
+        j.trayId === trayId &&
+        (targetSelector === undefined || j.target === targetSelector),
+    );
+    if (targetSelector === undefined) {
+      const identities = new Set(
+        listDownloadJobCandidates(id)
+          .filter((j) => j.trayId === trayId)
+          .map((j) => `${j.id}\n${j.trayId}\n${j.target ?? ""}`),
+      );
+      if (identities.size > 1) {
+        return {
+          found: true,
+          owned: false,
+          aborted: false,
+          ambiguous: true,
+          candidates: listDownloadJobCandidates(id),
+          status: trayCandidates[0]?.status,
+          job: trayCandidates[0],
+        };
+      }
+    }
     // Explicit selection: find the ONE local entry with this composite identity.
     // Scanning entries (rather than jobs.get(id)) matters because the registry's
     // id row holds only one of several same-destination jobs.
     const entry = [...new Set(jobs.values())].find(
-      (e) => e.job.id === id && e.job.trayId === trayId,
+      (e) =>
+        e.job.id === id &&
+        e.job.trayId === trayId &&
+        (targetSelector === undefined || e.job.target === targetSelector),
     );
     if (entry) {
       const { job, controller } = entry;
@@ -1892,11 +2033,15 @@ export function cancelDownloadJob(
     // Not ours. It may be another session's (persisted). A LIVE one is reportable,
     // not abortable — but a STALE one whose writer is proven gone is reclaimed
     // (#858): closed as cancelled so the download can be safely re-issued.
-    const foreign = listDownloadJobCandidates(id).find((j) => j.trayId === trayId);
+    const foreign = trayCandidates[0];
     if (foreign) {
       if (foreign.status === "downloading" && foreign.staleInflight) {
         const rec = listPersistedDownloadJobs().find(
-          (r) => r.id === id && r.trayId === trayId && r.status === "downloading",
+          (r) =>
+            r.id === id &&
+            r.trayId === trayId &&
+            r.status === "downloading" &&
+            (targetSelector === undefined || r.target === targetSelector),
         );
         if (rec) {
           const re = reclaimDeadPersistedDownload(rec);
@@ -1927,12 +2072,17 @@ export function cancelDownloadJob(
   }
 
   const entry = jobs.get(id);
-  if (entry) {
-    const { job, controller } = entry;
+  const localEntry =
+    entry &&
+    (targetSelector === undefined || entry.job.target === targetSelector)
+      ? entry
+      : undefined;
+  if (localEntry) {
+    const { job, controller } = localEntry;
     // Cross-session ambiguity: a live foreign download shares this id with a DIFFERENT
     // trayId. Aborting by id could act on the wrong logical download — decline so a
     // cancel-by-id can never hit an unintended concurrent download (a #515 invariant).
-    if (job.status === "downloading" && hasAmbiguousForeignSibling(id, job.trayId)) {
+    if (job.status === "downloading" && hasAmbiguousForeignSibling(id, job.trayId, job.target)) {
       return {
         found: true,
         owned: true,
@@ -1978,7 +2128,9 @@ export function cancelDownloadJob(
   // tray id of the one they mean. Only STILL-DOWNLOADING records create that
   // ambiguity: a settled record cannot be cancelled wrongly (the call is a no-op
   // report either way), so it must not block the one row that could be acted on.
-  const persistedCandidates = listDownloadJobCandidates(id);
+  const persistedCandidates = listDownloadJobCandidates(id).filter(
+    (candidate) => targetSelector === undefined || candidate.target === targetSelector,
+  );
   if (persistedCandidates.filter((c) => c.status === "downloading").length > 1) {
     return {
       found: true,
@@ -1990,7 +2142,30 @@ export function cancelDownloadJob(
       job: persistedCandidates[0],
     };
   }
-  const persisted = readPersistedDownloadJob(id);
+  const persistedMatches = listPersistedDownloadJobs().filter(
+    (r) => r.id === id && (targetSelector === undefined || r.target === targetSelector),
+  );
+  const persistedLive = persistedMatches.filter(
+    (r) => r.status === "downloading" && Date.now() - (r.updated ?? 0) < PERSISTED_INFLIGHT_STALE_MS,
+  );
+  const persistedIdentities = new Set(
+    persistedLive.map((r) => `${r.id}\n${r.trayId}\n${r.target ?? ""}`),
+  );
+  if (persistedIdentities.size > 1) {
+    return {
+      found: true,
+      owned: false,
+      aborted: false,
+      ambiguous: true,
+      candidates: persistedCandidates,
+      status: persistedCandidates[0]?.status,
+      job: persistedCandidates[0],
+    };
+  }
+  const persistedPool = persistedMatches.filter((r) => r.status === "done");
+  const persisted = (persistedLive[0] ?? (persistedPool.length > 0
+    ? persistedPool.sort((a, b) => (b.updated ?? 0) - (a.updated ?? 0))[0]
+    : persistedMatches.sort((a, b) => (b.updated ?? 0) - (a.updated ?? 0))[0])) ?? null;
   if (persisted) {
     // A STALE in-flight record whose writer is proven gone is reclaimed (#858);
     // a live or unprovable one stays refused exactly as before (#761).

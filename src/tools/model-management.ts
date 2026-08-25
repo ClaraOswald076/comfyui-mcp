@@ -952,7 +952,11 @@ async function statusAction(args: {
           // not "no such download" — reporting it as one turns "could not determine
           // which" into a definite (and wrong) verdict, and leaves the caller with
           // no move. Name the candidates and the exact selector that picks one.
-          const candidates = args.id && !args.tray_id ? listDownloadJobCandidates(args.id) : [];
+          const candidates = args.id
+            ? listDownloadJobCandidates(args.id).filter(
+                (c) => !args.tray_id || c.trayId === args.tray_id,
+              )
+            : [];
           if (candidates.length > 1) {
             const rows = candidates
               .map(
@@ -1008,7 +1012,7 @@ async function statusAction(args: {
         const liveModelsDir = await currentLiveModelsRoot();
         // #822: `id` is derived from the DESTINATION (+auth), so two rows fetching
         // different URLs into one file legitimately share it. The composite
-        // (id, trayId) is the real handle — render trayId on EVERY row so the
+        // (id, trayId, target) is the real handle — render trayId on EVERY row so the
         // printed handle always identifies exactly one download, and shout when a
         // listing actually contains a collision (two writers, one file).
         const idCounts = new Map<string, number>();
@@ -1033,11 +1037,11 @@ async function statusAction(args: {
           list
             .filter((j) => j.status === "cancelled" && !j.viaManager)
             .map(async (j) => {
-              partials.set(`${j.id}\n${j.trayId}`, await findResumablePartial(j.url));
+              partials.set(`${j.id}\n${j.trayId}\n${j.target ?? ""}`, await findResumablePartial(j.url));
             }),
         );
         const partialFor = (j: DownloadJob): { path: string; bytes: number } | null =>
-          partials.get(`${j.id}\n${j.trayId}`) ?? null;
+          partials.get(`${j.id}\n${j.trayId}\n${j.target ?? ""}`) ?? null;
         const collidingIds = [...idCounts.entries()].filter(([, n]) => n > 1).map(([k]) => k);
         const lines = list.map((j) => {
           const p = readDownloadProgress(j.progressId ?? j.trayId);
@@ -1057,7 +1061,8 @@ async function statusAction(args: {
             j.status === "error" && j.interruptedByRestart && j.viaManager
               ? "unwatched (host may still be fetching)"
               : j.status;
-          const head = `- \`${j.id}\` (tray \`${j.trayId}\`) **${statusToken}**${bytes}`;
+          const targetLabel = j.target ? `  target: \`${j.target}\`` : "";
+          const head = `- \`${j.id}\` (tray \`${j.trayId}\`) **${statusToken}**${bytes}${targetLabel}`;
           const collisionNote = idCounts.get(j.id)! > 1
             ? `\n    AMBIGUOUS id: another row in this listing shares \`${j.id}\` — these are DIFFERENT source URLs writing the SAME destination file, so the last writer wins and the result may be a mix. Select this one with \`tray_id\`: \`${j.trayId}\`. Pass that same tray_id to \`action:"cancel"\` to stop THIS one specifically.`
             : "";

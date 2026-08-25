@@ -213,8 +213,8 @@ export function migrateInFlightJobs(fromDir: string, toDir: string): number {
           : undefined;
       // TYPED, not inferred: an annotated object literal gets excess-property
       // checking, so a key that is NOT on PersistedDownloadJob is a COMPILE
-      // error. The five dead keys that lived here for months (`name`, `dest`,
-      // `target`, `total`, `received` — from the tray-row interface) are caught
+      // error. The four dead keys that lived here for months (`name`, `dest`,
+      // `total`, `received` — from the tray-row interface) are caught
       // this way. `persistDownloadJob` cannot help: it spreads a variable, which
       // defeats the check.
       //
@@ -248,6 +248,7 @@ export function migrateInFlightJobs(fromDir: string, toDir: string): number {
         // findable by id rather than emitting a malformed one.
         trayId: str("trayId") ?? "",
         filename: str("filename"),
+        target: str("target") ? redactUrl(str("target")!) : undefined,
         target_subfolder: str("target_subfolder") ?? "",
         started_at: num("started_at") ?? Date.now(),
         pid: num("pid"),
@@ -360,6 +361,14 @@ function redactUrl(raw: string): string {
   }
 }
 
+/** The credential-free ComfyUI endpoint that scopes a production download. */
+export function currentDownloadTarget(
+  raw: string | undefined = process.env.COMFYUI_URL,
+): string | undefined {
+  const value = raw?.trim();
+  return value ? redactUrl(value) : undefined;
+}
+
 /**
  * Write a progress snapshot for one download. The in-flight "downloading" state
  * is throttled to ~3/sec to avoid hammering the disk; terminal states
@@ -382,8 +391,7 @@ export function reportDownloadProgress(
     // reports against the new host while stale rows age out (codex finding:
     // a process-wide count let any download disable any pod's auto-stop).
     // Redacted — target URLs can carry userinfo (codex finding).
-    const rawTarget = p.target ?? (process.env.COMFYUI_URL?.trim() || undefined);
-    const target = rawTarget ? redactUrl(rawTarget) : undefined;
+    const target = p.target ? redactUrl(p.target) : currentDownloadTarget();
     // Stamp the panel tab that started this download (the spawned MCP child's own
     // COMFYUI_MCP_TAB) so the orchestrator can wake EXACTLY that tab's agent when
     // the download settles (#547), the same self-scoping trick `target` uses.
@@ -794,6 +802,8 @@ export interface PersistedDownloadJob {
   /** The id the physical progress rows are written under (post-auth/HF-rewrite);
    *  differs from trayId only for query-auth / mirror URLs. Optional/back-compat. */
   progressId?: string;
+  /** Credential-free ComfyUI endpoint this job serves; legacy records may omit it. */
+  target?: string;
   url: string;
   target_subfolder: string;
   filename?: string;
@@ -865,10 +875,9 @@ function sanitizeIdPart(id: string): string {
   return id.replace(/[^a-zA-Z0-9_.-]/g, "_");
 }
 
-/** THIS session's record file for a job id — owner-scoped, so a second session running
- *  the same id writes a DIFFERENT file rather than clobbering ours. */
-function jobFileFor(id: string): string {
-  return join(recordsDir(), `${JOB_PREFIX}${sanitizeIdPart(id)}-${PERSIST_OWNER}.json`);
+/** Owner-scoped record file for a job id, so concurrent sessions write separate files. */
+function jobFileFor(id: string, owner = PERSIST_OWNER): string {
+  return join(recordsDir(), `${JOB_PREFIX}${sanitizeIdPart(id)}-${sanitizeIdPart(owner)}.json`);
 }
 
 let persistSeq = 0;
@@ -929,20 +938,27 @@ function sleepSyncMs(ms: number): void {
   }
 }
 
-export function persistDownloadJob(job: Omit<PersistedDownloadJob, "updated">): boolean {
+/** Persist under the supplied owner when reconciling a reconstructed record; ordinary
+ * callers use the current session owner by default. */
+export function persistDownloadJob(
+  job: Omit<PersistedDownloadJob, "updated">,
+  owner = PERSIST_OWNER,
+): boolean {
   const dir = recordsDir();
   if (!dir) return false;
   try {
     mkdirSync(dir, { recursive: true });
+    const persistOwner = owner.trim() || PERSIST_OWNER;
     const safe: PersistedDownloadJob = {
       ...job,
-      owner: PERSIST_OWNER,
+      owner: persistOwner,
       pid: process.pid,
       url: job.url ? redactUrl(job.url) : job.url,
+      target: job.target ? redactUrl(job.target) : job.target,
       updated: Date.now(),
     };
     const body = JSON.stringify(safe);
-    const finalPath = jobFileFor(job.id);
+    const finalPath = jobFileFor(job.id, persistOwner);
     const tmpPath = `${finalPath}.${process.pid}-${persistSeq++}.tmp`;
     writeFileSync(tmpPath, body);
     // Atomic replace, retried a few times for a TRANSIENT Windows sharing violation (a
@@ -1157,21 +1173,32 @@ export function listPersistedDownloadJobs(): PersistedDownloadJob[] {
  *  the match exact AND credential-free. Prefers an in-flight ("downloading") match,
  *  then the most recently updated (a niche same-exact-URL-two-destinations case is
  *  inherently ambiguous from a URL alone — the id selector disambiguates it). */
-export function findPersistedDownloadJob(query: { trayId?: string; destKey?: string }): PersistedDownloadJob | null {
-  const { trayId, destKey } = query;
+export function findPersistedDownloadJob(query: {
+  trayId?: string;
+  destKey?: string;
+  target?: string;
+}): PersistedDownloadJob | null {
+  const { trayId, destKey, target } = query;
   if (!trayId && !destKey) return null;
   const matches = listPersistedDownloadJobs().filter(
-    (j) => (trayId && j.trayId === trayId) || (destKey && j.dest_key === destKey),
+    (j) =>
+      ((trayId && j.trayId === trayId) || (destKey && j.dest_key === destKey)) &&
+      (target === undefined || j.target === target),
   );
   if (matches.length === 0) return null;
   // AMBIGUITY GUARD: one URL can legitimately drive TWO jobs to different destinations
   // (they share a trayId), and one auth-free destination can back two different-auth
   // jobs (they share a dest_key). Adopting by URL/destination alone then can't tell them
   // apart — so REFUSE to guess when more than one DISTINCT LIVE job matches; the caller
-  // must use the exact id. Distinctness is (id, trayId). Ambiguity is judged over LIVE
+  // must use the exact id. Distinctness is (id, trayId, target). Ambiguity is judged over LIVE
   // (fresh in-flight) records ONLY: a heartbeat-stale record may still be streaming,
   // but must not block adoption or force a false decline.
-  const distinctKey = (j: PersistedDownloadJob): string => `${j.id}\n${j.trayId}`;
+  const distinctKey = (j: PersistedDownloadJob): string =>
+    `${j.id}\n${j.trayId}\n${j.target ?? ""}`;
+  // A URL/destination lookup without an explicit target cannot safely select
+  // between local, pod, and legacy targetless terminal rows. Keep the same
+  // fail-closed rule used by the in-flight path for the terminal fallback too.
+  if (target === undefined && new Set(matches.map(distinctKey)).size > 1) return null;
   const now = Date.now();
   const live = matches.filter(
     (j) => j.status === "downloading" && now - (j.updated ?? 0) < PERSISTED_INFLIGHT_STALE_MS,

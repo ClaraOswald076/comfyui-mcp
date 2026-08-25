@@ -32,12 +32,17 @@ import {
   COMPLETION_DISAGREEMENT_NOTE,
   FAILURE_DISAGREEMENT_NOTE,
   completionDisagreesWithRecord,
+  failureErrorDetail,
   failureDisagreesWithRecord,
+  reconcileDownloadDoneFailures,
 } from "../../orchestrator/download-done-guard.js";
+
+const TARGET = "http://127.0.0.1:8188";
 
 /** A progress row: identified by the PROGRESS/TRAY id, as written on disk. */
 const row = (over: Record<string, unknown> = {}) => ({
   id: "93015fbfa0fa9933",
+  target: TARGET,
   name: "model.safetensors",
   status: "done",
   ...over,
@@ -47,6 +52,7 @@ const row = (over: Record<string, unknown> = {}) => ({
 const job = (over: Record<string, unknown> = {}) => ({
   id: "6226e26ba97f8527",
   trayId: "93015fbfa0fa9933",
+  target: TARGET,
   filename: "model.safetensors",
   status: "downloading",
   ...over,
@@ -144,8 +150,9 @@ describe("the disagreement actually reaches the user (#1574)", () => {
   it("the tick FLAGS the disagreeing entries", async () => {
     const src = await read("index.ts");
     expect(src).toMatch(/settled\.filter\(\(d\) => completionDisagreesWithRecord\(d, records\)\)/);
-    expect(src).toMatch(/settled\.filter\(\(d\) => failureDisagreesWithRecord\(d, records\)\)/);
-    expect(src).toMatch(/\.recordDisagrees = true/);
+    expect(src).toMatch(
+      /reconcileDownloadDoneBatch\(\s*settled,\s*records,\s*downloadSnapshots/,
+    );
   });
 
   it("and still injects EVERY settled entry", async () => {
@@ -154,8 +161,8 @@ describe("the disagreement actually reaches the user (#1574)", () => {
     const src = await read("index.ts");
     // EXACTLY settled, with nothing chained onto it. A .filter() appended here reads as
     // "still uses settled" to a looser regex, and is the exact regression this forbids.
-    expect(src).toMatch(/kind: "download_done", downloads: settled }/);
-    expect(src).not.toMatch(/downloads: settled\s*\.filter/);
+    expect(src).toMatch(/manager\.injectEvent\(key, event/);
+    expect(src).not.toMatch(/downloads: injected\s*\.filter/);
     expect(src).not.toMatch(/downloads: honest/);
     expect(src).not.toMatch(/if \(honest\.length === 0\) continue;/);
   });
@@ -201,12 +208,10 @@ describe("a row is identified by (id, target), not id alone (#1574)", () => {
     ).toBe(true);
   });
 
-  it("still matches when EITHER side has no target", () => {
-    // Rows and records predating the field, or a route that never sets it, must keep
-    // matching — requiring it on both sides would make the check inert again, which is
-    // exactly how the first version shipped.
-    expect(completionDisagreesWithRecord(row(), [job({ target: "/pod/models" })])).toBe(true);
-    expect(completionDisagreesWithRecord(row({ target: "/local" }), [job()])).toBe(true);
+  it("fails closed when EITHER side has no target", () => {
+    // Legacy targetless records are ambiguous once local and pod transfers share an id.
+    expect(completionDisagreesWithRecord(row({ target: undefined }), [job()])).toBe(false);
+    expect(completionDisagreesWithRecord(row(), [job({ target: undefined })])).toBe(false);
   });
 });
 
@@ -258,13 +263,13 @@ describe("an exact (id, target) record wins over a targetless one (#1574)", () =
     ).toBe(true);
   });
 
-  it("falls back to a targetless record only when nothing matches on target", () => {
+  it("does not fall back to a targetless record when nothing matches on target", () => {
     expect(
       completionDisagreesWithRecord(row({ target: "/local/models" }), [
         job({ target: "/pod/models", status: "done" }),
         job({ target: undefined, status: "downloading" }),
       ]),
-    ).toBe(true);
+    ).toBe(false);
   });
 });
 
@@ -280,7 +285,7 @@ describe("an exact (id, target) record wins over a targetless one (#1574)", () =
 // tray row, and here the tray row itself was the error.
 
 const errorRow = (over: Record<string, unknown> = {}) =>
-  row({ id: "31bba4a9cdb04e28", status: "error", ...over });
+  row({ id: "31bba4a9cdb04e28", status: "error", progressAdvanced: true, ...over });
 const liveJob = (over: Record<string, unknown> = {}) =>
   job({ id: "07d14bb0c73bc007", trayId: "31bba4a9cdb04e28", status: "downloading", ...over });
 
@@ -303,6 +308,23 @@ describe("a failure the record disagrees with is DISCLOSED (#2057)", () => {
 
   it("says nothing when the record agrees the download failed", () => {
     expect(failureDisagreesWithRecord(errorRow(), [liveJob({ status: "error" })])).toBe(false);
+  });
+
+  it("prefers a matching live record over an older terminal snapshot", () => {
+    expect(
+      failureDisagreesWithRecord(errorRow(), [
+        liveJob({ status: "error" }),
+        liveJob({ status: "downloading" }),
+      ]),
+    ).toBe(true);
+  });
+
+  it("does not treat a heartbeat-stale record as the live status", () => {
+    expect(failureDisagreesWithRecord(errorRow(), [liveJob({ staleInflight: true })])).toBe(false);
+  });
+
+  it("does not treat a fresh heartbeat as byte advancement", () => {
+    expect(failureDisagreesWithRecord(errorRow({ progressAdvanced: false }), [liveJob()])).toBe(false);
   });
 
   it("says nothing when the record has no opinion", () => {
@@ -349,9 +371,51 @@ describe("a failure the record disagrees with is DISCLOSED (#2057)", () => {
     ).toBe(true);
   });
 
-  it("still matches when EITHER side has no target", () => {
-    expect(failureDisagreesWithRecord(errorRow(), [liveJob({ target: "/pod/models" })])).toBe(true);
-    expect(failureDisagreesWithRecord(errorRow({ target: "/local" }), [liveJob()])).toBe(true);
+  it("fails closed when EITHER side has no target", () => {
+    expect(failureDisagreesWithRecord(errorRow({ target: undefined }), [liveJob()])).toBe(false);
+    expect(failureDisagreesWithRecord(errorRow(), [liveJob({ target: undefined })])).toBe(false);
+  });
+
+  it("carries useful terminal error detail without allowing unbounded lines", () => {
+    expect(
+      failureErrorDetail(errorRow(), [
+        liveJob({ status: "error", error: "HTTP 503\nupstream reset" }),
+      ]),
+    ).toBe("HTTP 503 upstream reset");
+    expect(failureErrorDetail(errorRow({ error: "HTTP 404" }), [liveJob({ status: "error" })])).toBe(
+      "HTTP 404",
+    );
+    expect(failureErrorDetail(errorRow(), [liveJob({ status: "downloading", error: "stale" })])).toBe(
+      undefined,
+    );
+    expect(failureErrorDetail(errorRow({ error: "x".repeat(401) }), [])).toBe("x".repeat(400));
+    expect(
+      failureErrorDetail(errorRow(), [
+        liveJob({ status: "downloading", staleInflight: true }),
+        liveJob({ status: "error", error: "HTTP 503" }),
+      ]),
+    ).toBe("HTTP 503");
+  });
+
+  it("reconciles the production download_done batch against fresh status", () => {
+    const fresh = errorRow({ id: "fresh-tray", error: "f".repeat(800) });
+    const stale = errorRow({ id: "stale-tray", error: "stale" });
+    const terminal = errorRow({ id: "terminal-tray" });
+    const flagged = reconcileDownloadDoneFailures(
+      [fresh, stale, terminal],
+      [
+        liveJob({ id: "fresh-job", trayId: "fresh-tray", status: "downloading" }),
+        liveJob({ id: "stale-job", trayId: "stale-tray", status: "downloading", staleInflight: true }),
+        liveJob({ id: "terminal-job", trayId: "terminal-tray", status: "error", error: "HTTP 503" }),
+      ],
+    );
+
+    expect(flagged).toEqual([fresh]);
+    expect(fresh.recordDisagrees).toBe(true);
+    expect(fresh.error).toBe("f".repeat(400));
+    expect(stale.recordDisagrees).toBeUndefined();
+    expect(terminal.recordDisagrees).toBeUndefined();
+    expect(terminal.error).toBe("HTTP 503");
   });
 
   it("does not let a targetless DOWNLOADING shadow the exact ERROR", () => {

@@ -119,7 +119,11 @@ import {
 } from "../services/panel-template-relay.js";
 import { logger } from "../utils/logger.js";
 import { listDownloadJobs } from "../services/download-jobs.js";
-import { completionDisagreesWithRecord, failureDisagreesWithRecord } from "./download-done-guard.js";
+import {
+  boundedDownloadError,
+  completionDisagreesWithRecord,
+} from "./download-done-guard.js";
+import { reconcileDownloadDoneBatch } from "./download-done-loop.js";
 import { assembleVocabularyHash, describeVocabularySkew } from "../tools/vocabulary.js";
 import { buildPanelToolDefs } from "./panel-tools.js";
 
@@ -749,15 +753,53 @@ export function pushModelsFrame(
  * hello/re-hello so a reconnect cannot retain rows from an old process.
  */
 export class DownloadProgressSnapshots {
+  /** A recent byte increase is required; heartbeat-only rows must not keep this hedge live. */
+  static readonly ADVANCEMENT_MAX_AGE_MS = 5_000;
   private lastSnapshot: string | null = null;
   private rows: Array<Record<string, unknown>> = [];
+  private progressByKey = new Map<string, { downloaded: number; total: number }>();
+  private lastAdvancedAt = new Map<string, number>();
+
+  private progressKey(row: Record<string, unknown>): string | null {
+    if (typeof row.id !== "string" || !row.id) return null;
+    const target = typeof row.target === "string" ? row.target : "";
+    const attempt = typeof row.attempt === "number" ? String(row.attempt) : "";
+    return `${row.id}\n${target}\n${attempt}`;
+  }
 
   record(rows: Array<Record<string, unknown>>): boolean {
+    for (const row of rows) {
+      if (row.status !== "downloading") continue;
+      const key = this.progressKey(row);
+      const downloaded = typeof row.downloaded === "number" ? row.downloaded : undefined;
+      const total = typeof row.total === "number" ? row.total : undefined;
+      if (
+        !key ||
+        downloaded === undefined ||
+        !Number.isFinite(downloaded) ||
+        downloaded < 0 ||
+        total === undefined ||
+        !Number.isFinite(total) ||
+        total < 0
+      ) continue;
+      const previous = this.progressByKey.get(key);
+      if (previous && downloaded > previous.downloaded) this.lastAdvancedAt.set(key, Date.now());
+      this.progressByKey.set(key, { downloaded, total });
+    }
     const snapshot = JSON.stringify(rows);
     if (snapshot === this.lastSnapshot) return false;
     this.lastSnapshot = snapshot;
     this.rows = rows;
     return true;
+  }
+
+  /** True only after a recent later progress row proves downloaded bytes increased. */
+  hasAdvanced(row: { id?: unknown; target?: unknown; attempt?: unknown }, now = Date.now()): boolean {
+    if (typeof row.id !== "string" || !row.id) return false;
+    const target = typeof row.target === "string" ? row.target : "";
+    const attempt = typeof row.attempt === "number" ? String(row.attempt) : "";
+    const advancedAt = this.lastAdvancedAt.get(`${row.id}\n${target}\n${attempt}`);
+    return advancedAt !== undefined && now - advancedAt <= DownloadProgressSnapshots.ADVANCEMENT_MAX_AGE_MS;
   }
 
   forPanel(): Array<Record<string, unknown>> {
@@ -5868,6 +5910,7 @@ export async function runPanelOrchestrator(): Promise<void> {
           target?: string;
           name: string;
           status: string;
+          error?: string;
           attempt?: number;
           supKey: string;
           recordDisagrees?: boolean;
@@ -6024,6 +6067,11 @@ export async function runPanelOrchestrator(): Promise<void> {
         continue; // mid-write or corrupt — retry next tick
       }
       if (!row || typeof row !== "object") continue;
+      if ("error" in row) {
+        const error = boundedDownloadError(row.error);
+        if (error) row.error = error;
+        else delete row.error;
+      }
       const updated = typeof row.updated === "number" ? row.updated : now;
       parsed.push({ full, row, status: row.status, updated });
     }
@@ -6092,6 +6140,7 @@ export async function runPanelOrchestrator(): Promise<void> {
                     target?: string;
                     name: string;
                     status: string;
+                    error?: string;
                     attempt?: number;
                     supKey: string;
                     recordDisagrees?: boolean;
@@ -6114,6 +6163,7 @@ export async function runPanelOrchestrator(): Promise<void> {
               target: typeof row.target === "string" ? row.target : undefined,
               name: String(row.name ?? row.id ?? "model"),
               status: String(status),
+              error: boundedDownloadError(row.error),
               attempt: typeof row.attempt === "number" ? row.attempt : undefined,
               supKey,
             });
@@ -6197,8 +6247,15 @@ export async function runPanelOrchestrator(): Promise<void> {
       // advancing. #1150 only sees a live TRAY row of that filename; here the tray
       // row itself was the error, so that hedge never ran. Flag it so the formatter
       // will not say FAILED.
-      const failedDisagreeing = settled.filter((d) => failureDisagreesWithRecord(d, records));
-      for (const d of failedDisagreeing) (d as { recordDisagrees?: boolean }).recordDisagrees = true;
+      const failedDisagreeing = reconcileDownloadDoneBatch(
+        settled,
+        records,
+        downloadSnapshots,
+        (event) =>
+          manager.injectEvent(key, event, {
+            mid: turnOrigins.mintInheritedOrigin(),
+          }),
+      );
       if (failedDisagreeing.length) {
         logger.warn(
           "[panel-orchestrator] a download failure disagrees with the job record; disclosing rather than announcing FAILED (#2057)",
@@ -6214,9 +6271,6 @@ export async function runPanelOrchestrator(): Promise<void> {
       // ran — the turn routed to whatever tab was active (confirming gate 3,
       // P1). The minted mid contributes nothing and the batch close inherits
       // (or refuses, when no origin was ever established).
-      manager.injectEvent(key, { kind: "download_done", downloads: settled }, {
-        mid: turnOrigins.mintInheritedOrigin(),
-      });
     }
     // MCP-child control channel (#269): runpod_* tools that ran in spawned
     // agent children ask the orchestrator to retarget / watch / unwatch /

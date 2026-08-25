@@ -121,6 +121,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { setProgressDir, PERSIST_OWNER, __resetStableRecordsDir } from "../../services/download-progress.js";
 import * as progressModule from "../../services/download-progress.js";
 import { downloadModel, resolveDownloadTarget } from "../../services/model-resolver.js";
+import { reconcileDownloadDoneBatch } from "../../orchestrator/download-done-loop.js";
 import { mkdtemp, mkdir, symlink, writeFile, readFile, rm as fsRm } from "node:fs/promises";
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -162,6 +163,8 @@ async function writeForeignJobRecord(
     /** The writing process's pid (#858) — present on records written after the
      *  liveness stamp was added; absent simulates a pre-fix (unprovable) record. */
     pid?: number;
+    /** The ComfyUI target this persisted record belongs to. */
+    target?: string;
   },
 ): Promise<void> {
   const status = rec.status ?? "downloading";
@@ -178,6 +181,7 @@ async function writeForeignJobRecord(
     started_at: Date.now(),
     finished_at: status === "downloading" ? undefined : Date.now(),
     owner: rec.owner,
+    target: rec.target,
     pid: rec.pid,
     updated: Date.now() - (rec.ageMs ?? 0),
   };
@@ -633,6 +637,111 @@ describe("download job registry", () => {
   // neither can be selected. The composite (id, trayId) is the real identity; this
   // block is about making it reachable from the public surface.
   describe("#822 selecting one download when an id names several", () => {
+    it("keeps a live in-memory writer authoritative over an older persisted terminal through list, poll, and status", async () => {
+      const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-live-order-"));
+      const savedTarget = process.env.COMFYUI_URL;
+      process.env.COMFYUI_URL = "http://127.0.0.1:8188";
+      setProgressDir(dir);
+      try {
+        const active = await startDownloadJob(URL_A, "checkpoints");
+        const progressId = active.job.progressId;
+        expect(progressId).toBeTruthy();
+
+        await writeForeignJobRecord(dir, {
+          id: active.job.id,
+          trayId: active.job.trayId,
+          progressId: progressId!,
+          url: URL_A,
+          owner: `${PERSIST_OWNER}-older-terminal`,
+          target: "http://127.0.0.1:8188",
+          status: "error",
+          ageMs: 30_000,
+        });
+
+        const listed = listDownloadJobs().find(
+          (job) => job.id === active.job.id && job.target === "http://127.0.0.1:8188",
+        );
+        expect(listed).toBe(active.job);
+        expect(listed?.status).toBe("downloading");
+        expect(getDownloadJob(active.job.id, active.job.trayId)?.status).toBe("downloading");
+
+        const row = {
+          id: progressId,
+          target: "http://127.0.0.1:8188",
+          name: "big.safetensors",
+          status: "error",
+          downloaded: 220,
+          total: 1_000,
+          error: "upstream reset",
+        };
+        const injected: Array<{ downloads: typeof row[] }> = [];
+        const disagreeing = reconcileDownloadDoneBatch(
+          [row],
+          listDownloadJobs(),
+          { hasAdvanced: () => true },
+          (event) => injected.push(event),
+        );
+        expect(disagreeing).toHaveLength(1);
+        expect(row.recordDisagrees).toBe(true);
+        expect(injected).toHaveLength(1);
+        expect(injected[0].downloads[0]).toBe(row);
+        expect(active.job.status).toBe("downloading");
+      } finally {
+        if (savedTarget === undefined) delete process.env.COMFYUI_URL;
+        else process.env.COMFYUI_URL = savedTarget;
+        setProgressDir("");
+        await fsRm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("keeps same-id/same-tray local and pod records separate in candidates, status, and URL adoption", async () => {
+      const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-target-select-"));
+      const savedTarget = process.env.COMFYUI_URL;
+      setProgressDir(dir);
+      const id = "same-target-selector";
+      const trayId = downloadIdFor(URL_A);
+      try {
+        await writeForeignJobRecord(dir, {
+          id,
+          trayId,
+          progressId: "local-progress",
+          url: URL_A,
+          owner: "local-session",
+          target: "http://127.0.0.1:8188",
+        });
+        await writeForeignJobRecord(dir, {
+          id,
+          trayId,
+          progressId: "pod-progress",
+          url: URL_A,
+          owner: "pod-session",
+          target: "https://pod-3000.proxy.runpod.net",
+        });
+
+        expect(listDownloadJobCandidates(id)).toHaveLength(2);
+        expect(new Set(listDownloadJobCandidates(id).map((job) => job.target))).toEqual(
+          new Set(["http://127.0.0.1:8188", "https://pod-3000.proxy.runpod.net"]),
+        );
+
+        process.env.COMFYUI_URL = "http://127.0.0.1:8188";
+        expect(getDownloadJob(id, trayId)?.target).toBe("http://127.0.0.1:8188");
+        expect(findDownloadJob({ url: URL_A })?.target).toBe("http://127.0.0.1:8188");
+
+        process.env.COMFYUI_URL = "https://pod-3000.proxy.runpod.net";
+        expect(getDownloadJob(id, trayId)?.target).toBe("https://pod-3000.proxy.runpod.net");
+        expect(findDownloadJob({ url: URL_A })?.target).toBe("https://pod-3000.proxy.runpod.net");
+
+        delete process.env.COMFYUI_URL;
+        expect(getDownloadJob(id, trayId)).toBeUndefined();
+        expect(findDownloadJob({ url: URL_A })).toBeUndefined();
+      } finally {
+        if (savedTarget === undefined) delete process.env.COMFYUI_URL;
+        else process.env.COMFYUI_URL = savedTarget;
+        setProgressDir("");
+        await fsRm(dir, { recursive: true, force: true });
+      }
+    });
+
     it("lists EVERY download an id answers to, keyed by the true (id, trayId) identity", async () => {
       const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-822-"));
       setProgressDir(dir);
@@ -1188,6 +1297,73 @@ describe("download job registry", () => {
 
   // ── #529: adopt an in-flight download after a session reconnect ─────────────
   describe("#529 reconnect adoption", () => {
+    it("does not let a heartbeat-stale record replace an in-memory terminal error (#2057)", async () => {
+      const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
+      setProgressDir(dir);
+      try {
+        const id = "recurrence-terminal-wins";
+        const trayId = "recurrence-terminal-tray";
+        const progressId = "recurrence-terminal-progress";
+        await writeForeignJobRecord(dir, {
+          id,
+          trayId,
+          progressId,
+          url: URL_A,
+          owner: "terminal-snapshot",
+          status: "error",
+        });
+        await writeForeignJobRecord(dir, {
+          id,
+          trayId,
+          progressId,
+          url: URL_A,
+          owner: "stale-stream",
+          status: "downloading",
+          ageMs: 90_000,
+        });
+
+        expect(listDownloadJobs().find((j) => j.id === id)).toMatchObject({ status: "error" });
+      } finally {
+        setProgressDir("");
+        await fsRm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("lists the live record when an older terminal snapshot shares its identity (#2057)", async () => {
+      const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
+      setProgressDir(dir);
+      try {
+        const id = "recurrence-live-wins";
+        const trayId = "recurrence-tray";
+        const progressId = "recurrence-progress";
+        await writeForeignJobRecord(dir, {
+          id,
+          trayId,
+          progressId,
+          url: URL_A,
+          owner: "older-terminal",
+          status: "error",
+          ageMs: 30_000,
+        });
+        await writeForeignJobRecord(dir, {
+          id,
+          trayId,
+          progressId,
+          url: URL_A,
+          owner: "active-stream",
+          status: "downloading",
+        });
+
+        expect(listDownloadJobs().find((j) => j.id === id)).toMatchObject({
+          status: "downloading",
+          progressId,
+        });
+      } finally {
+        setProgressDir("");
+        await fsRm(dir, { recursive: true, force: true });
+      }
+    });
+
     it("still resolves an in-flight download by id (and by URL) after a simulated reconnect", async () => {
       const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
       setProgressDir(dir); // enable the cross-session persisted store (as the panel does)

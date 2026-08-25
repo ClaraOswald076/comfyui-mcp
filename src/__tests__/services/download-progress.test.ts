@@ -404,7 +404,7 @@ describe("migrateInFlightJobs (#1148)", () => {
   // The structural hole that produced BOTH key bugs in this function: every
   // fixture here is hand-built, so a key the WRITER never emits still reads as
   // "carried" and the test agrees with the mistake. `tray_id` vs `trayId` was
-  // caught by hand; `name`/`dest`/`target`/`total`/`received` — five keys that
+  // caught by hand; `name`/`dest`/`total`/`received` — legacy tray-row keys that
   // belong to the tray-row interface, not this record — survived for months and
   // even had an assertion claiming bytes that are always undefined.
   //
@@ -420,6 +420,7 @@ describe("migrateInFlightJobs (#1148)", () => {
     writer.persistDownloadJob({
       id: "rt-1",
       trayId: "tray-rt",
+      target: "https://user:secret@podabc-3000.proxy.runpod.net",
       url: "https://example.invalid/m.safetensors",
       target_subfolder: "checkpoints",
       filename: "m.safetensors",
@@ -447,6 +448,7 @@ describe("migrateInFlightJobs (#1148)", () => {
     // Every field the migration claims to carry, verified against the writer's
     // own output rather than a fixture that could share my typo.
     expect(rec!.trayId).toBe("tray-rt");
+    expect(rec!.target).toBe("https://podabc-3000.proxy.runpod.net");
     expect(rec!.filename).toBe("m.safetensors");
     expect(rec!.target_subfolder).toBe("checkpoints");
     expect(rec!.started_at).toBe(1_700_000_000_000);
@@ -457,7 +459,8 @@ describe("migrateInFlightJobs (#1148)", () => {
 
     // ...and the half that actually closes the class: NO key may appear that the
     // writer does not emit. Asserting presence alone is what let five dead keys
-    // (`name`/`dest`/`target`/`total`/`received`, from the tray-row interface)
+    // (`name`/`dest`/`target`/`total`/`received`, with `target` now being a real
+    // persisted job identity rather than a dead tray-row key)
     // survive for months — restoring them passed every test AND tsc, because
     // `persistDownloadJob` spreads a variable (no excess-property check) and
     // tsconfig EXCLUDES src/__tests__, so no fixture is ever typechecked.
