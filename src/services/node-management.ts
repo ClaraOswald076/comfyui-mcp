@@ -2434,7 +2434,12 @@ function findDisabledPackOnDisk(
     const isDisabled = lower.endsWith(".disabled");
     const canonical = isDisabled ? name.slice(0, -".disabled".length) : name;
     const canonicalLower = canonical.toLowerCase();
-    if (!wanted.has(canonicalLower)) continue;
+    if (
+      !wanted.has(canonicalLower) &&
+      !(isManagerSelfTarget(id) && isManagerSelfTarget(canonical))
+    ) {
+      continue;
+    }
 
     if (entry.isSymbolicLink()) {
       if (isDisabled) {
@@ -2443,12 +2448,19 @@ function findDisabledPackOnDisk(
             `the local recovery path only renames a real custom-node directory.`,
         );
       }
-      continue;
+      throw new NodeManagementError(
+        `Refusing to enable "${id}": the active destination ${join(customNodes, name)} ` +
+          `is a symlink. Remove the collision before retrying.`,
+      );
     }
-    if (!entry.isDirectory()) continue;
 
     const dir = join(customNodes, name);
     if (isDisabled) {
+      if (!entry.isDirectory()) {
+        throw new NodeManagementError(
+          `Refusing to enable "${id}": ${dir} is not a real directory.`,
+        );
+      }
       if (disabled) {
         throw new NodeManagementError(
           `Refusing to enable "${id}": multiple matching .disabled directories ` +
@@ -2461,6 +2473,9 @@ function findDisabledPackOnDisk(
         cliId: canonical,
       };
     } else {
+      // Any existing active-name entry is a collision, including a file. A
+      // POSIX rename could otherwise replace it, and a symlink could redirect
+      // what ComfyUI loads after restart.
       activeDir = dir;
     }
   }
@@ -2498,27 +2513,94 @@ function verifyLocalEnable(
   }
 }
 
+function revalidateLocalEnableTarget(
+  id: string,
+  comfyuiBase: string,
+  expected: DisabledPackOnDisk,
+): DisabledPackOnDisk {
+  const current = findDisabledPackOnDisk(id, comfyuiBase);
+  if (
+    !current ||
+    resolve(current.disabledDir) !== resolve(expected.disabledDir) ||
+    resolve(current.enabledDir) !== resolve(expected.enabledDir)
+  ) {
+    throw new NodeManagementError(
+      `Refusing to enable "${id}": the validated source or destination changed ` +
+        `before the local rename. NOTHING was changed by this tool.`,
+    );
+  }
+  return current;
+}
+
+/** Return undefined on a verified rollback, otherwise a safe refusal reason. */
+function rollbackLocalEnable(
+  id: string,
+  comfyuiBase: string,
+  disabled: DisabledPackOnDisk,
+): string | undefined {
+  try {
+    // Do not move a destination that appeared or changed while verification
+    // was running. A rollback is only safe when the original source is absent
+    // and the exact destination is still the directory we created.
+    if (findDisabledPackOnDisk(id, comfyuiBase)) {
+      return "the original .disabled source is still present or a collision appeared";
+    }
+    const active = findPackOnDisk(id, comfyuiBase);
+    if (
+      active.state !== "found" ||
+      resolve(active.dir) !== resolve(disabled.enabledDir) ||
+      basename(active.dir).toLowerCase().endsWith(".disabled")
+    ) {
+      return "the destination no longer matches the directory this call renamed";
+    }
+    renameSync(disabled.enabledDir, disabled.disabledDir);
+    const restored = findDisabledPackOnDisk(id, comfyuiBase);
+    if (
+      !restored ||
+      resolve(restored.disabledDir) !== resolve(disabled.disabledDir) ||
+      resolve(restored.enabledDir) !== resolve(disabled.enabledDir)
+    ) {
+      return "the rollback rename landed but its .disabled post-state could not be verified";
+    }
+    return undefined;
+  } catch (err) {
+    return `rollback failed: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
 function enablePackFromDisk(
   id: string,
   comfyuiBase: string,
   disabled: DisabledPackOnDisk,
 ): NodeOpResult {
+  const target = revalidateLocalEnableTarget(id, comfyuiBase, disabled);
   try {
-    renameSync(disabled.disabledDir, disabled.enabledDir);
+    renameSync(target.disabledDir, target.enabledDir);
   } catch (err) {
     throw new NodeManagementError(
-      `Could not enable "${id}" by renaming ${disabled.disabledDir}: ` +
+      `Could not enable "${id}" by renaming ${target.disabledDir}: ` +
         `${err instanceof Error ? err.message : String(err)}. NOTHING was changed by this tool.`,
     );
   }
-  verifyLocalEnable(id, comfyuiBase, disabled.enabledDir);
+  try {
+    verifyLocalEnable(id, comfyuiBase, target.enabledDir);
+  } catch (err) {
+    const rollbackError = rollbackLocalEnable(id, comfyuiBase, target);
+    const verification = err instanceof Error ? err.message : String(err);
+    throw new NodeManagementError(
+      `The local enable of "${id}" could NOT be verified: ${verification}. ` +
+        (rollbackError === undefined
+          ? "The rename was rolled back."
+          : `The rename could NOT be rolled back safely: ${rollbackError}.`),
+    );
+  }
   return {
     mechanism: "filesystem",
     message:
       `Enabled "${id}" by renaming its validated local directory to ` +
-      `${disabled.enabledDir} (verified on disk). A ComfyUI restart is required ` +
+      `${target.enabledDir} (verified on disk). A ComfyUI restart is required ` +
       `for the change to take effect.`,
-    details: { from: disabled.disabledDir, to: disabled.enabledDir },
+    details: { from: target.disabledDir, to: target.enabledDir },
   };
 }
 
@@ -4573,9 +4655,17 @@ async function setCustomNodeEnabled(
   // `<pack>.disabled` child of this operation's captured custom_nodes root.
   // Remote sessions never inspect or mutate local disk.
   const localPackId = !presenceCtx.remote ? assertSafeLocalPackId(id) : id;
+  const localRecoveryAllowed =
+    !presenceCtx.remote && opts.useCmCli !== false && isManagerSelfTarget(localPackId);
   const disabledOnDisk =
-    enable && !presenceCtx.remote && presenceCtx.diskRoot
+    enable && !presenceCtx.remote && opts.useCmCli !== false && presenceCtx.diskRoot
       ? findDisabledPackOnDisk(localPackId, presenceCtx.diskRoot)
+      : undefined;
+  const managerDisabledOnDisk =
+    localRecoveryAllowed &&
+    disabledOnDisk &&
+    isManagerSelfTarget(disabledOnDisk.cliId)
+      ? disabledOnDisk
       : undefined;
 
   // CLI availability probe FIRST (#808 fallback discipline), but NO subprocess
@@ -4598,11 +4688,11 @@ async function setCustomNodeEnabled(
   // precheck. This is the only safe early escape: the directory was found by
   // enumerating the captured custom_nodes root, its name is validated, and the
   // CLI is given the canonical directory name rather than the raw caller id.
-  if (enable && useCli && disabledOnDisk && presenceCtx.diskRoot) {
+  if (enable && useCli && managerDisabledOnDisk && presenceCtx.diskRoot) {
     return enablePackViaComfyCliFromDisk(
       localPackId,
       presenceCtx.diskRoot,
-      disabledOnDisk,
+      managerDisabledOnDisk,
     );
   }
 
@@ -4613,8 +4703,20 @@ async function setCustomNodeEnabled(
   // list read up front.
   const presence = await resolvePackPresence(id, base, presenceCtx);
   if (
+    enable &&
+    disabledOnDisk &&
+    !managerDisabledOnDisk &&
+    (presence.state === "on-disk" || presence.state === "unverifiable")
+  ) {
+    throw new NodeManagementError(
+      `Refusing local recovery for "${id}": only the validated ` +
+        `ComfyUI-Manager identity may be enabled from a .disabled directory ` +
+        `without a readable Manager installed-pack list. NOTHING was changed.`,
+    );
+  }
+  if (
     presence.state === "on-disk" &&
-    !(enable && disabledOnDisk) &&
+    !(enable && managerDisabledOnDisk) &&
     // A READABLE list that doesn't track the pack: refuse — neither mechanism
     // can verify the op through it. An UNREADABLE list with the pack on disk
     // only blocks the HTTP path; comfy-cli works on the local install directly,
@@ -4643,11 +4745,11 @@ async function setCustomNodeEnabled(
   // followed by an exact on-disk postcondition check.
   if (
     enable &&
-    disabledOnDisk &&
+    managerDisabledOnDisk &&
     presenceCtx.diskRoot &&
     (presence.state === "on-disk" || presence.state === "unverifiable")
   ) {
-    return enablePackFromDisk(localPackId, presenceCtx.diskRoot, disabledOnDisk);
+    return enablePackFromDisk(localPackId, presenceCtx.diskRoot, managerDisabledOnDisk);
   }
   if (presence.state === "absent") {
     throw new NodeManagementError(
