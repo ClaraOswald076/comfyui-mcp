@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -60,6 +60,21 @@ describe("panel launcher install", () => {
     const first = readPanelLauncherConfig(home)?.token;
     await installPanelLauncher({ home, platform: "win32", brokerSource: source, exec });
     expect(readPanelLauncherConfig(home)?.token).toBe(first);
+  });
+
+  it("recovers a crashed stale-lock reclaimer", async () => {
+    const { home, source } = fixture();
+    const paths = panelLauncherPaths(home);
+    mkdirSync(paths.root, { recursive: true });
+    writeFileSync(paths.lock, JSON.stringify({ pid: 2147483647, token: "crashed-owner" }), "utf8");
+    writeFileSync(
+      `${paths.lock}.reclaim`,
+      JSON.stringify({ pid: 2147483647, token: "crashed-reclaimer" }),
+      "utf8",
+    );
+    await installPanelLauncher({ home, platform: "linux", brokerSource: source, exec: (() => undefined) as never });
+    expect(readPanelLauncherConfig(home)).not.toBeNull();
+    expect(existsSync(`${paths.lock}.reclaim`)).toBe(false);
   });
 
   it("falls back to a Startup autostart when the scheduled task is DENIED", async () => {

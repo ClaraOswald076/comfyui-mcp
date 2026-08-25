@@ -214,9 +214,6 @@ export async function installPanelLauncher(
   const run = options.exec ?? execFileSync;
   const spawnBroker = options.spawnImpl ?? spawn;
   const paths = panelLauncherPaths(home, roamingAppData(options));
-  // Reinstall is the explicit operation that adopts this launcher root again.
-  // Remove the old uninstall tombstone before publishing the new ownership.
-  rmSync(paths.teardown, { force: true });
   mkdirSync(paths.launcherDir, { recursive: true });
   copyFileSync(source, paths.broker);
 
@@ -271,24 +268,34 @@ export async function installPanelLauncher(
     }
     child.unref?.();
   };
-  writePanelLauncherConfig(
-    {
-      protocol: PANEL_LAUNCHER_PROTOCOL,
-      host: "127.0.0.1",
-      port: previous?.port ?? 0,
-      token,
-      broker_id: brokerId,
-      broker_executable: brokerExecutable,
-      // The running broker's pid is the broker's to publish, not this install's
-      // to erase. Dropping it made the config say "no broker has ever run here"
-      // to every subsequent install (merge-gate P1) — the port and token were
-      // carried over but the pid was not, which is an incoherent record of the
-      // same broker.
-      ...(previous?.pid ? { pid: previous.pid } : {}),
-      updated_at: new Date().toISOString(),
-    },
-    home,
-  );
+  const initialPublished = withPanelLauncherLock(home, () => {
+    // Reinstall is the explicit operation that adopts this launcher root again.
+    // Remove the old uninstall tombstone while holding the same lock used by
+    // uninstall, so initial config publication cannot cross that teardown.
+    rmSync(paths.teardown, { force: true });
+    writePanelLauncherConfig(
+      {
+        protocol: PANEL_LAUNCHER_PROTOCOL,
+        host: "127.0.0.1",
+        port: previous?.port ?? 0,
+        token,
+        broker_id: brokerId,
+        broker_executable: brokerExecutable,
+        // The running broker's pid is the broker's to publish, not this install's
+        // to erase. Dropping it made the config say "no broker has ever run here"
+        // to every subsequent install (merge-gate P1) — the port and token were
+        // carried over but the pid was not, which is an incoherent record of the
+        // same broker.
+        ...(previous?.pid ? { pid: previous.pid } : {}),
+        updated_at: new Date().toISOString(),
+      },
+      home,
+    );
+    return true;
+  });
+  if (initialPublished === null) {
+    throw new Error("Could not acquire the panel launcher lock for install");
+  }
 
   if (platform === "win32") {
     writeFileSync(
@@ -618,6 +625,7 @@ function withPanelLauncherLock<T>(home: string, fn: () => T): T | null {
     const lockToken = randomBytes(16).toString("hex");
     let fd: number | undefined;
     let reclaimFd: number | undefined;
+    let reclaimToken: string | undefined;
     try {
       fd = openSync(paths.lock, "wx", 0o600);
     } catch (error) {
@@ -641,7 +649,41 @@ function withPanelLauncherLock<T>(home: string, fn: () => T): T | null {
       }
       if (!deadOwner) continue;
       try {
-        reclaimFd = openSync(reclaimPath, "wx", 0o600);
+        reclaimToken = randomBytes(16).toString("hex");
+        try {
+          reclaimFd = openSync(reclaimPath, "wx", 0o600);
+        } catch (reclaimError) {
+          if ((reclaimError as NodeJS.ErrnoException).code !== "EEXIST") throw reclaimError;
+          let reclaimOwnerDead = false;
+          try {
+            const reclaimOwner = JSON.parse(readFileSync(reclaimPath, "utf8")) as {
+              pid?: unknown;
+            };
+            if (
+              Number.isInteger(reclaimOwner.pid) &&
+              Number(reclaimOwner.pid) > 0 &&
+              Number(reclaimOwner.pid) <= 0x7fffffff
+            ) {
+              try {
+                process.kill(Number(reclaimOwner.pid), 0);
+              } catch (probeError) {
+                reclaimOwnerDead = (probeError as NodeJS.ErrnoException).code === "ESRCH";
+              }
+            }
+          } catch {
+            // An incomplete reclaim lock is never reclaimed.
+          }
+          if (reclaimOwnerDead) rmSync(reclaimPath, { force: true });
+        }
+        if (reclaimFd === undefined) continue;
+        // The auxiliary lock is itself a crash-recoverable owner lock. A
+        // process which dies between acquiring it and releasing it must not
+        // strand every later stale-main-lock recovery forever.
+        writeFileSync(
+          reclaimPath,
+          JSON.stringify({ pid: process.pid, token: reclaimToken }),
+          { encoding: "utf8", mode: 0o600 },
+        );
         let stillDead = false;
         try {
           const current = JSON.parse(readFileSync(paths.lock, "utf8")) as { pid?: unknown };
@@ -668,13 +710,20 @@ function withPanelLauncherLock<T>(home: string, fn: () => T): T | null {
           }
         }
       } catch {
-        // Another reclaimer owns the auxiliary lock, or the lock changed.
+        // Another live reclaimer owns the auxiliary lock, or the lock changed.
       }
       if (fd === undefined) {
         if (reclaimFd !== undefined) {
           closeSync(reclaimFd);
           reclaimFd = undefined;
-          rmSync(reclaimPath, { force: true });
+          try {
+            const owner = JSON.parse(readFileSync(reclaimPath, "utf8")) as {
+              token?: unknown;
+            };
+            if (owner.token === reclaimToken) rmSync(reclaimPath, { force: true });
+          } catch {
+            // The reclaim lock was already removed or became unreadable.
+          }
         }
         continue;
       }
@@ -696,7 +745,15 @@ function withPanelLauncherLock<T>(home: string, fn: () => T): T | null {
       }
       if (reclaimFd !== undefined) {
         closeSync(reclaimFd);
-        rmSync(reclaimPath, { force: true });
+        try {
+          const owner = JSON.parse(readFileSync(reclaimPath, "utf8")) as {
+            token?: unknown;
+          };
+          if (owner.token === reclaimToken) rmSync(reclaimPath, { force: true });
+        } catch {
+          // The reclaim lock was already removed or became unreadable; do not
+          // remove a replacement owned by another reclaimer.
+        }
       }
     }
   }
