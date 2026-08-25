@@ -99,6 +99,8 @@ const fsCtl = vi.hoisted(() => ({
   removed: [] as string[],
   /** Make removal fail, so the leftover has to be disclosed rather than swallowed. */
   rmThrows: false,
+  /** Simulate a local .disabled rename without touching the fake filesystem. */
+  renameSync: undefined as ((from: string, to: string) => void) | undefined,
 }));
 vi.mock("node:fs", async (importOriginal) => {
   const real = await importOriginal<typeof import("node:fs")>();
@@ -111,6 +113,10 @@ vi.mock("node:fs", async (importOriginal) => {
       fsCtl.removed.push(String(path));
       if (fsCtl.rmThrows) throw new Error("EPERM: removal refused");
       return (real.rmSync as (p: unknown, o?: unknown) => unknown)(path, options);
+    }),
+    renameSync: vi.fn((from: unknown, to: unknown) => {
+      if (fsCtl.renameSync) return fsCtl.renameSync(String(from), String(to));
+      return (real.renameSync as (a: unknown, b: unknown) => unknown)(from, to);
     }),
     readdirSync: vi.fn((path: unknown, options?: unknown) =>
       fsCtl.readdirSync
@@ -303,10 +309,18 @@ function jsonResponse(obj: unknown): Response {
 }
 
 /** A minimal fs.Dirent stand-in for the #797 on-disk presence scan fixtures. */
-function dirEnt(name: string) {
+function dirEnt(name: string, symbolicLink = false) {
   return {
     name,
-    isDirectory: () => true,
+    isDirectory: () => !symbolicLink,
+    isSymbolicLink: () => symbolicLink,
+  };
+}
+
+function fileEnt(name: string) {
+  return {
+    name,
+    isDirectory: () => false,
     isSymbolicLink: () => false,
   };
 }
@@ -338,6 +352,7 @@ describe("node-management service", () => {
     fsCtl.readdirSync = undefined;
     fsCtl.removed = [];
     fsCtl.rmThrows = false;
+    fsCtl.renameSync = undefined;
     fsCtl.readFileSync = undefined;
     savedDefault.value = undefined;
     config.comfyuiPath = "/fake/comfy";
@@ -2398,6 +2413,200 @@ describe("node-management service", () => {
       const res = await enableCustomNode({ id: "my-pack" });
       expect(taskOf(calls, "enable").params).toMatchObject({ cnr_id: "my-pack" });
       expect(res.message).toMatch(/Enabled "my-pack"/);
+    });
+
+    it("#2247 enables Manager via comfy-cli before its disabled HTTP precheck", async () => {
+      let enabled = false;
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes")
+          ? [dirEnt(enabled ? "ComfyUI-Manager" : "ComfyUI-Manager.disabled")]
+          : [];
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (args.includes("enable")) enabled = true;
+        return cliEnvelope({ message: "enabled" });
+      }) as never);
+      const fetchMock = vi.fn(async () => {
+        throw new Error("Manager HTTP must not be consulted before local enable");
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const res = await enableCustomNode({ id: "ComfyUI-Manager", useCmCli: true });
+
+      expect(res.mechanism).toBe("comfy-cli");
+      expect(res.message).toMatch(/verified on disk/);
+      expect(mockedExec.mock.calls.some(([, args]) => (args as string[]).includes("enable"))).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("#2247 falls back to a validated filesystem rename when Manager and comfy-cli are unavailable", async () => {
+      let enabled = false;
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes")
+          ? [dirEnt(enabled ? "ComfyUI-Manager" : "ComfyUI-Manager.disabled")]
+          : [];
+      fsCtl.renameSync = (from, to) => {
+        expect(from).toContain("ComfyUI-Manager.disabled");
+        expect(to).toContain("ComfyUI-Manager");
+        enabled = true;
+      };
+      mockedExists.mockImplementation((p: unknown) => {
+        const normalized = String(p).replace(/\\/g, "/").toLowerCase();
+        return !normalized.includes("/.venv/") && !/(^|\/)comfy(?:\.exe|\.cmd|\.bat)?$/.test(normalized);
+      });
+      const { calls } = stubFetch({ installedBody: {}, managerQueueStatus: "absent" });
+
+      const res = await enableCustomNode({ id: "ComfyUI-Manager", useCmCli: true });
+
+      expect(res.mechanism).toBe("filesystem");
+      expect(res.message).toMatch(/verified on disk/);
+      expect(calls.some((c) => c.url.includes("/queue/task"))).toBe(false);
+      expect(mockedExec).not.toHaveBeenCalled();
+    });
+
+    it("#2247 refuses traversal-shaped local enable ids before CLI or filesystem mutation", async () => {
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes")
+          ? [dirEnt("ComfyUI-Manager.disabled")]
+          : [];
+      const err = await enableCustomNode({
+        id: "../ComfyUI-Manager",
+        useCmCli: true,
+      }).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(ValidationError);
+      expect(String(err)).toMatch(/path separators/);
+      expect(mockedExec).not.toHaveBeenCalled();
+      expect(fsCtl.renameSync).toBeUndefined();
+    });
+
+    it("#2247 refuses an active/.disabled duplicate instead of choosing a directory", async () => {
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes")
+          ? [dirEnt("ComfyUI-Manager"), dirEnt("ComfyUI-Manager.disabled")]
+          : [];
+
+      const err = await enableCustomNode({ id: "ComfyUI-Manager", useCmCli: true }).catch(
+        (e: unknown) => e,
+      );
+
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect(String(err)).toMatch(/both .*ComfyUI-Manager.*ComfyUI-Manager\.disabled/);
+      expect(mockedExec).not.toHaveBeenCalled();
+      expect(fsCtl.renameSync).toBeUndefined();
+    });
+
+    it("#2247 does not recover an arbitrary disabled pack when Manager is unreadable", async () => {
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes")
+          ? [dirEnt("Some-Pack.disabled")]
+          : [];
+      const { calls } = stubFetch({ installedBody: {}, managerQueueStatus: "absent" });
+
+      const err = await enableCustomNode({ id: "some-pack", useCmCli: true }).catch(
+        (e: unknown) => e,
+      );
+
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect(String(err)).toMatch(/only the validated ComfyUI-Manager identity/);
+      expect(mockedExec).not.toHaveBeenCalled();
+      expect(fsCtl.renameSync).toBeUndefined();
+      expect(calls.some((c) => c.url.includes("/queue/task"))).toBe(false);
+    });
+
+    it("#2247 useCmCli:false never local-renames Manager when its HTTP API is unavailable", async () => {
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes")
+          ? [dirEnt("ComfyUI-Manager.disabled")]
+          : [];
+      fsCtl.renameSync = () => {
+        throw new Error("useCmCli:false must not reach the filesystem rename");
+      };
+      const { calls } = stubFetch({ installedBody: {}, managerQueueStatus: "absent" });
+
+      const err = await enableCustomNode({
+        id: "ComfyUI-Manager",
+        useCmCli: false,
+      }).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect(String(err)).toMatch(/installed-pack list could not be read|NOTHING was queued/);
+      expect(calls.some((c) => c.url.includes("/queue/task"))).toBe(false);
+    });
+
+    it("#2247 treats an active destination symlink as a collision", async () => {
+      fsCtl.readdirSync = (p) =>
+        p.replace(/\\/g, "/").endsWith("/custom_nodes")
+          ? [dirEnt("ComfyUI-Manager.disabled"), dirEnt("ComfyUI-Manager", true)]
+          : [];
+
+      const err = await enableCustomNode({
+        id: "ComfyUI-Manager",
+        useCmCli: true,
+      }).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect(String(err)).toMatch(/active destination.*symlink/);
+      expect(mockedExec).not.toHaveBeenCalled();
+      expect(fsCtl.renameSync).toBeUndefined();
+    });
+
+    it("#2247 revalidates source and destination immediately before renaming", async () => {
+      let customNodesScans = 0;
+      fsCtl.readdirSync = (p) => {
+        if (!p.replace(/\\/g, "/").endsWith("/custom_nodes")) return [];
+        customNodesScans++;
+        return customNodesScans < 3
+          ? [dirEnt("ComfyUI-Manager.disabled")]
+          : [dirEnt("ComfyUI-Manager")];
+      };
+      fsCtl.renameSync = () => {
+        throw new Error("rename must not run after the target changed");
+      };
+      mockedExists.mockImplementation((p: unknown) => {
+        const normalized = String(p).replace(/\\/g, "/").toLowerCase();
+        return !normalized.includes("/.venv/") && !/(^|\/)comfy(?:\.exe|\.cmd|\.bat)?$/.test(normalized);
+      });
+      stubFetch({ installedBody: {}, managerQueueStatus: "absent" });
+
+      const err = await enableCustomNode({ id: "ComfyUI-Manager", useCmCli: true }).catch(
+        (e: unknown) => e,
+      );
+
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect(String(err)).toMatch(/source or destination changed/);
+      expect(customNodesScans).toBeGreaterThanOrEqual(3);
+    });
+
+    it("#2247 rolls back the rename when local post-state verification fails", async () => {
+      let customNodesScans = 0;
+      let renameCalls = 0;
+      fsCtl.readdirSync = (p) => {
+        if (!p.replace(/\\/g, "/").endsWith("/custom_nodes")) return [];
+        customNodesScans++;
+        if (customNodesScans === 5) return [fileEnt("ComfyUI-Manager")];
+        if (customNodesScans >= 8) return [dirEnt("ComfyUI-Manager.disabled")];
+        return customNodesScans < 4
+          ? [dirEnt("ComfyUI-Manager.disabled")]
+          : [dirEnt("ComfyUI-Manager")];
+      };
+      fsCtl.renameSync = () => {
+        renameCalls++;
+      };
+      mockedExists.mockImplementation((p: unknown) => {
+        const normalized = String(p).replace(/\\/g, "/").toLowerCase();
+        return !normalized.includes("/.venv/") && !/(^|\/)comfy(?:\.exe|\.cmd|\.bat)?$/.test(normalized);
+      });
+      stubFetch({ installedBody: {}, managerQueueStatus: "absent" });
+
+      const err = await enableCustomNode({ id: "ComfyUI-Manager", useCmCli: true }).catch(
+        (e: unknown) => e,
+      );
+
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect(String(err)).toMatch(/could NOT be verified/);
+      expect(String(err)).toMatch(/rolled back/);
+      expect(renameCalls).toBe(2);
+      expect(customNodesScans).toBeGreaterThanOrEqual(8);
     });
 
     it("uninstall refuses a pack that resolves nowhere — NOTHING is queued", async () => {

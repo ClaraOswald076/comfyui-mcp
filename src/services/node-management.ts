@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import {
   config,
@@ -152,7 +152,7 @@ export interface InstalledNode {
 
 export interface NodeOpResult {
   /** Which mechanism handled the request. */
-  mechanism: "manager-http" | "comfy-cli" | "git-clone";
+  mechanism: "manager-http" | "comfy-cli" | "filesystem" | "git-clone";
   /** Human-readable summary. */
   message: string;
   /** Raw queue status (HTTP path) or subprocess output (cm-cli path). */
@@ -2303,7 +2303,13 @@ function findInstalledNode(
 /** Directory names a pack could plausibly be installed under for `id`. */
 function packDirNameCandidates(id: string): Set<string> {
   const wanted = id.trim().toLowerCase();
-  const names = new Set<string>([wanted, basename(wanted)]);
+  // A path-shaped enable/disable id must never be reduced to its basename:
+  // doing that would let `../pack` vouch for `custom_nodes/pack` and could
+  // hand an untrusted id to a local mutation path. Git URLs are the one
+  // deliberate exception because their checkout directory is derived from
+  // the URL after it has already passed git-URL validation.
+  const names = new Set<string>();
+  if (!/[/\\]/.test(wanted)) names.add(wanted);
   if (looksLikeGitUrl(id)) {
     names.add(gitCheckoutDir(parseGitUrl(id).baseUrl).toLowerCase());
   }
@@ -2364,6 +2370,265 @@ export function findPackOnDisk(id: string, comfyuiBase: string): DiskPackPresenc
     }
   }
   return { state: "not-found", scanned: customNodes };
+}
+
+interface DisabledPackOnDisk {
+  disabledDir: string;
+  enabledDir: string;
+  /** The directory name passed to comfy-cli, never the caller's raw id. */
+  cliId: string;
+}
+
+/**
+ * Validate the id before it can participate in a local filesystem mutation or
+ * become a comfy-cli argument. Installed-pack ids are single directory names;
+ * URLs, separators, option-like names, and control characters are not valid
+ * targets for this recovery path.
+ */
+function assertSafeLocalPackId(id: string): string {
+  const trimmed = id.trim();
+  if (
+    trimmed.length === 0 ||
+    trimmed !== id ||
+    trimmed === "." ||
+    trimmed === ".." ||
+    trimmed.startsWith("-") ||
+    /[/\\]/.test(trimmed) ||
+    /[\x00-\x1F\x7F]/.test(trimmed)
+  ) {
+    throw new ValidationError(
+      `Refusing to enable local custom node "${id}": expected a single installed ` +
+        `pack id without path separators, control characters, or a leading '-'.`,
+    );
+  }
+  return trimmed;
+}
+
+/**
+ * Find a real directory named `<pack>.disabled` under the selected
+ * custom_nodes root. This intentionally does not follow symlink entries and
+ * refuses duplicate active/disabled identities; otherwise a rename could
+ * enable a different pack than the caller named or make ComfyUI load an
+ * arbitrary external tree after restart.
+ */
+function findDisabledPackOnDisk(
+  id: string,
+  comfyuiBase: string,
+): DisabledPackOnDisk | undefined {
+  const customNodes = join(comfyuiBase, "custom_nodes");
+  let entries: import("node:fs").Dirent[];
+  try {
+    if (!existsSync(customNodes)) return undefined;
+    entries = readdirSync(customNodes, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+
+  const wanted = new Set([id.toLowerCase()]);
+  let disabled: DisabledPackOnDisk | undefined;
+  let activeDir: string | undefined;
+  for (const entry of entries) {
+    const name = entry.name;
+    if (name.startsWith(".")) continue;
+    const lower = name.toLowerCase();
+    const isDisabled = lower.endsWith(".disabled");
+    const canonical = isDisabled ? name.slice(0, -".disabled".length) : name;
+    const canonicalLower = canonical.toLowerCase();
+    if (
+      !wanted.has(canonicalLower) &&
+      !(isManagerSelfTarget(id) && isManagerSelfTarget(canonical))
+    ) {
+      continue;
+    }
+
+    if (entry.isSymbolicLink()) {
+      if (isDisabled) {
+        throw new NodeManagementError(
+          `Refusing to enable "${id}": ${join(customNodes, name)} is a symlink; ` +
+            `the local recovery path only renames a real custom-node directory.`,
+        );
+      }
+      throw new NodeManagementError(
+        `Refusing to enable "${id}": the active destination ${join(customNodes, name)} ` +
+          `is a symlink. Remove the collision before retrying.`,
+      );
+    }
+
+    const dir = join(customNodes, name);
+    if (isDisabled) {
+      if (!entry.isDirectory()) {
+        throw new NodeManagementError(
+          `Refusing to enable "${id}": ${dir} is not a real directory.`,
+        );
+      }
+      if (disabled) {
+        throw new NodeManagementError(
+          `Refusing to enable "${id}": multiple matching .disabled directories ` +
+            `exist under ${customNodes}.`,
+        );
+      }
+      disabled = {
+        disabledDir: dir,
+        enabledDir: join(customNodes, canonical),
+        cliId: canonical,
+      };
+    } else {
+      // Any existing active-name entry is a collision, including a file. A
+      // POSIX rename could otherwise replace it, and a symlink could redirect
+      // what ComfyUI loads after restart.
+      activeDir = dir;
+    }
+  }
+
+  if (disabled && activeDir) {
+    throw new NodeManagementError(
+      `Refusing to enable "${id}": both ${activeDir} and ${disabled.disabledDir} ` +
+        `exist. Remove the duplicate before retrying.`,
+    );
+  }
+  return disabled;
+}
+
+function verifyLocalEnable(
+  id: string,
+  comfyuiBase: string,
+  enabledDir: string,
+): void {
+  const disabled = findDisabledPackOnDisk(id, comfyuiBase);
+  if (disabled) {
+    throw new NodeManagementError(
+      `The local enable of "${id}" did NOT take effect: ${disabled.disabledDir} ` +
+        `is still disabled.`,
+    );
+  }
+  const after = findPackOnDisk(id, comfyuiBase);
+  if (
+    after.state !== "found" ||
+    resolve(after.dir) !== resolve(enabledDir) ||
+    basename(after.dir).toLowerCase().endsWith(".disabled")
+  ) {
+    throw new NodeManagementError(
+      `The local enable of "${id}" could NOT be verified under ${join(comfyuiBase, "custom_nodes")}.`,
+    );
+  }
+}
+
+function revalidateLocalEnableTarget(
+  id: string,
+  comfyuiBase: string,
+  expected: DisabledPackOnDisk,
+): DisabledPackOnDisk {
+  const current = findDisabledPackOnDisk(id, comfyuiBase);
+  if (
+    !current ||
+    resolve(current.disabledDir) !== resolve(expected.disabledDir) ||
+    resolve(current.enabledDir) !== resolve(expected.enabledDir)
+  ) {
+    throw new NodeManagementError(
+      `Refusing to enable "${id}": the validated source or destination changed ` +
+        `before the local rename. NOTHING was changed by this tool.`,
+    );
+  }
+  return current;
+}
+
+/** Return undefined on a verified rollback, otherwise a safe refusal reason. */
+function rollbackLocalEnable(
+  id: string,
+  comfyuiBase: string,
+  disabled: DisabledPackOnDisk,
+): string | undefined {
+  try {
+    // Do not move a destination that appeared or changed while verification
+    // was running. A rollback is only safe when the original source is absent
+    // and the exact destination is still the directory we created.
+    if (findDisabledPackOnDisk(id, comfyuiBase)) {
+      return "the original .disabled source is still present or a collision appeared";
+    }
+    const active = findPackOnDisk(id, comfyuiBase);
+    if (
+      active.state !== "found" ||
+      resolve(active.dir) !== resolve(disabled.enabledDir) ||
+      basename(active.dir).toLowerCase().endsWith(".disabled")
+    ) {
+      return "the destination no longer matches the directory this call renamed";
+    }
+    renameSync(disabled.enabledDir, disabled.disabledDir);
+    const restored = findDisabledPackOnDisk(id, comfyuiBase);
+    if (
+      !restored ||
+      resolve(restored.disabledDir) !== resolve(disabled.disabledDir) ||
+      resolve(restored.enabledDir) !== resolve(disabled.enabledDir)
+    ) {
+      return "the rollback rename landed but its .disabled post-state could not be verified";
+    }
+    return undefined;
+  } catch (err) {
+    return `rollback failed: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+function enablePackFromDisk(
+  id: string,
+  comfyuiBase: string,
+  disabled: DisabledPackOnDisk,
+): NodeOpResult {
+  const target = revalidateLocalEnableTarget(id, comfyuiBase, disabled);
+  try {
+    renameSync(target.disabledDir, target.enabledDir);
+  } catch (err) {
+    throw new NodeManagementError(
+      `Could not enable "${id}" by renaming ${target.disabledDir}: ` +
+        `${err instanceof Error ? err.message : String(err)}. NOTHING was changed by this tool.`,
+    );
+  }
+  try {
+    verifyLocalEnable(id, comfyuiBase, target.enabledDir);
+  } catch (err) {
+    const rollbackError = rollbackLocalEnable(id, comfyuiBase, target);
+    const verification = err instanceof Error ? err.message : String(err);
+    throw new NodeManagementError(
+      `The local enable of "${id}" could NOT be verified: ${verification}. ` +
+        (rollbackError === undefined
+          ? "The rename was rolled back."
+          : `The rename could NOT be rolled back safely: ${rollbackError}.`),
+    );
+  }
+  return {
+    mechanism: "filesystem",
+    message:
+      `Enabled "${id}" by renaming its validated local directory to ` +
+      `${target.enabledDir} (verified on disk). A ComfyUI restart is required ` +
+      `for the change to take effect.`,
+    details: { from: target.disabledDir, to: target.enabledDir },
+  };
+}
+
+function enablePackViaComfyCliFromDisk(
+  id: string,
+  comfyuiBase: string,
+  disabled: DisabledPackOnDisk,
+): NodeOpResult {
+  const out = runCmCli(["enable", disabled.cliId], comfyuiBase);
+  try {
+    verifyLocalEnable(id, comfyuiBase, disabled.enabledDir);
+  } catch (err) {
+    if (err instanceof NodeManagementError) {
+      return {
+        mechanism: "comfy-cli",
+        message: err.message + " comfy-cli reported success, but the local post-state disagrees.",
+        details: out.trim(),
+      };
+    }
+    throw err;
+  }
+  return {
+    mechanism: "comfy-cli",
+    message:
+      `Enabled "${id}" via official comfy-cli (verified on disk at ` +
+      `${disabled.enabledDir}). A ComfyUI restart is required for the change to take effect.`,
+    details: out.trim(),
+  };
 }
 
 export type PackPresence =
@@ -4385,6 +4650,24 @@ async function setCustomNodeEnabled(
   const cliWorkspace = resolveEffectiveComfyUIBase();
   const presenceCtx = capturePackPresenceContext(cliWorkspace);
 
+  // A disabled Manager cannot answer its own installed-list or queue routes.
+  // For local enable, only permit the recovery path for a validated real
+  // `<pack>.disabled` child of this operation's captured custom_nodes root.
+  // Remote sessions never inspect or mutate local disk.
+  const localPackId = !presenceCtx.remote ? assertSafeLocalPackId(id) : id;
+  const localRecoveryAllowed =
+    !presenceCtx.remote && opts.useCmCli !== false && isManagerSelfTarget(localPackId);
+  const disabledOnDisk =
+    enable && !presenceCtx.remote && opts.useCmCli !== false && presenceCtx.diskRoot
+      ? findDisabledPackOnDisk(localPackId, presenceCtx.diskRoot)
+      : undefined;
+  const managerDisabledOnDisk =
+    localRecoveryAllowed &&
+    disabledOnDisk &&
+    isManagerSelfTarget(disabledOnDisk.cliId)
+      ? disabledOnDisk
+      : undefined;
+
   // CLI availability probe FIRST (#808 fallback discipline), but NO subprocess
   // runs yet: the presence pre-check below comes before either mechanism,
   // because a CLI run of an already-satisfied/no-such-pack request reports a
@@ -4401,6 +4684,18 @@ async function setCustomNodeEnabled(
       `NOTHING was run through comfy-cli — ComfyUI-Manager was used for what follows instead.`;
   }
 
+  // Honor an explicitly requested usable comfy-cli BEFORE the Manager list
+  // precheck. This is the only safe early escape: the directory was found by
+  // enumerating the captured custom_nodes root, its name is validated, and the
+  // CLI is given the canonical directory name rather than the raw caller id.
+  if (enable && useCli && managerDisabledOnDisk && presenceCtx.diskRoot) {
+    return enablePackViaComfyCliFromDisk(
+      localPackId,
+      presenceCtx.diskRoot,
+      managerDisabledOnDisk,
+    );
+  }
+
   // Pre-op validation: a disable/enable for an id Manager never heard of is a
   // silent no-op (queue or CLI alike), and the LEGACY dialects key the body on
   // the pack's REAL installed version (node-bisect's controller does the same
@@ -4408,7 +4703,20 @@ async function setCustomNodeEnabled(
   // list read up front.
   const presence = await resolvePackPresence(id, base, presenceCtx);
   if (
+    enable &&
+    disabledOnDisk &&
+    !managerDisabledOnDisk &&
+    (presence.state === "on-disk" || presence.state === "unverifiable")
+  ) {
+    throw new NodeManagementError(
+      `Refusing local recovery for "${id}": only the validated ` +
+        `ComfyUI-Manager identity may be enabled from a .disabled directory ` +
+        `without a readable Manager installed-pack list. NOTHING was changed.`,
+    );
+  }
+  if (
     presence.state === "on-disk" &&
+    !(enable && managerDisabledOnDisk) &&
     // A READABLE list that doesn't track the pack: refuse — neither mechanism
     // can verify the op through it. An UNREADABLE list with the pack on disk
     // only blocks the HTTP path; comfy-cli works on the local install directly,
@@ -4429,6 +4737,19 @@ async function setCustomNodeEnabled(
           `Manager can ${op} it could NOT be determined and NOTHING was queued. Check ` +
           `that ComfyUI-Manager is reachable, then retry.`,
     );
+  }
+
+  // Manager-unreadable or Manager-untracked local disabled packs can still be
+  // enabled safely without queueing blind: the source and destination are
+  // validated siblings under the captured custom_nodes root, and the rename is
+  // followed by an exact on-disk postcondition check.
+  if (
+    enable &&
+    managerDisabledOnDisk &&
+    presenceCtx.diskRoot &&
+    (presence.state === "on-disk" || presence.state === "unverifiable")
+  ) {
+    return enablePackFromDisk(localPackId, presenceCtx.diskRoot, managerDisabledOnDisk);
   }
   if (presence.state === "absent") {
     throw new NodeManagementError(
@@ -5443,6 +5764,7 @@ async function listInstalledNodesAt(
         (v) => v !== null && typeof v === "object" && !Array.isArray(v),
       );
   }
+
   if (!readable) {
     throw new NodeManagementError(
       `ComfyUI-Manager's installed-pack list returned an unreadable payload ` +
