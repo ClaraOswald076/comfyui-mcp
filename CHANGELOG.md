@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.111] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- report staged ComfyUI-Manager panel updates instead of false success (#639)
+
 ## [0.52.110] - 2026-08-25
 
 ### MCP
