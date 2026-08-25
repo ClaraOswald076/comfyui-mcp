@@ -1,6 +1,10 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { MANAGED_SECRET_KEYS_ENV, resetEnvFileProvenanceForTests } from "../../env-file.js";
-import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
+import {
+  MANAGED_SECRET_KEYS_ENV,
+  loadEnvFileIntoProcess,
+  resetEnvFileProvenanceForTests,
+} from "../../env-file.js";
+import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -125,6 +129,40 @@ describe("panel-secrets (canonical .env store)", () => {
     } finally {
       if (previous === undefined) delete process.env.COMFYUI_CODE_PATH;
       else process.env.COMFYUI_CODE_PATH = previous;
+    }
+  });
+
+  it("forwards a cache path added to the canonical env into the panel-spawned child", () => {
+    const previous = process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+    try {
+      delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+      writeFileSync(envPath, "COMFYUI_DOWNLOAD_CACHE_DIR=E:\\comfy-cache\\models\n");
+
+      const env = buildComfyuiMcpEnv({
+        COMFYUI_URL: "http://127.0.0.1:8188",
+        COMFYUI_MCP_PROGRESS_DIR: "/tmp/p",
+      });
+
+      expect(env.COMFYUI_DOWNLOAD_CACHE_DIR).toBe("E:\\comfy-cache\\models");
+      expect(env.COMFYUI_MCP_ENV_FILE).toBe(envPath);
+    } finally {
+      if (previous === undefined) delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+      else process.env.COMFYUI_DOWNLOAD_CACHE_DIR = previous;
+    }
+  });
+
+  it("uses a rotated canonical cache path instead of the value loaded at orchestrator boot", () => {
+    const previous = process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+    try {
+      writeFileSync(envPath, "COMFYUI_DOWNLOAD_CACHE_DIR=E:\\old-cache\n");
+      expect(loadEnvFileIntoProcess()).toContain("COMFYUI_DOWNLOAD_CACHE_DIR");
+
+      writeFileSync(envPath, "COMFYUI_DOWNLOAD_CACHE_DIR=E:\\new-cache\n");
+
+      expect(buildComfyuiMcpEnv({}).COMFYUI_DOWNLOAD_CACHE_DIR).toBe("E:\\new-cache");
+    } finally {
+      if (previous === undefined) delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+      else process.env.COMFYUI_DOWNLOAD_CACHE_DIR = previous;
     }
   });
 
