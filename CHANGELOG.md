@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.102] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- recover stale panel MCP transport safely (#1777)
+
+
 ## [0.52.101] - 2026-08-24
 
 ### MCP
