@@ -286,6 +286,8 @@ interface StartResult {
   spawn_error?: ChildProcessErrorDetails;
   /** How the relaunch environment was resolved (#776). */
   launch_env?: LaunchEnvInfo;
+  /** The server argv observed after a relaunch, when the endpoint answered. */
+  serving_argv?: string[];
   /**
    * Whether the process now listening on the port is the one WE launched.
    *
@@ -317,6 +319,8 @@ interface RestartResult {
   spawn_error?: ChildProcessErrorDetails;
   /** How the relaunch environment was resolved (#776). */
   launch_env?: LaunchEnvInfo;
+  /** The server argv observed after a relaunch, when the endpoint answered. */
+  serving_argv?: string[];
   /**
    * Whether the process now listening on the port is the one WE launched.
    *
@@ -329,6 +333,11 @@ interface RestartResult {
    * it explicitly.
    */
   listener_ownership: ListenerOwnership;
+}
+
+export interface RestartComfyUIOptions {
+  /** Boolean ComfyUI launch flags to append to a proven local relaunch. */
+  additionalFlags?: readonly string[];
 }
 
 interface StartupReadinessResult {
@@ -1770,6 +1779,55 @@ function spawnFromProcessInfo(info: ProcessInfo): SpawnedComfyUI | null {
   // above: that exe is a launcher, not an interpreter.)
   if (child.pid) recordLaunchedInterpreter(child.pid, cmd.exe);
   return { child, launchArgv: [cmd.exe, ...cmd.args], launchLogPath: launchLog?.path };
+}
+
+const ADDITIONAL_LAUNCH_FLAG = /^--[A-Za-z0-9][A-Za-z0-9-]*$/;
+
+function normalizeAdditionalLaunchFlags(
+  flags: readonly string[] | undefined,
+): { flags: string[]; error?: string } {
+  if (flags === undefined) return { flags: [] };
+  if (!Array.isArray(flags)) return { flags: [], error: "the additional launch flags were not an array" };
+  const unique: string[] = [];
+  for (const flag of flags) {
+    if (typeof flag !== "string" || !ADDITIONAL_LAUNCH_FLAG.test(flag)) {
+      return {
+        flags: [],
+        error: `the additional launch flag ${JSON.stringify(flag)} is not a boolean --flag`,
+      };
+    }
+    if (!unique.includes(flag)) unique.push(flag);
+  }
+  return { flags: unique };
+}
+
+/**
+ * Add a flag only to the exact argv that was observed for the process being
+ * restarted. The returned record is a copy: the live-process evidence remains
+ * untouched until the stop has committed, and the augmented record then becomes
+ * the persisted in-process relaunch recipe for manual/automatic future starts.
+ */
+function withAdditionalLaunchFlags(info: ProcessInfo, flags: string[]): ProcessInfo | null {
+  if (flags.length === 0) return info;
+  const observed =
+    info.argv.length > 0 ? info.argv : info.osArgvExact === true ? (info.osArgv ?? []) : [];
+  if (observed.length === 0) return null;
+  const argv = [...observed];
+  for (const flag of flags) {
+    if (!argv.includes(flag)) argv.push(flag);
+  }
+  return info.argv.length > 0 ? { ...info, argv } : { ...info, osArgv: argv };
+}
+
+function launchFlagMutationRefusal(flag: string, reason: string): RestartResult {
+  return {
+    stopped: false,
+    started: false,
+    startup: "not-attempted",
+    message:
+      `Refusing to apply ${flag}: ${reason} No launch argument was changed and ComfyUI was not stopped.`,
+    listener_ownership: unclassifiedOwnership(),
+  };
 }
 
 /**
@@ -4428,6 +4486,7 @@ export async function startComfyUI(anchor?: {
     pid: newPid ?? undefined,
     auto_restart: supervisorResult(info),
     launch_env: env,
+    serving_argv: servingArgv,
     listener_ownership: ownership,
   };
 }
@@ -5353,8 +5412,21 @@ async function restartViaConfiguredCommand(command: string): Promise<RestartResu
   }
 }
 
-export async function restartComfyUI(): Promise<RestartResult> {
+export async function restartComfyUI(
+  options: RestartComfyUIOptions = {},
+): Promise<RestartResult> {
+  const normalizedFlags = normalizeAdditionalLaunchFlags(options.additionalFlags);
+  if (normalizedFlags.error) {
+    return launchFlagMutationRefusal("the requested launch flag", normalizedFlags.error);
+  }
+  const additionalFlags = normalizedFlags.flags;
   if (isRemoteMode()) {
+    if (additionalFlags.length > 0) {
+      return launchFlagMutationRefusal(
+        additionalFlags.join(", "),
+        "the ComfyUI target is remote and this process does not own its launcher; add the flag to the remote launcher's configuration and restart that instance there",
+      );
+    }
     // Remote target: can't process-control it, but a Manager HTTP reboot brings
     // back a self-supervised ComfyUI (e.g. the tunnelled Desktop app).
     return restartViaManagerReboot({ label: "remote" });
@@ -5367,6 +5439,12 @@ export async function restartComfyUI(): Promise<RestartResult> {
   // every inferred path below (including Desktop's), and it needs no live
   // process info, so it also works when the server is too wedged to answer.
   if (config.comfyuiRestartCommand) {
+    if (additionalFlags.length > 0) {
+      return launchFlagMutationRefusal(
+        additionalFlags.join(", "),
+        "COMFYUI_RESTART_COMMAND is an opaque external launcher command that this process cannot safely edit; update that launcher command/configuration to include the flag, then restart it there",
+      );
+    }
     return restartViaConfiguredCommand(config.comfyuiRestartCommand);
   }
   // EZi/CEI can serve the panel through a local helper port while the real
@@ -5376,6 +5454,12 @@ export async function restartComfyUI(): Promise<RestartResult> {
   // and keep the ordinary process-ownership refusal for every other shape.
   const verifiedProxy = await resolveVerifiedProxyRestartTarget();
   if (verifiedProxy) {
+    if (additionalFlags.length > 0) {
+      return launchFlagMutationRefusal(
+        additionalFlags.join(", "),
+        "the ComfyUI process is behind a verified proxy and its launcher is not owned by this process; add the flag to the backend launcher's configuration and restart it there",
+      );
+    }
     return restartViaManagerReboot({
       label: "EZi/CEI-proxied",
       prior: { argv: verifiedProxy.argv, generation: verifiedProxy.generation },
@@ -5404,7 +5488,8 @@ export async function restartComfyUI(): Promise<RestartResult> {
   // command can't be built/validated (stale COMFYUI_PATH, unknown Desktop exe),
   // refuse and leave the server up rather than take it down with no way back
   // (issues #368/#370).
-  const { info, diagnostic } = await acquireProcessInfo();
+  const acquired = await acquireProcessInfo();
+  const { info, diagnostic } = acquired;
   if (!info) {
     return {
       stopped: false,
@@ -5446,6 +5531,22 @@ export async function restartComfyUI(): Promise<RestartResult> {
       listener_ownership: unclassifiedOwnership(),
     };
   }
+  const launchInfo = withAdditionalLaunchFlags(info, additionalFlags);
+  if (additionalFlags.length > 0) {
+    if (info.isDesktopApp) {
+      return launchFlagMutationRefusal(
+        additionalFlags.join(", "),
+        "ComfyUI Desktop owns the saved launch settings and its supervised restart re-execs the existing process. Add the flag in ComfyUI Desktop's launch settings for this install, then fully quit and relaunch the Desktop app",
+      );
+    }
+    if (!launchInfo) {
+      return launchFlagMutationRefusal(
+        additionalFlags.join(", "),
+        "the running ComfyUI did not expose an exact launch argv that can be safely extended; add the flag through the launcher or console that owns this instance, then restart it there",
+      );
+    }
+  }
+  const relaunchInfo = launchInfo ?? info;
   // A locally-installed ComfyUI **Desktop** instance is Electron-supervised.
   // Killing it (Python backend or Electron shell) and re-spawning the exe does
   // not reliably bring the :PORT listener back (issue #400: stopped:true,
@@ -5497,7 +5598,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
 
   // requireReproducibleEnv: this path KILLS the process and spawns a fresh one, so
   // the launch ENVIRONMENT has to be rebuilt as well as the command (#776).
-  const relaunch = assessRelaunch(info, { requireReproducibleEnv: true });
+  const relaunch = assessRelaunch(relaunchInfo, { requireReproducibleEnv: true });
   if (!relaunch.ok) {
     return {
       stopped: false,
@@ -5542,6 +5643,12 @@ export async function restartComfyUI(): Promise<RestartResult> {
 
   // Brief pause to let OS fully release resources
   await sleep(1000);
+
+  // `stopComfyUI` records the observed recipe before killing. Replace that
+  // record only after the stop committed, so a failed pre-stop safety check or
+  // failed kill cannot silently turn a live server's current state into a new
+  // launch configuration.
+  lastProcessInfo = relaunchInfo;
 
   // A caveat from the stop must survive into whatever we report: the stop can
   // commit WITHOUT confirming the process exited (every port probe failed after
@@ -5632,6 +5739,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
         stopCaveat,
       auto_restart: startResult.auto_restart,
       launch_env: startResult.launch_env,
+      serving_argv: startResult.serving_argv,
       listener_ownership: startResult.listener_ownership,
     };
   }
@@ -5660,6 +5768,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
       auto_restart: startResult.auto_restart,
       spawn_error: startResult.spawn_error,
       launch_env: startResult.launch_env,
+      serving_argv: startResult.serving_argv,
       listener_ownership: startResult.listener_ownership,
     };
   }
@@ -5692,6 +5801,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
       stopCaveat,
     auto_restart: startResult.auto_restart,
     launch_env: startResult.launch_env,
+    serving_argv: startResult.serving_argv,
     listener_ownership: startResult.listener_ownership,
   };
 }

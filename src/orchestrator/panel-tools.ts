@@ -151,6 +151,7 @@ import {
   extractLoaders,
   gatherKitchenStatus,
   kitchenProactiveHint,
+  type KitchenFlagApplyOutcome,
 } from "../services/kitchen.js";
 
 /**
@@ -21846,7 +21847,7 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
       "See what comfy-kitchen can do on this GPU against the OPEN canvas, find where the live graph leaves it on the table, and apply the faster path. Same actions as the core `kitchen` tool, fenced like every other panel mutation. Driven by `action`:\n" +
         '- action:"status" — kitchen version, backends (hip/cuda/triton/eager), INT8 attention, GPU fp8/NVFP4/MXFP8, launch flags. Remote sessions report the import probe and model.quant as unknown.\n' +
         '- action:"assess" — walk the live graph\'s UNETLoaders. A recommendation fires only when every fact it needs is known (fp8_e4m3fn_fast widget; --use-ck-attention flag; NVFP4 swap; ROCm --enable-triton-backend).\n' +
-        '- action:"apply" — apply one recommendation_id. Widget edits go through graph_set_widget (Ctrl+Z). Flags need confirm:true; restart_comfyui / panel_restart_comfyui replay argv and do not inject flags. skip_proof:true skips the follow-up panel_run. A black or slower after-run reverts the widget.',
+        '- action:"apply" — apply one recommendation_id. Widget edits go through graph_set_widget (Ctrl+Z). Flags need confirm:true; directly managed local Python installs get a proven relaunch with the flag appended and retained for later managed starts, while Desktop/remote/external launchers receive an actionable refusal without being stopped or edited. skip_proof:true skips the follow-up panel_run. A black or slower after-run reverts the widget.',
       {
         action: z
           .enum(["status", "assess", "apply"])
@@ -21917,6 +21918,37 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         const result = await applyKitchenRecommendation({
           rec,
           confirm: args.confirm === true,
+          applyFlag:
+            rec.change.type === "flag"
+              ? async (flag): Promise<KitchenFlagApplyOutcome> => {
+                  let restart: Awaited<ReturnType<typeof restartComfyUI>>;
+                  try {
+                    restart = await restartComfyUI({ additionalFlags: [flag] });
+                  } catch (err) {
+                    return {
+                      applied: false,
+                      note:
+                        `Could not apply ${flag}: ${err instanceof Error ? err.message : String(err)} ` +
+                        "No launch argument was changed; verify the launcher and current ComfyUI argv before retrying.",
+                    };
+                  }
+                  const flagObserved = restart.serving_argv?.includes(flag) === true;
+                  const applied =
+                    restart.started === true &&
+                    restart.startup === "confirmed" &&
+                    restart.listener_ownership === "ours" &&
+                    flagObserved;
+                  return {
+                    applied,
+                    note: applied
+                      ? `Applied ${flag} through the proven local relaunch and observed it in the serving ComfyUI argv. The augmented launch recipe is retained for later managed starts.`
+                      :
+                        `Did not confirm ${flag} in effect: ${restart.message} ` +
+                        "panel_kitchen reports applied:false because the relaunch and the new serving argv were not both proven.",
+                    restart,
+                  };
+                }
+              : undefined,
           applyWidget:
             rec.change.type === "widget" || rec.change.type === "model_swap"
               ? async (nodeId, widget, value) => {
