@@ -2130,6 +2130,30 @@ describe("resolveLiveServerRoot (#369)", () => {
     }
   });
 
+  it("anchors the Windows embedded layout: <root>\\python\\python.exe + <root>\\main.py", async () => {
+    const dir = await tmpDir();
+    try {
+      const root = join(dir, "ComfyUI");
+      const python = join(root, "python", "python.exe");
+      await mkdir(dirname(python), { recursive: true });
+      await writeFile(python, "", "utf-8");
+      await writeFile(join(root, "main.py"), "", "utf-8");
+
+      const res = resolveLiveServerRoot(["main.py", "--listen"], undefined, {
+        observedPython: python,
+        observedPid: 2252,
+      });
+
+      expect(res.source).toBe("observed-process");
+      expect(res.root).toBe(root);
+      expect(res.anchorDir).toBe(root);
+      expect(res.observedPython).toBe(python);
+      expect(res.observedPid).toBe(2252);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("stays UNRESOLVED when nothing observes the process — never a layout guess", () => {
     h.mockLiveInterpreter.mockReturnValue(undefined);
     const res = resolveLiveServerRoot([join("ComfyUI", "main.py")]);

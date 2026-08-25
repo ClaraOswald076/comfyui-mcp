@@ -119,6 +119,17 @@ vi.mock("node:fs", () => ({
     if (!mockExistsSync(String(p))) throw new Error("ENOENT");
     return { isFile: () => mockIsFile(String(p)) };
   }),
+  // #2252's exact embedded layout rejects symlinked roots/files rather than
+  // turning a lexical observation into a relaunch target.
+  lstatSync: vi.fn((p: string) => {
+    const s = String(p);
+    if (!mockExistsSync(s)) throw new Error("ENOENT");
+    return {
+      isFile: () => s !== EMBEDDED_ROOT && mockIsFile(s),
+      isDirectory: () => s === EMBEDDED_ROOT || s === join(EMBEDDED_ROOT, "python"),
+      isSymbolicLink: () => false,
+    };
+  }),
 }));
 
 vi.mock("../../comfyui/client.js", () => ({
@@ -169,6 +180,13 @@ import {
 const BASE = resolve("ComfyUI_portable", "ComfyUI");
 const ABS_MAIN = join(BASE, "main.py");
 const ABS_PYTHON = join(BASE, "python_embeded", "python.exe");
+// #2252: the standalone embedded-python layout is different from the classic
+// portable bundle: the interpreter is directly under `<root>\python` and the
+// server's bare `main.py` is directly under that same root.
+const EMBEDDED_ROOT = resolve("ComfyUI_embedded");
+const EMBEDDED_MAIN = join(EMBEDDED_ROOT, "main.py");
+const EMBEDDED_PYTHON_DIR = join(EMBEDDED_ROOT, "python");
+const EMBEDDED_PYTHON = join(EMBEDDED_ROOT, "python", "python.exe");
 
 const ORIGINAL_ENV = { ...process.env };
 
@@ -248,6 +266,8 @@ afterEach(() => {
 });
 
 describe("restart_comfyui — live-first script resolution (#476, #426)", () => {
+  const winIt = process.platform === "win32" ? it : it.skip;
+
   it("RESTARTS a reachable install, anchoring a relative argv[0] to the canonical absolute base (not refusing on a stale/relative COMFYUI_PATH)", async () => {
     mockLivePortThenFree();
     const children: FakeChild[] = [];
@@ -406,6 +426,107 @@ describe("restart_comfyui — live-first script resolution (#476, #426)", () => 
 
     killSpy.mockRestore();
   });
+
+  winIt(
+    "#2252: anchors bare main.py from an observed <root>\\python\\python.exe",
+    async () => {
+      // The old path resolved the live root but then asked the general layout
+      // resolver for a python candidate. That resolver intentionally does not
+      // guess this embedded layout, so the script stayed relative and preflight
+      // refused before stopping anything. The narrow repair may use this pair
+      // only because the interpreter came from the PID-correlated command line.
+      mockResolveBase.mockReturnValue(undefined);
+      mockLiveRootFromArgv.mockReturnValue(undefined);
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: ["main.py", "--port", "8188"] },
+      });
+      mockExistsSync.mockImplementation((p: string) => {
+        const s = String(p);
+        return (
+          s === EMBEDDED_ROOT ||
+          s === EMBEDDED_PYTHON_DIR ||
+          s === EMBEDDED_MAIN ||
+          s === EMBEDDED_PYTHON
+        );
+      });
+      mockFindComfyuiPython.mockReturnValue("python");
+      __processControlTestHooks.setLiveCwdResolver(() => undefined);
+      mockResolveLiveServerRoot.mockReturnValue({
+        source: "observed-process",
+        anchorDir: EMBEDDED_ROOT,
+        observedPid: 4321,
+      });
+      __processControlTestHooks.setProcessIdentityResolver(() => ({
+        startedAt: "stable-stamp",
+        commandLine: `"${EMBEDDED_PYTHON}" main.py --port 8188`,
+        argv: [EMBEDDED_PYTHON, "main.py", "--port", "8188"],
+        argvFidelity: "exact",
+      }));
+      mockLivePortThenFree();
+      mockSpawn.mockImplementation(() => new FakeChild());
+      vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true }) as Response));
+      const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+      const result = await restartComfyUI();
+
+      expect(result.message).not.toMatch(/refusing to restart/i);
+      expect(result.stopped).toBe(true);
+      expect(result.started).toBe(true);
+      expect(mockSpawn).toHaveBeenCalledTimes(1);
+      const [exe, args, opts] = mockSpawn.mock.calls[0];
+      expect(exe).toBe(EMBEDDED_PYTHON);
+      expect(args[0]).toBe(EMBEDDED_MAIN);
+      expect((opts as { cwd?: string }).cwd).toBe(EMBEDDED_ROOT);
+
+      killSpy.mockRestore();
+    },
+  );
+
+  winIt(
+    "#2252: refuses the same shape when the observed main.py is not a regular file",
+    async () => {
+      mockResolveBase.mockReturnValue(undefined);
+      mockLiveRootFromArgv.mockReturnValue(undefined);
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: ["main.py", "--port", "8188"] },
+      });
+      mockExistsSync.mockImplementation((p: string) => {
+        const s = String(p);
+        return (
+          s === EMBEDDED_ROOT ||
+          s === EMBEDDED_PYTHON_DIR ||
+          s === EMBEDDED_MAIN ||
+          s === EMBEDDED_PYTHON
+        );
+      });
+      mockFindComfyuiPython.mockReturnValue("python");
+      mockIsFile.mockImplementation((p: string) => String(p) !== EMBEDDED_MAIN);
+      __processControlTestHooks.setLiveCwdResolver(() => undefined);
+      mockResolveLiveServerRoot.mockReturnValue({
+        source: "observed-process",
+        anchorDir: EMBEDDED_ROOT,
+        observedPid: 4321,
+      });
+      __processControlTestHooks.setProcessIdentityResolver(() => ({
+        startedAt: "stable-stamp",
+        commandLine: `"${EMBEDDED_PYTHON}" main.py --port 8188`,
+        argv: [EMBEDDED_PYTHON, "main.py", "--port", "8188"],
+        argvFidelity: "exact",
+      }));
+      mockLivePortThenFree();
+      const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+      const result = await restartComfyUI();
+
+      expect(result.message).toMatch(/refusing to restart/i);
+      expect(result.stopped).toBe(false);
+      expect(result.started).toBe(false);
+      expect(mockSpawn).not.toHaveBeenCalled();
+      expect(killSpy).not.toHaveBeenCalled();
+
+      killSpy.mockRestore();
+    },
+  );
 
   it("WINDOWS: a PID MISMATCH discards the observed anchor and keeps the refusal (#535)", async () => {
     // The safety property. The observation is anchored on "whatever is listening on

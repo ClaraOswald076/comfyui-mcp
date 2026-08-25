@@ -64,10 +64,18 @@ const mockSpawn = vi.hoisted(() => vi.fn());
 const mockGetSystemStats = vi.hoisted(() => vi.fn());
 const mockExistsSync = vi.hoisted(() => vi.fn((_p: string) => true));
 const mockIsFile = vi.hoisted(() => vi.fn((_p: string) => true));
+const mockIsDirectory = vi.hoisted(() => vi.fn((_p: string) => true));
+const mockIsSymlink = vi.hoisted(() => vi.fn((_p: string) => false));
 const mockFindComfyuiPython = vi.hoisted(() => vi.fn());
 const mockResolveBase = vi.hoisted(() => vi.fn<[], string | undefined>());
 const mockLiveRootFromArgv = vi.hoisted(() =>
   vi.fn<[string[], string?], string | undefined>(),
+);
+const mockResolveLiveRoot = vi.hoisted(() =>
+  vi.fn<
+    [],
+    { source: "unresolved" | "observed-process"; anchorDir?: string; observedPid?: number }
+  >(),
 );
 
 vi.mock("../../config.js", () => ({
@@ -86,6 +94,14 @@ vi.mock("node:child_process", () => ({
 
 vi.mock("node:fs", () => ({
   existsSync: mockExistsSync,
+  lstatSync: vi.fn((p: string) => {
+    if (!mockExistsSync(String(p))) throw new Error("ENOENT");
+    return {
+      isDirectory: () => mockIsDirectory(String(p)),
+      isFile: () => mockIsFile(String(p)),
+      isSymbolicLink: () => mockIsSymlink(String(p)),
+    };
+  }),
   readlinkSync: vi.fn(() => {
     throw new Error("no /proc in test");
   }),
@@ -120,6 +136,7 @@ vi.mock("../../services/env-capabilities.js", () => ({
 vi.mock("../../services/workspace-env.js", () => ({
   resolveEffectiveComfyUIBase: mockResolveBase,
   liveRootFromArgv: mockLiveRootFromArgv,
+  resolveLiveServerRoot: mockResolveLiveRoot,
   markLocalComfyUILaunched: vi.fn(),
   resetLocalComfyUILaunchState: vi.fn(),
 }));
@@ -184,6 +201,9 @@ beforeEach(() => {
   mockFindComfyuiPython.mockReturnValue(ABS_PYTHON);
   mockLiveRootFromArgv.mockReturnValue(undefined);
   mockResolveBase.mockReturnValue(BASE);
+  mockResolveLiveRoot.mockReturnValue({ source: "unresolved" });
+  mockIsDirectory.mockImplementation((_p: string) => true);
+  mockIsSymlink.mockImplementation((_p: string) => false);
   mockExistsSync.mockImplementation((p: string) => {
     const s = String(p);
     return s === ABS_MAIN || s === ABS_PYTHON;
@@ -789,6 +809,134 @@ describe("restart_comfyui (action:\"stop\") — has_restart_info means a relaunc
     expect(stopped.message).not.toMatch(/will NOT be able/i);
 
     killSpy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #2252 — Windows embedded-python portable layout
+// ---------------------------------------------------------------------------
+
+describe("restart_comfyui — anchors the observed embedded-python root (#2252)", () => {
+  const runOnWindows = it.skipIf(process.platform !== "win32");
+
+  runOnWindows("uses the corroborated <root>\\python\\python.exe with <root>\\main.py", async () => {
+    const root = "C:\\ComfyUI-portable";
+    const pythonDir = join(root, "python");
+    const python = join(root, "python", "python.exe");
+    const main = join(root, "main.py");
+    const argv = ["main.py", "--port", "8188"];
+
+    mockGetSystemStats.mockResolvedValue({ system: { argv } });
+    mockLivePortThenFree();
+    mockFindComfyuiPython.mockReturnValue("C:\\stale\\python.exe");
+    mockResolveBase.mockReturnValue(undefined);
+    mockResolveLiveRoot.mockReturnValue({
+      source: "observed-process",
+      anchorDir: root,
+      observedPid: 4321,
+    });
+    mockExistsSync.mockImplementation((p: string) => {
+      const value = String(p);
+      return value === root || value === pythonDir || value === python || value === main;
+    });
+    mockIsDirectory.mockImplementation(
+      (p: string) => String(p) === root || String(p) === `${root}\\python`,
+    );
+    mockIsFile.mockImplementation((p: string) => String(p) === python || String(p) === main);
+    __processControlTestHooks.setProcessIdentityResolver(() => ({
+      startedAt: "stable-stamp",
+      commandLine: `"${python}" main.py --port 8188`,
+      argv: [python, ...argv],
+      argvFidelity: "exact",
+    }));
+    mockSpawn.mockImplementation(() => new FakeChild());
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true }) as Response));
+
+    await restartComfyUI();
+
+    const [exe, args, options] = mockSpawn.mock.calls[0] as [
+      string,
+      string[],
+      { cwd?: string },
+    ];
+    expect(exe).toBe(python);
+    expect(args).toEqual([main, "--port", "8188"]);
+    expect(options.cwd).toBe(root);
+  });
+
+  runOnWindows("keeps the refusal when the exact embedded layout is symlinked", async () => {
+    const root = "C:\\ComfyUI-portable";
+    const pythonDir = join(root, "python");
+    const python = join(root, "python", "python.exe");
+    const main = join(root, "main.py");
+    mockGetSystemStats.mockResolvedValue({ system: { argv: ["main.py", "--port", "8188"] } });
+    mockLivePortThenFree();
+    mockFindComfyuiPython.mockReturnValue(undefined);
+    mockResolveBase.mockReturnValue(undefined);
+    mockResolveLiveRoot.mockReturnValue({
+      source: "observed-process",
+      anchorDir: root,
+      observedPid: 4321,
+    });
+    mockExistsSync.mockImplementation((p: string) => {
+      const value = String(p);
+      return value === root || value === pythonDir || value === python || value === main;
+    });
+    mockIsDirectory.mockImplementation(
+      (p: string) => String(p) === root || String(p) === `${root}\\python`,
+    );
+    mockIsFile.mockImplementation((p: string) => String(p) === python || String(p) === main);
+    mockIsSymlink.mockImplementation((p: string) => String(p) === main);
+    __processControlTestHooks.setProcessIdentityResolver(() => ({
+      startedAt: "stable-stamp",
+      commandLine: `"${python}" main.py --port 8188`,
+      argv: [python, "main.py", "--port", "8188"],
+      argvFidelity: "exact",
+    }));
+
+    const result = await preflightLocalRestart();
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/main\.py|launch command/i);
+    expect(killWasIssued()).toBe(false);
+    expect(mockSpawn).not.toHaveBeenCalled();
+  });
+
+  runOnWindows("does not broaden the repair to a different relative script path", async () => {
+    const root = "C:\\ComfyUI-portable";
+    const pythonDir = join(root, "python");
+    const python = join(root, "python", "python.exe");
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["ComfyUI\\main.py", "--port", "8188"] },
+    });
+    mockLivePortThenFree();
+    mockFindComfyuiPython.mockReturnValue(undefined);
+    mockResolveBase.mockReturnValue(undefined);
+    mockResolveLiveRoot.mockReturnValue({
+      source: "observed-process",
+      anchorDir: root,
+      observedPid: 4321,
+    });
+    mockExistsSync.mockImplementation(
+      (p: string) =>
+        String(p) === root || String(p) === pythonDir || String(p) === python,
+    );
+    mockIsDirectory.mockImplementation(
+      (p: string) => String(p) === root || String(p) === `${root}\\python`,
+    );
+    mockIsFile.mockImplementation((p: string) => String(p) === python);
+    __processControlTestHooks.setProcessIdentityResolver(() => ({
+      startedAt: "stable-stamp",
+      commandLine: `"${python}" ComfyUI\\main.py --port 8188`,
+      argv: [python, "ComfyUI\\main.py", "--port", "8188"],
+      argvFidelity: "exact",
+    }));
+
+    const result = await preflightLocalRestart();
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/main\.py|launch command/i);
+    expect(killWasIssued()).toBe(false);
   });
 });
 
