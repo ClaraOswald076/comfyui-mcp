@@ -438,6 +438,7 @@ function makeDeps(opts: {
   installedVersion?: string;
   pin?: PanelPinState;
   dirs?: string[];
+  managerReserved?: boolean;
   /** Mutate the live files map to simulate what the Manager actually did. */
   onUpdate?: (files: Record<string, string>) => void;
   updateDetails?: unknown;
@@ -445,6 +446,11 @@ function makeDeps(opts: {
   const files: Record<string, string> = {};
   if (opts.installedVersion !== undefined) {
     files[join(PANEL_DIR, "pyproject.toml")] = pyproject(opts.installedVersion);
+  }
+  if (opts.managerReserved) {
+    files[
+      join(COMFY, "user", "__manager", "startup-scripts", "install-scripts.txt")
+    ] = `['${PANEL_REGISTRY_ID}', '#LAZY-CNR-SWITCH-SCRIPT', 'https://x/y.zip']\n`;
   }
   const dirs = opts.dirs ?? (opts.installedVersion !== undefined ? ["comfyui-mcp-panel"] : []);
   const h: Harness = { updates: 0, installs: 0, deps: undefined as never };
@@ -618,6 +624,40 @@ describe("performPanelSync", () => {
     await expect(performPanelSync({ deps: h.deps, ...RUN })).rejects.toThrow(
       /Could not verify|NOT reporting/i,
     );
+  });
+
+  it("does not call a staged legacy-Manager update a completed sync (#639)", async () => {
+    // Current recurrence: panel 0.15.57 is behind the 0.15.58 floor, while
+    // legacy Manager reports success and leaves its startup reservation. The
+    // panel is still 0.15.57 on disk until ComfyUI restarts.
+    const h = makeDeps({
+      installedVersion: "0.15.57",
+      managerReserved: true,
+      updateDetails: {
+        total_count: 0,
+        done_count: 2,
+        in_progress_count: 0,
+        pending_count: 0,
+        is_processing: false,
+      },
+      onUpdate: () => {
+        /* Manager staged the update; nothing moves until restart. */
+      },
+    });
+    const r = await performPanelSync({
+      deps: h.deps,
+      requiredVersion: "0.15.58",
+      orchestratorVersion: ORCH,
+    });
+
+    expect(h.updates).toBe(1);
+    expect(r.synced).toBe(false);
+    expect(r.staged).toBe(true);
+    expect(r.verifiedVersion).toBeUndefined();
+    expect(r.previousVersion).toBe("0.15.57");
+    expect(r.requiredPanelVersion).toBe("0.15.58");
+    expect(r.restartRequired).toBe(true);
+    expect(r.message).toMatch(/STAGED|RESTART ComfyUI/i);
   });
 
   it("reports stillBehind honestly when the sync landed but did not close the gap", async () => {
