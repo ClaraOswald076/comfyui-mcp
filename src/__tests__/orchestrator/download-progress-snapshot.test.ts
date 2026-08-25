@@ -40,4 +40,25 @@ describe("download progress snapshot emission (#717)", () => {
     expect(snapshots.record(terminal)).toBe(true);
     expect(snapshots.forPanel()).toEqual(terminal);
   });
+
+  it("proves byte advancement separately from heartbeat-shaped row updates", () => {
+    const snapshots = new DownloadProgressSnapshots();
+    const first = { id: "model-a", status: "downloading", downloaded: 140, total: 1_000 };
+    const next = { id: "model-a", status: "downloading", downloaded: 220, total: 1_000 };
+
+    snapshots.record([first]);
+    expect(snapshots.hasAdvanced(first)).toBe(false);
+    snapshots.record([{ ...first, updated: 1 }]);
+    expect(snapshots.hasAdvanced(first)).toBe(false);
+    snapshots.record([next]);
+    expect(snapshots.hasAdvanced(next)).toBe(true);
+    snapshots.record([{ ...next, updated: 2 }]);
+    expect(snapshots.hasAdvanced(next)).toBe(true);
+    expect(
+      snapshots.hasAdvanced(
+        next,
+        Date.now() + DownloadProgressSnapshots.ADVANCEMENT_MAX_AGE_MS + 1,
+      ),
+    ).toBe(false);
+  });
 });

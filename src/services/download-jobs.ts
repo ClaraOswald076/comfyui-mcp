@@ -36,6 +36,7 @@ import {
   readDownloadProgress,
   listInFlightDownloadProgress,
   persistDownloadJob,
+  currentDownloadTarget,
   readPersistedDownloadJob,
   listPersistedDownloadJobs,
   findPersistedDownloadJob,
@@ -65,6 +66,10 @@ export interface DownloadJob {
    *  (falling back to trayId when unset). Never used for URL adoption (that needs the
    *  stable original-URL trayId). */
   progressId?: string;
+  /** Credential-free ComfyUI endpoint this job serves; absent only on legacy records. */
+  target?: string;
+  /** Persisted record owner, retained so reconciliation updates that same file. */
+  owner?: string;
   /** This job's OWN resume decision (#467), reported by its physical download via
    *  a callback and stored here — so download_model action:"status" surfaces exactly this job's
    *  outcome and never a stale/other job's. Absent when no resumable download ran
@@ -77,6 +82,8 @@ export interface DownloadJob {
   /** "cancelled" is a user-requested abort (#515): the stream was aborted, no
    *  false-complete is reported, and the resumable .partial is left on disk. */
   status: "downloading" | "done" | "error" | "cancelled";
+  /** Persisted snapshot time when this view came from the cross-session store. */
+  updated?: number;
   /** Absolute path once the file has landed. */
   path?: string;
   error?: string;
@@ -592,6 +599,7 @@ export async function startDownloadJob(
   const job: DownloadJob = {
     id,
     trayId,
+    target: currentDownloadTarget(),
     url,
     target_subfolder: targetSubfolder,
     filename,
@@ -962,11 +970,12 @@ function finalizeCancelled(job: DownloadJob): void {
  *  URL. No-op outside the panel. Keeps the persisted copy in step with the job.
  *  Returns whether the record was DURABLY replaced (so the heartbeat can retry a
  *  transiently-failing terminal persist). */
-function persistJobRecord(job: DownloadJob): boolean {
+function persistJobRecord(job: DownloadJob, owner = PERSIST_OWNER): boolean {
   return persistDownloadJob({
     id: job.id,
     trayId: job.trayId,
     progressId: job.progressId,
+    target: job.target,
     url: job.url,
     target_subfolder: job.target_subfolder,
     filename: job.filename,
@@ -986,7 +995,33 @@ function persistJobRecord(job: DownloadJob): boolean {
     disk_verified: job.disk_verified,
     verified_root: job.verified_root,
     reclaimed_dead: job.reclaimedDead,
-  });
+  }, owner);
+}
+
+function boundedDownloadJobError(value: string | undefined): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const compact = value.replace(/\s+/g, " ").trim();
+  return compact ? compact.slice(0, 400) : undefined;
+}
+
+/** Turn a stale/frozen in-flight record into the terminal state the tray is reporting. */
+export function reconcileStalledDownloadRecord(job: DownloadJob, error?: string): boolean {
+  if (job.status !== "downloading") return true;
+  const wasPersisted = job.updated !== undefined;
+  job.status = "error";
+  job.error = boundedDownloadJobError(error);
+  job.finished_at = Date.now();
+  job.updated = job.finished_at;
+  // A reconstructed foreign record must be terminalized in its ORIGINAL owner file;
+  // writing a fresh current-owner snapshot leaves the original fresh downloading row
+  // authoritative to status. Legacy persisted records without an owner cannot be safely
+  // reconciled, so callers keep the event explicitly disclosed instead.
+  if (wasPersisted && !job.owner) return false;
+  const durable = persistJobRecord(job, job.owner ?? PERSIST_OWNER);
+  // In non-panel mode the in-memory object is the authoritative status store. In panel
+  // mode a failed persist leaves the old downloading snapshot visible, so the caller must
+  // keep the event explicitly reconciled instead of emitting an unflagged FAILED row.
+  return durable || !persistedRecordsEnabled();
 }
 
 /** Rebuild an in-memory DownloadJob view from a persisted record (#529 adoption
@@ -998,10 +1033,13 @@ function jobFromPersisted(rec: PersistedDownloadJob): DownloadJob {
     id: rec.id,
     trayId: rec.trayId,
     progressId: rec.progressId,
+    target: rec.target,
+    owner: rec.owner,
     url: rec.url,
     target_subfolder: rec.target_subfolder,
     filename: rec.filename,
     status: rec.status,
+    updated: rec.updated,
     path: rec.path,
     error: rec.error,
     started_at: rec.started_at,
@@ -1528,12 +1566,11 @@ export function compareTrayIds(a: string | undefined, b: string | undefined): nu
 
 export function listDownloadJobs(): DownloadJob[] {
   // One Entry is indexed under multiple keys — dedup by identity so a job appears once
-  // regardless of how many keys point at it. Identity is (id, trayId), NOT id alone:
-  // two distinct URLs to one dest+auth share an id but are distinct physical downloads
-  // (different trayId), and both must be listed — download_model action:"status" with no selector
-  // promises EVERY tracked download.
+  // regardless of how many keys point at it. Identity is (id, trayId, target), NOT id alone:
+  // concurrent local and pod transfers can share the first two fields and must remain
+  // separately visible to the tray reconciliation and status action.
   const seen = new Set<Entry>();
-  const keyOf = (j: DownloadJob): string => `${j.id}\n${j.trayId}`;
+  const keyOf = (j: DownloadJob): string => `${j.id}\n${j.trayId}\n${j.target ?? ""}`;
   const byKey = new Map<string, DownloadJob>();
   for (const e of jobs.values()) {
     if (seen.has(e)) continue;
@@ -1544,18 +1581,26 @@ export function listDownloadJobs(): DownloadJob[] {
   }
   // #529: fold in persisted records for jobs THIS session's registry doesn't hold
   // (started before a reconnect), so download_model action:"status" still lists in-flight downloads.
-  // INTEGRITY TRUTH: a validated DONE (file landed) WINS over a cancelled/error record for
-  // the SAME (id, trayId) — whether that other record is a persisted counterpart OR this
-  // session's own in-memory cancelled/error. So a persisted DONE overrides any current
-  // entry that is neither DONE nor a LIVE in-memory download (which stays visible as the
-  // user's active action). The list never shows a cancelled in place of a validated file.
+  // INTEGRITY TRUTH: a LIVE or validated DONE record WINS over a cancelled/error snapshot
+  // for the SAME (id, trayId) — whether that other record is persisted or this session's
+  // in-memory terminal entry. A live record must stay visible as the user's active action,
+  // and the list must never replace a validated file with a terminal snapshot.
   for (const rec of listPersistedDownloadJobs()) {
     const job = jobFromPersisted(rec);
     const k = keyOf(job);
     const cur = byKey.get(k);
     if (!cur) {
       byKey.set(k, job);
-    } else if (job.status === "done" && cur.status !== "done" && cur.status !== "downloading") {
+    } else if (
+      (job.status === "downloading" &&
+        job.staleInflight !== true &&
+        cur.status !== "done" &&
+        !(cur.status === "downloading" && cur.staleInflight !== true)) ||
+      (job.status !== "downloading" &&
+        cur.status === "downloading" &&
+        (cur.staleInflight === true || (job.updated ?? job.finished_at ?? 0) >= (cur.updated ?? 0))) ||
+      (job.status === "done" && cur.status !== "done" && cur.status !== "downloading")
+    ) {
       byKey.set(k, job);
     }
   }

@@ -1188,6 +1188,73 @@ describe("download job registry", () => {
 
   // ── #529: adopt an in-flight download after a session reconnect ─────────────
   describe("#529 reconnect adoption", () => {
+    it("does not let a heartbeat-stale record replace an in-memory terminal error (#2057)", async () => {
+      const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
+      setProgressDir(dir);
+      try {
+        const id = "recurrence-terminal-wins";
+        const trayId = "recurrence-terminal-tray";
+        const progressId = "recurrence-terminal-progress";
+        await writeForeignJobRecord(dir, {
+          id,
+          trayId,
+          progressId,
+          url: URL_A,
+          owner: "terminal-snapshot",
+          status: "error",
+        });
+        await writeForeignJobRecord(dir, {
+          id,
+          trayId,
+          progressId,
+          url: URL_A,
+          owner: "stale-stream",
+          status: "downloading",
+          ageMs: 90_000,
+        });
+
+        expect(listDownloadJobs().find((j) => j.id === id)).toMatchObject({ status: "error" });
+      } finally {
+        setProgressDir("");
+        await fsRm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("lists the live record when an older terminal snapshot shares its identity (#2057)", async () => {
+      const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
+      setProgressDir(dir);
+      try {
+        const id = "recurrence-live-wins";
+        const trayId = "recurrence-tray";
+        const progressId = "recurrence-progress";
+        await writeForeignJobRecord(dir, {
+          id,
+          trayId,
+          progressId,
+          url: URL_A,
+          owner: "older-terminal",
+          status: "error",
+          ageMs: 30_000,
+        });
+        await writeForeignJobRecord(dir, {
+          id,
+          trayId,
+          progressId,
+          url: URL_A,
+          owner: "active-stream",
+          status: "downloading",
+        });
+
+        expect(listDownloadJobs().find((j) => j.id === id)).toMatchObject({
+          status: "downloading",
+          progressId,
+        });
+      } finally {
+        setProgressDir("");
+        await fsRm(dir, { recursive: true, force: true });
+      }
+    });
+
     it("still resolves an in-flight download by id (and by URL) after a simulated reconnect", async () => {
       const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
       setProgressDir(dir); // enable the cross-session persisted store (as the panel does)

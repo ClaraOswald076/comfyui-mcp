@@ -48,17 +48,23 @@ interface RowLike {
    *  LOCAL and POD transfer of the same URL share an id and must stay distinguishable. */
   target?: unknown;
   status?: unknown;
+  error?: unknown;
+  /** Derived from monotonic progress snapshots, never from heartbeat timestamps. */
+  progressAdvanced?: unknown;
 }
-interface JobLike {
+export interface DownloadDoneRecordLike {
   id?: unknown;
   trayId?: unknown;
   progressId?: unknown;
   target?: unknown;
   status?: unknown;
+  error?: unknown;
+  /** Persisted records set this when their heartbeat is outside status' live window. */
+  staleInflight?: unknown;
 }
 
 /** The identity a PROGRESS ROW is written under. */
-function progressIdentityOf(job: JobLike): string | null {
+function progressIdentityOf(job: DownloadDoneRecordLike): string | null {
   const progress = typeof job.progressId === "string" ? job.progressId : null;
   const tray = typeof job.trayId === "string" ? job.trayId : null;
   return progress ?? tray;
@@ -72,34 +78,53 @@ function progressIdentityOf(job: JobLike): string | null {
  * outcomes. Matching on id alone could annotate the wrong terminal, or miss a real
  * disagreement by finding the other one first (review).
  *
- * A target is compared only when BOTH sides carry one. Rows and records that predate the
- * field, or a route that never sets it, must not silently stop matching — that would make
- * the check inert again, which is exactly how the first version shipped.
- *
- * PREFER THE EXACT (id, target) MATCH (review, round 3). Taking the first id match in
- * array order let a TARGETLESS record shadow the exact one: a targetless "downloading"
- * sitting before an exact-target terminal reported a disagreement that does not exist.
- * The targetless record still stands in when nothing matches on target.
+ * Target identity is production data, not a test-only discriminator. A row or record
+ * without it is ambiguous when local and pod transfers share an id, so legacy targetless
+ * records fail closed and never suppress or promote a terminal event.
  */
-function matchingRecord(row: RowLike, jobs: readonly JobLike[]): JobLike | null {
+function matchingRecord(
+  row: RowLike,
+  jobs: readonly DownloadDoneRecordLike[],
+): DownloadDoneRecordLike | null {
   if (!row || typeof row !== "object") return null;
   const id = typeof row.id === "string" ? row.id : null;
   if (!id) return null;
   if (!Array.isArray(jobs)) return null;
-  const target = typeof row.target === "string" ? row.target : null;
-  const sameId = jobs.filter((j) => j && typeof j === "object" && progressIdentityOf(j) === id);
-  if (!sameId.length) return null;
+  const target = typeof row.target === "string" && row.target.length > 0 ? row.target : null;
+  if (!target) return null;
+  const candidates = jobs.filter(
+    (j) =>
+      j &&
+      typeof j === "object" &&
+      progressIdentityOf(j) === id &&
+      typeof j.target === "string" &&
+      j.target.length > 0 &&
+      j.target === target,
+  );
+  if (!candidates.length) return null;
+  // A reconnect can leave both an older terminal snapshot and the newer live record in
+  // the persisted store. `download_model action:"status"` resolves that ambiguity in
+  // favour of the live transfer; the tray guard must make the same choice or it can
+  // announce FAILED while status is still advancing.
+  // `download_model action:"status"` treats stale persisted rows as historical
+  // diagnostics and resolves the terminal record instead. Prefer a fresh live record
+  // when both snapshots are present, but keep a stale one available for error-detail
+  // lookup and explicit non-live handling below.
   return (
-    (target ? sameId.find((j) => j.target === target) : undefined) ??
-    sameId.find((j) => typeof j.target !== "string") ??
-    (target ? undefined : sameId[0]) ??
+    candidates.find((j) => j.status === "downloading" && j.staleInflight !== true) ??
+    candidates.find((j) => j.status !== "downloading") ??
+    candidates.find((j) => j.status === "downloading") ??
+    candidates[0] ??
     null
   );
 }
 
-function recordStillDownloading(row: RowLike, jobs: readonly JobLike[]): boolean {
+function recordStillDownloading(row: RowLike, jobs: readonly DownloadDoneRecordLike[]): boolean {
   const record = matchingRecord(row, jobs);
-  return record != null && record.status === "downloading";
+  // This is deliberately the same freshness boundary as the status action. A stale
+  // persisted heartbeat can remain on disk for six hours, but status resolves it as a
+  // terminal/no-live answer; it must not suppress a real FAILED tray notification.
+  return record != null && record.status === "downloading" && record.staleInflight !== true;
 }
 
 /**
@@ -109,12 +134,38 @@ function recordStillDownloading(row: RowLike, jobs: readonly JobLike[]): boolean
  * still says `downloading`. A missing record is not evidence — the record store resets on an
  * orchestrator respawn, which is exactly the reported session.
  */
-export function completionDisagreesWithRecord(row: RowLike, jobs: readonly JobLike[]): boolean {
+export function completionDisagreesWithRecord(
+  row: RowLike,
+  jobs: readonly DownloadDoneRecordLike[],
+): boolean {
   if (!row || typeof row !== "object") return false;
   // Completions only. Failures have their own check (#2057); #1150's live-tray hedge
   // stays a separate question (a different id writing the same filename).
   if (row.status !== "done") return false;
   return recordStillDownloading(row, jobs);
+}
+
+export type FailureRecordDisposition = "none" | "advancing" | "stalled" | "stale";
+
+export interface FailureRecordMatch {
+  disposition: FailureRecordDisposition;
+  record: DownloadDoneRecordLike | null;
+}
+
+/** Classify a terminal tray row against the exact production job identity. */
+export function failureRecordDisposition(
+  row: RowLike,
+  jobs: readonly DownloadDoneRecordLike[],
+): FailureRecordMatch {
+  if (!row || typeof row !== "object" || row.status !== "error") {
+    return { disposition: "none", record: null };
+  }
+  const record = matchingRecord(row, jobs);
+  if (!record || record.status !== "downloading") {
+    return { disposition: "none", record: null };
+  }
+  if (record.staleInflight === true) return { disposition: "stale", record };
+  return { disposition: row.progressAdvanced === true ? "advancing" : "stalled", record };
 }
 
 /**
@@ -125,10 +176,70 @@ export function completionDisagreesWithRecord(row: RowLike, jobs: readonly JobLi
  * `download_model action:"status"` reads. The reported case had no live tray row — the tray
  * itself was the error — while status still showed the same id streaming and advancing.
  */
-export function failureDisagreesWithRecord(row: RowLike, jobs: readonly JobLike[]): boolean {
+export function failureDisagreesWithRecord(
+  row: RowLike,
+  jobs: readonly DownloadDoneRecordLike[],
+): boolean {
   if (!row || typeof row !== "object") return false;
   if (row.status !== "error") return false;
-  return recordStillDownloading(row, jobs);
+  // A fresh heartbeat says only that persistence happened. The failure hedge requires
+  // an actual byte increase observed by the poller, or a stalled stream could suppress
+  // a genuine FAILED notification indefinitely. Stalled/stale records are reconciled to
+  // terminal state by the production poll seam instead of being treated as live.
+  return failureRecordDisposition(row, jobs).disposition === "advancing";
+}
+
+/** Bound one error string before it reaches the tray/agent event. */
+export function boundedDownloadError(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const compact = value.replace(/\s+/g, " ").trim();
+  return compact ? compact.slice(0, 400) : undefined;
+}
+
+/** Return the bounded error detail from the authoritative terminal record, when present. */
+export function failureErrorDetail(
+  row: RowLike,
+  jobs: readonly DownloadDoneRecordLike[],
+): string | undefined {
+  if (!row || typeof row !== "object" || row.status !== "error") return undefined;
+  const rowError = boundedDownloadError(row.error);
+  const record = matchingRecord(row, jobs);
+  return (
+    rowError ??
+    (record?.status !== "downloading" ? boundedDownloadError(record?.error) : undefined)
+  );
+}
+
+export interface DownloadDoneFailureLike {
+  id?: unknown;
+  target?: unknown;
+  status?: unknown;
+  error?: unknown;
+  recordDisagrees?: boolean;
+  progressAdvanced?: boolean;
+}
+
+/**
+ * Reconcile the failure half of one production download_done batch.
+ *
+ * The poll loop calls this after it has read the tray rows and authoritative job records,
+ * before injecting the batch into the panel agent. Keeping the mutation here makes that
+ * production seam directly testable without treating PanelAgentManager injection as the
+ * producer-side proof.
+ */
+export function reconcileDownloadDoneFailures<T extends DownloadDoneFailureLike>(
+  rows: T[],
+  jobs: readonly DownloadDoneRecordLike[],
+): T[] {
+  const disagreeing: T[] = [];
+  for (const row of rows) {
+    if (failureDisagreesWithRecord(row, jobs)) {
+      row.recordDisagrees = true;
+      disagreeing.push(row);
+    }
+    if (row.status === "error") row.error = failureErrorDetail(row, jobs);
+  }
+  return disagreeing;
 }
 
 /** The disclosure appended to a completion the record disagrees with. Deliberately states
