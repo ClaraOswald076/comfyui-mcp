@@ -1,7 +1,12 @@
-import { readFile, copyFile, readdir, stat } from "node:fs/promises";
-import { join, basename, extname, relative, sep } from "node:path";
-import { config, isRemoteMode } from "../config.js";
-import { getHistory, getObjectInfo, resetObjectInfoCache } from "../comfyui/client.js";
+import { readFile, copyFile, open, readdir, realpath, stat } from "node:fs/promises";
+import { join, basename, extname, isAbsolute, relative, resolve, sep } from "node:path";
+import { config, isCloudMode, isRemoteMode } from "../config.js";
+import {
+  getHistory,
+  getObjectInfo,
+  resetObjectInfoCache,
+  MAX_VIEW_RESPONSE_BYTES,
+} from "../comfyui/client.js";
 import type { ObjectInfo } from "../comfyui/types.js";
 import { ValidationError, ModelError, ComfyUIError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -544,6 +549,108 @@ function assertSafeViewRef(filename: string, subfolder: string): void {
   }
 }
 
+/** Strict lexical containment for the local fallback below. */
+function isStrictlyInside(root: string, candidate: string): boolean {
+  const rel = relative(resolve(root), resolve(candidate));
+  return (
+    rel !== "" &&
+    rel !== ".." &&
+    !rel.startsWith(`..${sep}`) &&
+    !rel.startsWith("../") &&
+    !isAbsolute(rel)
+  );
+}
+
+function localViewMimeType(filename: string): string {
+  const ext = extname(filename).toLowerCase();
+  return (
+    IMAGE_MIME[ext] ??
+    VIDEO_MIME[ext] ??
+    AUDIO_MIME[ext] ??
+    (ext === ".json" ? "application/json" : "application/octet-stream")
+  );
+}
+
+/** Read at most the shared /view limit, including when the file grows after stat(). */
+async function readLocalViewFileBounded(path: string): Promise<Buffer | undefined> {
+  const handle = await open(path, "r");
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      // Read one byte beyond the limit so growth after the initial stat is
+      // refused rather than silently truncated into a valid-looking payload.
+      const capacity = Math.min(64 * 1024, MAX_VIEW_RESPONSE_BYTES - total + 1);
+      const chunk = Buffer.allocUnsafe(capacity);
+      const { bytesRead } = await handle.read(chunk, 0, capacity, null);
+      if (bytesRead === 0) return Buffer.concat(chunks, total);
+      total += bytesRead;
+      if (total > MAX_VIEW_RESPONSE_BYTES) return undefined;
+      chunks.push(chunk.subarray(0, bytesRead));
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Recover a local file when ComfyUI rejects an otherwise valid /view reference
+ * with HTTP 400. Some ComfyUI builds reject basenames containing repeated
+ * periods even though the loader can read the file from disk. This is only a
+ * local, 400-specific fallback; remote and cloud targets must never read this
+ * process's filesystem.
+ */
+async function readLocalViewFallback(
+  filename: string,
+  type: "output" | "input" | "temp",
+  subfolder: string,
+): Promise<{ base64: string; mimeType: string } | undefined> {
+  if (isRemoteMode() || isCloudMode()) return undefined;
+
+  try {
+    // Use the same live/argv-aware roots as local filesystem tools. In
+    // particular, input may be redirected with --input-directory and the
+    // configured COMFYUI_PATH may belong to a different installed copy.
+    const root =
+      type === "input"
+        ? await resolveInputDir()
+        : type === "output"
+          ? await resolveOutputDir()
+          : config.comfyuiPath
+            ? resolve(config.comfyuiPath, "temp")
+            : undefined;
+    if (!root) return undefined;
+    const candidate = resolve(root, subfolder, filename);
+    if (!isStrictlyInside(root, candidate)) return undefined;
+
+    // Check the canonical paths too: an input-side symlink must not turn this
+    // compatibility path into an arbitrary local file read.
+    const [realRoot, realCandidate] = await Promise.all([
+      realpath(root),
+      realpath(candidate),
+    ]);
+    if (!isStrictlyInside(realRoot, realCandidate)) return undefined;
+    const candidateStat = await stat(realCandidate);
+    if (!candidateStat.isFile() || candidateStat.size > MAX_VIEW_RESPONSE_BYTES) return undefined;
+    const data = await readLocalViewFileBounded(realCandidate);
+    if (!data) return undefined;
+    return { base64: data.toString("base64"), mimeType: localViewMimeType(filename) };
+  } catch {
+    // Preserve the original /view 400 when the local path cannot be resolved
+    // or read; the fallback must not hide the server's actionable error.
+    return undefined;
+  }
+}
+
+function isViewBadRequest(error: unknown): error is ComfyUIError {
+  if (!(error instanceof ComfyUIError) || error.code !== "VIEW_ERROR") return false;
+  return (
+    typeof error.details === "object" &&
+    error.details !== null &&
+    (error.details as { status?: unknown }).status === 400
+  );
+}
+
 /**
  * Media formats get_image can save, identified by magic-byte sniff (#663).
  * Format — not just family — so a cross-format mislabel (MP3 bytes declared
@@ -765,7 +872,15 @@ export async function getOutputImage(
   }: { allowMedia?: boolean; allowJson?: boolean } = {},
 ): Promise<{ base64: string; mimeType: string; filename: string }> {
   assertSafeViewRef(filename, subfolder);
-  const result = await fetchImage(filename, type, subfolder);
+  let result: { base64: string; mimeType: string };
+  try {
+    result = await fetchImage(filename, type, subfolder);
+  } catch (error) {
+    if (!isViewBadRequest(error)) throw error;
+    const local = await readLocalViewFallback(filename, type, subfolder);
+    if (!local) throw error;
+    result = local;
+  }
 
   // Guard against non-image /view payloads. ComfyUI (or a reverse proxy in
   // front of it) can answer /view with a 200 whose body is actually a JSON or
