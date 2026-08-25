@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.110] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- anchor portable ComfyUI restarts from the live absolute working directory (#2260)
+
 ## [0.52.109] - 2026-08-25
 
 ### MCP
