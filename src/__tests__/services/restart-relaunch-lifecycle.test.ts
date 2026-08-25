@@ -960,14 +960,28 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
    * Desktop-flavoured `--extra-model-paths-config`, which is what identifies it
    * (captured from the #814 report's own recovery command line).
    */
-  const DESKTOP_ARGV = [
-    "ComfyUI\\main.py",
-    "--enable-manager",
-    "--extra-model-paths-config",
-    "C:\\Users\\u\\AppData\\Roaming\\Comfy Desktop\\shared_model_paths.yaml",
-    "--port",
-    "8188",
-  ];
+  // Keep the production-level recovery fixture in the path dialect of the host
+  // running the test. The recovery path must not accidentally pass because a
+  // POSIX runner accepted Windows separators (or because its process-list parser
+  // happened to parse a Windows CSV row).
+  const TEST_IS_WIN = process.platform === "win32";
+  const DESKTOP_ARGV = TEST_IS_WIN
+    ? [
+        "ComfyUI\\main.py",
+        "--enable-manager",
+        "--extra-model-paths-config",
+        "C:\\Users\\u\\AppData\\Roaming\\Comfy Desktop\\shared_model_paths.yaml",
+        "--port",
+        "8188",
+      ]
+    : [
+        "ComfyUI/main.py",
+        "--enable-manager",
+        "--extra-model-paths-config",
+        "/Users/u/Library/Application Support/Comfy Desktop/shared_model_paths.yaml",
+        "--port",
+        "8188",
+      ];
 
   function desktopServer(): void {
     mockGetSystemStats.mockResolvedValue({ system: { argv: DESKTOP_ARGV } });
@@ -985,15 +999,21 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
   function desktopListenerFailure(
     identities: Record<number, ProcessIdentity | undefined>,
     pythonPids = [DESKTOP_PYTHON_PID, DESKTOP_SERVER_PID],
+    options: { serverArgv?: string[]; processListError?: boolean } = {},
   ): void {
-    mockGetSystemStats.mockResolvedValue({ system: { argv: DESKTOP_ARGV } });
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: options.serverArgv ?? DESKTOP_ARGV },
+    });
     mockExecSync.mockImplementation((cmd: string) => {
       const c = String(cmd);
       if (/netstat|lsof/i.test(c)) throw new Error("listener unavailable");
       if (/tasklist.*Comfy(?:UI| Desktop)\.exe|pgrep -f/i.test(c)) {
-        return '"Comfy Desktop.exe","18752","Console","1","206,248 K"';
+        return TEST_IS_WIN ? '"Comfy Desktop.exe","18752","Console","1","206,248 K"' : "18752\n";
       }
       if (/tasklist.*python|pgrep -x/i.test(c)) {
+        if (options.processListError && /pythonw|python3/i.test(c)) {
+          throw new Error("python process query unavailable");
+        }
         return /tasklist/i.test(c)
           ? pythonPids.map((pid) => `"python.exe","${pid}","Console","1","20,000 K"`).join("\n")
           : `${pythonPids.join("\n")}\n`;
@@ -1008,29 +1028,31 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
   function verifiedDesktopTree(
     serverArgv = DESKTOP_SERVER_OS_ARGV,
   ): Record<number, ProcessIdentity> {
+    const desktopExe = TEST_IS_WIN
+      ? "C:\\Program Files\\Comfy Desktop\\Comfy Desktop.exe"
+      : "/Applications/Comfy Desktop.app/Contents/MacOS/Comfy Desktop";
+    const pythonExe = TEST_IS_WIN
+      ? "C:\\Users\\u\\ComfyUI\\.venv\\Scripts\\python.exe"
+      : "/Users/u/ComfyUI/.venv/bin/python";
     return {
       [DESKTOP_ROOT_PID]: {
-        executablePath: "C:\\Program Files\\Comfy Desktop\\Comfy Desktop.exe",
-        commandLine: '"C:\\Program Files\\Comfy Desktop\\Comfy Desktop.exe"',
-        argv: ["C:\\Program Files\\Comfy Desktop\\Comfy Desktop.exe"],
+        executablePath: desktopExe,
+        commandLine: `"${desktopExe}"`,
+        argv: [desktopExe],
         argvFidelity: "exact",
         startedAt: "1000",
         parentPid: 1,
       },
       [DESKTOP_PYTHON_PID]: {
-        executablePath: "C:\\Users\\u\\ComfyUI\\.venv\\Scripts\\python.exe",
-        commandLine: '"C:\\Users\\u\\ComfyUI\\.venv\\Scripts\\python.exe" -m desktop_server',
-        argv: [
-          "C:\\Users\\u\\ComfyUI\\.venv\\Scripts\\python.exe",
-          "-m",
-          "desktop_server",
-        ],
+        executablePath: pythonExe,
+        commandLine: `"${pythonExe}" -m desktop_server`,
+        argv: [pythonExe, "-m", "desktop_server"],
         argvFidelity: "exact",
         startedAt: "2000",
         parentPid: DESKTOP_ROOT_PID,
       },
       [DESKTOP_SERVER_PID]: {
-        executablePath: "C:\\Users\\u\\ComfyUI\\.venv\\Scripts\\python.exe",
+        executablePath: pythonExe,
         commandLine: `"${serverArgv[0]}" ${serverArgv.slice(1).join(" ")}`,
         argv: [...serverArgv],
         argvFidelity: "exact",
@@ -1063,6 +1085,28 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
   it("refuses a Desktop descendant whose OS command has an extra or mismatched argument", async () => {
     const wrongArgv = [...DESKTOP_SERVER_OS_ARGV, "--wrong-command"];
     desktopListenerFailure(verifiedDesktopTree(wrongArgv));
+    healthyFetch();
+
+    const result = await restartComfyUI();
+
+    expect(result.message).toMatch(/could not be mapped|could not be identified|reachable/i);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(killWasIssued()).toBe(false);
+  });
+
+  it("does not let an unrelated helper with Desktop markers satisfy the H3 authority shape", async () => {
+    const helperArgv = [
+      TEST_IS_WIN ? "tools\\main.py" : "tools/main.py",
+      "--extra-model-paths-config",
+      DESKTOP_ARGV[3]!,
+      "--port",
+      "8188",
+      "--helper-mode",
+    ];
+    desktopListenerFailure(verifiedDesktopTree([DESKTOP_SERVER_OS_ARGV[0]!, ...helperArgv]), [
+      DESKTOP_PYTHON_PID,
+      DESKTOP_SERVER_PID,
+    ], { serverArgv: helperArgv });
     healthyFetch();
 
     const result = await restartComfyUI();
@@ -1133,6 +1177,89 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
 
     expect(result.message).toMatch(/could not be mapped|could not be identified|reachable/i);
     expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(killWasIssued()).toBe(false);
+  });
+
+  it.each(["startedAt", "executablePath", "commandLine", "argv"] as const)(
+    "refuses a listener-failure candidate when %s evidence is missing",
+    async (missing) => {
+      const identities = verifiedDesktopTree();
+      const server = identities[DESKTOP_SERVER_PID]!;
+      if (missing === "startedAt") delete server.startedAt;
+      if (missing === "executablePath") delete server.executablePath;
+      if (missing === "commandLine") delete server.commandLine;
+      if (missing === "argv") delete server.argv;
+      desktopListenerFailure(identities);
+      healthyFetch();
+
+      const result = await restartComfyUI();
+
+      expect(result.message).toMatch(/could not be mapped|could not be identified|reachable/i);
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+      expect(killWasIssued()).toBe(false);
+    },
+  );
+
+  it("refuses an otherwise valid candidate when a process-list query is unavailable", async () => {
+    desktopListenerFailure(verifiedDesktopTree(), [DESKTOP_PYTHON_PID, DESKTOP_SERVER_PID], {
+      processListError: true,
+    });
+    healthyFetch();
+
+    const result = await restartComfyUI();
+
+    expect(result.message).toMatch(/could not be mapped|could not be identified|reachable/i);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(killWasIssued()).toBe(false);
+  });
+
+  it("rejects absolute Python and Desktop paths that only have a trusted-looking basename", async () => {
+    const identities = verifiedDesktopTree();
+    const serverExecutable = TEST_IS_WIN
+      ? "C:\\attacker\\venv\\Scripts\\python.exe"
+      : "/tmp/attacker/venv/bin/python";
+    const desktopExecutable = TEST_IS_WIN
+      ? "C:\\attacker\\Comfy Desktop\\Comfy Desktop.exe"
+      : "/tmp/Comfy Desktop.app/Contents/MacOS/Comfy Desktop";
+    identities[DESKTOP_SERVER_PID] = {
+      ...identities[DESKTOP_SERVER_PID],
+      executablePath: serverExecutable,
+      commandLine: `"${serverExecutable}" ${DESKTOP_ARGV.join(" ")}`,
+      argv: [serverExecutable, ...DESKTOP_ARGV],
+    };
+    identities[DESKTOP_ROOT_PID] = {
+      ...identities[DESKTOP_ROOT_PID],
+      executablePath: desktopExecutable,
+      commandLine: `"${desktopExecutable}"`,
+      argv: [desktopExecutable],
+    };
+    desktopListenerFailure(identities);
+    healthyFetch();
+
+    const result = await restartComfyUI();
+
+    expect(result.message).toMatch(/could not be mapped|could not be identified|reachable/i);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(killWasIssued()).toBe(false);
+  });
+
+  it("uses exact platform-aware argument matching for the process-table script token", async () => {
+    const observed = [...DESKTOP_SERVER_OS_ARGV];
+    observed[1] = TEST_IS_WIN
+      ? "C:\\Users\\u\\ComfyUI\\main.py"
+      : "/Users/u/ComfyUI/main.py";
+    desktopListenerFailure(verifiedDesktopTree(observed), [DESKTOP_PYTHON_PID, DESKTOP_SERVER_PID]);
+    healthyFetch();
+
+    const result = await restartComfyUI();
+
+    if (TEST_IS_WIN) {
+      expect(globalThis.fetch).toHaveBeenCalled();
+      expect(result.message).not.toMatch(/refusing to restart/i);
+    } else {
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+      expect(result.message).toMatch(/could not be mapped|could not be identified|reachable/i);
+    }
     expect(killWasIssued()).toBe(false);
   });
 

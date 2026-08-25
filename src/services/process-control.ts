@@ -460,8 +460,24 @@ export { parseListenerPidFromNetstat, findPidByPort };
  * "ComfyUI.app"). The Python backend is a child of the Electron app, so we
  * need to kill the parent to fully stop the Desktop app.
  */
-function findDesktopAppPids(): number[] {
+interface ProcessListProbe {
+  pids: number[];
+  complete: boolean;
+}
+
+function isExpectedPgrepNoMatch(error: unknown): boolean {
+  return (
+    !IS_WIN &&
+    typeof error === "object" &&
+    error !== null &&
+    "status" in error &&
+    (error as { status?: unknown }).status === 1
+  );
+}
+
+function findDesktopAppPidsWithStatus(): ProcessListProbe {
   const pids: number[] = [];
+  let complete = true;
   if (IS_WIN) {
     for (const exe of ["ComfyUI.exe", "Comfy Desktop.exe"]) {
       try {
@@ -476,7 +492,7 @@ function findDesktopAppPids(): number[] {
           if (match) pids.push(parseInt(match[1], 10));
         }
       } catch {
-        // No processes with this image name
+        complete = false;
       }
     }
   } else {
@@ -489,11 +505,15 @@ function findDesktopAppPids(): number[] {
         const pid = parseInt(line, 10);
         if (!isNaN(pid) && pid > 0) pids.push(pid);
       }
-    } catch {
-      // No Desktop app processes found
+    } catch (error) {
+      if (!isExpectedPgrepNoMatch(error)) complete = false;
     }
   }
-  return pids;
+  return { pids, complete };
+}
+
+function findDesktopAppPids(): number[] {
+  return findDesktopAppPidsWithStatus().pids;
 }
 
 /**
@@ -502,8 +522,9 @@ function findDesktopAppPids(): number[] {
  * re-read through the process identity reader and must still pass the exact
  * command and authenticated-ancestry checks below.
  */
-function findPythonProcessPids(): number[] {
+function findPythonProcessPids(): ProcessListProbe {
   const pids = new Set<number>();
+  let complete = true;
   const names = IS_WIN ? ["python.exe", "pythonw.exe"] : ["python", "python3", "pythonw"];
   for (const name of names) {
     try {
@@ -521,11 +542,11 @@ function findPythonProcessPids(): number[] {
         const pid = match ? Number.parseInt(match[1], 10) : NaN;
         if (Number.isInteger(pid) && pid > 0) pids.add(pid);
       }
-    } catch {
-      // A missing process-list query is unknown evidence, not an empty tree.
+    } catch (error) {
+      if (!isExpectedPgrepNoMatch(error)) complete = false;
     }
   }
-  return [...pids];
+  return { pids: [...pids], complete };
 }
 
 function killProcessTree(pid: number): void {
@@ -687,26 +708,74 @@ function isDesktopApp(argv: string[]): boolean {
 }
 
 /**
- * Is this the narrow server command shape that can be recovered from Desktop?
- * The Desktop markers alone are not enough: an arbitrary Python helper launched
- * from the Desktop install must not become a restart target.
+ * Return a path without command-line quoting and with the host's path rules
+ * applied. POSIX paths are intentionally not case-folded: unlike Windows,
+ * `/ComfyUI/main.py` and `/comfyui/main.py` are different paths.
  */
-function isDesktopServerArgv(argv: string[]): boolean {
-  const script = argv[0]?.trim().replace(/^['"]+|['"]+$/g, "") ?? "";
-  const basename = script.split(/[\\/]/).pop()?.toLowerCase();
-  return basename === "main.py" && isDesktopApp(argv);
+function normalizeRecoveryPath(path: string): string {
+  const unquoted = path.trim().replace(/^['"]+|['"]+$/g, "");
+  if (!IS_WIN) return unquoted;
+  return unquoted.replace(/\\/g, "/").toLowerCase();
 }
 
-function normalizedWindowsToken(token: string): string {
-  return token.trim().replace(/^['"]+|['"]+$/g, "").replace(/\\/g, "/").toLowerCase();
+function isAbsoluteRecoveryPath(path: string): boolean {
+  return IS_WIN
+    ? /^[a-z]:[\\/]/i.test(path) || /^\\\\/.test(path)
+    : path.startsWith("/");
+}
+
+function isComfyUIServerScript(path: string): boolean {
+  const normalized = normalizeRecoveryPath(path);
+  const segments = normalized.split("/").filter(Boolean);
+  if (segments.pop() !== "main.py") return false;
+  // Desktop's H3 launch names the ComfyUI install explicitly. A broad
+  // "Desktop" marker elsewhere in argv must not make an arbitrary helper.py
+  // authoritative.
+  return segments.some((segment) => segment === (IS_WIN ? "comfyui" : "ComfyUI"));
+}
+
+function isDesktopConfigPath(path: string): boolean {
+  const normalized = normalizeRecoveryPath(path);
+  if (!isAbsoluteRecoveryPath(path)) return false;
+  const segments = normalized.split("/").filter(Boolean);
+  return segments.some((segment) => segment === (IS_WIN ? "comfy desktop" : "Comfy Desktop"));
+}
+
+/**
+ * Is this the exact H3 server command Desktop uses for its backend?
+ *
+ * The old check only looked for `main.py` plus any Desktop-looking token. That
+ * allowed an unrelated helper launched from the Desktop install to become a
+ * restart target. Keep the accepted shape deliberately narrow: script, Manager
+ * flag, one absolute Desktop model-paths config, and the requested port, in that
+ * order and with no extra arguments.
+ */
+function isDesktopServerArgv(argv: string[], port: number): boolean {
+  if (argv.length !== 6) return false;
+  const [script, managerFlag, configFlag, configPath, portFlag, reportedPort] = argv;
+  return Boolean(
+    script &&
+      managerFlag === "--enable-manager" &&
+      configFlag === "--extra-model-paths-config" &&
+      configPath &&
+      isComfyUIServerScript(script) &&
+      isDesktopConfigPath(configPath) &&
+      portFlag === "--port" &&
+      reportedPort === String(port),
+  );
+}
+
+function normalizeRecoveryToken(token: string): string {
+  const unquoted = token.trim().replace(/^['"]+|['"]+$/g, "");
+  return IS_WIN ? unquoted.replace(/\\/g, "/").toLowerCase() : unquoted;
 }
 
 /**
  * Match the server's argv to an OS process command without the permissive
- * substring semantics used for ordinary corroboration. The OS argv is exact on
- * Windows; requiring equal lengths rejects an injected extra command or flag.
- * A relative server script may correspond to the absolute script the process
- * table reports, but every other token must agree exactly.
+ * substring semantics used for ordinary corroboration. Requiring equal lengths
+ * rejects an injected extra command or flag. Windows permits the process table to
+ * report an absolute spelling for Desktop's relative `ComfyUI\\main.py`; POSIX
+ * does not get that suffix fallback because its path and case rules are exact.
  */
 function exactDesktopServerCommand(
   identity: ProcessIdentity,
@@ -723,29 +792,125 @@ function exactDesktopServerCommand(
   const observed = identity.argv.slice(1);
   if (observed.length !== serverArgv.length) return false;
   return observed.every((token, index) => {
-    const actual = normalizedWindowsToken(token);
-    const expected = normalizedWindowsToken(serverArgv[index] ?? "");
+    const actual = normalizeRecoveryToken(token);
+    const expected = normalizeRecoveryToken(serverArgv[index] ?? "");
     if (actual === expected) return true;
-    // Only the script token may be relative in sys.argv. The process table's
-    // absolute spelling still has to end at that exact script name.
-    if (index !== 0 || expected.includes("/") || /^[a-z]:/.test(expected)) return false;
+    // Only Windows may reconcile Desktop's relative sys.argv[0] with the
+    // absolute script path exposed by the process table.
+    const expectedRaw = (serverArgv[index] ?? "").trim().replace(/^['"]+|['"]+$/g, "");
+    if (
+      !IS_WIN ||
+      index !== 0 ||
+      /^[a-z]:[\\/]/i.test(expectedRaw) ||
+      /^\\\\/.test(expectedRaw)
+    ) {
+      return false;
+    }
     return actual.endsWith(`/${expected}`);
   });
 }
 
 function isVerifiedExecutablePath(path: string | undefined): path is string {
-  return Boolean(path && /^(?:[a-z]:[\\/]|\\\\|\/)/i.test(path));
+  return Boolean(path && isAbsoluteRecoveryPath(path));
 }
 
-function isAuthenticatedPython(identity: ProcessIdentity): boolean {
+function sameRecoveryPath(a: string, b: string): boolean {
+  return normalizeRecoveryPath(a) === normalizeRecoveryPath(b);
+}
+
+function hasExactProcessIdentity(identity: ProcessIdentity | undefined): identity is ProcessIdentity {
+  return Boolean(
+    identity?.startedAt &&
+      identity.executablePath &&
+      identity.commandLine &&
+      identity.argvFidelity === "exact" &&
+      identity.argv?.length,
+  );
+}
+
+/**
+ * The executable path is useful only when it agrees with the OS command's first
+ * token. A basename or absolute-path shape alone is not authentication: an
+ * unrelated `python.exe`/`Comfy Desktop.exe` can live at either.
+ */
+function isAuthenticatedPython(
+  identity: ProcessIdentity,
+  serverArgv?: string[],
+): boolean {
   const executable = identity.executablePath;
-  if (!executable) return false;
-  // A bare image name is only a claim. The recovery path needs the OS-reported
-  // executable location so an unrelated launcher cannot masquerade as the
-  // Python process that Desktop owns.
-  if (!isVerifiedExecutablePath(executable)) return false;
+  if (!hasExactProcessIdentity(identity) || !executable || !isVerifiedExecutablePath(executable)) {
+    return false;
+  }
+  if (!identity.argv?.[0] || !sameRecoveryPath(executable, identity.argv[0])) return false;
   const basename = executable.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
-  return /^python(?:w)?(?:\d+(?:\.\d+)*)?(?:\.exe)?$/.test(basename);
+  if (!/^python(?:w)?(?:\d+(?:\.\d+)*)?(?:\.exe)?$/.test(basename)) return false;
+  if (!serverArgv) return true;
+
+  // A recovered Desktop server must use a venv interpreter under the same
+  // ComfyUI install named by its H3 script. This rejects an arbitrary absolute
+  // `C:\\attacker\\venv\\Scripts\\python.exe` even when its basename is valid.
+  const script = normalizeRecoveryPath(serverArgv[0] ?? "");
+  const pythonPath = normalizeRecoveryPath(executable);
+  const comfySegment = IS_WIN ? "comfyui" : "ComfyUI";
+  const scriptSegments = script.split("/").filter(Boolean);
+  const pythonSegments = pythonPath.split("/").filter(Boolean);
+  const scriptRootIndex = scriptSegments.lastIndexOf(comfySegment);
+  const pythonRootIndex = pythonSegments.lastIndexOf(comfySegment);
+  if (scriptRootIndex < 0 || pythonRootIndex < 0) return false;
+  if (!isVenvInterpreterPath(executable)) return false;
+  if (isAbsoluteRecoveryPath(serverArgv[0] ?? "")) {
+    const expectedRoot = scriptSegments.slice(0, scriptRootIndex + 1).join("/");
+    if (!pythonPath.startsWith(`${expectedRoot}/`)) return false;
+  }
+  return true;
+}
+
+function expectedDesktopExecutablePaths(): string[] {
+  if (IS_WIN) {
+    const localAppData = process.env.LOCALAPPDATA;
+    const userProfile = process.env.USERPROFILE;
+    return [
+      "C:/Program Files/Comfy Desktop/Comfy Desktop.exe",
+      "C:/Program Files/ComfyUI/ComfyUI.exe",
+      ...(localAppData
+        ? [
+            `${localAppData}/Programs/Comfy Desktop/Comfy Desktop.exe`,
+            `${localAppData}/Programs/@comfyorgcomfyui-electron/ComfyUI.exe`,
+            `${localAppData}/Programs/ComfyUI/ComfyUI.exe`,
+          ]
+        : []),
+      ...(userProfile ? [`${userProfile}/Programs/ComfyUI/ComfyUI.exe`] : []),
+    ];
+  }
+  const home = homedir();
+  return [
+    "/Applications/Comfy Desktop.app/Contents/MacOS/Comfy Desktop",
+    "/Applications/Comfy Desktop.app/Contents/MacOS/ComfyUI",
+    "/Applications/ComfyUI.app/Contents/MacOS/Comfy Desktop",
+    "/Applications/ComfyUI.app/Contents/MacOS/ComfyUI",
+    `${home}/Applications/Comfy Desktop.app/Contents/MacOS/Comfy Desktop`,
+    `${home}/Applications/Comfy Desktop.app/Contents/MacOS/ComfyUI`,
+    `${home}/Applications/ComfyUI.app/Contents/MacOS/Comfy Desktop`,
+    `${home}/Applications/ComfyUI.app/Contents/MacOS/ComfyUI`,
+  ];
+}
+
+function isExpectedDesktopExecutablePath(path: string): boolean {
+  const normalized = normalizeRecoveryPath(path);
+  return expectedDesktopExecutablePaths().some((candidate) =>
+    sameRecoveryPath(normalized, candidate),
+  );
+}
+
+function isAuthenticatedDesktopSupervisor(identity: ProcessIdentity): boolean {
+  return Boolean(
+    hasExactProcessIdentity(identity) &&
+      identity.executablePath &&
+      identity.argv?.[0] &&
+      isExpectedDesktopExecutablePath(identity.executablePath) &&
+      sameRecoveryPath(identity.executablePath, identity.argv[0]) &&
+      isDesktopSupervisorProcess(identity),
+  );
 }
 
 function directDesktopPythonAncestry(
@@ -761,8 +926,7 @@ function directDesktopPythonAncestry(
   if (pythonPid == null) return "unavailable";
   if (pythonPid <= 1 || pythonPid === pid) return undefined;
   const python = readIdentity(pythonPid);
-  if (!python || !python.startedAt) return "unavailable";
-  if (!isAuthenticatedPython(python)) return undefined;
+  if (!python || !isAuthenticatedPython(python)) return "unavailable";
 
   const desktopPid = readParent(pythonPid);
   if (desktopPid == null) return "unavailable";
@@ -771,12 +935,12 @@ function directDesktopPythonAncestry(
   const desktop = readIdentity(desktopPid);
   if (
     !desktop ||
-    !desktop.startedAt ||
+    !hasExactProcessIdentity(desktop) ||
     !isVerifiedExecutablePath(desktop.executablePath)
   ) {
     return "unavailable";
   }
-  if (!isDesktopSupervisorProcess(desktop)) return undefined;
+  if (!isAuthenticatedDesktopSupervisor(desktop)) return undefined;
   return { desktopPid, desktopIdentity: desktop };
 }
 
@@ -3104,10 +3268,15 @@ function recoverDesktopProcessFromAncestry(
   port: number,
   serverArgv: string[],
 ): ProcessInfo | undefined {
-  if (!isDesktopServerArgv(serverArgv)) return undefined;
+  if (!isDesktopServerArgv(serverArgv, port)) return undefined;
 
-  const desktopPids = new Set(findDesktopAppPids());
+  const desktopProbe = findDesktopAppPidsWithStatus();
+  if (!desktopProbe.complete) return undefined;
+  const desktopPids = new Set(desktopProbe.pids);
   if (desktopPids.size === 0) return undefined;
+
+  const pythonProbe = findPythonProcessPids();
+  if (!pythonProbe.complete) return undefined;
 
   const identities = new Map<number, ProcessIdentity | undefined>();
   const readIdentity = (pid: number): ProcessIdentity | undefined => {
@@ -3129,15 +3298,20 @@ function recoverDesktopProcessFromAncestry(
     desktopIdentity: ProcessIdentity;
   }> = [];
   let evidenceUnavailable = false;
-  for (const pid of findPythonProcessPids()) {
+  for (const pid of pythonProbe.pids) {
     const identity = readIdentity(pid);
-    if (!identity) {
+    if (!hasExactProcessIdentity(identity)) {
       evidenceUnavailable = true;
       continue;
     }
-    if (!identity.startedAt) continue;
-    if (!isAuthenticatedPython(identity)) continue;
+    // Fully observed non-matching Python processes are ordinary background
+    // processes and can be ignored. Once the exact H3 command matches, however,
+    // an untrusted executable path is an ambiguous target and must fail closed.
     if (!exactDesktopServerCommand(identity, serverArgv)) continue;
+    if (!isAuthenticatedPython(identity, serverArgv)) {
+      evidenceUnavailable = true;
+      continue;
+    }
     const ancestry = directDesktopPythonAncestry(
       pid,
       desktopPids,
