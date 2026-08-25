@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.108] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- preserve workflow-list readiness refusals through panel-consumer rehello healing (#1785)
+
 ## [0.52.107] - 2026-08-25
 
 ### MCP
