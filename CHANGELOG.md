@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.103] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- extend add-node refresh ACK budget (#2242)
+
+
 ## [0.52.102] - 2026-08-25
 
 ### MCP
