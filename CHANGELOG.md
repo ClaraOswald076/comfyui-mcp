@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.116] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- apply ck_attention launch recommendations only with target-fenced local relaunch proof (#2277)
+
 ## [0.52.115] - 2026-08-25
 
 ### MCP
