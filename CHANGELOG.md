@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.119] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- forward validated workflow-save subfolders through panel save and Save-As commands (#1794)
+
 ## [0.52.118] - 2026-08-25
 
 ### MCP
