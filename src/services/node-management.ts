@@ -2227,7 +2227,10 @@ function runGitCheckout(
       timeout: GIT_CLONE_TIMEOUT,
       env: nonInteractiveGitEnv(),
     });
-    execFileSync("git", ["-C", nodeDir, "checkout", "--detach", "--end-of-options", checkoutRef], {
+    // `--end-of-options` is not a portable `git checkout` argument.
+    // checkoutRef has already passed validateGitRef(), which rejects leading
+    // dashes and control/whitespace characters before it reaches argv.
+    execFileSync("git", ["-C", nodeDir, "checkout", "--detach", checkoutRef], {
       cwd: comfyuiBase,
       encoding: "utf-8",
       timeout: GIT_CLONE_TIMEOUT,
