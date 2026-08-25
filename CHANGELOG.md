@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.105] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- safely re-enable a disabled ComfyUI-Manager pack (#2247)
+
 ## [0.52.104] - 2026-08-25
 
 ### MCP
