@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.114] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- allow panel_set_widget to share an authoritative in-flight object_info refresh before retrying (#2274)
+
 ## [0.52.113] - 2026-08-25
 
 ### MCP
