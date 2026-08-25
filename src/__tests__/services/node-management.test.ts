@@ -1079,6 +1079,16 @@ describe("node-management service", () => {
           (c) => c[0] === "git" && (c[1] as string[]).includes("checkout"),
         ),
       ).toBe(true);
+      const checkoutCall = mockedExec.mock.calls.find(
+        (c) => c[0] === "git" && (c[1] as string[])[2] === "checkout",
+      );
+      expect(checkoutCall?.[1]).toEqual([
+        "-C",
+        NODE_DIR_UTILS,
+        "checkout",
+        "--detach",
+        "v1.2.3",
+      ]);
     });
 
     it("cleans up a clone when the version-derived nightly probe is unknown", async () => {
@@ -1442,7 +1452,12 @@ describe("node-management service", () => {
     });
 
     it("checks out the requested git ref after forced cm-cli install", async () => {
-      mockedExec.mockReturnValue(cliEnvelope({ message: "installed ok" }) as never);
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[2] === "checkout" && args.includes("--end-of-options")) {
+          throw new Error("fatal: git checkout: --detach does not take a path argument");
+        }
+        return bin === COMFY_CLI ? cliEnvelope({ message: "installed ok" }) : "";
+      }) as never);
       const res = await installCustomNode({
         id: "https://github.com/foo/bar/tree/dev",
         ref: "abc123",
@@ -1478,9 +1493,9 @@ describe("node-management service", () => {
         BAR_DIR,
         "checkout",
         "--detach",
-        "--end-of-options",
         "abc123",
       ]);
+      expect(mockedExec.mock.calls[2][1]).not.toContain("--end-of-options");
     });
 
     it("does not use a SAVED DEFAULT workspace for cm-cli when COMFYUI_PATH is unset", async () => {
@@ -1520,7 +1535,6 @@ describe("node-management service", () => {
         resolve("/split/data", "custom_nodes", "bar"),
         "checkout",
         "--detach",
-        "--end-of-options",
         "abc123",
       ]);
     });
@@ -2181,7 +2195,6 @@ describe("node-management service", () => {
         BAR_DIR,
         "checkout",
         "--detach",
-        "--end-of-options",
         "refs/remotes/origin/nightly",
       ]);
     });
