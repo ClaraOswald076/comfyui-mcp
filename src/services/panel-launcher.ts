@@ -274,7 +274,7 @@ export async function installPanelLauncher(
       readPanelLauncherConfig(home)?.token !== token ||
       readPanelLauncherConfig(home)?.install_id !== installId
     ) return;
-    const child = spawnBroker(nodePath, brokerRunArgs(paths.broker, brokerId), {
+    const child = spawnBroker(nodePath, brokerRunArgs(paths.broker, brokerId, installId), {
       detached: true,
       stdio: "ignore",
     });
@@ -328,7 +328,7 @@ export async function installPanelLauncher(
   if (platform === "win32") {
     writeFileSync(
       paths.windowsScript,
-      `@echo off\r\n"${nodePath}" "${paths.broker}" run --broker-id=${brokerId}\r\n`,
+      `@echo off\r\n"${nodePath}" "${paths.broker}" run --broker-id=${brokerId} --install-id=${installId}\r\n`,
       "utf8",
     );
     // A scheduled task is the preferred registration, but it is NOT available to
@@ -461,7 +461,7 @@ export async function installPanelLauncher(
       `<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n` +
       `<plist version="1.0"><dict>\n` +
       `<key>Label</key><string>${PANEL_LAUNCHER_LABEL}</string>\n` +
-      `<key>ProgramArguments</key><array><string>${xml(nodePath)}</string><string>${xml(paths.broker)}</string><string>run</string><string>--broker-id=${xml(brokerId)}</string></array>\n` +
+      `<key>ProgramArguments</key><array><string>${xml(nodePath)}</string><string>${xml(paths.broker)}</string><string>run</string><string>--broker-id=${xml(brokerId)}</string><string>--install-id=${xml(installId)}</string></array>\n` +
         `<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n` +
         `<key>StandardOutPath</key><string>${xml(join(paths.launcherDir, "launcher.log"))}</string>\n` +
         `<key>StandardErrorPath</key><string>${xml(join(paths.launcherDir, "launcher-error.log"))}</string>\n` +
@@ -481,7 +481,7 @@ export async function installPanelLauncher(
   writeFileSync(
     paths.linuxService,
     `[Unit]\nDescription=ComfyUI MCP panel launcher\n\n` +
-      `[Service]\nExecStart="${nodePath}" "${paths.broker}" run --broker-id=${brokerId}\nRestart=on-failure\n\n` +
+      `[Service]\nExecStart="${nodePath}" "${paths.broker}" run --broker-id=${brokerId} --install-id=${installId}\nRestart=on-failure\n\n` +
       `[Install]\nWantedBy=default.target\n`,
     "utf8",
   );
@@ -495,7 +495,7 @@ export async function installPanelLauncher(
     writeFileSync(
       paths.linuxAutostart,
       `[Desktop Entry]\nType=Application\nName=ComfyUI MCP Launcher\n` +
-        `Exec="${nodePath}" "${paths.broker}" run --broker-id=${brokerId}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n`,
+        `Exec="${nodePath}" "${paths.broker}" run --broker-id=${brokerId} --install-id=${installId}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n`,
       "utf8",
     );
     needsFallbackBroker = true;
@@ -894,8 +894,8 @@ function markPanelLauncherTornDown(home: string): void {
   });
 }
 
-function brokerRunArgs(broker: string, brokerId: string): string[] {
-  return [broker, "run", `--broker-id=${brokerId}`];
+function brokerRunArgs(broker: string, brokerId: string, installId?: string): string[] {
+  return [broker, "run", `--broker-id=${brokerId}`, ...(installId ? [`--install-id=${installId}`] : [])];
 }
 
 export function uninstallPanelLauncher(options: UninstallLauncherOptions = {}): void {
@@ -1217,6 +1217,9 @@ export type PanelLauncherBrokerOptions = {
   recoveryMaxAttempts?: number;
   /** Deterministic seam for uninstall racing the initial config publication. */
   beforeConfigWrite?: () => void;
+  /** Identity supplied by the installed command line; absent for in-process tests/legacy launchers. */
+  expectedBrokerId?: string;
+  expectedInstallId?: string;
 };
 
 export async function startPanelLauncherBroker(
@@ -1233,6 +1236,12 @@ export async function startPanelLauncherBroker(
   // Older installs may not have a marker yet. Persist one as part of this
   // broker's runtime publication so future uninstall can fail closed.
   const brokerId = current.broker_id ?? randomBytes(24).toString("base64url");
+  if (options.expectedBrokerId !== undefined && brokerId !== options.expectedBrokerId) {
+    throw new Error("Panel launcher broker identity changed before startup");
+  }
+  if (options.expectedInstallId !== undefined && current.install_id !== options.expectedInstallId) {
+    throw new Error("Panel launcher install generation changed before startup");
+  }
   const runtimeConfig = { ...current, broker_id: brokerId };
   const brokerConfigStillOwned = () => {
     if (existsSync(panelLauncherPaths(home).teardown)) return false;
@@ -1473,7 +1482,12 @@ export async function queryPanelLauncher(home: string = homedir()): Promise<Reco
 // is imported by index.ts and therefore does not enter this branch.
 const invokedPath = process.argv[1] ? basename(process.argv[1]) : "";
 if (invokedPath === "broker.mjs" && process.argv[2] === "run") {
-  startPanelLauncherBroker().catch((error) => {
+  const brokerArg = process.argv.slice(3).find((arg) => arg.startsWith("--broker-id="));
+  const installArg = process.argv.slice(3).find((arg) => arg.startsWith("--install-id="));
+  startPanelLauncherBroker(undefined, {
+    expectedBrokerId: brokerArg?.slice("--broker-id=".length),
+    expectedInstallId: installArg?.slice("--install-id=".length),
+  }).catch((error) => {
     process.stderr.write(`ComfyUI MCP launcher failed: ${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;
   });

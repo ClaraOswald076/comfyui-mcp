@@ -180,7 +180,12 @@ describe("panel launcher install", () => {
     expect(readFileSync(paths.windowsStartup, "utf8")).toContain(paths.windowsScript);
     // …and the broker starts NOW, or the install "succeeds" while leaving the
     // panel with nothing to talk to until the next logon.
-    expect(spawned).toEqual([[paths.broker, "run", expect.stringMatching(/^--broker-id=/)]]);
+    expect(spawned).toEqual([[
+      paths.broker,
+      "run",
+      expect.stringMatching(/^--broker-id=/),
+      expect.stringMatching(/^--install-id=/),
+    ]]);
     // The install must not throw: everything the launcher needs now exists.
     expect(readPanelLauncherConfig(home)?.token.length).toBeGreaterThanOrEqual(32);
   });
@@ -305,7 +310,12 @@ describe("panel launcher install", () => {
     });
     expect(existsSync(paths.windowsStartup)).toBe(false);
     expect(spawned, "install threw before starting a broker").toEqual([
-      [paths.broker, "run", expect.stringMatching(/^--broker-id=/)],
+      [
+        paths.broker,
+        "run",
+        expect.stringMatching(/^--broker-id=/),
+        expect.stringMatching(/^--install-id=/),
+      ],
     ]);
   });
 
@@ -391,7 +401,12 @@ describe("panel launcher install", () => {
       await new Promise<void>((r) => server.close(() => r()));
     }
     expect(spawned).toEqual([
-      [panelLauncherPaths(home).broker, "run", expect.stringMatching(/^--broker-id=/)],
+      [
+        panelLauncherPaths(home).broker,
+        "run",
+        expect.stringMatching(/^--broker-id=/),
+        expect.stringMatching(/^--install-id=/),
+      ],
     ]);
   });
 
@@ -456,7 +471,12 @@ describe("panel launcher install", () => {
       }) as never,
     });
     expect(spawned).toEqual([
-      [panelLauncherPaths(home).broker, "run", expect.stringMatching(/^--broker-id=/)],
+      [
+        panelLauncherPaths(home).broker,
+        "run",
+        expect.stringMatching(/^--broker-id=/),
+        expect.stringMatching(/^--install-id=/),
+      ],
     ]);
   });
 
@@ -515,7 +535,12 @@ describe("panel launcher install", () => {
     // The task IS registered — no duplicate autostart.
     expect(existsSync(paths.windowsStartup)).toBe(false);
     // …but this session still needs a broker, since /Run did not give it one.
-    expect(spawned).toEqual([[paths.broker, "run", expect.stringMatching(/^--broker-id=/)]]);
+    expect(spawned).toEqual([[
+      paths.broker,
+      "run",
+      expect.stringMatching(/^--broker-id=/),
+      expect.stringMatching(/^--install-id=/),
+    ]]);
   });
 
   it("uninstall removes the Startup fallback, not just the task", async () => {
