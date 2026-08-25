@@ -494,6 +494,7 @@ describe("panel launcher install", () => {
       }) as never,
       processIdentityImpl: () => ({
         commandLine: `"${paths.broker}" run --broker-id=${config.broker_id}`,
+        executable: config.broker_executable!,
       }),
     });
     expect(calls).toContainEqual({ file: "taskkill.exe", args: ["/PID", "4321", "/F"] });
@@ -522,6 +523,7 @@ describe("panel launcher install", () => {
       }) as typeof process.kill,
       processIdentityImpl: () => ({
         commandLine: `${paths.broker} run --broker-id=${config.broker_id}`,
+        executable: config.broker_executable!,
       }),
     });
     expect(killed).toEqual([{ pid: 4322, signal: "SIGTERM" }]);
@@ -568,6 +570,7 @@ describe("panel launcher install", () => {
       }) as typeof process.kill,
       processIdentityImpl: () => ({
         commandLine: `${paths.broker} run --broker-id=not-${config.broker_id}`,
+        executable: config.broker_executable!,
       }),
     });
     expect(killed).toEqual([]);
