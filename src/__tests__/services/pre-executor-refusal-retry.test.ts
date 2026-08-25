@@ -143,14 +143,20 @@ describe("isPreExecutorRefusal — only the panel's own claim (#1529)", () => {
 //    never reads it, and both are single lines in large files.
 
 describe("the channel is actually connected (#1529)", () => {
-  it("the bridge attaches a validated refusal to the rejected error", async () => {
+  it("the bridge preserves refusal attachment and workflow-list readiness handling", async () => {
     const { readFileSync } = await import("node:fs");
     const src = readFileSync(new URL("../../services/ui-bridge.ts", import.meta.url), "utf-8");
     const at = src.indexOf('new Error(String(msg.error ?? "panel reported an error"))');
     expect(at, "the reply-to-error conversion must still be recognisable").toBeGreaterThan(-1);
-    const block = src.slice(at, at + 700);
+    const block = src.slice(at, at + 1200);
     expect(block).toMatch(/readPanelRefusal\(/);
-    expect(block).toMatch(/refusal \? attachPanelRefusal\(err, refusal\) : err/);
+    expect(block).toMatch(/let rejected = refusal \? attachPanelRefusal\(err, refusal\) : err;/);
+    expect(block).toMatch(
+      /p\.cmd === "workflow_list" && hasOwnField\(msg, "workflow_list_readiness"\)[\s\S]+?readWorkflowListReadiness\(/,
+    );
+    expect(block).toMatch(
+      /if \(workflowListReadiness\) \{[\s\S]+?attachWorkflowListReadiness\(rejected, workflowListReadiness\);[\s\S]+?p\.reject\(rejected\);/,
+    );
   });
 
   it("the retry gate keys on the FIELD, and lets a MUTATION through on it", async () => {

@@ -18,6 +18,7 @@ import {
   workflowListReadinessOf,
   type WorkflowListReadinessRefusal,
 } from "../../services/panel-workflow-readiness.js";
+import { isPreExecutorRefusal } from "../../services/panel-refusal.js";
 import { waitFor } from "../helpers/wait-for.js";
 
 const BEFORE = "4808c797-417c-4c33-8ab0-99cf2f6ba648";
@@ -29,6 +30,13 @@ const READINESS_REFUSAL: WorkflowListReadinessRefusal = {
   ready: false,
   applied: false,
   stage: "pre-probe",
+  retryable: true,
+};
+
+const PRE_EXECUTOR_REFUSAL = {
+  code: "backend-reconnecting",
+  applied: false,
+  stage: "pre-executor",
   retryable: true,
 };
 
@@ -54,7 +62,7 @@ describe("Panel workflow_list readiness reaches the rebind consumer (#1785)", ()
   let port: number;
   let socket: WebSocket;
   let fence: string;
-  let replyMode: "readiness" | "success";
+  let replyMode: "readiness" | "both" | "success";
   let received: Array<Record<string, unknown>>;
 
   beforeEach(async () => {
@@ -91,19 +99,18 @@ describe("Panel workflow_list readiness reaches the rebind consumer (#1785)", ()
         socket.send(JSON.stringify({ rid: message.rid, ok: true, result: { cmd: message.cmd } }));
         return;
       }
-      if (replyMode === "readiness") {
+      if (replyMode === "readiness" || replyMode === "both") {
         // Model a real re-hello/fence change racing the refusal. The changed
         // fence is deliberately not accompanied by a successful list proof.
         fence = READY;
         sendHello();
-        socket.send(
-          JSON.stringify({
-            rid: message.rid,
-            ok: false,
-            error: "workflow_list readiness is still settling",
-            workflow_list_readiness: READINESS_REFUSAL,
-          }),
-        );
+        socket.send(JSON.stringify({
+          rid: message.rid,
+          ok: false,
+          error: "workflow_list readiness is still settling",
+          workflow_list_readiness: READINESS_REFUSAL,
+          ...(replyMode === "both" ? { refusal: PRE_EXECUTOR_REFUSAL } : {}),
+        }));
       } else {
         socket.send(
           JSON.stringify({ rid: message.rid, ok: true, result: settled(READY) }),
@@ -146,6 +153,16 @@ describe("Panel workflow_list readiness reaches the rebind consumer (#1785)", ()
       .then(() => null, (err: unknown) => err);
 
     expect(error).toBeInstanceOf(Error);
+    expect(workflowListReadinessOf(error)).toEqual(READINESS_REFUSAL);
+  });
+
+  it("preserves the existing refusal attachment alongside readiness", async () => {
+    replyMode = "both";
+    const error = await bridge
+      .send({ cmd: "workflow_list" }, { tabId: TAB, timeoutMs: 3000 })
+      .then(() => null, (err: unknown) => err);
+
+    expect(isPreExecutorRefusal(error)?.code).toBe("backend-reconnecting");
     expect(workflowListReadinessOf(error)).toEqual(READINESS_REFUSAL);
   });
 
