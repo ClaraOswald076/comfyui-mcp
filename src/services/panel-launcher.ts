@@ -12,6 +12,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readlinkSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -41,6 +42,10 @@ export type PanelLauncherConfig = {
   host: "127.0.0.1";
   port: number;
   token: string;
+  /** Random command-line marker proving that a recorded pid is our broker. */
+  broker_id?: string;
+  /** Executable recorded when the autostart command was installed. */
+  broker_executable?: string;
   pid?: number;
   updated_at: string;
 };
@@ -49,6 +54,8 @@ export type LauncherPaths = {
   root: string;
   launcherDir: string;
   config: string;
+  /** Persistent uninstall tombstone; prevents an old broker from republishing config. */
+  teardown: string;
   broker: string;
   windowsScript: string;
   /** Windows fallback autostart, for accounts that may not create scheduled
@@ -72,6 +79,7 @@ export function panelLauncherPaths(
     root,
     launcherDir,
     config: join(root, "launcher.json"),
+    teardown: join(root, "launcher.uninstalled"),
     broker: join(launcherDir, "broker.mjs"),
     windowsScript: join(launcherDir, "start-launcher.cmd"),
     windowsStartup: join(
@@ -100,6 +108,8 @@ function isConfig(value: unknown): value is PanelLauncherConfig {
     Number(v.port) <= 65535 &&
     typeof v.token === "string" &&
     v.token.length >= 32 &&
+    (v.broker_id === undefined ||
+      (typeof v.broker_id === "string" && /^[A-Za-z0-9_-]{32,}$/.test(v.broker_id))) &&
     typeof v.updated_at === "string"
   );
 }
@@ -192,10 +202,16 @@ export async function installPanelLauncher(
   const run = options.exec ?? execFileSync;
   const spawnBroker = options.spawnImpl ?? spawn;
   const paths = panelLauncherPaths(home, roamingAppData(options));
+  // Reinstall is the explicit operation that adopts this launcher root again.
+  // Remove the old uninstall tombstone before publishing the new ownership.
+  rmSync(paths.teardown, { force: true });
   mkdirSync(paths.launcherDir, { recursive: true });
   copyFileSync(source, paths.broker);
 
   const previous = readPanelLauncherConfig(home);
+  const token = previous?.token ?? randomBytes(32).toString("base64url");
+  const brokerId = previous?.broker_id ?? randomBytes(24).toString("base64url");
+  const brokerExecutable = nodePath;
 
   /**
    * Start the broker unless the previous one is still alive.
@@ -222,10 +238,25 @@ export async function installPanelLauncher(
       const live = (await queryPanelLauncher(home)) as { running?: boolean };
       if (live.running) return; // a real broker answered — leave it alone
     }
-    const child = spawnBroker(nodePath, [paths.broker, "run"], {
+    const child = spawnBroker(nodePath, brokerRunArgs(paths.broker, brokerId), {
       detached: true,
       stdio: "ignore",
     });
+    const current = readPanelLauncherConfig(home);
+    if (current?.token === token) {
+      // Only persist a PID that this fallback launch actually owns. Keeping a
+      // previous PID when a spawn implementation cannot report one would make
+      // uninstall capable of targeting an unrelated recycled process.
+      const next = {
+        ...current,
+        broker_id: brokerId,
+        broker_executable: brokerExecutable,
+        updated_at: new Date().toISOString(),
+      };
+      if (child.pid) next.pid = child.pid;
+      else delete next.pid;
+      writeOwnedPanelLauncherConfig(next, home, token);
+    }
     child.unref?.();
   };
   writePanelLauncherConfig(
@@ -233,7 +264,9 @@ export async function installPanelLauncher(
       protocol: PANEL_LAUNCHER_PROTOCOL,
       host: "127.0.0.1",
       port: previous?.port ?? 0,
-      token: previous?.token ?? randomBytes(32).toString("base64url"),
+      token,
+      broker_id: brokerId,
+      broker_executable: brokerExecutable,
       // The running broker's pid is the broker's to publish, not this install's
       // to erase. Dropping it made the config say "no broker has ever run here"
       // to every subsequent install (merge-gate P1) — the port and token were
@@ -248,7 +281,7 @@ export async function installPanelLauncher(
   if (platform === "win32") {
     writeFileSync(
       paths.windowsScript,
-      `@echo off\r\n"${nodePath}" "${paths.broker}" run\r\n`,
+      `@echo off\r\n"${nodePath}" "${paths.broker}" run --broker-id=${brokerId}\r\n`,
       "utf8",
     );
     // A scheduled task is the preferred registration, but it is NOT available to
@@ -378,10 +411,10 @@ export async function installPanelLauncher(
     writeFileSync(
       paths.macPlist,
       `<?xml version="1.0" encoding="UTF-8"?>\n` +
-        `<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n` +
-        `<plist version="1.0"><dict>\n` +
-        `<key>Label</key><string>${PANEL_LAUNCHER_LABEL}</string>\n` +
-        `<key>ProgramArguments</key><array><string>${xml(nodePath)}</string><string>${xml(paths.broker)}</string><string>run</string></array>\n` +
+      `<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n` +
+      `<plist version="1.0"><dict>\n` +
+      `<key>Label</key><string>${PANEL_LAUNCHER_LABEL}</string>\n` +
+      `<key>ProgramArguments</key><array><string>${xml(nodePath)}</string><string>${xml(paths.broker)}</string><string>run</string><string>--broker-id=${xml(brokerId)}</string></array>\n` +
         `<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n` +
         `<key>StandardOutPath</key><string>${xml(join(paths.launcherDir, "launcher.log"))}</string>\n` +
         `<key>StandardErrorPath</key><string>${xml(join(paths.launcherDir, "launcher-error.log"))}</string>\n` +
@@ -401,7 +434,7 @@ export async function installPanelLauncher(
   writeFileSync(
     paths.linuxService,
     `[Unit]\nDescription=ComfyUI MCP panel launcher\n\n` +
-      `[Service]\nExecStart="${nodePath}" "${paths.broker}" run\nRestart=on-failure\n\n` +
+      `[Service]\nExecStart="${nodePath}" "${paths.broker}" run --broker-id=${brokerId}\nRestart=on-failure\n\n` +
       `[Install]\nWantedBy=default.target\n`,
     "utf8",
   );
@@ -415,7 +448,7 @@ export async function installPanelLauncher(
     writeFileSync(
       paths.linuxAutostart,
       `[Desktop Entry]\nType=Application\nName=ComfyUI MCP Launcher\n` +
-        `Exec="${nodePath}" "${paths.broker}" run\nTerminal=false\nX-GNOME-Autostart-enabled=true\n`,
+        `Exec="${nodePath}" "${paths.broker}" run --broker-id=${brokerId}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n`,
       "utf8",
     );
     await startBrokerIfIdle();
@@ -426,15 +459,174 @@ export async function installPanelLauncher(
 export type UninstallLauncherOptions = Pick<
   InstallLauncherOptions,
   "home" | "platform" | "exec" | "appData"
->;
+> & {
+  /** Test seam for the owned fallback-broker stop. */
+  killImpl?: typeof process.kill;
+  /** Test seam; production reads the target process command line from the OS. */
+  processIdentityImpl?: (pid: number, platform: NodeJS.Platform, run: typeof execFileSync) =>
+    PanelLauncherProcessIdentity | null;
+};
+
+export type PanelLauncherProcessIdentity = {
+  commandLine: string;
+  executable?: string;
+};
+
+function readPanelLauncherProcessIdentity(
+  pid: number,
+  platform: NodeJS.Platform,
+  run: typeof execFileSync,
+): PanelLauncherProcessIdentity | null {
+  try {
+    if (platform === "linux") {
+      const argv = readFileSync(`/proc/${pid}/cmdline`, "utf8")
+        .split("\0")
+        .filter(Boolean);
+      if (argv.length === 0) return null;
+      return {
+        commandLine: argv.join(" "),
+        executable: readlinkSync(`/proc/${pid}/exe`),
+      };
+    }
+    if (platform === "win32") {
+      const script =
+        `$p=Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}';` +
+        `if($p){$p|Select-Object -First 1 ExecutablePath,CommandLine|ConvertTo-Json -Compress}`;
+      const raw = run(
+        "powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-Command", script],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+      );
+      const parsed = JSON.parse(String(raw)) as { CommandLine?: unknown; ExecutablePath?: unknown };
+      if (typeof parsed.CommandLine !== "string" || parsed.CommandLine.length === 0) return null;
+      return {
+        commandLine: parsed.CommandLine,
+        ...(typeof parsed.ExecutablePath === "string" ? { executable: parsed.ExecutablePath } : {}),
+      };
+    }
+    const raw = run(
+      "ps",
+      ["-p", String(pid), "-o", "command="],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    );
+    const commandLine = String(raw).trim();
+    if (!commandLine) return null;
+    let executable: string | undefined;
+    try {
+      executable = String(
+        run("ps", ["-p", String(pid), "-o", "comm="], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+        }),
+      ).trim() || undefined;
+    } catch {
+      // The command line is still useful; an unavailable executable field is
+      // handled as a fail-closed limitation by the caller.
+    }
+    return { commandLine, ...(executable ? { executable } : {}) };
+  } catch {
+    // If the platform/permissions do not expose identity, safe cleanup is to
+    // leave the process alone. PID equality is never sufficient evidence.
+    return null;
+  }
+}
+
+function processIdentityOwnsBroker(
+  identity: PanelLauncherProcessIdentity | null,
+  brokerPath: string,
+  brokerId: string | undefined,
+  brokerExecutable: string | undefined,
+): boolean {
+  if (!identity || !brokerId || !identity.commandLine) return false;
+  const normalize = (value: string) => value.replaceAll("\\", "/").toLowerCase();
+  const commandLine = normalize(identity.commandLine);
+  const expectedPath = normalize(brokerPath);
+  // The path and random per-install marker must both be present in the OS
+  // observation. A recycled PID or unrelated process cannot satisfy this by
+  // merely reusing the numeric pid. If the OS returns a shortened/opaque
+  // command line, this deliberately fails closed.
+  if (!commandLine.includes(expectedPath) ||
+    !commandLine.includes(`--broker-id=${brokerId.toLowerCase()}`) ||
+    !/(^|[\s"'])run([\s"']|$)/i.test(identity.commandLine)) {
+    return false;
+  }
+  if (identity.executable && brokerExecutable) {
+    const normalizedBase = (value: string) => basename(value.replaceAll("\\", "/")).toLowerCase();
+    if (normalizedBase(identity.executable) !== normalizedBase(brokerExecutable)) return false;
+  }
+  return true;
+}
+
+function stopOwnedPanelLauncherBroker(
+  platform: NodeJS.Platform,
+  run: typeof execFileSync,
+  killImpl: typeof process.kill,
+  pid: number | undefined,
+  brokerPath: string,
+  brokerId: string | undefined,
+  brokerExecutable: string | undefined,
+  processIdentityImpl: UninstallLauncherOptions["processIdentityImpl"],
+): void {
+  // Never let an in-process test broker (or a future embedded caller) kill its
+  // own process. The installed login broker always has a distinct PID.
+  if (!pid || pid === process.pid) return;
+  const identity = (processIdentityImpl ?? readPanelLauncherProcessIdentity)(pid, platform, run);
+  if (!processIdentityOwnsBroker(identity, brokerPath, brokerId, brokerExecutable)) return;
+  try {
+    if (platform === "win32") {
+      // Stop only the owned broker. Its orchestrator child is independent and
+      // may be serving an already-connected panel; what uninstall must prevent
+      // is the broker's recovery loop bringing that child back.
+      run("taskkill.exe", ["/PID", String(pid), "/F"], { stdio: "ignore" });
+    } else {
+      killImpl(pid, "SIGTERM");
+    }
+  } catch {
+    // The service/task may already have stopped it, or the PID may have exited
+    // between reading the owned config and issuing the stop.
+  }
+}
+
+function writeOwnedPanelLauncherConfig(
+  config: PanelLauncherConfig,
+  home: string,
+  ownerToken: string,
+): boolean {
+  const paths = panelLauncherPaths(home);
+  // The tombstone is written before uninstall removes the config. A broker
+  // which is still publishing after that point must not recreate launcher.json.
+  if (existsSync(paths.teardown)) return false;
+  if (readPanelLauncherConfig(home)?.token !== ownerToken) return false;
+  writePanelLauncherConfig(config, home);
+  return true;
+}
+
+function markPanelLauncherTornDown(home: string): void {
+  const paths = panelLauncherPaths(home);
+  mkdirSync(paths.root, { recursive: true });
+  writeFileSync(paths.teardown, `${new Date().toISOString()}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+}
+
+function brokerRunArgs(broker: string, brokerId: string): string[] {
+  return [broker, "run", `--broker-id=${brokerId}`];
+}
 
 export function uninstallPanelLauncher(options: UninstallLauncherOptions = {}): void {
   const home = options.home ?? homedir();
   const platform = options.platform ?? process.platform;
   const run = options.exec ?? execFileSync;
+  const killImpl = options.killImpl ?? process.kill.bind(process);
+  const ownedConfig = readPanelLauncherConfig(home);
+  const ownedBrokerPid = ownedConfig?.pid;
   // Same resolution as install, or uninstall deletes a path the install never
   // wrote and leaves the real autostart in place.
   const paths = panelLauncherPaths(home, roamingAppData(options));
+  // This must precede service-manager teardown and config deletion. A broker
+  // with an in-flight probe can otherwise publish/spawn while uninstall runs.
+  markPanelLauncherTornDown(home);
   if (platform === "win32") {
     try {
       run("schtasks.exe", ["/End", "/TN", PANEL_LAUNCHER_TASK], { stdio: "ignore" });
@@ -469,7 +661,22 @@ export function uninstallPanelLauncher(options: UninstallLauncherOptions = {}): 
     rmSync(paths.linuxService, { force: true });
     rmSync(paths.linuxAutostart, { force: true });
   }
+  // Service-manager teardown does not cover the direct broker started by a
+  // Windows Startup/XDG fallback. Stop the broker after disabling every future
+  // autostart, or its exit watcher can relaunch the orchestrator during remove.
   rmSync(paths.config, { force: true });
+  // Remove ownership first so a recovery callback racing uninstall observes a
+  // disabled install before we stop the recorded fallback process.
+  stopOwnedPanelLauncherBroker(
+    platform,
+    run,
+    killImpl,
+    ownedBrokerPid,
+    paths.broker,
+    ownedConfig?.broker_id,
+    ownedConfig?.broker_executable,
+    options.processIdentityImpl,
+  );
   rmSync(paths.launcherDir, { force: true, recursive: true });
 }
 
@@ -719,6 +926,8 @@ export type PanelLauncherBrokerOptions = {
   now?: () => number;
   recoveryDelayMs?: number;
   recoveryMaxAttempts?: number;
+  /** Deterministic seam for uninstall racing the initial config publication. */
+  beforeConfigWrite?: () => void;
 };
 
 export async function startPanelLauncherBroker(
@@ -732,31 +941,55 @@ export async function startPanelLauncherBroker(
   const recoveryDelayMs = options.recoveryDelayMs ?? ORCHESTRATOR_RECOVERY_DELAY_MS;
   const recoveryMaxAttempts = options.recoveryMaxAttempts ?? ORCHESTRATOR_RECOVERY_MAX_ATTEMPTS;
   if (!current) throw new Error("Panel launcher is not installed or its config is invalid");
+  // Older installs may not have a marker yet. Persist one as part of this
+  // broker's runtime publication so future uninstall can fail closed.
+  const brokerId = current.broker_id ?? randomBytes(24).toString("base64url");
+  const runtimeConfig = { ...current, broker_id: brokerId };
+  const brokerConfigStillOwned = () =>
+    !existsSync(panelLauncherPaths(home).teardown) &&
+    readPanelLauncherConfig(home)?.token === current.token;
   let launch: TerminalLaunch | null = null;
   let lastLaunchAt = 0;
   let recoveryTimer: NodeJS.Timeout | null = null;
-  let recoveryWindowStarted = 0;
+  let recoveryWindowStarted: number | null = null;
   let recoveryAttempts = 0;
-  let starting: Promise<{ already_running: boolean; started: boolean }> | null = null;
+  let starting: Promise<{
+    already_running: boolean;
+    started: boolean;
+    recovery_exhausted?: boolean;
+    start_in_progress?: boolean;
+    disabled?: boolean;
+  }> | null = null;
 
   const resetRecoveryBudget = () => {
-    recoveryWindowStarted = 0;
+    recoveryWindowStarted = null;
     recoveryAttempts = 0;
   };
 
+  const recoveryExhausted = (): boolean => {
+    if (recoveryWindowStarted === null) return false;
+    if (now() - recoveryWindowStarted >= ORCHESTRATOR_RECOVERY_WINDOW_MS) {
+      resetRecoveryBudget();
+      return false;
+    }
+    return recoveryAttempts >= recoveryMaxAttempts;
+  };
+
   const scheduleRecovery = (exitCode: number | null) => {
+    if (!brokerConfigStillOwned()) return;
     if (recoveryTimer) return;
     const currentTime = now();
-    if (!recoveryWindowStarted || currentTime - recoveryWindowStarted >= ORCHESTRATOR_RECOVERY_WINDOW_MS) {
+    if (recoveryWindowStarted === null || currentTime - recoveryWindowStarted >= ORCHESTRATOR_RECOVERY_WINDOW_MS) {
       recoveryWindowStarted = currentTime;
       recoveryAttempts = 0;
     }
-    if (recoveryAttempts >= recoveryMaxAttempts) return;
+    if (recoveryExhausted()) return;
     // A clean exit is the normal self-update handoff. Give the replacement npx
     // process time to resolve/install and bind before deciding it needs help.
     const delay = exitCode === 0 ? recoveryDelayMs : Math.min(recoveryDelayMs, 5_000);
     recoveryTimer = setTimeout(() => {
       recoveryTimer = null;
+      if (!brokerConfigStillOwned()) return;
       if (recoveryAttempts >= recoveryMaxAttempts) return;
       recoveryAttempts += 1;
       // The failed child is no longer the launch in progress. This retry is
@@ -784,7 +1017,12 @@ export async function startPanelLauncherBroker(
 
   const ensureRunning = (fromRecovery = false) => {
     if (!starting) {
-      starting = probe().then((running) => {
+      const afterProbe = (running: boolean) => {
+        // The probe is asynchronous. Uninstall may have removed ownership while
+        // it was in flight; no result from that probe may publish or launch.
+        if (!brokerConfigStillOwned()) {
+          return { already_running: false, started: false, disabled: true };
+        }
         if (running) {
           lastLaunchAt = 0;
           if (recoveryTimer) {
@@ -794,8 +1032,19 @@ export async function startPanelLauncherBroker(
           resetRecoveryBudget();
           return { already_running: true, started: false };
         }
+        // Panel polls are also recovery requests. Once the bounded supervisor
+        // has used its budget, do not let a request after the normal launch
+        // cooldown turn the same broken install into an unbounded spawn loop.
+        if (!fromRecovery && recoveryExhausted()) {
+          return { already_running: false, started: false, recovery_exhausted: true };
+        }
         if (!fromRecovery && lastLaunchAt && now() - lastLaunchAt < 90_000) {
           return { already_running: false, started: false, start_in_progress: true };
+        }
+        // Keep this as the last synchronous ownership check before spawn. Once
+        // this JS turn calls spawn, uninstall cannot interleave within it.
+        if (!brokerConfigStillOwned()) {
+          return { already_running: false, started: false, disabled: true };
         }
         lastLaunchAt = now();
         try {
@@ -810,7 +1059,11 @@ export async function startPanelLauncherBroker(
           throw error;
         }
         return { already_running: false, started: true };
-      }).finally(() => {
+      };
+      const pending = brokerConfigStillOwned()
+        ? probe().then(afterProbe)
+        : Promise.resolve({ already_running: false, started: false, disabled: true });
+      starting = pending.finally(() => {
         starting = null;
       });
     }
@@ -852,10 +1105,20 @@ export async function startPanelLauncherBroker(
   });
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Launcher failed to bind loopback");
-  writePanelLauncherConfig(
-    { ...current, port: address.port, pid: process.pid, updated_at: new Date().toISOString() },
+  options.beforeConfigWrite?.();
+  if (!brokerConfigStillOwned()) {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    throw new Error("Panel launcher was uninstalled while the broker was starting");
+  }
+  const published = writeOwnedPanelLauncherConfig(
+    { ...runtimeConfig, port: address.port, pid: process.pid, updated_at: new Date().toISOString() },
     home,
+    current.token,
   );
+  if (!published) {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    throw new Error("Panel launcher ownership changed before broker publication");
+  }
   return server;
 }
 
