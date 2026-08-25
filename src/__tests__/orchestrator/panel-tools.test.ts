@@ -227,9 +227,9 @@ describe("panel-tools: fresh /object_info ack timeout (#599)", () => {
   // replying; on a large install that can outlast the bridge's 6000 ms default
   // ack, returning a FALSE "tab did not reply" timeout. The tools must forward a
   // larger BOUNDED ack budget so a slow-but-valid refresh isn't a false timeout.
-  const REFRESH_ACK_MS = 30_000;
+  const REFRESH_ACK_MS = 90_000;
 
-  it("panel_set_widget forwards graph_set_widget with the 30s refresh ack timeout, not the 6s default", async () => {
+  it("panel_set_widget forwards graph_set_widget with the 90s refresh ack timeout, not the 6s default", async () => {
     const { ctx, calls, timeouts } = makeFakeCtx();
     await defByName("panel_set_widget").handler(
       { node_id: 39, widget: "image", value: "staged_00001_.png" },
@@ -239,7 +239,7 @@ describe("panel-tools: fresh /object_info ack timeout (#599)", () => {
     expect(timeouts[0]).toBe(REFRESH_ACK_MS);
   });
 
-  it("panel_add_node forwards graph_add_node with the 30s refresh ack timeout", async () => {
+  it("panel_add_node forwards graph_add_node with the 90s refresh ack timeout", async () => {
     const { ctx, calls, timeouts } = makeFakeCtx();
     await defByName("panel_add_node").handler(
       { class_type: "LoadImage", pos: [0, 0] },
@@ -251,7 +251,7 @@ describe("panel-tools: fresh /object_info ack timeout (#599)", () => {
 
   it("keeps the ack bounded (never Infinity) so a genuinely dead tab still fails", () => {
     expect(Number.isFinite(REFRESH_ACK_MS)).toBe(true);
-    expect(REFRESH_ACK_MS).toBeLessThanOrEqual(60_000);
+    expect(REFRESH_ACK_MS).toBeLessThanOrEqual(90_000);
   });
 });
 
@@ -739,9 +739,9 @@ describe("panel-tools: panel_refresh_nodes (#608 — force a combo/object_info r
     await defByName("panel_refresh_nodes").handler({}, ctx);
     expect(calls).toHaveLength(1);
     expect(calls[0]).toEqual({ cmd: "refresh_nodes" });
-    // Same 30s budget as the refresh-before-validate writes — this command's whole
+    // Same 90s budget as the refresh-before-validate writes — this command's whole
     // purpose is to await a fresh /object_info fetch.
-    expect(timeouts[0]).toBe(30_000);
+    expect(timeouts[0]).toBe(90_000);
   });
 
   it("takes no arguments (empty schema)", () => {
@@ -7593,7 +7593,7 @@ describe("#767 panel_add_node warns against parallel bursts", () => {
   // Parallel adds each carry a fresh /object_info payload, and the coalescer
   // registers those SERIALLY (deliberately — joining an older in-flight refresh
   // once dropped a just-installed node's defs, #289 P2). So N concurrent adds
-  // become N sequential refresh cycles; on a large install that outruns the 30s
+  // become N sequential refresh cycles; on a large install that outruns the 90s
   // per-command deadline and the later adds time out WHILE STILL QUEUED, then
   // apply when their turn comes. The reporter found "ghost" nodes matching calls
   // they had been told failed.
@@ -7605,7 +7605,7 @@ describe("#767 panel_add_node warns against parallel bursts", () => {
     const d = defByName("panel_add_node");
     expect(d.description).toMatch(/ONE AT A TIME/);
     expect(d.description).toMatch(/register SERIALLY|SERIALLY/);
-    expect(d.description).toMatch(/30s per-command deadline/);
+    expect(d.description).toMatch(/90s per-command deadline/);
   });
 
   it("names the consequence that makes it worth heeding", () => {

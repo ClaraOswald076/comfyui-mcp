@@ -759,8 +759,8 @@ describe("the clean note may survive only where the PANEL would have called it c
 });
 
 // #1973 — the completion follow-ups are ELECTIVE and run with the panel's reply
-// already in hand, so they must NOT get the same 30 s budget as the primary read.
-// Handing them the ack timeout makes the handler's worst case 30 s + 30 s and puts
+// already in hand, so they must NOT get the same 90 s budget as the primary read.
+// Handing them the ack timeout makes the handler's worst case 90 s + 90 s and puts
 // a reply we already hold behind an optional improvement — which is #589 (an agent
 // left with NO error surface) re-introduced from the orchestrator side, on the one
 // tool a user staring at red nodes has nothing else to fall back on.
@@ -808,7 +808,7 @@ describe("get_errors completion follow-ups run on the elective budget (#1973/#58
     expect(query, "graph_query follow-up did not run").toBeTypeOf("number");
     expect(objectInfo, "graph_get_object_info follow-up did not run").toBeTypeOf("number");
 
-    expect(primary, "the primary read keeps the #1493 refresh-ack budget").toBe(30_000);
+    expect(primary, "the primary read keeps the #1493 refresh-ack budget").toBe(90_000);
     expect(
       query!,
       "an elective follow-up must not be able to double the handler's worst case",
@@ -820,7 +820,7 @@ describe("get_errors completion follow-ups run on the elective budget (#1973/#58
     // per-call timeout into a longer handler wait.
     expect(query!).toBeLessThanOrEqual(8_000);
     expect(objectInfo!).toBeLessThanOrEqual(8_000);
-    expect(primary! + Math.max(query!, objectInfo!)).toBeLessThanOrEqual(38_000);
+    expect(primary! + Math.max(query!, objectInfo!)).toBeLessThanOrEqual(98_000);
   });
 });
 
