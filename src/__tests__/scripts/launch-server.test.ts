@@ -427,6 +427,32 @@ describe("rescue deadline tracks the CLIENT's budget (#1447)", () => {
     // A frame with an id and no method is a RESPONSE and belongs to whoever asked.
     expect(installingDecision({ jsonrpc: "2.0", id: 8, result: {} })).toEqual({ action: "forward" });
   });
+
+  it("routes a JSON-RPC BATCH member by member instead of parking it on the install", () => {
+    // Round-3 gate: an array frame fell through to "forward", so every request
+    // inside it waited for npm — the same timeout this fix removes, wearing a
+    // different hat. MCP dropped batching in 2025-06-18; 2025-03-26 allows it.
+    const { installingDecision } = launcher;
+    const decision = installingDecision([
+      { jsonrpc: "2.0", method: "notifications/initialized" },
+      { jsonrpc: "2.0", id: 8, method: "tools/list" },
+      { jsonrpc: "2.0", id: 9, method: "ping" },
+    ]) as { action: string; replies: Frame[]; forward: Frame[] };
+    expect(decision.action).toBe("batch");
+    // One array back, which is the response shape a batching client waits for.
+    expect(decision.replies).toEqual([
+      { jsonrpc: "2.0", id: 8, result: { tools: [] } },
+      { jsonrpc: "2.0", id: 9, result: {} },
+    ]);
+    // …and the notification still reaches the server, or it never initializes.
+    expect(decision.forward).toEqual([{ jsonrpc: "2.0", method: "notifications/initialized" }]);
+
+    // A batch with nothing to answer is forwarded exactly as it arrived.
+    expect(installingDecision([{ jsonrpc: "2.0", method: "notifications/initialized" }])).toEqual({
+      action: "forward",
+    });
+    expect(installingDecision([])).toEqual({ action: "forward" });
+  });
 });
 
 describe("cold-start proxy state machine (#1447)", () => {
@@ -584,6 +610,29 @@ describe("cold-start proxy state machine (#1447)", () => {
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(parseAll(r.toClient).some((f) => f.method === "notifications/tools/list_changed")).toBe(false);
     expect(parseAll(r.toClient).filter((f) => f.id === 7)).toHaveLength(1);
+  });
+
+  it("answers a batched tools/list mid-install instead of forwarding it into the wait", async () => {
+    const r = rig(40);
+    r.fromClient(INIT);
+    await waitFor(() => parseAll(r.toClient)[0]);
+    expect(r.proxy.phase()).toBe("installing");
+    const forwardedSoFar = r.toChild.length;
+
+    r.fromClient([
+      { jsonrpc: "2.0", method: "notifications/initialized" },
+      { jsonrpc: "2.0", id: 8, method: "tools/list" },
+    ] as unknown as Frame);
+
+    const answer = (await waitFor(() => parseAll(r.toClient)[1])) as unknown as Frame[];
+    expect(Array.isArray(answer)).toBe(true);
+    expect(answer).toEqual([{ jsonrpc: "2.0", id: 8, result: { tools: [] } }]);
+    // The notification went through; the request did NOT — forwarding it would
+    // have left the client waiting on npm and produced a duplicate answer later.
+    await waitFor(() => (r.toChild.length > forwardedSoFar ? true : undefined));
+    expect(parseAll(r.toChild).slice(forwardedSoFar)).toEqual([
+      { jsonrpc: "2.0", method: "notifications/initialized" },
+    ]);
   });
 
   it("an error the server sends in TIME is the client's to see, untouched", async () => {

@@ -303,9 +303,33 @@ const NOT_READY_CODE = -32002;
  * whoever asked, so it is forwarded rather than swallowed. Other notifications
  * are dropped: they can only refer to requests this wrapper answered itself.
  *
- * @returns {{action: "forward"} | {action: "drop"} | {action: "reply", message: object}}
+ * A JSON-RPC BATCH (an array) is routed member by member. MCP dropped batching
+ * in 2025-06-18, but 2025-03-26 allows it, and forwarding one whole would park
+ * every request inside it on the install — the round-3 gate's finding, and the
+ * same timeout this fix exists to remove wearing a different hat. The answers
+ * go back as ONE array, which is the response shape the client is waiting for;
+ * members that need no answer are forwarded on their own, which is valid
+ * JSON-RPC (a notification is a notification, batched or not).
+ *
+ * @returns {{action: "forward"} | {action: "drop"} | {action: "reply", message: object}
+ *          | {action: "batch", replies: object[], forward: object[]}}
  */
 export function installingDecision(msg) {
+  if (Array.isArray(msg)) {
+    const replies = [];
+    const forward = [];
+    for (const member of msg) {
+      const decision = installingDecision(member);
+      if (decision.action === "reply") replies.push(decision.message);
+      else if (decision.action === "forward") forward.push(member);
+      // A nested array is not legal JSON-RPC; `drop` covers it and everything
+      // else that cannot be answered.
+    }
+    // Nothing to answer — the batch is notifications and/or responses, so the
+    // original line goes to the server exactly as it arrived.
+    if (replies.length === 0) return { action: "forward" };
+    return { action: "batch", replies, forward };
+  }
   if (!msg || typeof msg !== "object") return { action: "drop" };
   if (msg.method === "initialized" || msg.method === "notifications/initialized") {
     return { action: "forward" };
@@ -453,8 +477,16 @@ export function attachColdStartProxy({
       return;
     }
     const decision = installingDecision(parseFrame(line));
-    if (decision.action === "forward") writeFrame(childIn, clientIn, line);
-    else if (decision.action === "reply") toClient(decision.message);
+    if (decision.action === "forward") {
+      writeFrame(childIn, clientIn, line);
+    } else if (decision.action === "reply") {
+      toClient(decision.message);
+    } else if (decision.action === "batch") {
+      // Order matters: the server sees the batch's notifications before the
+      // client is told its requests are answered.
+      for (const member of decision.forward) writeFrame(childIn, clientIn, JSON.stringify(member));
+      toClient(decision.replies);
+    }
   });
 
   // The client closing stdin is how an MCP stdio session ends. With inherited
