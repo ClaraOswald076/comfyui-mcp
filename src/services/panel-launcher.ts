@@ -232,7 +232,9 @@ export async function installPanelLauncher(
     // Preserve the generation only for a broker that positively answers the
     // recorded port. A stale nonzero port and a port-0/unfinished install get a
     // new generation, invalidating any delayed fallback from that install.
-    const installId = previousLive.running ? previous?.install_id : randomBytes(24).toString("base64url");
+    const installId = previousLive.running && previous?.install_id
+      ? previous.install_id
+      : randomBytes(24).toString("base64url");
     const brokerId = previous?.broker_id ?? randomBytes(24).toString("base64url");
     const brokerExecutable = nodePath;
     let needsFallbackBroker = false;
@@ -863,7 +865,7 @@ function withPanelLauncherLock<T>(home: string, fn: () => T | Promise<T>): T | P
 function writeOwnedPanelLauncherConfig(
   config: PanelLauncherConfig,
   home: string,
-  ownership: { token: string; installId?: string },
+  ownership: { token: string; installId?: string; brokerId?: string },
 ): boolean {
   return withPanelLauncherLock(home, () => {
     const paths = panelLauncherPaths(home);
@@ -871,7 +873,13 @@ function writeOwnedPanelLauncherConfig(
     // which is still publishing after that point must not recreate launcher.json.
     if (existsSync(paths.teardown)) return false;
     const current = readPanelLauncherConfig(home);
-    if (current?.token !== ownership.token || current.install_id !== ownership.installId) return false;
+    const sameGeneration = current?.install_id === ownership.installId;
+    const legacyRuntimeMigration =
+      ownership.installId === undefined &&
+      ownership.brokerId !== undefined &&
+      current?.install_id !== undefined &&
+      current.broker_id === ownership.brokerId;
+    if (current?.token !== ownership.token || (!sameGeneration && !legacyRuntimeMigration)) return false;
     writePanelLauncherConfig(config, home);
     return true;
   }) ?? false;
@@ -1226,10 +1234,13 @@ export async function startPanelLauncherBroker(
   // broker's runtime publication so future uninstall can fail closed.
   const brokerId = current.broker_id ?? randomBytes(24).toString("base64url");
   const runtimeConfig = { ...current, broker_id: brokerId };
-  const brokerConfigStillOwned = () =>
-    !existsSync(panelLauncherPaths(home).teardown) &&
-    readPanelLauncherConfig(home)?.token === current.token &&
-    readPanelLauncherConfig(home)?.install_id === current.install_id;
+  const brokerConfigStillOwned = () => {
+    if (existsSync(panelLauncherPaths(home).teardown)) return false;
+    const latest = readPanelLauncherConfig(home);
+    if (latest?.token !== current.token) return false;
+    return latest.install_id === current.install_id ||
+      (current.install_id === undefined && latest.install_id !== undefined && latest.broker_id === brokerId);
+  };
   let launch: TerminalLaunch | null = null;
   let lastLaunchAt = 0;
   let recoveryTimer: NodeJS.Timeout | null = null;
@@ -1400,9 +1411,15 @@ export async function startPanelLauncherBroker(
     throw new Error("Panel launcher was uninstalled while the broker was starting");
   }
   const published = writeOwnedPanelLauncherConfig(
-    { ...runtimeConfig, port: address.port, pid: process.pid, updated_at: new Date().toISOString() },
+    {
+      ...(readPanelLauncherConfig(home) ?? runtimeConfig),
+      broker_id: brokerId,
+      port: address.port,
+      pid: process.pid,
+      updated_at: new Date().toISOString(),
+    },
     home,
-    { token: current.token, installId: current.install_id },
+    { token: current.token, installId: current.install_id, brokerId },
   );
   if (!published) {
     await new Promise<void>((resolve) => server.close(() => resolve()));
