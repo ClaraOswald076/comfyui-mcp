@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.113] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- recover Desktop backends from verified ancestry when the listener is unavailable (#2265)
+
 ## [0.52.112] - 2026-08-25
 
 ### MCP
