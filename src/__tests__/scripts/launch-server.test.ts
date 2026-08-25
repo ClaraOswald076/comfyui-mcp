@@ -13,7 +13,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,7 +32,14 @@ type Launcher = {
     extraArgs: string[],
     opts?: { platform?: string; node?: string },
   ) => { command: string; args: string[]; shell: boolean };
-  rescueDeadlineMs: (env?: Record<string, string | undefined>) => number;
+  coldStartDeadlineMs: (
+    env?: Record<string, string | undefined>,
+    opts?: { cachedInstall?: boolean },
+  ) => number;
+  cachedNpxInstallExists: (
+    stdout: unknown,
+    opts?: { readdir?: (p: string) => string[]; exists?: (p: string) => boolean },
+  ) => boolean;
   rescueInitializeResult: (params: unknown) => Frame;
   installingDecision: (msg: unknown) => Decision;
   attachColdStartProxy: (opts: {
@@ -242,25 +249,86 @@ async function waitFor<T>(probe: () => T | undefined, budgetMs = 8000): Promise<
 describe("rescue deadline tracks the CLIENT's budget (#1447)", () => {
   beforeAll(loadLauncher);
 
-  it("uses a fraction of MCP_TIMEOUT, which the client really does hand us", () => {
+  it("with a cached tree it waits, tracking MCP_TIMEOUT, which the client really does hand us", () => {
     // Verified by measurement, not by reading: a server launched by
     // `MCP_TIMEOUT=17000 claude -p …` observed process.env.MCP_TIMEOUT === "17000".
-    const { rescueDeadlineMs, RESCUE_BUDGET_FRACTION, DEFAULT_CLIENT_BUDGET_MS, RESCUE_MIN_MS, RESCUE_MAX_MS } =
+    const { coldStartDeadlineMs, RESCUE_BUDGET_FRACTION, DEFAULT_CLIENT_BUDGET_MS, RESCUE_MIN_MS, RESCUE_MAX_MS } =
       launcher;
-    expect(rescueDeadlineMs({ MCP_TIMEOUT: "20000" })).toBe(20000 * RESCUE_BUDGET_FRACTION);
+    const cached = (env: Record<string, string | undefined>) => coldStartDeadlineMs(env, { cachedInstall: true });
+    expect(cached({ MCP_TIMEOUT: "20000" })).toBe(20000 * RESCUE_BUDGET_FRACTION);
     // …and it must leave the client real margin, never spend the whole budget.
-    expect(rescueDeadlineMs({ MCP_TIMEOUT: "20000" })).toBeLessThan(20000);
-    expect(rescueDeadlineMs({ MCP_TIMEOUT: "10000" })).toBe(4000);
+    expect(cached({ MCP_TIMEOUT: "20000" })).toBeLessThan(20000);
+    expect(cached({ MCP_TIMEOUT: "10000" })).toBe(4000);
     // A tightened budget rescues SOONER — the direction that matters.
-    expect(rescueDeadlineMs({ MCP_TIMEOUT: "5000" })).toBeLessThan(rescueDeadlineMs({ MCP_TIMEOUT: "20000" }));
+    expect(cached({ MCP_TIMEOUT: "5000" })).toBeLessThan(cached({ MCP_TIMEOUT: "20000" }));
     // No budget stated → the documented default.
-    expect(rescueDeadlineMs({})).toBe(DEFAULT_CLIENT_BUDGET_MS * RESCUE_BUDGET_FRACTION);
+    expect(cached({})).toBe(DEFAULT_CLIENT_BUDGET_MS * RESCUE_BUDGET_FRACTION);
     // Junk is not a budget.
     for (const bad of ["", "soon", "-1", "0", "NaN", undefined]) {
-      expect(rescueDeadlineMs({ MCP_TIMEOUT: bad })).toBe(DEFAULT_CLIENT_BUDGET_MS * RESCUE_BUDGET_FRACTION);
+      expect(cached({ MCP_TIMEOUT: bad })).toBe(DEFAULT_CLIENT_BUDGET_MS * RESCUE_BUDGET_FRACTION);
     }
-    expect(rescueDeadlineMs({ MCP_TIMEOUT: "100" })).toBe(RESCUE_MIN_MS);
-    expect(rescueDeadlineMs({ MCP_TIMEOUT: "600000" })).toBe(RESCUE_MAX_MS);
+    expect(cached({ MCP_TIMEOUT: "100" })).toBe(RESCUE_MIN_MS);
+    expect(cached({ MCP_TIMEOUT: "600000" })).toBe(RESCUE_MAX_MS);
+    // The measured warm-npx handshake is ~1.2 s (7.0 s once, when npx updated
+    // first). The cached deadline must sit well clear of that or it would swap
+    // a healthy server's real serverInfo for the stand-in on every launch.
+    expect(cached({})).toBeGreaterThan(8000);
+  });
+
+  it("with NOTHING cached it rescues at the floor — independent of the budget we assume", () => {
+    // The gate's P1 on round 1: a client that waits less than DEFAULT_CLIENT_BUDGET_MS
+    // and does not export MCP_TIMEOUT would be killed before a budget-derived
+    // deadline fired. On a first run there is no server process to wait for at
+    // all (npm has 818MB to fetch first), so waiting cannot pay — and this
+    // branch must not read the assumed default.
+    const { coldStartDeadlineMs, RESCUE_MIN_MS, DEFAULT_CLIENT_BUDGET_MS, RESCUE_BUDGET_FRACTION } = launcher;
+    const cold = (env: Record<string, string | undefined>) => coldStartDeadlineMs(env, { cachedInstall: false });
+    expect(cold({})).toBe(RESCUE_MIN_MS);
+    // …and it is under every client budget in the reproduction, including the
+    // 10 s one that actually produced "Failed to connect" on this machine.
+    for (const budget of [5000, 10000, 30000]) {
+      expect(cold({})).toBeLessThan(budget);
+      expect(cold({ MCP_TIMEOUT: String(budget) })).toBeLessThan(budget);
+    }
+    // A budget smaller than the floor still shortens it.
+    expect(cold({ MCP_TIMEOUT: "2000" })).toBe(2000 * RESCUE_BUDGET_FRACTION);
+    // Raising the assumed default must NOT be able to move this branch.
+    expect(cold({})).toBeLessThan(DEFAULT_CLIENT_BUDGET_MS * RESCUE_BUDGET_FRACTION);
+  });
+
+  it("reads `npm config get cache` to tell a first run from a warm one", () => {
+    const { cachedNpxInstallExists } = launcher;
+    const seen: string[] = [];
+    const present = cachedNpxInstallExists("  C:/cache  
+", {
+      readdir: () => ["8af3af54f44861ce", "other"],
+      exists: (p: string) => {
+        seen.push(p);
+        return p.includes("8af3af54f44861ce");
+      },
+    });
+    expect(present).toBe(true);
+    // It looks under the cache npm named, in _npx, for a real manifest.
+    expect(seen[0].replace(/\/g, "/")).toBe("C:/cache/_npx/8af3af54f44861ce/node_modules/comfyui-mcp/package.json");
+
+    // A comfyui-mcp directory with no manifest is the half-deleted state a
+    // failed Windows uninstall leaves behind; it is not a runnable install.
+    expect(cachedNpxInstallExists("/cache", { readdir: () => ["a"], exists: () => false })).toBe(false);
+    // No _npx directory at all — a genuinely first run.
+    expect(
+      cachedNpxInstallExists("/cache", {
+        readdir: () => {
+          throw new Error("ENOENT");
+        },
+        exists: () => true,
+      }),
+    ).toBe(false);
+    // Every unusable answer means "assume nothing is cached", which rescues
+    // sooner. Being early costs one session's serverInfo; being late costs the
+    // connection.
+    for (const bad of [null, undefined, "", "   ", "undefined", "null", 42]) {
+      expect(cachedNpxInstallExists(bad, { readdir: () => ["a"], exists: () => true })).toBe(false);
+    }
   });
 
   it("the stand-in handshake is honest about being a stand-in", () => {
@@ -483,6 +551,8 @@ const FAKE_SERVER_SOURCE = [
 
 describe("the shipped launcher rescues a real cold start (#1447)", () => {
   let stubDir = "";
+  let coldCache = "";
+  let warmCache = "";
   const children: ChildProcessWithoutNullStreams[] = [];
 
   beforeAll(async () => {
@@ -491,13 +561,34 @@ describe("the shipped launcher rescues a real cold start (#1447)", () => {
     const emptyGlobal = join(stubDir, "empty-global-root");
     const fakeServer = join(stubDir, "fake-server.mjs");
     writeFileSync(fakeServer, FAKE_SERVER_SOURCE, "utf8");
+    // Two npm cache roots: one a first run (no _npx at all), one with a tree
+    // already unpacked, so BOTH deadline branches run through production.
+    coldCache = join(stubDir, "cold-cache");
+    warmCache = join(stubDir, "warm-cache");
+    mkdirSync(join(warmCache, "_npx", "deadbeef", "node_modules", "comfyui-mcp"), { recursive: true });
+    writeFileSync(
+      join(warmCache, "_npx", "deadbeef", "node_modules", "comfyui-mcp", "package.json"),
+      JSON.stringify({ name: "comfyui-mcp", version: "9.9.9" }),
+      "utf8",
+    );
+    // `npm root -g` and `npm config get cache` are different questions, so the
+    // stub answers them differently — otherwise the cache branch would be handed
+    // the global root and prove nothing.
     // POSIX forms (npm/npx are spawned without a shell there) …
-    writeFileSync(join(stubDir, "npm"), `#!/bin/sh\necho "${emptyGlobal}"\n`, "utf8");
+    writeFileSync(
+      join(stubDir, "npm"),
+      `#!/bin/sh\nif [ "$1" = "config" ]; then echo "$NPM_STUB_CACHE"; else echo "${emptyGlobal}"; fi\n`,
+      "utf8",
+    );
     writeFileSync(join(stubDir, "npx"), `#!/bin/sh\nexec "${process.execPath}" "${fakeServer}"\n`, "utf8");
     chmodSync(join(stubDir, "npm"), 0o755);
     chmodSync(join(stubDir, "npx"), 0o755);
     // … and the .cmd forms, because the Windows spec goes through cmd.exe.
-    writeFileSync(join(stubDir, "npm.cmd"), `@echo ${emptyGlobal}\r\n`, "utf8");
+    writeFileSync(
+      join(stubDir, "npm.cmd"),
+      `@echo off\r\nif "%1"=="config" (echo %NPM_STUB_CACHE%) else (echo ${emptyGlobal})\r\n`,
+      "utf8",
+    );
     writeFileSync(join(stubDir, "npx.cmd"), `@"${process.execPath}" "${fakeServer}"\r\n`, "utf8");
   });
 
@@ -544,9 +635,15 @@ describe("the shipped launcher rescues a real cold start (#1447)", () => {
     "answers the handshake while the install is still running, then serves the real tools",
     async () => {
       const log = join(stubDir, "rescue-log.txt");
-      // MCP_TIMEOUT 3000 → a 1500 ms deadline (the floor); the stand-in server
-      // cannot answer for 4 s. Without the rescue this is the reported failure.
-      const client = launch({ MCP_TIMEOUT: "3000", FAKE_DELAY_MS: "4000", FAKE_LOG: log });
+      // A first run: `npm config get cache` names a cache with no _npx, so the
+      // deadline is the floor and does NOT depend on the budget we assume. The
+      // stand-in server cannot answer for 4 s — the reported failure exactly.
+      const client = launch({
+        MCP_TIMEOUT: "3000",
+        NPM_STUB_CACHE: coldCache,
+        FAKE_DELAY_MS: "4000",
+        FAKE_LOG: log,
+      });
       client.send(INIT);
 
       const handshake = (await waitFor(() => parseAll(client.stdout).find((f) => f.id === 1), 12000)) as {
@@ -590,7 +687,7 @@ describe("the shipped launcher rescues a real cold start (#1447)", () => {
   it(
     "control: a server that starts promptly keeps its own serverInfo and instructions",
     async () => {
-      const client = launch({ MCP_TIMEOUT: "30000", FAKE_DELAY_MS: "0" });
+      const client = launch({ MCP_TIMEOUT: "30000", NPM_STUB_CACHE: warmCache, FAKE_DELAY_MS: "0" });
       client.send(INIT);
       const handshake = (await waitFor(() => parseAll(client.stdout).find((f) => f.id === 1), 12000)) as {
         result: { serverInfo: { name: string; version: string }; instructions: string };
@@ -600,6 +697,27 @@ describe("the shipped launcher rescues a real cold start (#1447)", () => {
       expect(handshake.result.serverInfo).toEqual({ name: "fake-comfyui-mcp", version: "9.9.9" });
       expect(handshake.result.instructions).toBe("REAL_SERVER_INSTRUCTIONS");
       expect(client.stderr()).not.toMatch(/answered the MCP handshake on its behalf/);
+    },
+    25000,
+  );
+
+  it(
+    "a CACHED tree is still rescued when the client budget is tight",
+    async () => {
+      // The cached branch waits longer on purpose, but it is still bounded by
+      // the client's budget: MCP_TIMEOUT 4000 → a 1600 ms deadline, so a server
+      // that takes 4 s (npx updating to a newer release, say) is rescued rather
+      // than left to time out.
+      const client = launch({ MCP_TIMEOUT: "4000", NPM_STUB_CACHE: warmCache, FAKE_DELAY_MS: "4000" });
+      client.send(INIT);
+      const handshake = (await waitFor(() => parseAll(client.stdout).find((f) => f.id === 1), 12000)) as {
+        result: { serverInfo: { version: string } };
+      };
+      expect(handshake.result.serverInfo.version).toBe(launcher.INSTALLING_VERSION);
+      await waitFor(
+        () => parseAll(client.stdout).find((f) => f.method === "notifications/tools/list_changed"),
+        15000,
+      );
     },
     25000,
   );

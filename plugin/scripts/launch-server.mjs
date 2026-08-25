@@ -21,8 +21,9 @@
  *    a genuinely empty npm cache and an empty global prefix:
  *
  *      cold `npx -y comfyui-mcp --full` → `initialize` response  21.6 s
- *      warm `_npx` cache                → `initialize` response   7.0 s
  *      npm install alone (818 MB, 170 packages)                  15.2 s
+ *      warm `_npx` cache                → `initialize` response   1.2 s
+ *                                        (7.0 s once, when npx updated first)
  *
  *    …and `claude mcp list` on that cold cache reported
  *    `✘ Failed to connect — MCP server connection timed out`, while the same
@@ -32,11 +33,17 @@
  *    So on the fallback the wrapper stops being a pipe and becomes a
  *    transparent MCP proxy that can WIN THE HANDSHAKE RACE. It forwards
  *    everything verbatim; if the real server has not answered the client's
- *    `initialize` by a deadline derived from the client's own budget, the
- *    wrapper answers it itself, keeps the connection alive with an empty tool
- *    list while npm works, and hands over to the real server the moment it is
- *    up — announcing the real tools with `notifications/tools/list_changed`.
- *    A cold cache then costs LATENCY instead of a failed connection.
+ *    `initialize` by its deadline, the wrapper answers it itself, keeps the
+ *    connection alive with an empty tool list while npm works, and hands over
+ *    to the real server the moment it is up — announcing the real tools with
+ *    `notifications/tools/list_changed`. A cold cache then costs LATENCY
+ *    instead of a failed connection.
+ *
+ *    The deadline is not one number. With nothing unpacked under `_npx` there
+ *    is no server to wait for, so it is the floor and does NOT depend on the
+ *    client budget we assume; with a tree already cached the launch is normally
+ *    1.2 s and must stay transparent, so it gets the generous deadline bounded
+ *    by the client’s own MCP_TIMEOUT. See coldStartDeadlineMs.
  *
  *    Measured against the real client (Claude Code 2.1.246): it re-issues
  *    `tools/list` after that notification and calls a tool that existed only
@@ -52,7 +59,7 @@
  */
 
 import { execFile, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { pathToFileURL } from "node:url";
@@ -130,22 +137,64 @@ export const RESCUE_MIN_MS = 1500;
 export const RESCUE_MAX_MS = 12000;
 
 /**
+ * Is there already an unpacked comfyui-mcp under npm's `_npx` cache?
+ *
+ * This is the difference between "npm has to fetch 818 MB before a server
+ * process can exist" and "npx has a tree on disk and is about to exec it".
+ * `npm config get cache` is the authority on where that lives — guessing the
+ * platform default would misread every machine with a cache path in `.npmrc`,
+ * and misreading it in that direction would degrade every launch.
+ *
+ * Any failure answers false, i.e. "assume nothing is cached". That is the safe
+ * direction: it rescues sooner, and being early costs one session's
+ * `serverInfo`, while being late costs the connection.
+ */
+export function cachedNpxInstallExists(npmCacheStdout, { readdir = readdirSync, exists = existsSync } = {}) {
+  const root = typeof npmCacheStdout === "string" ? npmCacheStdout.trim() : "";
+  if (!root || root === "undefined" || root === "null") return false;
+  const npxRoot = join(root, "_npx");
+  let entries;
+  try {
+    entries = readdir(npxRoot);
+  } catch {
+    return false;
+  }
+  // A `comfyui-mcp` directory with no manifest is the half-deleted state a
+  // failed Windows uninstall leaves behind (`npm ls -g` shows `comfyui-mcp@`
+  // with no version). It is not a runnable install, so it does not count.
+  return entries.some((name) => exists(join(npxRoot, name, "node_modules", "comfyui-mcp", "package.json")));
+}
+
+/**
  * The rescue deadline, in ms after the client's `initialize` arrives.
  *
- * MCP_TIMEOUT is the client's own handshake budget and it is VISIBLE to us —
- * verified by measurement: a server launched by `MCP_TIMEOUT=17000 claude …`
- * reads `process.env.MCP_TIMEOUT === "17000"`. So the deadline tracks the
- * client instead of guessing: a user who tightened the budget gets rescued
- * sooner, not later.
+ * TWO CASES, because they are not the same question.
  *
- * The floor keeps a pathological budget from making the wrapper answer before
- * the server has had any chance at all; the ceiling keeps a huge budget from
- * parking the user on "connecting" for a minute when we could have answered.
+ * NOTHING CACHED — the reported first run. npm must fetch and unpack the whole
+ * tree before a server process exists at all (measured: 15.2 s of npm on a fast
+ * link, 818 MB / 170 packages), so waiting cannot pay: there is no server to
+ * wait for. The deadline is the floor, and deliberately does NOT depend on the
+ * assumed default budget — a client that waits less than we assume must still
+ * be rescued in time. This is the branch the gate was right to press on.
+ *
+ * SOMETHING CACHED — npx has a tree and is about to exec it. Measured warm-npx
+ * handshakes on this machine: 1.2 s, 1.2 s, 1.2 s, and 7.0 s once when npx
+ * updated to a newer release first. Those must stay TRANSPARENT, because
+ * rescuing them would swap the server's real `serverInfo` and instructions for
+ * a stand-in on a launch that was going to succeed. So this branch gets the
+ * generous deadline, bounded by the client's own budget.
+ *
+ * MCP_TIMEOUT is that budget and it is VISIBLE to us — verified by measurement:
+ * a server launched by `MCP_TIMEOUT=17000 claude …` reads
+ * `process.env.MCP_TIMEOUT === "17000"`. So a user who tightens the budget gets
+ * rescued sooner, not later.
  */
-export function rescueDeadlineMs(env = process.env) {
+export function coldStartDeadlineMs(env = process.env, { cachedInstall = true } = {}) {
   const raw = Number(env.MCP_TIMEOUT);
   const budget = Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_CLIENT_BUDGET_MS;
-  return Math.min(RESCUE_MAX_MS, Math.max(RESCUE_MIN_MS, Math.round(budget * RESCUE_BUDGET_FRACTION)));
+  const share = Math.round(budget * RESCUE_BUDGET_FRACTION);
+  if (!cachedInstall) return Math.min(RESCUE_MIN_MS, share);
+  return Math.min(RESCUE_MAX_MS, Math.max(RESCUE_MIN_MS, share));
 }
 
 /**
@@ -420,17 +469,18 @@ function sameId(a, b) {
   return typeof a === typeof b && a === b;
 }
 
-/** Ask npm where global packages live. String-command form on Windows for the
- *  same DEP0190 reason as serverSpec; the command is a fixed literal, so there
- *  is nothing to inject. Resolves null on any failure — the npx fallback is
- *  the original behaviour, so a failed probe degrades to exactly what the
- *  plugin did before this wrapper existed. */
-function probeGlobalRoot() {
+/** Ask npm something. String-command form on Windows for the same DEP0190
+ *  reason as serverSpec; the arguments are fixed literals, so there is nothing
+ *  to inject. Resolves null on any failure — for the global root that degrades
+ *  to exactly what the plugin did before this wrapper existed (the npx path),
+ *  and for the cache root it degrades to "assume nothing is cached", which
+ *  rescues sooner rather than later. */
+function probeNpm(args) {
   const isWin = process.platform === "win32";
   return new Promise((resolve) => {
     execFile(
-      isWin ? "npm root -g" : "npm",
-      isWin ? [] : ["root", "-g"],
+      isWin ? ["npm", ...args].join(" ") : "npm",
+      isWin ? [] : args,
       { shell: isWin, timeout: NPM_ROOT_TIMEOUT_MS },
       (error, stdout) => resolve(error ? null : stdout),
     );
@@ -468,7 +518,7 @@ function run(spec) {
  * handshake if npm is still working. stderr stays inherited — npm's progress
  * and the server's own logs belong in the client's server log untouched.
  */
-function runProxied(spec, deadlineMs = rescueDeadlineMs()) {
+function runProxied(spec, deadlineMs) {
   const child = spawn(spec.command, spec.args, { stdio: ["pipe", "pipe", "inherit"], shell: spec.shell });
   if (child.stdin && child.stdout) {
     // EPIPE when the install dies mid-frame is not worth a crash: the child's
@@ -494,12 +544,16 @@ function runProxied(spec, deadlineMs = rescueDeadlineMs()) {
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
   const extraArgs = process.argv.slice(2);
-  const entry = globalEntry(await probeGlobalRoot());
-  const spec = serverSpec(entry, extraArgs);
+  const entry = globalEntry(await probeNpm(["root", "-g"]));
   // The rescue exists for the npx fallback, which is the only path that can
   // have an install in front of the handshake. A resolved global entry starts
   // a server that is already on disk, so it keeps inherited stdio and this
-  // wrapper stays out of its protocol entirely.
-  if (entry) run(spec);
-  else runProxied(spec);
+  // wrapper stays out of its protocol entirely — and never pays the second
+  // npm probe either.
+  if (entry) {
+    run(serverSpec(entry, extraArgs));
+  } else {
+    const cachedInstall = cachedNpxInstallExists(await probeNpm(["config", "get", "cache"]));
+    runProxied(serverSpec(null, extraArgs), coldStartDeadlineMs(process.env, { cachedInstall }));
+  }
 }
