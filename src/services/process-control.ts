@@ -8,6 +8,7 @@ import {
 import { randomUUID } from "node:crypto";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -1496,6 +1497,48 @@ function resolveScriptAnchor(argv: string[]): string | undefined {
 }
 
 /**
+ * Resolve the one embedded-python layout that process-control can prove without
+ * turning the general interpreter resolver into a layout guess:
+ *
+ *   <root>\python\python.exe  <root>\main.py
+ *
+ * `python` is the interpreter observed in the already-correlated process command
+ * line, and `root` is the live process anchor recovered by resolveLiveServerRoot.
+ * Keep this deliberately narrower than findComfyuiPython: this is only a relaunch
+ * repair for a process we are about to stop, not authority for arbitrary local
+ * filesystem writes. The caller still validates the script and interpreter as
+ * regular files before adopting the pair.
+ */
+function observedEmbeddedMainAnchor(
+  observedPython: string | undefined,
+  liveRoot: string | undefined,
+  scriptToken: string,
+): { python: string; script: string } | null | undefined {
+  if (!IS_WIN || !observedPython || !liveRoot) return undefined;
+  if (!isAbsolute(observedPython) || !isAbsolute(liveRoot)) return undefined;
+
+  // Only the bare script form is eligible. A different relative path may name a
+  // launcher/symlink or depend on the cwd in a way this narrow repair cannot prove.
+  if (scriptToken.trim().toLowerCase() !== "main.py") return undefined;
+
+  const python = join(liveRoot, "python", "python.exe");
+  const script = join(liveRoot, "main.py");
+  if (!sameInterpreterPath(observedPython, python)) return undefined;
+  // An exact observed layout must not fall through to findComfyuiPython when its
+  // own files are missing, directories, or links. That would replace a narrow
+  // refusal with an unverified layout guess.
+  if (
+    !isNonSymlinkDirectory(liveRoot) ||
+    !isNonSymlinkDirectory(join(liveRoot, "python")) ||
+    !isNonSymlinkRegularFile(python) ||
+    !isNonSymlinkRegularFile(script)
+  ) {
+    return null;
+  }
+  return { python, script };
+}
+
+/**
  * The live process's own working directory — the most authoritative anchor for a
  * RELATIVE launch script. A ComfyUI launched as `python main.py …` has argv[0] =
  * `main.py` with no path root, an unset/stale COMFYUI_PATH gives no canonical base,
@@ -2074,16 +2117,28 @@ function resolveLaunchCommand(
     let liveCwdPython: string | undefined;
     if (!scriptIsAbsolute && info.liveCwd && relSegments.length > 0) {
       const candidateScript = join(info.liveCwd, ...relSegments);
-      const candidatePython = findComfyuiPython(info.liveCwd, argv);
+      const embeddedAnchor = observedEmbeddedMainAnchor(
+        info.observedInterpreter,
+        info.liveCwd,
+        firstUnquoted,
+      );
+      // `null` means the observed process proved the exact embedded layout but
+      // its root/interpreter/script failed validation. Do not let that explicit
+      // refusal fall through to the broader canonical anchor below: it could
+      // relaunch a different install after stopping the observed process.
+      if (embeddedAnchor === null) return null;
+      const candidatePython =
+        embeddedAnchor?.python ??
+        findComfyuiPython(info.liveCwd, argv);
       const pythonIsAbsolute =
         !!candidatePython &&
         (isAbsolute(candidatePython) || /^[a-zA-Z]:[\\/]/.test(candidatePython));
       if (
-        isRegularFile(candidateScript) &&
+        isRegularFile(embeddedAnchor?.script ?? candidateScript) &&
         pythonIsAbsolute &&
         isRegularFile(candidatePython)
       ) {
-        liveCwdScript = candidateScript;
+        liveCwdScript = embeddedAnchor?.script ?? candidateScript;
         liveCwdPython = candidatePython;
       }
     }
@@ -2193,6 +2248,32 @@ function isRegularFile(p: string | undefined): boolean {
   if (!p) return false;
   try {
     return statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The exact embedded-portable repair is deliberately stricter than the existing
+ * generic live-cwd path: a symlinked executable or entrypoint would make the
+ * lexical `<root>` anchor mean something different from the process identity we
+ * observed, so it must retain the refusal.
+ */
+function isNonSymlinkRegularFile(p: string | undefined): boolean {
+  if (!p) return false;
+  try {
+    const st = lstatSync(p);
+    return st.isFile() && !st.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function isNonSymlinkDirectory(p: string | undefined): boolean {
+  if (!p) return false;
+  try {
+    const st = lstatSync(p);
+    return st.isDirectory() && !st.isSymbolicLink();
   } catch {
     return false;
   }
@@ -5458,7 +5539,7 @@ export const __processControlTestHooks = {
    *  recycled-PID scenarios on any host, including where the native read is
    *  deliberately skipped. */
   setProcessIdentityResolver(
-    fn: ((pid: number) => { startedAt?: string } | undefined) | null,
+    fn: ((pid: number) => ProcessIdentity | undefined) | null,
   ): void {
     processIdentityOverride = fn;
   },
