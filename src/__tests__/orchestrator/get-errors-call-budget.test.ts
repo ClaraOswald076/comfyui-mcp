@@ -7,7 +7,7 @@
 // the real panel_get_errors def: a stubbed panel returns the reporter's shape,
 // and the assertions read the payload the caller actually gets.
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildPanelToolDefs, type PanelToolCtx } from "../../orchestrator/panel-tools.js";
 
 type ToolResult = { isError?: boolean; content: Array<{ type: string; text?: string }> };
@@ -22,6 +22,13 @@ const EXECUTION_NODES = [
   { id: 71, type: "SaveVideo", widget: "codec", value: "h264" },
   { id: 73, type: "ImpactSwitch", widget: "select", value: "prompt_a" },
 ] as const;
+
+const FIFTY_NODE_WORKFLOW = Array.from({ length: 50 }, (_, i) => ({
+  id: i + 1,
+  type: `Loader${i + 1}`,
+  widget: "asset",
+  value: `asset-${i + 1}.safetensors`,
+}));
 
 function budgetExhaustedReply(opts?: { extraUnchecked?: number }): Record<string, unknown> {
   const extra = opts?.extraUnchecked ?? 35;
@@ -73,38 +80,76 @@ function detailText(
     .join("\n");
 }
 
+function fiftyNodeBudgetReply(): Record<string, unknown> {
+  return {
+    viewing: { kind: "root", workflow: "fifty.json", workflow_uuid: "workflow-50" },
+    node_count: FIFTY_NODE_WORKFLOW.length,
+    errored_count: 0,
+    nodes: [],
+    unchecked_nodes: FIFTY_NODE_WORKFLOW.map((n) => ({
+      id: n.id,
+      type: n.type,
+      reason: BUDGET_REASON,
+    })),
+    unchecked_budget_exhausted: true,
+    last_execution_error: null,
+    node_errors: null,
+    note: CLEAN_NOTE,
+  };
+}
+
 async function runGetErrors(
   replies: (cmd: Record<string, unknown>) => Record<string, unknown>,
-  opts: { rebindAfterPrimary?: string } = {},
-): Promise<{ payload: Record<string, unknown>; cmds: string[]; keys: string[] }> {
+  opts: {
+    rebindAfterPrimary?: string;
+    onDispatched?: (
+      cmd: Record<string, unknown>,
+      reply: Record<string, unknown>,
+    ) => Record<string, unknown> | Promise<Record<string, unknown>>;
+  } = {},
+): Promise<{
+  payload: Record<string, unknown>;
+  cmds: string[];
+  calls: Record<string, unknown>[];
+  keys: string[];
+}> {
   const def = buildPanelToolDefs().find((d) => d.name === "panel_get_errors");
   if (!def) throw new Error("panel_get_errors is not registered");
   const cmds: string[] = [];
+  const calls: Record<string, unknown>[] = [];
   let primaryViewing: unknown;
+  let graphLane = Promise.resolve();
+  const dispatch = async (cmd: Record<string, unknown>) => {
+    cmds.push(String(cmd.cmd));
+    calls.push(cmd);
+    let reply = replies(cmd);
+    if (opts.onDispatched) reply = await opts.onDispatched(cmd, reply);
+    if (cmd.cmd === "graph_get_errors" && reply.viewing != null) primaryViewing = reply.viewing;
+    // Current graph_query replies always carry viewing. Keep older fixture
+    // bodies compact while supplying the same root identity to the real
+    // completion path; mismatch tests provide an explicit different one.
+    const withViewing =
+      cmd.cmd === "graph_query" && !Object.hasOwn(reply, "viewing")
+        ? { viewing: primaryViewing ?? { kind: "root", workflow_uuid: "workflow-a" }, ...reply }
+        : reply;
+    if (cmd.cmd === "graph_get_errors" && opts.rebindAfterPrimary) {
+      ctx.tabId = opts.rebindAfterPrimary;
+    }
+    return { content: [{ type: "text" as const, text: JSON.stringify(withViewing, null, 2) }] };
+  };
   const ctx = {
-      call: async (cmd: Record<string, unknown>) => {
-        cmds.push(String(cmd.cmd));
-        const reply = replies(cmd);
-        if (cmd.cmd === "graph_get_errors" && reply.viewing != null) primaryViewing = reply.viewing;
-        // Current graph_query replies always carry viewing. Keep older fixture
-        // bodies compact while supplying the same root identity to the real
-        // completion path; mismatch tests provide an explicit different one.
-        const withViewing =
-          cmd.cmd === "graph_query" && !Object.hasOwn(reply, "viewing")
-            ? { viewing: primaryViewing ?? { kind: "root", workflow_uuid: "workflow-a" }, ...reply }
-            : reply;
-        if (cmd.cmd === "graph_get_errors" && opts.rebindAfterPrimary) {
-          ctx.tabId = opts.rebindAfterPrimary;
-        }
-        return { content: [{ type: "text" as const, text: JSON.stringify(withViewing, null, 2) }] };
-      },
-      tabId: "test-tab",
-    } as unknown as PanelToolCtx;
+    call: (cmd: Record<string, unknown>) => {
+      const next = graphLane.then(() => dispatch(cmd), () => dispatch(cmd));
+      graphLane = next.then(() => undefined, () => undefined);
+      return next;
+    },
+    tabId: "test-tab",
+  } as unknown as PanelToolCtx;
   const res = (await def.handler({}, ctx)) as ToolResult;
   const text = res.content.find((c) => c.type === "text")?.text;
   if (typeof text !== "string") throw new Error("panel_get_errors returned no text");
   const payload = JSON.parse(text) as Record<string, unknown>;
-  return { payload, cmds, keys: Object.keys(payload) };
+  return { payload, cmds, calls, keys: Object.keys(payload) };
 }
 
 describe("panel_get_errors leftover call-budget audit (#1973)", () => {
@@ -165,6 +210,117 @@ describe("panel_get_errors leftover call-budget audit (#1973)", () => {
     }
     expect(payload.errored_count).toBe(0);
     expect(payload.unavailable_widget_values).toBeUndefined();
+  });
+
+  it("pages a 50-node detail audit so graph_query's character cap cannot strand leftovers (#2199)", async () => {
+    const panel = fiftyNodeBudgetReply();
+    const pages: number[][] = [];
+    const { payload, calls } = await runGetErrors((cmd) => {
+      if (cmd.cmd === "graph_get_errors") return panel;
+      if (cmd.cmd === "graph_query") {
+        const ids = (cmd.ids as unknown[]).map(Number);
+        pages.push(ids);
+        const rows = FIFTY_NODE_WORKFLOW.filter((n) => ids.includes(n.id));
+        // Model graph_query's max_chars truncation if the completion regresses
+        // to one oversized detail request. The fixed-size pages below fit.
+        if (ids.length > 10) {
+          const shown = rows.slice(0, 10);
+          return {
+            matched: rows.length,
+            shown: shown.length,
+            truncated: true,
+            truncated_by: "max_chars",
+            text: detailText(shown),
+          };
+        }
+        return {
+          matched: rows.length,
+          shown: rows.length,
+          truncated: false,
+          truncated_by: null,
+          text: detailText(rows),
+        };
+      }
+      if (cmd.cmd === "graph_get_object_info") {
+        return { ok: true, object_info: objectInfoFor(FIFTY_NODE_WORKFLOW) };
+      }
+      return { ok: false };
+    });
+
+    expect(calls.map((call) => call.cmd)).toEqual([
+      "graph_get_errors",
+      "graph_get_object_info",
+      "graph_query",
+      "graph_query",
+      "graph_query",
+      "graph_query",
+      "graph_query",
+    ]);
+    expect(pages).toEqual([
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+      [11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+      [21, 22, 23, 24, 25, 26, 27, 28, 29, 30],
+      [31, 32, 33, 34, 35, 36, 37, 38, 39, 40],
+      [41, 42, 43, 44, 45, 46, 47, 48, 49, 50],
+    ]);
+    expect(payload.audit_complete).toBe(true);
+    expect(payload.node_count).toBe(50);
+    expect(payload.checked_count).toBe(50);
+    expect(payload.unchecked_count).toBe(0);
+    expect(payload.unchecked_nodes).toBeUndefined();
+    expect(payload.errored_count).toBe(0);
+    expect(payload.unavailable_widget_values).toBeUndefined();
+    expect(payload.note).toBe(CLEAN_NOTE);
+  });
+
+  it("stops serialized completion at the aggregate deadline instead of queueing later pages (#2199)", async () => {
+    const panel = fiftyNodeBudgetReply();
+    let now = 1_000_000;
+    const start = now;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      const { payload, calls } = await runGetErrors(
+        (cmd) => {
+          if (cmd.cmd === "graph_get_errors") return panel;
+          if (cmd.cmd === "graph_query") {
+            const ids = (cmd.ids as unknown[]).map(Number);
+            return {
+              matched: ids.length,
+              shown: ids.length,
+              truncated: false,
+              truncated_by: null,
+              text: detailText(FIFTY_NODE_WORKFLOW.filter((n) => ids.includes(n.id))),
+            };
+          }
+          if (cmd.cmd === "graph_get_object_info") {
+            return { ok: true, object_info: objectInfoFor(FIFTY_NODE_WORKFLOW) };
+          }
+          return { ok: false };
+        },
+        {
+          onDispatched: (cmd, reply) => {
+            if (cmd.cmd !== "graph_get_errors") now += 4_000;
+            return reply;
+          },
+        },
+      );
+
+      expect(calls.map((call) => call.cmd)).toEqual([
+        "graph_get_errors",
+        "graph_get_object_info",
+        "graph_query",
+      ]);
+      expect((calls[2].ids as unknown[]).map(Number)).toEqual([
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+      ]);
+      expect(now).toBe(start + 8_000);
+      expect(payload.audit_complete).toBe(false);
+      expect(payload.node_count).toBe(50);
+      expect(payload.checked_count).toBe(10);
+      expect(payload.unchecked_count).toBe(40);
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 
   it("keeps the completion pass on the live route after a primary reconnect rebind", async () => {
@@ -625,6 +781,14 @@ describe("get_errors completion follow-ups run on the elective budget (#1973/#58
           const body =
             cmd.cmd === "graph_get_errors"
               ? budgetExhaustedReply({ extraUnchecked: 0 })
+              : cmd.cmd === "graph_query"
+                ? {
+                    matched: EXECUTION_NODES.length,
+                    shown: EXECUTION_NODES.length,
+                    text: detailText(EXECUTION_NODES),
+                  }
+                : cmd.cmd === "graph_get_object_info"
+                  ? { ok: true, object_info: objectInfoFor(EXECUTION_NODES) }
               : { ok: false };
           return { content: [{ type: "text" as const, text: JSON.stringify(body) }] };
         },
@@ -651,9 +815,12 @@ describe("get_errors completion follow-ups run on the elective budget (#1973/#58
     ).toBeLessThan(primary!);
     expect(objectInfo!).toBeLessThan(primary!);
 
-    // Worst case is the primary budget plus ONE follow-up budget: the two
-    // follow-ups are issued concurrently, so they overlap rather than sum.
-    expect(primary! + Math.max(query!, objectInfo!)).toBeLessThanOrEqual(40_000);
+    // The follow-up wave has one aggregate 8 s budget. Each individual dispatch
+    // is capped by the remaining time, so serialized pages cannot sum their
+    // per-call timeout into a longer handler wait.
+    expect(query!).toBeLessThanOrEqual(8_000);
+    expect(objectInfo!).toBeLessThanOrEqual(8_000);
+    expect(primary! + Math.max(query!, objectInfo!)).toBeLessThanOrEqual(38_000);
   });
 });
 
