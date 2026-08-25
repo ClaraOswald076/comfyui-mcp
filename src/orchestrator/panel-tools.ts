@@ -383,6 +383,7 @@ import {
 import { convertUiToApi, collectNodeTypes } from "../services/workflow-converter.js";
 import type { ObjectInfo } from "../comfyui/types.js";
 import {
+  captureComfyUITargetFence,
   restartComfyUI,
   preflightLocalRestart,
   readServingArgv,
@@ -395,6 +396,9 @@ import {
   RESTART_DISPATCH_CAUSATION_WINDOW_MS,
   PROCESS_WIDE_RESTART_DISPATCH_TOKEN,
   __processControlTestHooks,
+  targetFenceMatchesCurrent,
+  targetFencesEqual,
+  type ComfyUITargetFence,
 } from "../services/process-control.js";
 import { resetManagerApiCache } from "../services/manager-api-cache.js";
 import {
@@ -15056,6 +15060,55 @@ export function buildPanelToolDefs(): PanelToolDef[] {
   // the same shape), so handlers read fields off a loosely-typed bag.
   type A = Record<string, unknown>;
 
+  interface PanelKitchenTarget {
+    fence: ComfyUITargetFence;
+    tabId: string;
+  }
+
+  const capturePanelKitchenTarget = (ctx: PanelToolCtx): PanelKitchenTarget | undefined => {
+    const base = getComfyUIBaseUrl().replace(/\/+$/, "");
+    const observed = ctx.bridge.tabServerOrigin?.(ctx.tabId);
+    // A hello.comfyui_url/tabOrigin value is page-JS-writable and cannot authorize
+    // a process mutation. The server-observed handshake proves only the origin,
+    // not a path mount; refuse mounted targets rather than guessing which instance
+    // this tab fronts. This is the same fail-closed rule used by panel_reboot.
+    if (
+      ctx.bridge.tabIsLocal?.(ctx.tabId) !== true ||
+      !observed ||
+      !sameHttpOrigin(observed, base) ||
+      (() => {
+        try {
+          return new URL(base).pathname.replace(/\/+$/, "") !== "";
+        } catch {
+          return true;
+        }
+      })()
+    ) {
+      return undefined;
+    }
+    return { fence: captureComfyUITargetFence(), tabId: ctx.tabId };
+  };
+
+  const panelKitchenTargetStillCurrent = (
+    ctx: PanelToolCtx,
+    target: PanelKitchenTarget,
+  ): boolean => {
+    if (ctx.tabId !== target.tabId || !targetFenceMatchesCurrent(target.fence)) return false;
+    const observed = ctx.bridge.tabServerOrigin?.(target.tabId);
+    return (
+      ctx.bridge.tabIsLocal?.(target.tabId) === true &&
+      observed != null &&
+      sameHttpOrigin(observed, target.fence.baseUrl) &&
+      (() => {
+        try {
+          return new URL(target.fence.baseUrl).pathname.replace(/\/+$/, "") === "";
+        } catch {
+          return false;
+        }
+      })()
+    );
+  };
+
   const defs: PanelToolDef[] = [
     def(
       "panel_query_graph",
@@ -15141,6 +15194,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         );
       },
     ),
+    // panel_kitchen mixes panel-routed graph evidence with process-global
+    // ComfyUI probes. Bind both halves to the same tab target before allowing
+    // an assessment or mutation; a concurrent hello from another tab must
+    // produce a refusal, never a cross-instance apply.
     def(
       "panel_graph_outline",
       "READ THE LIVE CANVAS the user is looking at, as text. 'Show me what's on the canvas' / 'what's on the graph right now' / 'read the current workflow' / 'describe the open graph' -> THIS TOOL, with no arguments. NOT visualize_workflow (it DRAWS A DIAGRAM of a workflow you PASS IN — a saved file or JSON — and never sees the live canvas). NOT panel_query_graph (that FILTERS a SUBSET, for when you already know what you're looking for). Returns one `outline` string covering the WHOLE open graph, topologically sorted (sources first, sinks last): each node as `id Type \"title\" [bypass/mute] [OUTPUT] · group:X  widget=value …` with `← inputs` (source_node.output_name) and `→ outputs` (target_node.input_name), after a GROUPS index (title → member node ids). It gives you the WIRING you would otherwise reconstruct by hand — read it FIRST to get oriented, then panel_query_graph to inspect one node ({ids:[42], fields:'detail'}) or panel_find_nodes for free-text search. Over `max_chars` it never cuts the graph short: it sheds per-node detail, or refuses with a reason — never a partial outline. Read-only.",
@@ -21866,10 +21923,21 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           .describe("If true, apply the widget/flag plan without queueing a proof panel_run."),
       },
       async (args: A, ctx) => {
+        const target = capturePanelKitchenTarget(ctx);
+        if (!target) {
+          return fail(
+            "panel_kitchen refused: the process target could not be tied to this panel tab's exact ComfyUI target and generation. Keep one target selected, then retry.",
+          );
+        }
         const status = await gatherKitchenStatus();
+        if (!panelKitchenTargetStillCurrent(ctx, target)) {
+          return fail(
+            "panel_kitchen refused: the ComfyUI target changed while status was being assessed. No recommendation was applied; retry after the target settles.",
+          );
+        }
         if (args.action === "status") {
           const hint = kitchenProactiveHint(status, assessKitchen(status, {}));
-          return ok(hint ? { status, hint } : { status });
+          return ok(hint ? { status, hint, target_fence: target.fence } : { status, target_fence: target.fence });
         }
         const query = await ctx.call({
           cmd: "graph_query",
@@ -21879,6 +21947,11 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           max_chars: 60000,
         });
         if (query.isError) return query;
+        if (!panelKitchenTargetStillCurrent(ctx, target)) {
+          return fail(
+            "panel_kitchen refused: the ComfyUI target changed while the live graph was being read. No recommendation was applied; retry after the target settles.",
+          );
+        }
         const graph = normalizeGraphQueryResult(query);
         if (graph.truncated === true) {
           const truncationCause =
@@ -21894,12 +21967,18 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           );
         }
         const recs = await assessKitchenGraph(status, graph);
+        if (!panelKitchenTargetStillCurrent(ctx, target)) {
+          return fail(
+            "panel_kitchen refused: the ComfyUI target changed during assessment. No recommendation was applied; retry after the target settles.",
+          );
+        }
         if (args.action === "assess") {
           const hint = kitchenProactiveHint(status, recs);
           return ok({
             status,
             loaders: extractLoaders(graph),
             recommendations: recs,
+            target_fence: target.fence,
             ...(hint ? { hint } : {}),
           });
         }
@@ -21921,9 +22000,20 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
           applyFlag:
             rec.change.type === "flag"
               ? async (flag): Promise<KitchenFlagApplyOutcome> => {
+                  if (!panelKitchenTargetStillCurrent(ctx, target)) {
+                    return {
+                      applied: false,
+                      note:
+                        `Refusing to apply ${flag}: the ComfyUI target changed after assessment. ` +
+                        "No launch argument was changed and no restart was attempted.",
+                    };
+                  }
                   let restart: Awaited<ReturnType<typeof restartComfyUI>>;
                   try {
-                    restart = await restartComfyUI({ additionalFlags: [flag] });
+                    restart = await restartComfyUI({
+                      additionalFlags: [flag],
+                      targetFence: target.fence,
+                    });
                   } catch (err) {
                     return {
                       applied: false,
@@ -21933,18 +22023,23 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
                     };
                   }
                   const flagObserved = restart.serving_argv?.includes(flag) === true;
+                  const targetProven =
+                    restart.target_stable !== false &&
+                    targetFencesEqual(restart.target_fence, target.fence) &&
+                    panelKitchenTargetStillCurrent(ctx, target);
                   const applied =
                     restart.started === true &&
                     restart.startup === "confirmed" &&
                     restart.listener_ownership === "ours" &&
-                    flagObserved;
+                    flagObserved &&
+                    targetProven;
                   return {
                     applied,
                     note: applied
                       ? `Applied ${flag} through the proven local relaunch and observed it in the serving ComfyUI argv. The augmented launch recipe is retained for later managed starts.`
                       :
                         `Did not confirm ${flag} in effect: ${restart.message} ` +
-                        "panel_kitchen reports applied:false because the relaunch and the new serving argv were not both proven.",
+                        "panel_kitchen reports applied:false because the relaunch, target fence, and new serving argv were not all proven.",
                     restart,
                   };
                 }
@@ -21972,10 +22067,21 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
                 }
               : undefined,
         });
-        if (result.applied && args.skip_proof !== true && rec.change.type !== "flag") {
-          const run = await ctx.call({ cmd: "graph_run" });
+        if (!panelKitchenTargetStillCurrent(ctx, target)) {
           return ok({
             ...result,
+            applied: false,
+            target_fence: target.fence,
+            flag_note:
+              (result.flag_note ? `${result.flag_note} ` : "") +
+              "panel_kitchen reports applied:false because the ComfyUI target changed before the result was returned.",
+          });
+        }
+        const fencedResult = { ...result, target_fence: target.fence };
+        if (fencedResult.applied && args.skip_proof !== true && rec.change.type !== "flag") {
+          const run = await ctx.call({ cmd: "graph_run" });
+          return ok({
+            ...fencedResult,
             proof: {
               ...result.proof,
               status: "queued",
@@ -21986,7 +22092,7 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
             run: parseToolResultJson(run),
           });
         }
-        return ok(result);
+        return ok(fencedResult);
       },
     ),
     def(

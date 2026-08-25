@@ -9,6 +9,11 @@ const mockConfig = vi.hoisted(() => ({
   comfyuiRestartCommand: undefined as string | undefined,
 }));
 
+const mockTarget = vi.hoisted(() => ({
+  baseUrl: "http://127.0.0.1:8188",
+  generation: 0,
+}));
+
 // #742: the two classifications the preflight now distinguishes. `remote` is
 // how the target is ADDRESSED; `onThisMachine` is where the instance actually
 // runs. They disagree for a local install reached by its own LAN address, and
@@ -22,10 +27,10 @@ const mockResetClient = vi.hoisted(() => vi.fn());
 
 vi.mock("../../config.js", () => ({
   config: mockConfig,
-  getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
+  getComfyUIBaseUrl: () => mockTarget.baseUrl,
   getComfyUIAuthHeaders: () => ({}),
   // #848 instance fence — a stable target here; the retarget case has its own test.
-  getComfyuiTargetGeneration: () => 0,
+  getComfyuiTargetGeneration: () => mockTarget.generation,
   isRemoteMode: () => mockLocality.remote,
   targetIsOnThisMachine: () => mockLocality.onThisMachine,
 }));
@@ -166,8 +171,8 @@ function mockNoPortProcess(): void {
   });
 }
 
-function mockFetchOk(ok: boolean): Mock {
-  const fetchMock = vi.fn(async () => ({ ok }) as Response);
+function mockFetchOk(ok: boolean, body?: unknown): Mock {
+  const fetchMock = vi.fn(async () => ({ ok, json: async () => body }) as Response);
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
 }
@@ -197,6 +202,8 @@ beforeEach(() => {
   mockConfig.resolvedPort = 8188;
   mockConfig.comfyuiPath = "/fake/ComfyUI";
   mockConfig.comfyuiRestartCommand = undefined;
+  mockTarget.baseUrl = "http://127.0.0.1:8188";
+  mockTarget.generation = 0;
   mockFindComfyuiPython.mockReturnValue("/fake/ComfyUI/python_embeded/python.exe");
   mockExistsSync.mockImplementation(() => true);
   mockStatSync.mockImplementation(() => ({ isDirectory: () => true }));
@@ -785,7 +792,7 @@ describe("process-control restart relaunch preflight (#368/#370)", () => {
       system: { argv: statsCalls++ < 2 ? currentArgv : augmentedArgv },
     }));
     mockSpawnedChildren();
-    mockFetchOk(true);
+    mockFetchOk(true, { system: { argv: augmentedArgv } });
 
     const restarted = await restartComfyUI({ additionalFlags: [flag] });
 
@@ -804,6 +811,45 @@ describe("process-control restart relaunch preflight (#368/#370)", () => {
     expect(laterStart.started).toBe(true);
     expect(mockSpawn).toHaveBeenCalledTimes(2);
     expect(mockSpawn.mock.calls[1][1]).toEqual(expect.arrayContaining([flag]));
+  });
+
+  it("refuses before killing when the target switches while process evidence is gathered (#2277)", async () => {
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (cmd.includes("netstat"))
+        return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      if (cmd.includes("lsof")) return "p4321\nn127.0.0.1:8188\n";
+      return "";
+    });
+    mockGetSystemStats.mockImplementation(async () => {
+      mockTarget.baseUrl = "http://127.0.0.1:8288";
+      mockTarget.generation = 1;
+      return { system: { argv: ["/fake/ComfyUI/main.py", "--port", "8188"] } };
+    });
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI({ additionalFlags: ["--use-ck-attention"] });
+
+    expect(result.started).toBe(false);
+    expect(result.stopped).toBe(false);
+    expect(result.startup).toBe("not-attempted");
+    expect(result.target_stable).toBe(false);
+    expect(result.message).toMatch(/target changed/i);
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+  });
+
+  it("does not consume an augmented recipe saved for an older target (#2277)", async () => {
+    setLaunchInfo();
+    mockTarget.baseUrl = "http://127.0.0.1:8288";
+    mockTarget.generation = 1;
+
+    const result = await startComfyUI();
+
+    expect(result.started).toBe(false);
+    expect(result.startup).toBe("not-attempted");
+    expect(result.target_stable).toBe(false);
+    expect(result.message).toMatch(/older ComfyUI target/i);
+    expect(mockSpawn).not.toHaveBeenCalled();
   });
 
   it("refuses launch-flag mutation for an opaque external launcher without touching it (#2277)", async () => {
