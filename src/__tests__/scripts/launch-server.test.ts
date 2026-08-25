@@ -11,12 +11,19 @@
 // top-level `await import` of a CRLF shebang is a SyntaxError during
 // transform, which vitest reports as "1 failed / Tests no tests" (#1857).
 
-import { beforeAll, describe, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { PassThrough } from "node:stream";
 
 const LAUNCHER_REL = "plugin/scripts/launch-server.mjs";
 const LAUNCHER_URL = new URL("../../../plugin/scripts/launch-server.mjs", import.meta.url);
+
+type Frame = Record<string, unknown>;
+type Decision = { action: "forward" | "drop" } | { action: "reply"; message: Frame };
 
 type Launcher = {
   globalEntry: (stdout: unknown, opts?: { exists?: (p: string) => boolean }) => string | null;
@@ -25,13 +32,30 @@ type Launcher = {
     extraArgs: string[],
     opts?: { platform?: string; node?: string },
   ) => { command: string; args: string[]; shell: boolean };
+  rescueDeadlineMs: (env?: Record<string, string | undefined>) => number;
+  rescueInitializeResult: (params: unknown) => Frame;
+  installingDecision: (msg: unknown) => Decision;
+  attachColdStartProxy: (opts: {
+    clientIn: NodeJS.ReadableStream;
+    clientOut: NodeJS.WritableStream;
+    childIn: NodeJS.WritableStream;
+    childOut: NodeJS.ReadableStream;
+    deadlineMs: number;
+    onRescue?: () => void;
+  }) => { phase: () => string; forceRescue: () => void };
+  INSTALLING_VERSION: string;
+  RESCUE_MIN_MS: number;
+  RESCUE_MAX_MS: number;
+  DEFAULT_CLIENT_BUDGET_MS: number;
+  RESCUE_BUDGET_FRACTION: number;
 };
 
 let globalEntry!: Launcher["globalEntry"];
 let serverSpec!: Launcher["serverSpec"];
+let launcher!: Launcher;
 
 async function loadLauncher(): Promise<void> {
-  const launcher = (await import("../../../plugin/scripts/launch-server.mjs")) as Launcher;
+  launcher = (await import("../../../plugin/scripts/launch-server.mjs")) as Launcher;
   globalEntry = launcher.globalEntry;
   serverSpec = launcher.serverSpec;
 }
@@ -153,11 +177,430 @@ describe("plugin/.mcp.json (#1447)", () => {
     expect(src).toMatch(/if \(isMain\) \{/);
   });
 
-  it("the wrapper never writes to stdout — stdio is the MCP transport", () => {
+  it("the wrapper never PRINTS to stdout — stdio is the MCP transport", () => {
     const src = readFileSync(LAUNCHER_URL, "utf8");
+    // console.log would put a non-JSON line into the transport and desynchronise
+    // the client. The cold path DOES write to stdout now, but only complete
+    // JSON-RPC frames — which is asserted behaviourally below, by parsing every
+    // line the launcher emits, rather than by grepping for a write call.
     expect(src).not.toMatch(/console\.log\(/);
-    expect(src).not.toMatch(/process\.stdout\.write\(/);
-    // stdio must be inherited verbatim, or the handshake frames never reach the client.
+    // The warm path still hands the real server the client's stdio untouched.
     expect(src).toMatch(/stdio: "inherit"/);
   });
+});
+
+// ---------------------------------------------------------------------------
+// #1447 reopened as a first-run BLOCKER — the npx fallback is what an actual
+// first-run user gets (no global install), and on a cold npm cache the install
+// runs INSIDE the client's handshake budget. Measured 2026-08-25 on Windows
+// against an empty npm cache and an empty global prefix: 21.6 s to the
+// `initialize` response (15.2 s of it npm, 818 MB / 170 packages), and
+// `claude mcp list` reporting `✘ Failed to connect — … timed out after 10000ms`
+// where the identical launcher with a warm cache reported `✔ Connected`.
+//
+// The fix makes the wrapper answer the handshake when the server cannot, so a
+// cold cache costs latency instead of a dead connection.
+// ---------------------------------------------------------------------------
+
+function collectLines(stream: NodeJS.ReadableStream): string[] {
+  const lines: string[] = [];
+  let buf = "";
+  stream.on("data", (chunk: Buffer | string) => {
+    buf += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    let nl = buf.indexOf("\n");
+    while (nl !== -1) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (line) lines.push(line);
+      nl = buf.indexOf("\n");
+    }
+  });
+  return lines;
+}
+
+/** Every frame the launcher emits must be complete JSON — the transport has no other framing. */
+function parseAll(lines: string[]): Frame[] {
+  return lines.map((line) => {
+    try {
+      return JSON.parse(line) as Frame;
+    } catch {
+      throw new Error(`launcher wrote a non-JSON line to stdout: ${line}`);
+    }
+  });
+}
+
+async function waitFor<T>(probe: () => T | undefined, budgetMs = 8000): Promise<T> {
+  const started = Date.now();
+  for (;;) {
+    const value = probe();
+    if (value !== undefined) return value;
+    if (Date.now() - started > budgetMs) throw new Error("timed out waiting for a frame");
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+describe("rescue deadline tracks the CLIENT's budget (#1447)", () => {
+  beforeAll(loadLauncher);
+
+  it("uses a fraction of MCP_TIMEOUT, which the client really does hand us", () => {
+    // Verified by measurement, not by reading: a server launched by
+    // `MCP_TIMEOUT=17000 claude -p …` observed process.env.MCP_TIMEOUT === "17000".
+    const { rescueDeadlineMs, RESCUE_BUDGET_FRACTION, DEFAULT_CLIENT_BUDGET_MS, RESCUE_MIN_MS, RESCUE_MAX_MS } =
+      launcher;
+    expect(rescueDeadlineMs({ MCP_TIMEOUT: "20000" })).toBe(20000 * RESCUE_BUDGET_FRACTION);
+    // …and it must leave the client real margin, never spend the whole budget.
+    expect(rescueDeadlineMs({ MCP_TIMEOUT: "20000" })).toBeLessThan(20000);
+    expect(rescueDeadlineMs({ MCP_TIMEOUT: "10000" })).toBe(4000);
+    // A tightened budget rescues SOONER — the direction that matters.
+    expect(rescueDeadlineMs({ MCP_TIMEOUT: "5000" })).toBeLessThan(rescueDeadlineMs({ MCP_TIMEOUT: "20000" }));
+    // No budget stated → the documented default.
+    expect(rescueDeadlineMs({})).toBe(DEFAULT_CLIENT_BUDGET_MS * RESCUE_BUDGET_FRACTION);
+    // Junk is not a budget.
+    for (const bad of ["", "soon", "-1", "0", "NaN", undefined]) {
+      expect(rescueDeadlineMs({ MCP_TIMEOUT: bad })).toBe(DEFAULT_CLIENT_BUDGET_MS * RESCUE_BUDGET_FRACTION);
+    }
+    expect(rescueDeadlineMs({ MCP_TIMEOUT: "100" })).toBe(RESCUE_MIN_MS);
+    expect(rescueDeadlineMs({ MCP_TIMEOUT: "600000" })).toBe(RESCUE_MAX_MS);
+  });
+
+  it("the stand-in handshake is honest about being a stand-in", () => {
+    const result = launcher.rescueInitializeResult({ protocolVersion: "2025-03-26" }) as {
+      protocolVersion: string;
+      capabilities: { tools: { listChanged: boolean } };
+      serverInfo: { name: string; version: string };
+      instructions: string;
+    };
+    // Echoing the client's protocol version is what keeps it from failing the
+    // handshake over a version it did not ask for.
+    expect(result.protocolVersion).toBe("2025-03-26");
+    // listChanged is load-bearing: it is how the REAL tools arrive at handover.
+    expect(result.capabilities.tools.listChanged).toBe(true);
+    // #1503: never a plausible-looking version. A stand-in must be identifiable.
+    expect(result.serverInfo.version).toBe(launcher.INSTALLING_VERSION);
+    expect(result.serverInfo.version).toMatch(/installing/);
+    // The reopened report's actual damage was the model improvising while the
+    // server was absent; the instructions have to head that off.
+    expect(result.instructions).toMatch(/still installing/i);
+    expect(result.instructions).toMatch(/notifications\/tools\/list_changed/);
+  });
+
+  it("routes each message that arrives mid-install", () => {
+    const { installingDecision } = launcher;
+    // The server's SDK serves nothing until it sees this, and the pipe preserves order.
+    expect(installingDecision({ jsonrpc: "2.0", method: "notifications/initialized" })).toEqual({
+      action: "forward",
+    });
+    // Answered HERE, never forwarded — forwarding would park the client on the
+    // install, which is the timeout this fix removes, moved one method along.
+    expect(installingDecision({ jsonrpc: "2.0", id: 3, method: "tools/list" })).toEqual({
+      action: "reply",
+      message: { jsonrpc: "2.0", id: 3, result: { tools: [] } },
+    });
+    expect(installingDecision({ jsonrpc: "2.0", id: 4, method: "ping" })).toEqual({
+      action: "reply",
+      message: { jsonrpc: "2.0", id: 4, result: {} },
+    });
+    expect(installingDecision({ jsonrpc: "2.0", id: 5, method: "prompts/list" })).toEqual({
+      action: "reply",
+      message: { jsonrpc: "2.0", id: 5, result: { prompts: [] } },
+    });
+    expect(installingDecision({ jsonrpc: "2.0", id: 6, method: "resources/list" })).toEqual({
+      action: "reply",
+      message: { jsonrpc: "2.0", id: 6, result: { resources: [] } },
+    });
+    // An unknown REQUEST is answered — an unanswered one is exactly the hang.
+    const unknown = installingDecision({ jsonrpc: "2.0", id: 7, method: "completion/complete" });
+    expect(unknown.action).toBe("reply");
+    expect((unknown as { message: { error: { message: string } } }).message.error.message).toMatch(
+      /still installing/i,
+    );
+    // A notification can only refer to something answered here; dropping it is right.
+    expect(installingDecision({ jsonrpc: "2.0", method: "notifications/cancelled" })).toEqual({
+      action: "drop",
+    });
+    // A frame with an id and no method is a RESPONSE and belongs to whoever asked.
+    expect(installingDecision({ jsonrpc: "2.0", id: 8, result: {} })).toEqual({ action: "forward" });
+  });
+});
+
+describe("cold-start proxy state machine (#1447)", () => {
+  beforeAll(loadLauncher);
+
+  function rig(deadlineMs: number) {
+    const clientIn = new PassThrough();
+    const clientOut = new PassThrough();
+    const childIn = new PassThrough();
+    const childOut = new PassThrough();
+    const toClient = collectLines(clientOut);
+    const toChild = collectLines(childIn);
+    const proxy = launcher.attachColdStartProxy({ clientIn, clientOut, childIn, childOut, deadlineMs });
+    return {
+      proxy,
+      toClient,
+      toChild,
+      fromClient: (m: Frame) => clientIn.write(`${JSON.stringify(m)}\n`),
+      fromChild: (m: Frame) => childOut.write(`${JSON.stringify(m)}\n`),
+    };
+  }
+
+  const INIT: Frame = {
+    jsonrpc: "2.0",
+    id: 7,
+    method: "initialize",
+    params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "t", version: "1" } },
+  };
+
+  it("a server that answers in time keeps its OWN handshake — no stand-in, nothing rewritten", async () => {
+    const r = rig(400);
+    r.fromClient(INIT);
+    await waitFor(() => (r.toChild.length ? true : undefined));
+    r.fromChild({
+      jsonrpc: "2.0",
+      id: 7,
+      result: {
+        protocolVersion: "2025-03-26",
+        capabilities: { tools: { listChanged: true } },
+        serverInfo: { name: "comfyui-mcp", version: "0.52.117" },
+        instructions: "the real instructions",
+      },
+    });
+    const answer = (await waitFor(() => parseAll(r.toClient)[0])) as {
+      result: { serverInfo: { version: string }; instructions: string };
+    };
+    expect(answer.result.serverInfo.version).toBe("0.52.117");
+    expect(answer.result.instructions).toBe("the real instructions");
+    expect(r.proxy.phase()).toBe("transparent");
+    // …and the armed deadline must not fire behind it and send a second answer.
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    expect(r.toClient).toHaveLength(1);
+  });
+
+  it("a server that is still installing gets its handshake answered, then hands over", async () => {
+    const r = rig(40);
+    r.fromClient(INIT);
+
+    // The initialize request still reaches the server: the wrapper is a proxy,
+    // not a replacement, and the server has to complete its own handshake.
+    await waitFor(() => (r.toChild.length >= 1 ? true : undefined));
+    expect((parseAll(r.toChild)[0] as { method: string }).method).toBe("initialize");
+
+    const stand = (await waitFor(() => parseAll(r.toClient)[0])) as {
+      id: number;
+      result: { serverInfo: { version: string }; protocolVersion: string };
+    };
+    expect(stand.id).toBe(7);
+    expect(stand.result.serverInfo.version).toBe(launcher.INSTALLING_VERSION);
+    expect(stand.result.protocolVersion).toBe("2025-03-26");
+    expect(r.proxy.phase()).toBe("installing");
+
+    r.fromClient({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await waitFor(() => (r.toChild.length >= 2 ? true : undefined));
+    expect((parseAll(r.toChild)[1] as { method: string }).method).toBe("notifications/initialized");
+
+    r.fromClient({ jsonrpc: "2.0", id: 8, method: "tools/list" });
+    const empty = (await waitFor(() => parseAll(r.toClient)[1])) as { result: { tools: unknown[] } };
+    expect(empty.result.tools).toEqual([]);
+    // …and it was NOT also forwarded, which would leave a duplicate response
+    // for id 8 arriving from the server a minute later.
+    expect(r.toChild).toHaveLength(2);
+
+    // The server finally answers the initialize we forwarded. The client already
+    // has a result for id 7, so a second one would be a protocol violation.
+    r.fromChild({
+      jsonrpc: "2.0",
+      id: 7,
+      result: {
+        protocolVersion: "2025-03-26",
+        capabilities: { tools: { listChanged: true } },
+        serverInfo: { name: "comfyui-mcp", version: "0.52.117" },
+      },
+    });
+    const notice = (await waitFor(() => parseAll(r.toClient)[2])) as Frame;
+    expect(notice).toEqual({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
+    expect(parseAll(r.toClient).filter((f) => f.id === 7)).toHaveLength(1);
+    expect(r.proxy.phase()).toBe("live");
+
+    // From here it is a wire again, in both directions.
+    r.fromClient({ jsonrpc: "2.0", id: 9, method: "tools/list" });
+    await waitFor(() => (r.toChild.length >= 3 ? true : undefined));
+    r.fromChild({ jsonrpc: "2.0", id: 9, result: { tools: [{ name: "generate_image" }] } });
+    const real = (await waitFor(() => parseAll(r.toClient)[3])) as {
+      result: { tools: { name: string }[] };
+    };
+    expect(real.result.tools[0].name).toBe("generate_image");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reachability. Everything above proves the mechanism works; none of it proves
+// PRODUCTION REACHES IT. `main()` is the only caller, it lives behind the
+// isMain guard, and a green mechanism nobody calls is this project's most
+// repeated failure. So this block runs the SHIPPED launcher as a subprocess,
+// exactly as .mcp.json does (`node launch-server.mjs --full`), with `npm` and
+// `npx` stubbed on PATH: `npm root -g` answers a prefix with no comfyui-mcp in
+// it, so the launcher takes the npx fallback, and `npx` is a stand-in server
+// that cannot answer for FAKE_DELAY_MS — which is what a cold install looks
+// like from the wrapper's side.
+//
+// Delete `runProxied` from the isMain block and the first test here fails.
+// ---------------------------------------------------------------------------
+const FAKE_SERVER_SOURCE = [
+  'import { appendFileSync } from "node:fs";',
+  'const delay = Number(process.env.FAKE_DELAY_MS || 0);',
+  'const log = process.env.FAKE_LOG;',
+  'const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n");',
+  'const queued = [];',
+  'let open = delay === 0;',
+  'let buf = "";',
+  'process.stdin.on("data", (c) => {',
+  '  buf += c.toString("utf8");',
+  '  let nl;',
+  '  while ((nl = buf.indexOf("\\n")) !== -1) {',
+  '    const line = buf.slice(0, nl); buf = buf.slice(nl + 1);',
+  '    let m; try { m = JSON.parse(line); } catch { continue; }',
+  '    if (log) appendFileSync(log, (m.method ?? "response") + "\\n");',
+  '    if (open) handle(m); else queued.push(m);',
+  '  }',
+  '});',
+  'function handle(m) {',
+  '  if (m.method === "initialize") {',
+  '    send({ jsonrpc: "2.0", id: m.id, result: {',
+  '      protocolVersion: (m.params && m.params.protocolVersion) || "2025-06-18",',
+  '      capabilities: { tools: { listChanged: true } },',
+  '      serverInfo: { name: "fake-comfyui-mcp", version: "9.9.9" },',
+  '      instructions: "REAL_SERVER_INSTRUCTIONS",',
+  '    }});',
+  '  } else if (m.method === "tools/list") {',
+  '    send({ jsonrpc: "2.0", id: m.id, result: { tools: [',
+  '      { name: "fake_generate", description: "d", inputSchema: { type: "object", properties: {} } },',
+  '    ]}});',
+  '  } else if (m.id !== undefined && m.id !== null) {',
+  '    send({ jsonrpc: "2.0", id: m.id, error: { code: -32601, message: "unhandled" } });',
+  '  }',
+  '}',
+  'if (!open) setTimeout(() => { open = true; for (const m of queued.splice(0)) handle(m); }, delay);',
+].join("\n");
+
+describe("the shipped launcher rescues a real cold start (#1447)", () => {
+  let stubDir = "";
+  const children: ChildProcessWithoutNullStreams[] = [];
+
+  beforeAll(async () => {
+    await loadLauncher();
+    stubDir = mkdtempSync(join(tmpdir(), "launch-1447-"));
+    const emptyGlobal = join(stubDir, "empty-global-root");
+    const fakeServer = join(stubDir, "fake-server.mjs");
+    writeFileSync(fakeServer, FAKE_SERVER_SOURCE, "utf8");
+    // POSIX forms (npm/npx are spawned without a shell there) …
+    writeFileSync(join(stubDir, "npm"), `#!/bin/sh\necho "${emptyGlobal}"\n`, "utf8");
+    writeFileSync(join(stubDir, "npx"), `#!/bin/sh\nexec "${process.execPath}" "${fakeServer}"\n`, "utf8");
+    chmodSync(join(stubDir, "npm"), 0o755);
+    chmodSync(join(stubDir, "npx"), 0o755);
+    // … and the .cmd forms, because the Windows spec goes through cmd.exe.
+    writeFileSync(join(stubDir, "npm.cmd"), `@echo ${emptyGlobal}\r\n`, "utf8");
+    writeFileSync(join(stubDir, "npx.cmd"), `@"${process.execPath}" "${fakeServer}"\r\n`, "utf8");
+  });
+
+  afterAll(() => {
+    for (const child of children) {
+      try {
+        child.kill();
+      } catch {
+        /* already gone */
+      }
+    }
+    if (stubDir) rmSync(stubDir, { recursive: true, force: true });
+  });
+
+  function launch(env: Record<string, string>): {
+    stdout: string[];
+    send: (m: Frame) => void;
+    stderr: () => string;
+  } {
+    const child = spawn(process.execPath, [fileURLToPath(LAUNCHER_URL), "--full"], {
+      env: { ...process.env, ...env, PATH: `${stubDir}${delimiter}${process.env.PATH ?? ""}` },
+      stdio: ["pipe", "pipe", "pipe"],
+    }) as ChildProcessWithoutNullStreams;
+    children.push(child);
+    let err = "";
+    child.stderr.on("data", (c: Buffer) => {
+      err += c.toString("utf8");
+    });
+    return {
+      stdout: collectLines(child.stdout),
+      send: (m: Frame) => child.stdin.write(`${JSON.stringify(m)}\n`),
+      stderr: () => err,
+    };
+  }
+
+  const INIT: Frame = {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } },
+  };
+
+  it(
+    "answers the handshake while the install is still running, then serves the real tools",
+    async () => {
+      const log = join(stubDir, "rescue-log.txt");
+      // MCP_TIMEOUT 3000 → a 1500 ms deadline (the floor); the stand-in server
+      // cannot answer for 4 s. Without the rescue this is the reported failure.
+      const client = launch({ MCP_TIMEOUT: "3000", FAKE_DELAY_MS: "4000", FAKE_LOG: log });
+      client.send(INIT);
+
+      const handshake = (await waitFor(() => parseAll(client.stdout).find((f) => f.id === 1), 12000)) as {
+        result: { serverInfo: { version: string }; capabilities: { tools: { listChanged: boolean } } };
+      };
+      expect(handshake.result.serverInfo.version).toBe(launcher.INSTALLING_VERSION);
+      expect(handshake.result.capabilities.tools.listChanged).toBe(true);
+
+      client.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      client.send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+      const empty = (await waitFor(() => parseAll(client.stdout).find((f) => f.id === 2), 8000)) as {
+        result: { tools: unknown[] };
+      };
+      expect(empty.result.tools).toEqual([]);
+
+      // The server comes up; the client is told to re-list rather than handed a
+      // second answer for id 1.
+      await waitFor(
+        () => parseAll(client.stdout).find((f) => f.method === "notifications/tools/list_changed"),
+        15000,
+      );
+      expect(parseAll(client.stdout).filter((f) => f.id === 1)).toHaveLength(1);
+
+      client.send({ jsonrpc: "2.0", id: 3, method: "tools/list" });
+      const real = (await waitFor(() => parseAll(client.stdout).find((f) => f.id === 3), 8000)) as {
+        result: { tools: { name: string }[] };
+      };
+      expect(real.result.tools.map((t) => t.name)).toEqual(["fake_generate"]);
+
+      // The server really did receive its own handshake — the wrapper proxied
+      // it rather than standing in for the server forever.
+      const received = readFileSync(log, "utf8");
+      expect(received).toMatch(/^initialize$/m);
+      expect(received).toMatch(/^notifications\/initialized$/m);
+      // The rescue is announced on stderr, never on the transport.
+      expect(client.stderr()).toMatch(/answered the MCP handshake on its behalf/);
+    },
+    25000,
+  );
+
+  it(
+    "control: a server that starts promptly keeps its own serverInfo and instructions",
+    async () => {
+      const client = launch({ MCP_TIMEOUT: "30000", FAKE_DELAY_MS: "0" });
+      client.send(INIT);
+      const handshake = (await waitFor(() => parseAll(client.stdout).find((f) => f.id === 1), 12000)) as {
+        result: { serverInfo: { name: string; version: string }; instructions: string };
+      };
+      // If the wrapper hijacked every launch, THIS is what would regress: the
+      // real version (#1503) and the server's own instructions.
+      expect(handshake.result.serverInfo).toEqual({ name: "fake-comfyui-mcp", version: "9.9.9" });
+      expect(handshake.result.instructions).toBe("REAL_SERVER_INSTRUCTIONS");
+      expect(client.stderr()).not.toMatch(/answered the MCP handshake on its behalf/);
+    },
+    25000,
+  );
 });
