@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.125] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- redact all-alphabetic and structured identifier details without over-redacting provider prose (#2313)
+
 ## [0.52.124] - 2026-08-25
 
 ### MCP
