@@ -141,7 +141,8 @@ for sub in checkpoints configs loras vae text_encoders clip diffusion_models \
            controlnet t2i_adapter gligen upscale_models latent_upscale_models \
            hypernetworks photomaker classifiers model_patches audio_encoders \
            background_removal frame_interpolation geometry_estimation \
-           optical_flow detection; do
+           optical_flow detection \
+           sams ultralytics ultralytics/bbox ultralytics/segm; do
   mkdir -p "${MODELS_DIR}/${sub}"
 done
 
@@ -442,6 +443,17 @@ CN_VOL="${WORKSPACE}/custom_nodes"
 CN_LINK="${COMFY_HOME}/custom_nodes"
 CN_SEED="${COMFY_HOME}/custom_nodes_seed"
 export PIP_CACHE_DIR="${WORKSPACE}/.cache/pip"
+# Pack install scripts resolve their OWN download dir from $COMFYUI_MODEL_PATH and
+# fall back to the IMAGE's models dir when it is unset. extra_model_paths.yaml cannot
+# reach them: it adds SEARCH paths, it does not move folder_paths.models_dir. So
+# Impact Subpack's installer drops face_yolov8m.pt into
+# /opt/ComfyUI/models/ultralytics/bbox (it has no folder_paths fallback at all) and
+# Impact Pack's drops sam_vit_b_01ec64.pth into /opt/ComfyUI/models/sams - both on the
+# ephemeral layer, both gone on the next rebuild (#2302). ComfyUI core never reads this
+# variable (models_dir comes from --models-directory or base_path), so setting it
+# redirects ONLY the node packs' own installers, and onto the same dirs
+# extra_model_paths.yaml already maps.
+export COMFYUI_MODEL_PATH="${MODELS_DIR}"
 mkdir -p "${CN_VOL}" "${PIP_CACHE_DIR}"
 
 # (a) Point the image's custom_nodes at the volume. Replace whatever is there — a
@@ -569,10 +581,12 @@ fi
 # -----------------------------------------------------------------------------
 # 5. Launch ComfyUI from the BAKED venv (image), pointed at the volume dirs.
 #    Invoke the venv python by ABSOLUTE PATH (no `activate` needed).
-#    Per-directory flags keep user/input/output on /workspace; models come from
-#    extra_model_paths.yaml (is_default → volume is primary). custom_nodes are
-#    symlinked onto the volume in §4.5 above (so runtime installs persist); we do
-#    NOT use --base-directory (it would relocate the whole tree, incl. the venv).
+#    Per-directory flags keep user/input/output on /workspace. --models-directory
+#    makes ComfyUI's folder_paths.models_dir the persistent volume root, which is
+#    required for Manager's explicit relative save_path values; the extra path map
+#    still puts every category's volume subfolder first. custom_nodes are symlinked
+#    onto the volume in §4.5 above (so runtime installs persist); we do NOT use
+#    --base-directory (it would relocate the whole tree, incl. the venv).
 # -----------------------------------------------------------------------------
 VPY="${COMFY_HOME}/venv/bin/python"
 if [ ! -x "${VPY}" ]; then
@@ -612,6 +626,7 @@ ARGS=(--listen 0.0.0.0 --port "${COMFY_PORT}"
       --enable-manager --enable-cors-header
       "${ATTN_ARGS[@]}"
       --user-directory  "${USER_DIR}"
+      --models-directory "${MODELS_DIR}"
       --input-directory "${INPUT_DIR}"
       --output-directory "${OUTPUT_DIR}")
 # Load the volume model map only if the file exists (it's baked, but be defensive).
