@@ -4718,8 +4718,11 @@ interface RebootResult {
 //     giving up (panel #253/#266, this repo #425). ComfyUI's frontend catchall
 //     answers unknown GETs 200/404 and unregistered POSTs 405, so a wrong route
 //     surfaces as 404/405 and we fall through to the next candidate.
+// Issue #2320: Some Manager v4 builds return 405 on POST /v2/manager/reboot, so
+// also try GET on the v2 endpoint before falling back to the legacy route.
 const REBOOT_ROUTES: ReadonlyArray<{ path: string; method: "POST" | "GET" }> = [
   { path: "/v2/manager/reboot", method: "POST" },
+  { path: "/v2/manager/reboot", method: "GET" },
   { path: "/manager/reboot", method: "GET" },
   { path: "/manager/reboot", method: "POST" },
 ];
@@ -4783,6 +4786,12 @@ async function looksLikeSpaCatchall(res: Response): Promise<boolean> {
  */
 async function rebootViaManager(base: string): Promise<RebootResult> {
   const failures: string[] = [];
+  // Issue #2320: when a 200 response looks like the SPA catchall, we can't be
+  // certain the reboot route didn't fire (e.g., a Manager reboot that kills
+  // mid-response leaves the browser serving cached HTML). Save it as a fallback
+  // candidate and return it if all explicit routes fail — the readiness poll
+  // afterwards will confirm whether it actually rebooted.
+  let fallbackCandidate: RebootResult | null = null;
 
   for (const { path, method } of REBOOT_ROUTES) {
     const url = `${base}${path}`;
@@ -4793,12 +4802,22 @@ async function rebootViaManager(base: string): Promise<RebootResult> {
         // with the SPA index — HTTP 200 text/html — so a 200 here does NOT prove
         // a reboot route exists. A genuine Manager reboot handler exits before it
         // can respond (→ a connection drop, handled below) or returns a tiny
-        // non-HTML ack; treat a 200 that looks like the HTML catchall as "route
-        // absent" and fall through to the next candidate rather than falsely
-        // reporting a reboot that never fired (which readiness — a still-up
-        // server — would then rubber-stamp as success).
+        // non-HTML ack; treat a 200 that looks like the HTML catchall as uncertain
+        // and fall through to the next candidate rather than falsely reporting
+        // success too early, but keep it as a fallback in case all routes fail.
         if (await looksLikeSpaCatchall(res)) {
-          failures.push(`${method} ${path} → HTTP 200 (frontend catchall, not a reboot route)`);
+          if (!fallbackCandidate) {
+            // Issue #2320: save this as our fallback — the readiness poll will
+            // confirm if it actually rebooted. Report as unacknowledged inference.
+            fallbackCandidate = {
+              rebooting: true,
+              acked: false,
+              endpoint: path,
+              method,
+              note: "Request returned HTTP 200 but may be the SPA catchall; will confirm via readiness poll",
+            };
+          }
+          failures.push(`${method} ${path} → HTTP 200 (possibly frontend catchall)`);
           continue;
         }
         // The one path with a real acknowledgement from the Manager itself.
@@ -4843,6 +4862,12 @@ async function rebootViaManager(base: string): Promise<RebootResult> {
         `${method} ${path} → ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+  }
+
+  // All explicit routes failed. If we saved a fallback from a possibly-reboot response,
+  // return it now so the readiness poll can confirm (issue #2320).
+  if (fallbackCandidate) {
+    return fallbackCandidate;
   }
 
   return {
