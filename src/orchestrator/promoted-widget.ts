@@ -30,10 +30,23 @@ export type InnerPromotedTarget = {
   widget: string;
 };
 
+export type PromotedViewingIdentity = {
+  scope: "root" | "subgraph";
+  ownerNodeId: string | null;
+  workflowUuid: string;
+};
+
+/** The stable scope witness carried from the promotion read to the inner write. */
+export type PromotedScopeWitness = {
+  workflowUuid: string;
+  ownerNodeId: string;
+};
+
 export type PromotedSubgraphEnvelope = {
   nodes: Array<Record<string, unknown>>;
   nodeId: string;
   nodeCount: number;
+  viewing?: PromotedViewingIdentity;
 };
 
 export type AmbiguousPromotedWidgetRefusal = {
@@ -168,6 +181,35 @@ function isNodeId(value: unknown): value is number | string {
   return typeof normalized === "string" || Number.isSafeInteger(normalized);
 }
 
+function canonicalPromotedNodeId(value: unknown): string | null {
+  if (!isNodeId(value)) return null;
+  const normalized = normalizeNodeId(value);
+  return typeof normalized === "number"
+    ? Number.isSafeInteger(normalized)
+      ? String(normalized)
+      : null
+    : normalized;
+}
+
+/** Parse the panel's structured current-graph identity without accepting a
+ * prose/detail fallback. The panel deliberately omits workflow_uuid when the
+ * live workflow identity cannot be read, so that omission is not a usable fence. */
+export function parsePromotedViewingIdentity(value: unknown): PromotedViewingIdentity | null {
+  if (!isRecord(value)) return null;
+  const scope = value.scope;
+  if (scope !== "root" && scope !== "subgraph") return null;
+  const workflowUuid = value.workflow_uuid;
+  if (typeof workflowUuid !== "string" || workflowUuid.length === 0) return null;
+
+  const rawOwner = value.owner_node_id;
+  let ownerNodeId: string | null = null;
+  if (rawOwner !== undefined && rawOwner !== null) {
+    ownerNodeId = canonicalPromotedNodeId(rawOwner);
+    if (!ownerNodeId) return null;
+  }
+  return { scope, ownerNodeId, workflowUuid };
+}
+
 /**
  * Validate the ownership and completeness claims made by graph_get_subgraph.
  * A node list is useful for a promoted write only when it names the wrapper the
@@ -181,6 +223,11 @@ export function validatePromotedSubgraphEnvelope(
 ): PromotedSubgraphEnvelope | null {
   if (!isRecord(subgraph)) return null;
   if (subgraph.truncated !== undefined && subgraph.truncated !== false) return null;
+
+  const viewing = Object.prototype.hasOwnProperty.call(subgraph, "viewing")
+    ? parsePromotedViewingIdentity(subgraph.viewing)
+    : undefined;
+  if (Object.prototype.hasOwnProperty.call(subgraph, "viewing") && !viewing) return null;
 
   const owner = subgraph.subgraph_of;
   if (
@@ -212,7 +259,38 @@ export function validatePromotedSubgraphEnvelope(
     nodes: normalized,
     nodeId: stripNodeId(String(owner.node_id)),
     nodeCount: nodeCount as number,
+    ...(viewing ? { viewing } : {}),
   };
+}
+
+/** Extract the target owner and workflow identity from a validated promotion
+ * envelope. The caller must keep this witness with the resolved inner mapping;
+ * a later inner-id/type match without it is not sufficient because ids are
+ * local to the currently viewed graph. */
+export function promotedScopeWitnessFromEnvelope(
+  envelope: PromotedSubgraphEnvelope | null,
+): PromotedScopeWitness | null {
+  if (!envelope?.viewing) return null;
+  const ownerNodeId = canonicalPromotedNodeId(envelope.nodeId);
+  if (!ownerNodeId) return null;
+  return {
+    workflowUuid: envelope.viewing.workflowUuid,
+    ownerNodeId,
+  };
+}
+
+/** A post-entry graph query must prove that the panel is viewing the exact
+ * subgraph owned by the wrapper that produced the promotion mapping. */
+export function promotedViewingMatchesScope(
+  payload: Record<string, unknown> | null,
+  expected: PromotedScopeWitness,
+): boolean {
+  const viewing = parsePromotedViewingIdentity(payload?.viewing);
+  return (
+    viewing?.scope === "subgraph" &&
+    viewing.workflowUuid === expected.workflowUuid &&
+    viewing.ownerNodeId === expected.ownerNodeId
+  );
 }
 
 /**

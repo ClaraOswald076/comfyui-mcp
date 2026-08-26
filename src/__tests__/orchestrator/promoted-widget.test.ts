@@ -95,13 +95,24 @@ function bridge(opts: {
   remappedWriteError?: string;
   reconnectBeforeWrite?: boolean;
   tabRebindBeforeWrite?: boolean;
+  workflowUuid?: string;
 }) {
   const calls: Array<Record<string, unknown>> = [];
   let writes = 0;
   let subgraphReads = 0;
   let inSubgraph = false;
+  const workflowUuid = opts.workflowUuid ?? "workflow-a";
   let connectionIdentity = { generation: 1, tabSessionId: "browser-tab-a" };
   const beforeWrite = { mutate: undefined as (() => void) | undefined };
+  const currentViewing = () => ({
+    scope: inSubgraph ? "subgraph" : "root",
+    ...(inSubgraph ? { owner_node_id: 78 } : {}),
+    workflow_uuid: workflowUuid,
+  });
+  const withCurrentViewing = (value: Record<string, unknown>): Record<string, unknown> =>
+    Object.prototype.hasOwnProperty.call(value, "viewing")
+      ? value
+      : { ...value, viewing: currentViewing() };
   const b = {
     send: async (
       cmd: Record<string, unknown>,
@@ -150,15 +161,16 @@ function bridge(opts: {
         subgraphReads += 1;
         if (subgraphReads === 1 && opts.preflightSubgraph !== undefined) {
           if (opts.preflightSubgraph instanceof Error) throw opts.preflightSubgraph;
-          return opts.preflightSubgraph;
+          return withCurrentViewing(opts.preflightSubgraph);
         }
         if (subgraphReads === 2 && opts.recoveryPreflightSubgraph !== undefined) {
           if (opts.recoveryPreflightSubgraph instanceof Error) throw opts.recoveryPreflightSubgraph;
-          return opts.recoveryPreflightSubgraph;
+          return withCurrentViewing(opts.recoveryPreflightSubgraph);
         }
         if (inSubgraph) throw new Error("No node with id 78 in the current graph");
         if (opts.subgraph instanceof Error) throw opts.subgraph;
-        return opts.subgraph ?? SUBGRAPH;
+        const subgraph = opts.subgraph ?? SUBGRAPH;
+        return subgraph instanceof Error ? subgraph : withCurrentViewing(subgraph);
       }
       if (cmd.cmd === "graph_enter_subgraph") {
         if (opts.enterFails) throw new Error("could not enter subgraph 78");
@@ -176,14 +188,16 @@ function bridge(opts: {
           inSubgraph && wantId ? opts.postEnterGraphQueryById?.[wantId] : undefined;
         if (postEnter !== undefined) {
           if (postEnter instanceof Error) throw postEnter;
-          return postEnter;
+          return withCurrentViewing(postEnter);
         }
         if (opts.detailById && wantId && opts.detailById[wantId] !== undefined) {
-          return opts.detailById[wantId];
+          return withCurrentViewing(opts.detailById[wantId]);
         }
-        if (opts.stackDataIdentity && !inSubgraph) return opts.stackDataIdentity;
+        if (opts.stackDataIdentity && !inSubgraph) return withCurrentViewing(opts.stackDataIdentity);
         if (opts.stackDataIdentity && inSubgraph) {
-          return opts.stackDataInnerIdentity ?? { nodes: [{ id: 76, type: "OtherLoraLoader" }] };
+          return withCurrentViewing(
+            opts.stackDataInnerIdentity ?? { nodes: [{ id: 76, type: "OtherLoraLoader" }] },
+          );
         }
         if (inSubgraph && wantId) {
           const subgraph = opts.subgraph && !(opts.subgraph instanceof Error) ? opts.subgraph : SUBGRAPH;
@@ -192,10 +206,10 @@ function bridge(opts: {
             candidate && typeof candidate === "object" && String(candidate.id) === wantId,
           );
           if (node && typeof node.type === "string") {
-            return { nodes: [{ id: node.id, type: node.type }] };
+            return withCurrentViewing({ nodes: [{ id: node.id, type: node.type }] });
           }
         }
-        return (
+        return withCurrentViewing(
           opts.promotedDetail ?? {
             nodes: [
               {
@@ -206,7 +220,7 @@ function bridge(opts: {
                 ],
               },
             ],
-          }
+          },
         );
       }
       if (cmd.cmd === "refresh_nodes") return opts.refreshNodes ?? { refreshed: true };
@@ -221,6 +235,7 @@ function bridge(opts: {
     tabConnectionIdentity: () => connectionIdentity,
     tabExpectedNodeTypeFenceCapability: () => true,
     tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
+    workflowUuidFor: () => ({ known: true, uuid: workflowUuid }),
   } as unknown as PanelToolCtx["bridge"];
   if (opts.reconnectBeforeWrite) {
     beforeWrite.mutate = () => {
@@ -649,6 +664,7 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
   it.each([
     ["stale owner", { ...SAFE_ANIMA_SUBGRAPH, subgraph_of: { node_id: 79 } }],
     ["wrong node count", { ...SAFE_ANIMA_SUBGRAPH, node_count: 2 }],
+    ["malformed viewing identity", { ...SAFE_ANIMA_SUBGRAPH, viewing: null }],
   ])("refuses a %s envelope before writing the container", async (_name, subgraph) => {
     const { text, isError, calls } = await setWidget(
       { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
@@ -657,6 +673,49 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
 
     expect(isError).toBe(true);
     expect(text).toMatch(/malformed, stale, or incomplete ownership envelope/);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(0);
+  });
+
+  it("refuses a same-session subgraph-owner collision even when inner id and type collide", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
+      {
+        firstWrite: "ok",
+        subgraph: SAFE_ANIMA_SUBGRAPH,
+        detailById: SAFE_ANIMA_IDENTITY_BY_ID,
+        postEnterGraphQueryById: {
+          "76": {
+            viewing: { scope: "subgraph", owner_node_id: 79, workflow_uuid: "workflow-a" },
+            nodes: [{ id: 76, type: "PrimitiveStringMultiline" }],
+          },
+        },
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/current graph scope changed|inner receiver changed|unverifiable/);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(0);
+    expect(calls).toEqual(expect.arrayContaining([{ cmd: "graph_enter_subgraph", node_id: 78 }]));
+  });
+
+  it("refuses a same-session workflow collision with the same owner, inner id, and type", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
+      {
+        firstWrite: "ok",
+        subgraph: SAFE_ANIMA_SUBGRAPH,
+        detailById: SAFE_ANIMA_IDENTITY_BY_ID,
+        postEnterGraphQueryById: {
+          "76": {
+            viewing: { scope: "subgraph", owner_node_id: 78, workflow_uuid: "workflow-b" },
+            nodes: [{ id: 76, type: "PrimitiveStringMultiline" }],
+          },
+        },
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/current graph scope changed|inner receiver changed|unverifiable/);
     expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(0);
   });
 

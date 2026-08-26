@@ -119,8 +119,11 @@ import {
   parseContradictoryPromotedWidgetRefusal,
   parseSubgraphScopeRefusal,
   parseUnpromotedControlPersistRemedy,
+  promotedScopeWitnessFromEnvelope,
+  promotedViewingMatchesScope,
   resolveInnerPromotedTarget,
   validatePromotedSubgraphEnvelope,
+  type PromotedScopeWitness,
   type UnpromotedControlPersistRemedy,
 } from "./promoted-widget.js";
 import { includeRequestedCreateGroupMembers } from "./create-group-membership.js";
@@ -6257,6 +6260,7 @@ type PromotedWritePlan = {
   outerNodeId: number | string;
   inner: { innerNodeId: number | string; widget: string };
   innerNodeType: string;
+  scope: PromotedScopeWitness;
   binding: PromotedWriteBinding;
 };
 
@@ -6304,6 +6308,33 @@ function currentPromotedBindingError(
   }
   if (!samePanelConnectionIdentity(binding.identity, current)) {
     return "the panel session or connection changed";
+  }
+  return null;
+}
+
+/** The bridge's workflow stamp is the strongest synchronous receiver witness
+ * available at the actual socket send. It complements the panel's structured
+ * `viewing` scope read: the latter proves the graph/subgraph after an await,
+ * while this check catches a workflow rebind in the final dispatch window. */
+function currentPromotedScopeError(
+  ctx: PanelToolCtx,
+  expected: PromotedScopeWitness,
+): string | null {
+  const read = ctx.bridge.workflowUuidFor;
+  if (typeof read !== "function") {
+    return "the receiving panel workflow scope was unavailable";
+  }
+  let observed: TabWorkflowUuidRead;
+  try {
+    observed = read.call(ctx.bridge, ctx.tabId);
+  } catch {
+    return "the receiving panel workflow scope became unreadable";
+  }
+  if (observed.known !== true || typeof observed.uuid !== "string" || observed.uuid.length === 0) {
+    return "the receiving panel workflow scope was unavailable";
+  }
+  if (observed.uuid !== expected.workflowUuid) {
+    return "the receiving panel workflow changed";
   }
   return null;
 }
@@ -6381,6 +6412,15 @@ async function preparePromotedWidgetWrite(
       "graph_get_subgraph returned a malformed, stale, or incomplete ownership envelope",
     );
   }
+  const scope = promotedScopeWitnessFromEnvelope(envelope);
+  if (!scope) {
+    return promotedWriteRefusal(
+      widget,
+      "graph_get_subgraph did not publish a verifiable workflow and viewing-scope identity",
+    );
+  }
+  const scopeError = currentPromotedScopeError(ctx, scope);
+  if (scopeError) return promotedWriteRefusal(widget, scopeError);
   const inner = resolveInnerPromotedTarget(payload, widget, nodeId as number | string);
   if (!inner) {
     const matches = promotedMatchCount(payload, widget);
@@ -6410,6 +6450,7 @@ async function preparePromotedWidgetWrite(
     outerNodeId: nodeId as number | string,
     inner,
     innerNodeType,
+    scope,
     binding: { tabId: tabBefore, identity: identityAfter },
   };
 }
@@ -6428,6 +6469,7 @@ async function recheckPromotedOuterMapping(
   outerNodeId: number | string,
   widget: string,
   expectedInner: { innerNodeId: number | string; widget: string },
+  expectedScope: PromotedScopeWitness,
 ): Promise<PromotedMappingProof | ToolResult> {
   const confirmation = await ctx.call({
     cmd: "graph_get_subgraph",
@@ -6441,11 +6483,15 @@ async function recheckPromotedOuterMapping(
   }
   const payload = parseToolResultJson(confirmation);
   const envelope = validatePromotedSubgraphEnvelope(payload, outerNodeId);
+  const observedScope = envelope ? promotedScopeWitnessFromEnvelope(envelope) : null;
   const inner = envelope
     ? resolveInnerPromotedTarget(payload, widget, outerNodeId)
     : null;
   if (
     !envelope ||
+    !observedScope ||
+    observedScope.workflowUuid !== expectedScope.workflowUuid ||
+    observedScope.ownerNodeId !== expectedScope.ownerNodeId ||
     !inner ||
     canonicalQueriedNodeId(inner.innerNodeId) !== canonicalQueriedNodeId(expectedInner.innerNodeId) ||
     inner.widget !== expectedInner.widget
@@ -6455,6 +6501,8 @@ async function recheckPromotedOuterMapping(
       "the promoted inner mapping changed or became unverifiable before the write",
     );
   }
+  const scopeError = currentPromotedScopeError(ctx, expectedScope);
+  if (scopeError) return promotedWriteRefusal(widget, scopeError);
   const targetId = canonicalQueriedNodeId(inner.innerNodeId);
   const innerNode = envelope.nodes.find(
     (candidate) => canonicalQueriedNodeId(candidate.id) === targetId,
@@ -6480,6 +6528,7 @@ async function recheckPromotedInnerTarget(
   expectedInner: { innerNodeId: number | string; widget: string },
   expectedNodeType: string,
   widget: string,
+  expectedScope: PromotedScopeWitness,
 ): Promise<PromotedMappingProof | ToolResult> {
   const probe = await ctx.call({
     cmd: "graph_query",
@@ -6493,7 +6542,14 @@ async function recheckPromotedInnerTarget(
       "the promoted inner receiver could not be queried in the entered graph",
     );
   }
-  const identity = parseVerifiedQueriedNodeIdentity(parseToolResultJson(probe));
+  const payload = parseToolResultJson(probe);
+  if (!promotedViewingMatchesScope(payload, expectedScope)) {
+    return promotedWriteRefusal(
+      widget,
+      "the current graph scope changed or became unverifiable in the entered graph",
+    );
+  }
+  const identity = parseVerifiedQueriedNodeIdentity(payload);
   const expectedId = canonicalQueriedNodeId(expectedInner.innerNodeId);
   if (
     !identity ||
@@ -16861,6 +16917,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               plan.outerNodeId,
               args.widget as string,
               plan.inner,
+              plan.scope,
             );
             if ("content" in beforeEnterMapping) return beforeEnterMapping;
             if (beforeEnterMapping.innerNodeType !== plan.innerNodeType) {
@@ -16897,6 +16954,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               plan.inner,
               plan.innerNodeType,
               args.widget as string,
+              plan.scope,
             );
             if ("content" in afterEnterMapping) {
               const exited = await leave();
@@ -16939,6 +16997,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               plan.inner,
               plan.innerNodeType,
               args.widget as string,
+              plan.scope,
             );
             if ("content" in finalMapping) {
               const exited = await leave();
@@ -16967,6 +17026,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 if (error) {
                   throw new Error(
                     `Refusing promoted inner graph_set_widget: ${error}. No graph_set_widget was dispatched.`,
+                  );
+                }
+                const scopeError = currentPromotedScopeError(ctx, plan.scope);
+                if (scopeError) {
+                  throw new Error(
+                    `Refusing promoted inner graph_set_widget: ${scopeError}. No graph_set_widget was dispatched.`,
                   );
                 }
               },
@@ -17250,6 +17315,29 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               `envelope, so the inner write was not retried.)`,
           );
         }
+        const recoveryScope = recoveryEnvelope
+          ? promotedScopeWitnessFromEnvelope(recoveryEnvelope)
+          : null;
+        if (recoveryEnvelope && !recoveryScope) {
+          return appendToolResultText(
+            first,
+            `\n\n${textOfToolResult(
+              promotedWriteRefusal(
+                refusal.widget,
+                "the recovery envelope did not publish a verifiable workflow and viewing-scope identity",
+              ),
+            )}`,
+          );
+        }
+        if (recoveryScope) {
+          const recoveryScopeError = currentPromotedScopeError(ctx, recoveryScope);
+          if (recoveryScopeError) {
+            return appendToolResultText(
+              first,
+              `\n\n${textOfToolResult(promotedWriteRefusal(refusal.widget, recoveryScopeError))}`,
+            );
+          }
+        }
         const inner = resolveInnerPromotedTarget(
           recoveryPayload,
           refusal.widget,
@@ -17314,6 +17402,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           inner,
           recoveryInnerNodeType,
           refusal.widget,
+          recoveryScope!,
         );
         if ("content" in legacyAfterEnterMapping) {
           const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
@@ -17468,6 +17557,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           inner,
           innerExpectedNodeType ?? recoveryInnerNodeType,
           refusal.widget,
+          recoveryScope!,
         );
         if ("content" in legacyFinalMapping) {
           const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
@@ -17501,6 +17591,14 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 if (error) {
                   throw new Error(
                     `Refusing promoted inner graph_set_widget: ${error}. No graph_set_widget was dispatched.`,
+                  );
+                }
+                const scopeError = recoveryScope
+                  ? currentPromotedScopeError(ctx, recoveryScope)
+                  : "the promoted recovery scope was unavailable";
+                if (scopeError) {
+                  throw new Error(
+                    `Refusing promoted inner graph_set_widget: ${scopeError}. No graph_set_widget was dispatched.`,
                   );
                 }
               }
