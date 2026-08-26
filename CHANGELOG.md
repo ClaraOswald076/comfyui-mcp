@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.124] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- fence local model listings against local/remote target retargets (#2319)
+
 ## [0.52.123] - 2026-08-25
 
 ### MCP
