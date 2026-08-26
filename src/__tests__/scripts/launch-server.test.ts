@@ -621,6 +621,41 @@ describe("cold-start proxy state machine (#1447)", () => {
     expect(parseAll(r.toClient).filter((f) => f.id === 7)).toHaveLength(1);
   });
 
+  it("arms on a BATCHED initialize, and swallows a batched handshake response", async () => {
+    // Round-6 gate. MCP 2025-03-26 forbids batching `initialize` and 2025-06-18
+    // has no batching at all, so this is a client bug — but the entire rescue
+    // hangs off finding that request, and "we did not arm because the client
+    // was slightly wrong" is a cold start that still times out. Every other
+    // frame shape here already handles batches; these two now match.
+    const r = rig(40);
+    r.fromClient([
+      { jsonrpc: "2.0", id: 7, method: "initialize", params: { protocolVersion: "2025-03-26" } },
+    ] as unknown as Frame);
+    const stand = (await waitFor(() => parseAll(r.toClient)[0])) as {
+      id: number;
+      result: { serverInfo: { version: string } };
+    };
+    expect(stand.id).toBe(7);
+    expect(stand.result.serverInfo.version).toBe(launcher.INSTALLING_VERSION);
+
+    r.fromClient({ jsonrpc: "2.0", method: "notifications/initialized" });
+    // The server answers inside a batch. Its handshake response must be
+    // swallowed; whatever shared the batch is still the client's.
+    r.fromChild([
+      { jsonrpc: "2.0", id: 7, result: { protocolVersion: "2025-03-26", capabilities: {} } },
+      { jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "hello" } },
+    ] as unknown as Frame);
+
+    const passedThrough = (await waitFor(() => parseAll(r.toClient)[1])) as unknown as Frame[];
+    expect(passedThrough).toEqual([
+      { jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "hello" } },
+    ]);
+    await waitFor(() => parseAll(r.toClient).find((f) => f.method === "notifications/tools/list_changed"));
+    // …and never a second answer for id 7.
+    expect(parseAll(r.toClient).filter((f) => f.id === 7)).toHaveLength(1);
+    expect(r.proxy.phase()).toBe("live");
+  });
+
   it("holds the re-list announcement until the client says it is initialized", async () => {
     // Round-4 gate: the announcement was sent the instant the server's
     // handshake landed, which can be BEFORE the client has finished its own —

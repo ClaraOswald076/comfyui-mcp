@@ -528,10 +528,10 @@ export function attachColdStartProxy({
       // a client that escapes. It costs nothing to drop — at most a couple of
       // frames reach here before the handshake settles.
       if (phase === "opening" && initializeId === undefined) {
-        const msg = parseFrame(line);
-        if (msg && msg.method === "initialize" && msg.id !== undefined && msg.id !== null) {
-          initializeId = msg.id;
-          initializeParams = msg.params;
+        const request = findInitializeRequest(parseFrame(line));
+        if (request) {
+          initializeId = request.id;
+          initializeParams = request.params;
           disarm();
           timer = setTimeout(rescue, deadlineMs);
           if (typeof timer.unref === "function") timer.unref();
@@ -574,11 +574,13 @@ export function attachColdStartProxy({
     }
     // Only the server's answer to the client's `initialize` changes anything,
     // and a response carries no `method`. Parse rather than sniff for `"id"`,
-    // for the same escaping reason as the client side.
-    const msg = parseFrame(line);
-    const isInitializeResponse =
-      msg && msg.method === undefined && initializeId !== undefined && sameId(msg.id, initializeId);
-    if (!isInitializeResponse) {
+    // for the same escaping reason as the client side, and look inside a batch
+    // for the same reason the client side does.
+    const parsed = parseFrame(line);
+    const { response: msg, rest } = initializeId === undefined
+      ? { response: null, rest: [] }
+      : splitResponseTo(parsed, initializeId);
+    if (!msg) {
       writeFrame(clientOut, childOut, line);
       return;
     }
@@ -591,7 +593,9 @@ export function attachColdStartProxy({
       return;
     }
     // phase === "installing": the client already has an `initialize` result for
-    // this id, so a second response for the same id cannot be forwarded.
+    // this id, so a second response for the same id cannot be forwarded — but
+    // anything that merely shared its batch still belongs to the client.
+    if (rest.length > 0) writeFrame(clientOut, childOut, JSON.stringify(rest));
     if (msg.error) {
       // …but the server FAILED to initialize. The client is holding a success
       // we sent on its behalf, and there is no way to retract it — so the
@@ -619,6 +623,48 @@ export function attachColdStartProxy({
 function carriesInitialized(msg) {
   if (Array.isArray(msg)) return msg.some(carriesInitialized);
   return Boolean(msg) && (msg.method === "notifications/initialized" || msg.method === "initialized");
+}
+
+/**
+ * The `initialize` REQUEST inside a frame, single or batched, or null.
+ *
+ * MCP 2025-03-26 forbids batching `initialize` and 2025-06-18 has no batching
+ * at all, so a batched handshake is a client bug — but the whole rescue hangs
+ * off finding this request, and "we did not arm because the client was slightly
+ * wrong" is a cold start that still times out (round-6 gate). Every other frame
+ * shape in this proxy already handles batches; this one now matches.
+ */
+export function findInitializeRequest(msg) {
+  if (Array.isArray(msg)) {
+    for (const member of msg) {
+      const found = findInitializeRequest(member);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (!msg || typeof msg !== "object") return null;
+  const usable = msg.method === "initialize" && msg.id !== undefined && msg.id !== null;
+  return usable ? msg : null;
+}
+
+/**
+ * Split a server frame into the response to `id` and everything else, so a
+ * response that arrives inside a batch can be swallowed at handover without
+ * taking its batch-mates with it.
+ *
+ * @returns {{response: object|null, rest: object[]}}
+ */
+export function splitResponseTo(msg, id) {
+  const members = Array.isArray(msg) ? msg : [msg];
+  let response = null;
+  const rest = [];
+  for (const member of members) {
+    const isResponse =
+      member && typeof member === "object" && member.method === undefined && sameId(member.id, id);
+    if (isResponse && response === null) response = member;
+    else rest.push(member);
+  }
+  return { response, rest };
 }
 
 function parseFrame(line) {
