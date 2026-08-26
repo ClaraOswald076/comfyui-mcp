@@ -6,6 +6,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.121] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- the plugin's first run no longer fails silently: on the cold `npx` path the launcher
+  answers the MCP handshake itself while the ~818 MB install is still running, holds the
+  session with an empty tool list, then announces the real tools via `tools/list_changed`
+  (#1447). Measured cold, a first `initialize` took 21.6 s against a 10 s budget - so the
+  server never registered, ~40 skills still loaded and told the model to call tools that
+  were not there, and the failure read as "the agent is bad" rather than as an install
+  problem. The warm global path is untouched. A rescued handshake reports `serverInfo.version`
+  as `0.0.0-installing` and carries a stand-in `instructions` string until the real server
+  takes over.
+- the merge gate's own probe reads at pinpoint budget rather than the survey cap (#2304)
+
+
 ## [0.52.120] - 2026-08-25
 
 ### MCP
