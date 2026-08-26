@@ -6087,6 +6087,49 @@ function dynamicComboSubWidgetRefusal(
   );
 }
 
+function dynamicComboSubWidgetRefusalFromDetail(
+  detail: QueriedNodeDetail | null,
+  widget: string,
+): ToolResult | null {
+  if (!detail) return null;
+  const dot = widget.indexOf(".");
+  if (dot <= 0 || dot === widget.length - 1) return null;
+
+  const parentInput = widget.slice(0, dot);
+  const childInput = detail.inputs.find(
+    (input) =>
+      input &&
+      typeof input === "object" &&
+      !Array.isArray(input) &&
+      (input as Record<string, unknown>).name === widget,
+  );
+  const childExists =
+    childInput !== undefined ||
+    (detail.widgets !== null && Object.prototype.hasOwnProperty.call(detail.widgets, widget));
+  if (!childExists) return null;
+
+  const parent = detail.inputs.find(
+    (input) =>
+      input &&
+      typeof input === "object" &&
+      !Array.isArray(input) &&
+      (input as Record<string, unknown>).name === parentInput,
+  );
+  if (!parent || typeof parent !== "object" || Array.isArray(parent)) return null;
+  if ((parent as Record<string, unknown>).type !== COMFY_DYNAMICCOMBO_V3) return null;
+
+  // A dynamic-combo parent is not on its own the #2299 shape. Only a child the
+  // probe PROVES is STRING is refused; a COMBO/INT/FLOAT/BOOLEAN child, or one
+  // whose declared type this row does not carry, keeps the normal setter path.
+  const childType =
+    childInput && typeof childInput === "object" && !Array.isArray(childInput)
+      ? (childInput as Record<string, unknown>).type
+      : undefined;
+  if (childType !== DYNAMIC_COMBO_REFUSED_CHILD_TYPE) return null;
+
+  return dynamicComboSubWidgetRefusal(detail.type, parentInput, widget);
+}
+
 /** Refuse a dotted widget only when the live detail row proves BOTH that its
  * prefix is a COMFY_DYNAMICCOMBO_V3 input and that the addressed child is a
  * STRING (see {@link DYNAMIC_COMBO_REFUSED_CHILD_TYPE} for why the child type is
@@ -6126,39 +6169,7 @@ async function refuseDynamicComboSubWidgetWrite(
   const requestedId = canonicalQueriedNodeId(nodeId);
   if (!detail || !requestedId || detail.id !== requestedId) return null;
 
-  const parentInput = widget.slice(0, dot);
-  const childInput = detail.inputs.find(
-    (input) =>
-      input &&
-      typeof input === "object" &&
-      !Array.isArray(input) &&
-      (input as Record<string, unknown>).name === widget,
-  );
-  const childExists =
-    childInput !== undefined ||
-    (detail.widgets !== null && Object.prototype.hasOwnProperty.call(detail.widgets, widget));
-  if (!childExists) return null;
-
-  const parent = detail.inputs.find(
-    (input) =>
-      input &&
-      typeof input === "object" &&
-      !Array.isArray(input) &&
-      (input as Record<string, unknown>).name === parentInput,
-  );
-  if (!parent || typeof parent !== "object" || Array.isArray(parent)) return null;
-  if ((parent as Record<string, unknown>).type !== COMFY_DYNAMICCOMBO_V3) return null;
-
-  // A dynamic-combo parent is not on its own the #2299 shape. Only a child the
-  // probe PROVES is STRING is refused; a COMBO/INT/FLOAT/BOOLEAN child, or one
-  // whose declared type this row does not carry, keeps the normal setter path.
-  const childType =
-    childInput && typeof childInput === "object" && !Array.isArray(childInput)
-      ? (childInput as Record<string, unknown>).type
-      : undefined;
-  if (childType !== DYNAMIC_COMBO_REFUSED_CHILD_TYPE) return null;
-
-  return dynamicComboSubWidgetRefusal(detail.type, parentInput, widget);
+  return dynamicComboSubWidgetRefusalFromDetail(detail, widget);
 }
 
 /** Refuse the known LC123 regional-canvas prompt widgets. Identity is read
@@ -6180,6 +6191,177 @@ async function refuseAnimaRegionalPromptWrite(
   const type = parseQueriedNodeType(parseToolResultJson(probe));
   if (!type || !ANIMA_REGIONAL_CANVAS_TYPES.has(type)) return null;
   return animaRegionalPromptRefusal(type, widget);
+}
+
+/** Run the complete known-bad widget refusal set for the node that will actually
+ * be written. Keep this as one call site so a new promoted-write path cannot
+ * accidentally re-run only one of the guards. The DaSiWa identity fence remains
+ * a separate final check because it also supplies the expected node type. */
+async function refuseKnownBadWidgetWrite(
+  ctx: PanelToolCtx,
+  nodeId: unknown,
+  widget: string,
+): Promise<ToolResult | null> {
+  const animaBlocked = await refuseAnimaRegionalPromptWrite(ctx, nodeId, widget);
+  if (animaBlocked) return animaBlocked;
+
+  const dynamicComboBlocked = await refuseDynamicComboSubWidgetWrite(ctx, nodeId, widget);
+  if (dynamicComboBlocked) return dynamicComboBlocked;
+
+  return refuseDaSiWaStackWrite(ctx, nodeId, widget);
+}
+
+/** Run the known-bad set against the node id that is about to be written, then
+ * inspect a uniquely mapped promoted inner node when the addressed node is a
+ * subgraph container. Keep promotion handling separate from the direct helper
+ * so the inner probe cannot recurse into another promotion preflight. */
+async function refuseKnownBadWriteBeforeDispatch(
+  ctx: PanelToolCtx,
+  nodeId: unknown,
+  widget: string,
+): Promise<ToolResult | null> {
+  const directBlocked = await refuseKnownBadWidgetWrite(ctx, nodeId, widget);
+  if (directBlocked) return directBlocked;
+  return refuseKnownBadPromotedWidgetWrite(ctx, nodeId, widget);
+}
+
+function mayHaveKnownBadPromotedWidget(widget: string): boolean {
+  const lower = widget.toLowerCase();
+  return (
+    [...ANIMA_REGIONAL_PROMPT_WIDGETS].some((name) => name.toLowerCase() === lower) ||
+    lower === DASIWA_STACK_WIDGET.toLowerCase() ||
+    widget.includes(".")
+  );
+}
+
+/**
+ * #2314 — a promoted write can succeed on the container and propagate to an
+ * unsafe inner widget without ever entering the recovery branch. Resolve the
+ * promotion and inspect the live inner-node listing before that first write.
+ * This keeps the caller in its original scope and avoids an enter/exit race
+ * merely to run a read-only guard. In particular, do not replace DaSiWa's live
+ * identity fence with a type copied from a subgraph listing.
+ *
+ * A failed/ambiguous/truncated subgraph read is not evidence of a promotion;
+ * the existing direct guard contracts remain responsible for the addressed
+ * node. A promoted stack candidate is live-verified with the existing DaSiWa
+ * identity fence inside the inner scope; Anima and dynamic-combo retain their
+ * existing fail-open behavior when their specific inner evidence is unavailable.
+ */
+async function refuseKnownBadPromotedWidgetWrite(
+  ctx: PanelToolCtx,
+  nodeId: unknown,
+  widget: string,
+): Promise<ToolResult | null> {
+  if (!mayHaveKnownBadPromotedWidget(widget)) return null;
+
+  const sub = await ctx.call({ cmd: "graph_get_subgraph", node_id: nodeId });
+  if (sub.isError) return null;
+  const payload = parseToolResultJson(sub);
+  const inner = resolveInnerPromotedTarget(payload, widget);
+  if (!inner) return null;
+
+  const nodes = payload?.nodes;
+  if (!Array.isArray(nodes)) return null;
+  const targetId = canonicalQueriedNodeId(inner.innerNodeId);
+  const innerNode = nodes.find((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+    const candidateId = canonicalQueriedNodeId((candidate as Record<string, unknown>).id);
+    return candidateId !== null && candidateId === targetId;
+  });
+  if (!innerNode || typeof innerNode !== "object" || Array.isArray(innerNode)) return null;
+
+  // The DaSiWa guard is deliberately stronger than a type classification from
+  // graph_get_subgraph: it authenticates the live node id, tab identity, and the
+  // panel's atomic expected-node-type fence. Preserve that contract for a
+  // promoted stack candidate instead of trusting the listing as a write fence.
+  if (inner.widget === DASIWA_STACK_WIDGET) {
+    return refusePromotedDaSiWaStackWrite(ctx, nodeId, inner.innerNodeId);
+  }
+
+  const identity = parseQueriedNodeIdentityRow(innerNode);
+  if (!identity) {
+    return null;
+  }
+
+  let blocked: ToolResult | null = null;
+  if (isAnimaRegionalPromptWidget(inner.widget)) {
+    if (ANIMA_REGIONAL_CANVAS_TYPES.has(identity.type)) {
+      blocked = animaRegionalPromptRefusal(identity.type, inner.widget);
+    }
+  } else if (inner.widget.includes(".")) {
+    blocked = dynamicComboSubWidgetRefusalFromDetail(
+      parseVerifiedQueriedNodeDetail({ nodes: [innerNode] }),
+      inner.widget,
+    );
+  }
+
+  return blocked
+    ? appendToolResultText(
+        blocked,
+        `\n\n(The addressed widget is promoted from node ${inner.innerNodeId} "${inner.widget}"; ` +
+          `the container write was refused before dispatch. No graph_set_widget was dispatched.)`,
+      )
+    : null;
+}
+
+/** Keep the DaSiWa promoted path on its existing live identity fence. The
+ * subgraph listing only establishes which inner node to inspect; it is never
+ * used as the final type proof for a mutation. */
+async function refusePromotedDaSiWaStackWrite(
+  ctx: PanelToolCtx,
+  containerNodeId: unknown,
+  innerNodeId: number | string,
+): Promise<ToolResult | null> {
+  let entered = false;
+  try {
+    const enter = await ctx.call(
+      { cmd: "graph_enter_subgraph", node_id: containerNodeId },
+      15000,
+    );
+    if (enter.isError) {
+      return daSiWaIdentityRefusal(
+        `the promoted inner node ${innerNodeId} could not be live-verified because ` +
+          `panel_enter_subgraph failed (${textOfToolResult(enter)})`,
+      );
+    }
+    entered = true;
+
+    const blocked = await refuseDaSiWaStackWrite(ctx, innerNodeId, DASIWA_STACK_WIDGET);
+    const exit = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+    entered = false;
+    if (blocked) {
+      return appendToolResultText(
+        blocked,
+        `\n\n(The addressed stack widget is promoted from node ${innerNodeId}; ` +
+          `the container write was refused before dispatch. No graph_set_widget was dispatched.` +
+          (exit.isError
+            ? ` panel_exit_subgraph also FAILED — the caller scope may still be inside ` +
+              `the subgraph. Call panel_exit_subgraph. (${textOfToolResult(exit)})`
+            : ""),
+      );
+    }
+    if (exit.isError) {
+      return daSiWaIdentityRefusal(
+        `the promoted inner node ${innerNodeId} was checked, but panel_exit_subgraph ` +
+          `failed before the container write (${textOfToolResult(exit)})`,
+      );
+    }
+    return null;
+  } catch (error) {
+    return daSiWaIdentityRefusal(
+      `the promoted inner node ${innerNodeId} could not be live-verified before dispatch: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+  } finally {
+    if (entered) {
+      try {
+        await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+      } catch {
+        // Preserve the refusal. The caller can explicitly recover the scope.
+      }
+    }
+  }
 }
 
 function daSiWaStackRefusal(type: string): ToolResult {
@@ -16429,24 +16611,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // reports success and is overwritten on APPLY. Refuse before the write
         // so the reply is not a lie. Identity is a one-node graph_query; an
         // unreadable probe is fail-open (some other node may own negative_prompt).
-        const blocked = await refuseAnimaRegionalPromptWrite(
+        const blocked = await refuseKnownBadWriteBeforeDispatch(
           ctx,
           args.node_id,
           args.widget as string,
         );
         if (blocked) return blocked;
-        const dynamicComboBlocked = await refuseDynamicComboSubWidgetWrite(
-          ctx,
-          args.node_id,
-          args.widget as string,
-        );
-        if (dynamicComboBlocked) return dynamicComboBlocked;
-        const daSiWaBlocked = await refuseDaSiWaStackWrite(
-          ctx,
-          args.node_id,
-          args.widget as string,
-        );
-        if (daSiWaBlocked) return daSiWaBlocked;
+
         let expectedNodeType: string | undefined;
         if (args.widget === DASIWA_STACK_WIDGET) {
           const daSiWaFence = await verifyDaSiWaStackWriteFence(ctx, args.node_id);
@@ -16494,6 +16665,15 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               echoFull,
             ),
           );
+        const guardedWrite = async (
+          nodeId: unknown,
+          widget: string,
+          targetExpectedNodeType: string | undefined = expectedNodeType,
+        ): Promise<ToolResult> => {
+          const blocked = await refuseKnownBadWriteBeforeDispatch(ctx, nodeId, widget);
+          if (blocked) return blocked;
+          return write(nodeId, widget, targetExpectedNodeType);
+        };
         let first = await write(args.node_id, args.widget as string);
         if (!first.isError) {
           markPanelSchemaReady(panelSchemaKey(ctx));
@@ -16577,7 +16757,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             entered.push(ownerNodeId);
           }
 
-          const retried = await write(args.node_id, args.widget as string);
+          const retried = await guardedWrite(args.node_id, args.widget as string);
           if (!retried.isError) {
             const persisted = await persistUnpromotedControlAfterGenerate(
               retried,
@@ -16624,7 +16804,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             return appendToolResultText(first, objectInfoWidgetRefreshNote(refreshed));
           }
           markPanelSchemaReady(schemaKey);
-          const retried = await write(args.node_id, args.widget as string);
+          const retried = await guardedWrite(args.node_id, args.widget as string);
           if (!retried.isError) {
             return persistUnpromotedControlAfterGenerate(retried, ctx, args.node_id);
           }
@@ -16648,7 +16828,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         if (!refusal || String(refusal.nodeId) !== String(args.node_id)) return first;
 
         if (refusal.widget !== args.widget) {
-          const remapped = await write(args.node_id, refusal.widget);
+          const remapped = await guardedWrite(args.node_id, refusal.widget);
           if (!remapped.isError) {
             return persistUnpromotedControlAfterGenerate(remapped, ctx, args.node_id);
           }

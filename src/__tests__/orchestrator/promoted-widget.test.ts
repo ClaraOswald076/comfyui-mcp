@@ -10,8 +10,9 @@
 // inner widget and write it there, then leave the subgraph.
 //
 // These tests drive the SHIPPED handler (and the parse/resolve helpers it uses).
-// A first-write success is untouched. A genuine miss (name not in the listed
-// set) is never retried. An ambiguous or truncated inner mapping is never guessed.
+// A first-write success stays successful for safe or unprovable mappings. A genuine
+// miss (name not in the listed set) is never retried. An ambiguous or truncated inner
+// mapping is never guessed.
 
 import { describe, expect, it } from "vitest";
 
@@ -81,10 +82,14 @@ function bridge(opts: {
    *  widget that is not #2299's `model.prompt`. Wins over the default above so
    *  the recovery resolves the name under test. */
   firstWriteError?: string;
+  /** #2314: make the first subgraph read unavailable so a recovery test can
+   *  continue into the existing post-refusal retry branch. */
+  preflightSubgraph?: Record<string, unknown> | Error;
 }) {
   const calls: Array<Record<string, unknown>> = [];
   let writes = 0;
-  let graphQueries = 0;
+  let subgraphReads = 0;
+  let inSubgraph = false;
   const b = {
     send: async (cmd: Record<string, unknown>) => {
       calls.push({ ...cmd });
@@ -92,9 +97,18 @@ function bridge(opts: {
         writes += 1;
         if (writes === 1 && opts.ambiguous) throw new Error(AMBIGUOUS);
         if (writes === 1 && opts.scopeLost) throw new Error(SCOPE_REFUSAL);
-        if (writes === 1 && opts.stackDataIdentity) throw new Error(STACK_DATA_CONTRADICTORY);
+        if (writes === 1 && opts.stackDataIdentity && opts.firstWrite !== "ok") {
+          throw new Error(STACK_DATA_CONTRADICTORY);
+        }
         if (writes === 1 && opts.firstWriteError) throw new Error(opts.firstWriteError);
-        if (writes === 1 && opts.detailById) throw new Error(DYNAMIC_CHILD_CONTRADICTORY);
+        if (
+          writes === 1 &&
+          opts.detailById &&
+          opts.firstWrite !== "ok" &&
+          !opts.firstWriteError
+        ) {
+          throw new Error(DYNAMIC_CHILD_CONTRADICTORY);
+        }
         const which =
           writes === 1
             ? (opts.firstWrite ?? "contradict")
@@ -108,25 +122,31 @@ function bridge(opts: {
         return { set: { node_id: cmd.node_id, widget: cmd.widget, value: cmd.value } };
       }
       if (cmd.cmd === "graph_get_subgraph") {
+        subgraphReads += 1;
+        if (subgraphReads === 1 && opts.preflightSubgraph !== undefined) {
+          if (opts.preflightSubgraph instanceof Error) throw opts.preflightSubgraph;
+          return opts.preflightSubgraph;
+        }
         if (opts.subgraph instanceof Error) throw opts.subgraph;
         return opts.subgraph ?? SUBGRAPH;
       }
       if (cmd.cmd === "graph_enter_subgraph") {
         if (opts.enterFails) throw new Error("could not enter subgraph 78");
+        inSubgraph = true;
         return { scope: "subgraph", node_id: cmd.node_id };
       }
       if (cmd.cmd === "graph_exit_subgraph") {
         if (opts.exitFails) throw new Error("could not confirm exit");
+        inSubgraph = false;
         return { scope: "root" };
       }
       if (cmd.cmd === "graph_query") {
-        graphQueries += 1;
         const wantId = Array.isArray(cmd.ids) && cmd.ids.length ? String(cmd.ids[0]) : null;
         if (opts.detailById && wantId && opts.detailById[wantId] !== undefined) {
           return opts.detailById[wantId];
         }
-        if (opts.stackDataIdentity && graphQueries <= 2) return opts.stackDataIdentity;
-        if (opts.stackDataIdentity && graphQueries === 3) {
+        if (opts.stackDataIdentity && !inSubgraph) return opts.stackDataIdentity;
+        if (opts.stackDataIdentity && inSubgraph) {
           return opts.stackDataInnerIdentity ?? { nodes: [{ id: 76, type: "OtherLoraLoader" }] };
         }
         return (
@@ -190,6 +210,10 @@ const DYNAMIC_SUBGRAPH = {
       id: 76,
       type: "MinimaxHailuo03TextToVideoNode",
       widgets: { model: "text-to-video", "model.prompt": "" },
+      inputs: [
+        { name: "model", type: "COMFY_DYNAMICCOMBO_V3" },
+        { name: "model.prompt", type: "STRING" },
+      ],
     },
   ],
 };
@@ -220,8 +244,10 @@ describe("panel_set_widget promoted inner dynamic-combo child (#2299)", () => {
       { node_id: 78, widget: "model.prompt", value: "a long prompt" },
       {
         firstWrite: "contradict",
+        firstWriteError: DYNAMIC_CHILD_CONTRADICTORY,
         subgraph: DYNAMIC_SUBGRAPH,
         detailById: DYNAMIC_DETAIL_BY_ID,
+        preflightSubgraph: new Error("preflight unavailable"),
       },
     );
     expect(isError).toBe(true);
@@ -240,8 +266,23 @@ describe("panel_set_widget promoted inner dynamic-combo child (#2299)", () => {
       { node_id: 78, widget: "model.prompt", value: "a long prompt" },
       {
         firstWrite: "contradict",
+        firstWriteError: DYNAMIC_CHILD_CONTRADICTORY,
         innerWrite: "ok",
         subgraph: DYNAMIC_SUBGRAPH,
+        preflightSubgraph: {
+          ...DYNAMIC_SUBGRAPH,
+          nodes: [
+            {
+              id: 76,
+              type: "OrdinaryNode",
+              widgets: { "model.prompt": "" },
+              inputs: [
+                { name: "model", type: "STRING" },
+                { name: "model.prompt", type: "STRING" },
+              ],
+            },
+          ],
+        },
         detailById: {
           "78": DYNAMIC_DETAIL_BY_ID["78"],
           // Same dotted name, ordinary STRING parent — not the #2299 shape.
@@ -304,6 +345,7 @@ describe("panel_set_widget promoted inner LC123 regional prompt (#2305)", () => 
         firstWriteError: ANIMA_CONTRADICTORY,
         subgraph: ANIMA_SUBGRAPH,
         detailById: ANIMA_IDENTITY_BY_ID,
+        preflightSubgraph: new Error("preflight unavailable"),
       },
     );
     expect(isError).toBe(true);
@@ -353,6 +395,200 @@ describe("panel_set_widget promoted inner LC123 regional prompt (#2305)", () => 
     const writes = calls.filter((c) => c.cmd === "graph_set_widget");
     expect(writes.some((c) => String(c.node_id) === "76")).toBe(true);
   });
+});
+
+const SAFE_ANIMA_SUBGRAPH = {
+  subgraph_of: { node_id: 78, title: "Container" },
+  node_count: 1,
+  nodes: [{ id: 76, type: "PrimitiveStringMultiline", widgets: { quality_prompt: "old" } }],
+};
+
+const SAFE_ANIMA_IDENTITY_BY_ID = {
+  "78": ANIMA_IDENTITY_BY_ID["78"],
+  "76": { nodes: [{ id: 76, type: "PrimitiveStringMultiline" }] },
+};
+
+describe("panel_set_widget promoted container success guards (#2314)", () => {
+  it.each([
+    [
+      "Anima regional prompt",
+      "quality_prompt",
+      "masterpiece",
+      ANIMA_SUBGRAPH,
+      ANIMA_IDENTITY_BY_ID,
+      undefined,
+      /animaPrompts/,
+    ],
+    [
+      "dynamic-combo STRING child",
+      "model.prompt",
+      "a long prompt",
+      DYNAMIC_SUBGRAPH,
+      DYNAMIC_DETAIL_BY_ID,
+      undefined,
+      /dynamic-combo (?:sub-widget|child)/,
+    ],
+    [
+      "DaSiWa stack",
+      "stack_data",
+      "NEW",
+      {
+        subgraph_of: { node_id: 78, title: "Container" },
+        node_count: 1,
+        nodes: [{ id: 76, type: "DaSiWa_LTX2LoraLoader", widgets: { stack_data: "old" } }],
+      },
+      undefined,
+      {
+        stackDataIdentity: { nodes: [{ id: 78, type: "OtherLoraLoader" }] },
+        stackDataInnerIdentity: { nodes: [{ id: 76, type: "DaSiWa_LTX2LoraLoader" }] },
+      },
+      /DaSiWa_LTX2LoraLoader/,
+    ],
+  ] as const)("refuses %s before a successful container write", async (
+    _name,
+    widget,
+    value,
+    subgraph,
+    probe,
+    stack,
+    message,
+  ) => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget, value },
+      {
+        firstWrite: "ok",
+        subgraph,
+        ...(probe ? { detailById: probe } : {}),
+        ...(stack ?? {}),
+      },
+    );
+    expect(isError).toBe(true);
+    expect(text).toMatch(message);
+    expect(calls.map((c) => c.cmd)).toContain("graph_get_subgraph");
+    if (widget === "stack_data") {
+      expect(calls.map((c) => c.cmd)).toContain("graph_enter_subgraph");
+      expect(calls.map((c) => c.cmd)).toContain("graph_exit_subgraph");
+    }
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(0);
+  });
+
+  it.each([
+    ["Anima regional prompt", "quality_prompt", SAFE_ANIMA_SUBGRAPH, SAFE_ANIMA_IDENTITY_BY_ID],
+    [
+      "dynamic-combo STRING child",
+      "model.prompt",
+      {
+        ...DYNAMIC_SUBGRAPH,
+        nodes: [
+          {
+            id: 76,
+            type: "OrdinaryNode",
+            widgets: { "model.prompt": "old" },
+            inputs: [
+              { name: "model", type: "STRING" },
+              { name: "model.prompt", type: "STRING" },
+            ],
+          },
+        ],
+      },
+      {
+        "78": DYNAMIC_DETAIL_BY_ID["78"],
+        "76": {
+          nodes: [
+            {
+              id: 76,
+              type: "OrdinaryNode",
+              widgets: { "model.prompt": "old" },
+              inputs: [
+                { name: "model", type: "STRING" },
+                { name: "model.prompt", type: "STRING" },
+              ],
+            },
+          ],
+        },
+      },
+    ],
+    [
+      "DaSiWa stack",
+      "stack_data",
+      {
+        subgraph_of: { node_id: 78, title: "Container" },
+        node_count: 1,
+        nodes: [{ id: 76, type: "OtherLoraLoader", widgets: { stack_data: "old" } }],
+      },
+      undefined,
+    ],
+  ] as const)("keeps a safe %s promoted write successful on the container", async (
+    _name,
+    widget,
+    subgraph,
+    probe,
+  ) => {
+    const stack = widget === "stack_data"
+      ? {
+          stackDataIdentity: { nodes: [{ id: 78, type: "OtherLoraLoader" }] },
+          stackDataInnerIdentity: { nodes: [{ id: 76, type: "OtherLoraLoader" }] },
+        }
+      : {};
+    const { isError, calls } = await setWidget(
+      { node_id: 78, widget, value: "NEW" },
+      {
+        firstWrite: "ok",
+        subgraph,
+        ...(probe ? { detailById: probe } : {}),
+        ...stack,
+      },
+    );
+    expect(isError).toBe(false);
+    expect(calls.some((c) => c.cmd === "graph_get_subgraph")).toBe(true);
+    if (widget === "stack_data") {
+      expect(calls.map((c) => c.cmd)).toContain("graph_enter_subgraph");
+      expect(calls.map((c) => c.cmd)).toContain("graph_exit_subgraph");
+    } else {
+      expect(calls.map((c) => c.cmd)).not.toContain("graph_enter_subgraph");
+      expect(calls.map((c) => c.cmd)).not.toContain("graph_exit_subgraph");
+    }
+    const writes = calls.filter((c) => c.cmd === "graph_set_widget");
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatchObject({ node_id: 78, widget });
+  });
+
+  it("keeps a successful container write when promotion preflight is unavailable", async () => {
+    const { isError, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
+      {
+        firstWrite: "ok",
+        subgraph: new Error("graph_get_subgraph unavailable"),
+      },
+    );
+
+    expect(isError).toBe(false);
+    expect(calls.map((c) => c.cmd)).toEqual([
+      "graph_query",
+      "graph_get_subgraph",
+      "graph_set_widget",
+    ]);
+  });
+
+  it("re-runs the guards for a case-only remapped container widget", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "Quality_Prompt", value: "masterpiece" },
+      {
+        firstWrite: "contradict",
+        firstWriteError: ANIMA_CONTRADICTORY,
+        subgraph: ANIMA_SUBGRAPH,
+        detailById: ANIMA_IDENTITY_BY_ID,
+        preflightSubgraph: new Error("preflight unavailable"),
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toContain("animaPrompts");
+    const writes = calls.filter((c) => c.cmd === "graph_set_widget");
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatchObject({ node_id: 78, widget: "Quality_Prompt" });
+  });
+
 });
 
 describe("parseContradictoryPromotedWidgetRefusal", () => {
@@ -469,12 +705,14 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
           node_count: 1,
           nodes: [{ id: 76, type: "OtherLoraLoader", widgets: { stack_data: "old" } }],
         },
+        preflightSubgraph: new Error("preflight unavailable"),
       },
     );
 
     expect(isError).toBe(false);
     expect(calls.map((c) => c.cmd)).toEqual([
       "graph_query",
+      "graph_get_subgraph",
       "graph_query",
       "graph_set_widget",
       "graph_get_subgraph",
@@ -483,8 +721,8 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
       "graph_set_widget",
       "graph_exit_subgraph",
     ]);
-    expect(calls[2]).toMatchObject({ expected_node_type: "OtherLoraLoader" });
-    expect(calls[6]).toMatchObject({ expected_node_type: "OtherLoraLoader" });
+    expect(calls[3]).toMatchObject({ expected_node_type: "OtherLoraLoader" });
+    expect(calls[7]).toMatchObject({ expected_node_type: "OtherLoraLoader" });
     expect(text).toMatch(/inner widget this promotion lists/);
   });
 
@@ -499,12 +737,14 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
           node_count: 1,
           nodes: [{ id: 76, type: "OtherLoraLoader", widgets: { stack_data: "old" } }],
         },
+        preflightSubgraph: new Error("preflight unavailable"),
       },
     );
 
     expect(isError).toBe(true);
     expect(calls.map((c) => c.cmd)).toEqual([
       "graph_query",
+      "graph_get_subgraph",
       "graph_query",
       "graph_set_widget",
       "graph_get_subgraph",
@@ -527,12 +767,14 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
           node_count: 1,
           nodes: [{ id: 76, type: "DaSiWa_LTX2LoraLoader", widgets: { stack_data: "old" } }],
         },
+        preflightSubgraph: new Error("preflight unavailable"),
       },
     );
 
     expect(isError).toBe(true);
     expect(calls.map((c) => c.cmd)).toEqual([
       "graph_query",
+      "graph_get_subgraph",
       "graph_query",
       "graph_set_widget",
       "graph_get_subgraph",
