@@ -141,7 +141,8 @@ for sub in checkpoints configs loras vae text_encoders clip diffusion_models \
            controlnet t2i_adapter gligen upscale_models latent_upscale_models \
            hypernetworks photomaker classifiers model_patches audio_encoders \
            background_removal frame_interpolation geometry_estimation \
-           optical_flow detection; do
+           optical_flow detection \
+           sams ultralytics ultralytics/bbox ultralytics/segm; do
   mkdir -p "${MODELS_DIR}/${sub}"
 done
 
