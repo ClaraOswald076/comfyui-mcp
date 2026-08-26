@@ -41,13 +41,32 @@ const PANEL_GONE = [
   { name: "comfyui", runtimeStatus: "connected", tools: { list_tools: {}, call_tool: {} } },
   { name: "panel", runtimeStatus: "failed", tools: CACHED_PANEL_TOOLS },
 ];
+const PANEL_MCP_URL = "http://127.0.0.1:9198/orchestrator%3A%3Acodex";
 const MCP_SERVERS = {
   comfyui: { transport: "stdio" as const, command: "node", args: ["mcp.js"] },
-  panel: { transport: "http" as const, url: "http://127.0.0.1:9198/tab" },
+  panel: { transport: "http" as const, url: PANEL_MCP_URL },
 };
+const MCP_SERVERS_WITH_UNRELATED_HTTP = {
+  ...MCP_SERVERS,
+  unrelated: { transport: "http" as const, url: "http://127.0.0.1:9198/unrelated" },
+};
+const MCP_SERVERS_WITH_UNRELATED_HTTP_UP = [
+  ...PANEL_UP,
+  { name: "unrelated", runtimeStatus: "connected", tools: { unrelated_tool: {} } },
+];
 const WORKER_TRANSPORT_FAILURE =
   "Transport send error: WorkerTransport<StreamableHttpClientWorker<...>> error: " +
   "HTTP request failed sending request to http://127.0.0.1:9198/orchestrator%3A%3Acodex";
+// The exact wrapper reported by panel_save_workflow -> immediate panel_run on
+// the affected EventNotificationTransport path. It is an outer HTTP-MCP client
+// failure, not a panel tool result; handling it must not retry panel_run.
+const EVENT_NOTIFICATION_TRANSPORT_FAILURE =
+  "Transport send error: EventNotificationTransport WorkerTransport StreamableHttpClientWorker error: " +
+  "Client error: HTTP request failed sending request to http://127.0.0.1:9198/orchestrator::codex";
+const UNRELATED_TRANSPORT_FAILURE = EVENT_NOTIFICATION_TRANSPORT_FAILURE.replace(
+  "http://127.0.0.1:9198/orchestrator::codex",
+  "http://127.0.0.1:9198/unrelated",
+);
 // Older Codex/MCP combinations scrubbed the WorkerTransport wrapper and used a
 // semicolon. This is an outer HTTP-MCP client error, not a UiBridge error from
 // inside the panel MCP handler.
@@ -86,7 +105,13 @@ interface Drive {
   pollParams: unknown[];
   turnStarts: number;
   endTurn(
-    kind?: "completed" | "worker-transport" | "worker-transport-retry" | "scrubbed-transport",
+    kind?:
+      | "completed"
+      | "worker-transport"
+      | "worker-transport-retry"
+      | "scrubbed-transport"
+      | "event-notification-transport"
+      | "unrelated-transport",
   ): Promise<void>;
   releaseInterrupt(): void;
   waitForIdle(): Promise<void>;
@@ -98,6 +123,7 @@ function startDrive(opts: {
   reloadThrows?: boolean;
   holdInterrupt?: boolean;
   requiredMcpTools?: Readonly<Record<string, readonly string[]>>;
+  mcpServers?: typeof MCP_SERVERS | typeof MCP_SERVERS_WITH_UNRELATED_HTTP;
 }): Drive {
   const listings = [...opts.listings];
   const events: AgentEvent[] = [];
@@ -173,7 +199,7 @@ function startDrive(opts: {
 
   const backend: Backend = new CodexBackend({
     model: "gpt-5.6-sol",
-    mcpServers: MCP_SERVERS,
+    mcpServers: opts.mcpServers ?? MCP_SERVERS,
     requiredMcpTools: opts.requiredMcpTools,
   });
   Object.assign(backend, { client, liveCatalog: [{ id: "gpt-5.6-sol", supportsEffort: true }] });
@@ -204,7 +230,9 @@ function startDrive(opts: {
       if (
         kind === "worker-transport" ||
         kind === "worker-transport-retry" ||
-        kind === "scrubbed-transport"
+        kind === "scrubbed-transport" ||
+        kind === "event-notification-transport" ||
+        kind === "unrelated-transport"
       ) {
         client.notificationHandler?.({
           method: "error",
@@ -212,7 +240,14 @@ function startDrive(opts: {
             threadId: "thread-1",
             turnId,
             error: {
-              message: kind === "scrubbed-transport" ? SCRUBBED_TRANSPORT_FAILURE : WORKER_TRANSPORT_FAILURE,
+              message:
+                kind === "scrubbed-transport"
+                  ? SCRUBBED_TRANSPORT_FAILURE
+                  : kind === "event-notification-transport"
+                    ? EVENT_NOTIFICATION_TRANSPORT_FAILURE
+                    : kind === "unrelated-transport"
+                      ? UNRELATED_TRANSPORT_FAILURE
+                      : WORKER_TRANSPORT_FAILURE,
             },
             willRetry: kind === "worker-transport-retry",
           },
@@ -295,6 +330,46 @@ describe("Codex mid-session MCP drop reconnects panel tools (#1524)", () => {
     );
     expect(failure?.outcomeUnknown).toBe(true);
     expect(failure?.message).toMatch(/did not retry/i);
+
+    await drive.finish();
+  });
+
+  it("handles the EventNotificationTransport panel_run failure after a successful save (#2378)", async () => {
+    // The reported save -> immediate run sequence loses the outer MCP response
+    // before Codex can return a tool result. The wrapper must enter the same
+    // bounded reload path as the plain WorkerTransport form; it must not let
+    // Codex replay the mutation or claim that the render was not accepted.
+    const drive = startDrive({ listings: [PANEL_UP] });
+    await drive.endTurn("event-notification-transport");
+
+    expect(drive.reloadCalls).toBe(1);
+    expect(drive.turnStarts).toBe(1);
+    const failure = drive.events.find(
+      (e): e is Extract<AgentEvent, { type: "error" }> =>
+        e.type === "error" && !(e as { sessionNotice?: boolean }).sessionNotice,
+    );
+    expect(failure?.outcomeUnknown).toBe(true);
+    expect(failure?.message).toMatch(/did not retry/i);
+    expect(failure?.message).toMatch(/outcome as UNKNOWN/i);
+
+    await drive.finish();
+  });
+
+  it("does not map an unrelated HTTP MCP transport failure to panel recovery", async () => {
+    const drive = startDrive({
+      listings: [MCP_SERVERS_WITH_UNRELATED_HTTP_UP],
+      mcpServers: MCP_SERVERS_WITH_UNRELATED_HTTP,
+    });
+    await drive.endTurn("unrelated-transport");
+
+    expect(drive.reloadCalls).toBe(0);
+    expect(drive.turnStarts).toBe(1);
+    const failure = drive.events.find(
+      (e): e is Extract<AgentEvent, { type: "error" }> =>
+        e.type === "error" && !(e as { sessionNotice?: boolean }).sessionNotice,
+    );
+    expect(failure?.outcomeUnknown).not.toBe(true);
+    expect(failure?.message).not.toMatch(/local panel MCP connection failed/i);
 
     await drive.finish();
   });
