@@ -468,6 +468,14 @@ export function currentPanelTemplateOrigin(
  *
  * A MIXED pair (`localhost` observed vs `127.0.0.1` configured, or the reverse)
  * is a genuine mismatch and stays a hard refusal.
+ *
+ * Unlike currentPanelTemplateOrigin, this does NOT compare `.origin`. There the
+ * comparison is load-bearing, because LOOPBACK_HOSTS holds two members and
+ * `127.0.0.1` vs `::1` would otherwise pass. Here the clauses below already
+ * force both origins to be equal — same single-name host, same protocol, same
+ * port — so an origin comparison could not fail, and a clause that cannot fail
+ * reads as a guard while guarding nothing. If AMBIGUOUS_LOOPBACK_NAMES ever
+ * gains a second name, add `observed.host === target.host` here.
  */
 export function ambiguousLoopbackNameOrigin(
   panelOrigin: string | undefined,
@@ -480,8 +488,7 @@ export function ambiguousLoopbackNameOrigin(
     AMBIGUOUS_LOOPBACK_NAMES.has(observed.host) &&
     AMBIGUOUS_LOOPBACK_NAMES.has(target.host) &&
     observed.protocol === target.protocol &&
-    observed.port === target.port &&
-    observed.origin === target.origin
+    observed.port === target.port
   );
 }
 

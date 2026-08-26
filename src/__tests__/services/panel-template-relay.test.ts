@@ -227,6 +227,11 @@ describe("authenticated panel template relay (#2196)", () => {
     expect(ambiguousLoopbackNameOrigin("http://localhost:8188", "http://127.0.0.1:8188/comfyapi")).toBe(false);
     expect(ambiguousLoopbackNameOrigin("http://127.0.0.1:8188", "http://localhost:8188/comfyapi")).toBe(false);
     expect(ambiguousLoopbackNameOrigin("http://localhost:8189", "http://localhost:8188/comfyapi")).toBe(false);
+    // Same name and port, different scheme, is still a mismatch: degrading would
+    // send the caller to a COMFYUI_URL that is not the origin the panel is on.
+    expect(ambiguousLoopbackNameOrigin("https://localhost:8188", "http://localhost:8188/comfyapi")).toBe(false);
+    expect(ambiguousLoopbackNameOrigin("http://localhost:8188", "https://localhost:8188/comfyapi")).toBe(false);
+    expect(ambiguousLoopbackNameOrigin("https://localhost:8188", "https://localhost:8188/comfyapi")).toBe(true);
     // Literal loopback addresses are authorized outright, never declined.
     expect(ambiguousLoopbackNameOrigin("http://127.0.0.1:8188", "http://127.0.0.1:8188/comfyapi")).toBe(false);
     expect(ambiguousLoopbackNameOrigin("http://[::1]:8188", "http://[::1]:8188/comfyapi")).toBe(false);
