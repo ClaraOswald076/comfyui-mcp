@@ -14,6 +14,7 @@ import {
   asRateLimitError,
   classifyRateLimit,
   humanWait,
+  gaveUpNotice,
   sanitizeDetail,
   sendWithRateLimitRetry,
 } from "../../orchestrator/rate-limit.js";
@@ -167,6 +168,40 @@ describe("sanitizeDetail", () => {
     // would eat the parts of a 429 that explain the limit, which is why it is shown.
     const out = sanitizeDetail("rate limit exceeded; see x-ratelimit-reset-requests");
     expect(out).toContain("x-ratelimit-reset-requests");
+  });
+});
+
+describe("gaveUpNotice", () => {
+  // agent-backend.ts documents `outcomeUnknown` as "renderers must NOT add the generic
+  // 'Nothing was lost — try again' prompt", and codex-backend.ts calls that phrase unsafe
+  // "when a mutation's dispatch/outcome was not established". A 429 mid tool-loop is that
+  // case: this module exists because completed tool rounds were being discarded, which
+  // means they RAN. Promising nothing was lost invites re-sending a prompt whose earlier
+  // steps already changed the graph.
+  it("never tells the user nothing was lost", () => {
+    const cases = [
+      gaveUpNotice("m", { kind: "unknown", detail: "slow down" }, 0),
+      gaveUpNotice("m", { kind: "unknown", detail: "slow down" }, 2),
+      gaveUpNotice("m", { kind: "unknown" }, 0, false),
+    ];
+    for (const line of cases) {
+      expect(line).not.toMatch(/nothing was lost/i);
+      // …and says the thing that replaces it, so this is not satisfied by an empty string.
+      expect(line).toMatch(/re-sending runs those steps again/i);
+    }
+  });
+
+  it("still names the model and the remedy", () => {
+    const line = gaveUpNotice("kimi-k3", { kind: "unknown", detail: "max RPM: 3" }, 0);
+    expect(line).toContain("kimi-k3");
+    expect(line).toContain("max RPM: 3");
+    expect(line).toContain("composer picker");
+  });
+
+  it("a quota wall keeps its own remedy and does not gain the retry advice", () => {
+    const line = gaveUpNotice("m", { kind: "quota", detail: "out of credit" }, 0);
+    expect(line).toMatch(/Retrying will not help/i);
+    expect(line).not.toMatch(/nothing was lost/i);
   });
 });
 
