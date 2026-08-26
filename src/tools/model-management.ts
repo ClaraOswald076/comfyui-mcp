@@ -1386,6 +1386,14 @@ export function describeEmptyModelListing(
   coverage: ModelListingCoverage,
 ): string {
   const scope = modelType ? `${modelType} models` : "local models";
+  if (coverage.targetChanged) {
+    return (
+      `Could not determine which ${scope} are installed because the connected ComfyUI target ` +
+      `changed while this listing was in progress (${coverage.targetChanged.startedBaseUrl} → ` +
+      `${coverage.targetChanged.currentBaseUrl}). No model names or paths from the stale target ` +
+      `were returned. Retry list_local_models for the current target.`
+    );
+  }
   // #1015 — a 404 is a definite "this server does not register that category",
   // and treating it as one is the whole fix. But if EVERY category came back 404
   // and none was ever answered, the definite thing established is not "you have
