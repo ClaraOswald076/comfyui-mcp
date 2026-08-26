@@ -726,9 +726,20 @@ async function collectLocalModels(
   }
 
   // Path 2 — filesystem fallback. Only useful in pure local mode without
-  // extra_model_paths.yaml. Returning empty here is only the RIGHT answer when
-  // HTTP actually answered; when it didn't, this is the false-empty path from
-  // #918 and the caller has to be told the difference (coverage.noSourceAvailable).
+  // extra_model_paths.yaml. A configured COMFYUI_PATH may deliberately coexist
+  // with a remote URL, so the path itself is not permission to scan it: doing so
+  // would answer a remote inventory question with this MCP host's models (#2319).
+  // Remote callers already have the connected server's HTTP result above; when
+  // that result is unavailable, return an explicitly source-less answer instead
+  // of consulting a local tree that belongs to another target.
+  if (isRemoteMode()) {
+    coverage.noSourceAvailable = coverage.unanswered.length > 0;
+    return results;
+  }
+
+  // Returning empty here is only the RIGHT answer when HTTP actually answered;
+  // when it didn't, this is the false-empty path from #918 and the caller has to
+  // be told the difference (coverage.noSourceAvailable).
   if (!config.comfyuiPath) {
     coverage.noSourceAvailable = coverage.unanswered.length > 0;
     return results;

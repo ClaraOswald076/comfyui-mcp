@@ -48,7 +48,27 @@ const { config } = await import("../../config.js");
 const { listLocalModelsWithCoverage, describeUnparsableBody } = await import(
   "../../services/model-resolver.js"
 );
-const { describeEmptyModelListing } = await import("../../tools/model-management.js");
+const { describeEmptyModelListing, registerModelManagementTools } = await import(
+  "../../tools/model-management.js"
+);
+
+type ToolHandler = (args: Record<string, unknown>) => Promise<{
+  isError?: boolean;
+  content: Array<{ type: string; text: string }>;
+}>;
+
+function registeredListLocalModelsTool(): ToolHandler {
+  let handler: ToolHandler | undefined;
+  const server = {
+    tool: (_name: string, _description: string, _schema: unknown, ...rest: unknown[]) => {
+      const candidate = rest.find((arg) => typeof arg === "function");
+      if (typeof candidate === "function") handler = candidate as ToolHandler;
+    },
+  };
+  registerModelManagementTools(server as never);
+  if (!handler) throw new Error("list_local_models was not registered");
+  return handler;
+}
 
 beforeEach(() => {
   getClient.mockReset();
@@ -140,6 +160,23 @@ describe("#918: the listing records whether ComfyUI actually answered", () => {
     expect(coverage.unanswered).toHaveLength(1);
   });
 
+  it("a remote target never scans a stale local COMFYUI_PATH", async () => {
+    config.comfyuiPath = "/comfy";
+    mode.remote = true;
+    getClient.mockReturnValue({ fetchApi });
+    fetchApi.mockRejectedValue(new Error("remote fetch failed"));
+    readdir.mockResolvedValue(["host-only.safetensors"]);
+    stat.mockResolvedValue({ isFile: () => true, size: 1024, mtime: new Date(0) });
+
+    const { models, coverage } = await listLocalModelsWithCoverage("checkpoints");
+
+    expect(models).toEqual([]);
+    expect(coverage.usedFilesystem).toBe(false);
+    expect(coverage.noSourceAvailable).toBe(true);
+    expect(readdir).not.toHaveBeenCalled();
+    expect(stat).not.toHaveBeenCalled();
+  });
+
   // getClient throws in cloud mode, before any per-category read runs. Every
   // requested category is then unanswered — not answered-and-empty.
   it("an outright unavailable client marks EVERY requested category unanswered", async () => {
@@ -153,6 +190,37 @@ describe("#918: the listing records whether ComfyUI actually answered", () => {
     expect(coverage.answered).toEqual([]);
     expect(coverage.unanswered.length).toBeGreaterThan(10); // all of MODEL_SUBDIRS
     expect(coverage.noSourceAvailable).toBe(true);
+  });
+});
+
+describe("#2319: list_local_models uses the target-aware listing service", () => {
+  it("does not expose host files through the registered tool for a remote target", async () => {
+    config.comfyuiPath = "/comfy";
+    mode.remote = true;
+    getClient.mockReturnValue({ fetchApi });
+    fetchApi.mockRejectedValue(new Error("remote fetch failed"));
+    readdir.mockResolvedValue(["host-only.safetensors"]);
+    stat.mockResolvedValue({ isFile: () => true, size: 1024, mtime: new Date(0) });
+
+    const result = await registeredListLocalModelsTool()({ action: "list", model_type: "checkpoints" });
+    const text = result.content[0].text;
+
+    expect(text).toMatch(/Could not determine/);
+    expect(text).toContain("no local ComfyUI path to scan");
+    expect(text).not.toContain("host-only.safetensors");
+    expect(readdir).not.toHaveBeenCalled();
+  });
+
+  it("keeps the local filesystem fallback through the registered tool", async () => {
+    getClient.mockReturnValue({ fetchApi });
+    fetchApi.mockRejectedValue(new Error("local server fetch failed"));
+    readdir.mockResolvedValue(["local-only.safetensors"]);
+    stat.mockResolvedValue({ isFile: () => true, size: 1024, mtime: new Date(0) });
+
+    const result = await registeredListLocalModelsTool()({ action: "list", model_type: "checkpoints" });
+
+    expect(result.content[0].text).toContain("local-only.safetensors");
+    expect(readdir).toHaveBeenCalled();
   });
 });
 
