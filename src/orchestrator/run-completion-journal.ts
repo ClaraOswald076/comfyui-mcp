@@ -92,6 +92,9 @@ export interface CompletionPayload {
   error?: string;
   note?: string;
   prompt_id?: string;
+  /** Stable panel delivery identity. Replays with this key are the same
+   * completion even when the first WebSocket write was not acknowledged. */
+  completion_key?: string;
   [k: string]: unknown;
 }
 
@@ -265,6 +268,9 @@ const MAX_ENTRIES_TOTAL = 96;
  *  it outlives the tickets that feed it; a resend later than THIS is delivered
  *  again, but as `foreign` — flagged UNDETERMINED, never as the awaited run. */
 const MAX_DELIVERED_MEMO = 512;
+/** Stable panel completion keys remembered after acknowledgement so a lost ack
+ * can be retried without creating a second agent turn. */
+const MAX_COMPLETION_KEY_MEMO = 512;
 /** Tabs whose evicted-completion counter is retained. */
 const MAX_DROPPED_KEYS = 64;
 /** Prompt ids whose ticket THIS party opened and which have since been evicted
@@ -337,6 +343,14 @@ function idlessFingerprint(key: string, payload: CompletionPayload): string {
   return `${key}|~idless~|${payload.kind ?? ""}|${payload.note ?? ""}|${payload.error ?? ""}|${files}`;
 }
 
+const MAX_COMPLETION_KEY_LENGTH = 512;
+
+function validCompletionKey(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 && value.length <= MAX_COMPLETION_KEY_LENGTH
+    ? value
+    : undefined;
+}
+
 export class RunCompletionJournalImpl {
   /** prompt id → ticket. Keyed globally: ComfyUI prompt ids are UUIDs, so an
    *  exact match is proof of identity on its own and survives a session's tab
@@ -351,6 +365,9 @@ export class RunCompletionJournalImpl {
    *  panel that re-sends the frame after the entry was removed can't produce a
    *  second delivery. */
   private delivered = new Set<string>();
+  /** Route/session-scoped completion keys already acknowledged. The route/session
+   * identity is part of the opaque key supplied by the panel. */
+  private completionReceipts = new Set<string>();
   /** Content fingerprint → delivery time, for ID-LESS completions (which have no
    *  run identity to memoize). Bounded FIFO + a time window, so an identical
    *  re-send is suppressed but a later genuinely-different render is not. */
@@ -832,6 +849,13 @@ export class RunCompletionJournalImpl {
     payload: CompletionPayload,
     opts: { conversation?: string } = {},
   ): JournalEntry {
+    const completionKey = validCompletionKey(payload.completion_key);
+    if (completionKey) {
+      const existing = [...this.entries.values()].find(
+        (entry) => entry.payload.completion_key === completionKey,
+      );
+      if (existing) return existing;
+    }
     const conversation = opts.conversation;
     const correlation = this.correlate(key, payload, conversation);
     let idlessRepeat = false;
@@ -1216,6 +1240,8 @@ export class RunCompletionJournalImpl {
     // and must not memoize the id as delivered, which would then suppress the new
     // run's real completion.
     if (entry.superseded) return;
+    const completionKey = validCompletionKey(entry.payload.completion_key);
+    if (completionKey) this.memoCompletionReceipt(completionKey);
     if (entry.correlation.status !== "unidentified") {
       // …and do not memoize a REUSED id either. DEFENSE IN DEPTH, not a live
       // defect: `openRun` already clears the memo on every path, so no reachable
@@ -1443,6 +1469,27 @@ export class RunCompletionJournalImpl {
     }
   }
 
+  /**
+   * Is this route-scoped completion already outstanding or acknowledged?
+   * The panel uses the answer to resend after a lost receipt without creating
+   * a second journal entry/agent turn.
+   */
+  hasCompletionReceipt(completionKey: string): boolean {
+    const value = validCompletionKey(completionKey);
+    if (!value) return false;
+    if (this.completionReceipts.has(value)) return true;
+    return [...this.entries.values()].some((entry) => entry.payload.completion_key === value);
+  }
+
+  private memoCompletionReceipt(completionKey: string): void {
+    this.completionReceipts.add(completionKey);
+    while (this.completionReceipts.size > MAX_COMPLETION_KEY_MEMO) {
+      const oldest = this.completionReceipts.values().next().value;
+      if (oldest === undefined) break;
+      this.completionReceipts.delete(oldest);
+    }
+  }
+
   /** Test/diagnostic helpers. */
   /** Whether this prompt identity still has an open or terminal ticket. */
   hasTicket(promptId: string): boolean {
@@ -1456,6 +1503,7 @@ export class RunCompletionJournalImpl {
     this.entries.clear();
     this.dropped.clear();
     this.delivered.clear();
+    this.completionReceipts.clear();
     this.idlessSeen.clear();
     this.forgottenOwnRuns.clear();
     this.seq = 0;

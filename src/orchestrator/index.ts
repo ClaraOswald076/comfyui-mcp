@@ -5308,6 +5308,8 @@ export async function runPanelOrchestrator(): Promise<void> {
         images?: Array<{ filename: string; subfolder?: string; type?: string }>;
         error?: string;
         note?: string;
+        prompt_id?: string;
+        completion_key?: string;
       };
       // A run error is URGENT: interrupt the live turn + front-queue it ("hey,
       // look at me") so the agent stops and fixes it instead of running blind.
@@ -5355,18 +5357,45 @@ export async function runPanelOrchestrator(): Promise<void> {
       // path — nothing is waiting on them the way a render is.
       if (ev.kind === "executed") {
         // Journal the BLIND-STRIPPED copy: a replay must not resurrect pixels
-        // the blind gate removed on arrival. `null` = the panel re-sent a
-        // completion this tab was already given; suppressed, never duplicated.
+        // the blind gate removed on arrival. A known completion key is the same
+        // completion being retried after a lost receipt, never a new turn.
         // #704 — WHO this completion is being reported to. The tab it arrived on
         // is an address that churns across a panel reconnect (a new `tmp:` id, no
         // same-socket migration to follow); the conversation is what actually
         // queued the run, so it is what decides "this is the run YOU queued"
         // versus the origin-UNDETERMINED warning.
-        const entry = RunCompletions.record(event.tab_id, evForTab as CompletionPayload, {
-          conversation: agentKeyFor(event.tab_id),
-        });
+        // #1824 — panel_run keeps its completion pending until this receipt. The
+        // key is route/session-scoped by the panel; recognize a replay of that
+        // same key before journaling so a lost ack cannot create a second turn.
+        const completionKey =
+          typeof ev.completion_key === "string" &&
+          ev.completion_key.length > 0 &&
+          ev.completion_key.length <= 512
+            ? ev.completion_key
+            : null;
+        const alreadyKnown =
+          completionKey !== null && RunCompletions.hasCompletionReceipt(completionKey);
+        const entry = alreadyKnown
+          ? null
+          : RunCompletions.record(event.tab_id, evForTab as CompletionPayload, {
+              conversation: agentKeyFor(event.tab_id),
+            });
+        if (completionKey && typeof ev.prompt_id === "string" && ev.prompt_id.length > 0) {
+          bridge.push(
+            {
+              type: "ack",
+              ok: true,
+              kind: "completion",
+              prompt_id: ev.prompt_id,
+              completion_key: completionKey,
+            },
+            event.tab_id,
+          );
+        }
         logger.info(
-          `[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} run completion for ${describeCorrelation(entry.correlation)}${entry.possibleRepeat ? " (flagged as a possible repeat)" : ""}`,
+          entry
+            ? `[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} run completion for ${describeCorrelation(entry.correlation)}${entry.possibleRepeat ? " (flagged as a possible repeat)" : ""}`
+            : `[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} replayed an acknowledged run completion key`,
         );
         flushRunCompletions(event.tab_id);
         return;
