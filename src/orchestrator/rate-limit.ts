@@ -184,6 +184,17 @@ function parseWaitFromProse(text: string): number | null {
  */
 export function sanitizeDetail(raw: string, max = 200): string {
   const masked = redactTokens(raw)
+    // UUID-shaped ids FIRST, with any prefix attached. Their hyphens defeat both
+    // rules below: the longest unbroken run inside a UUID is 12 characters, so the
+    // bare-run rule never fires, and the prefixed rule matches only the TAIL —
+    // which is worse than missing it outright, because
+    // `550e8400-e29b-41d4-a716-<redacted>` reads as sanitized while 24 of its 36
+    // characters shipped. A partial redaction nobody re-checks is the dangerous
+    // shape here, so this runs before anything can produce one.
+    .replace(
+      /\b(?:([A-Za-z][A-Za-z0-9]{1,12})[-_])?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g,
+      (_m, prefix: string | undefined) => (prefix ? `${prefix}-<redacted>` : "<redacted>"),
+    )
     // prefixed opaque identifiers: org-…, cak-…, key_…, acct-…
     .replace(/\b([A-Za-z][A-Za-z0-9]{1,12}[-_])[A-Za-z0-9]{10,}\b/g, "$1<redacted>")
     // bare long hex / base62 runs (an id that came without a prefix)

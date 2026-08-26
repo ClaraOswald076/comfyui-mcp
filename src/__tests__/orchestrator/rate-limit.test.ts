@@ -133,6 +133,33 @@ describe("sanitizeDetail", () => {
   it("redacts an email address", () => {
     expect(sanitizeDetail("quota for art@example.com exhausted")).not.toContain("art@example.com");
   });
+
+  // Hyphens defeated both shape rules: the longest unbroken run inside a UUID is 12
+  // characters, so the bare-run rule (20+) never fired, and the prefixed rule matched
+  // only the TAIL. The second case below is the dangerous one — it used to come back as
+  // "550e8400-e29b-41d4-a716-<redacted>", which READS as sanitized while 24 of its 36
+  // characters shipped. Nobody re-checks a redaction that already looks done.
+  it("redacts a UUID-shaped account id whole, with or without a vendor prefix", () => {
+    const prefixed = sanitizeDetail("org-12345678-1234-1234-1234-123456789012 reached its limit");
+    expect(prefixed).not.toContain("12345678");
+    expect(prefixed).not.toContain("123456789012");
+    expect(prefixed).toContain("org-");
+
+    const bare = sanitizeDetail("account 550e8400-e29b-41d4-a716-446655440000 limit");
+    // No FRAGMENT survives — asserting only on the full string would pass on the partial.
+    for (const part of ["550e8400", "e29b", "41d4", "a716", "446655440000"]) {
+      expect(bare).not.toContain(part);
+    }
+    expect(bare).toContain("account");
+    expect(bare).toContain("limit");
+  });
+
+  it("still leaves hyphenated prose and header names alone", () => {
+    // The UUID rule is shape-specific on purpose: widening it to any hyphenated run
+    // would eat the parts of a 429 that explain the limit, which is why it is shown.
+    const out = sanitizeDetail("rate limit exceeded; see x-ratelimit-reset-requests");
+    expect(out).toContain("x-ratelimit-reset-requests");
+  });
 });
 
 describe("humanWait", () => {

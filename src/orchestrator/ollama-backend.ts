@@ -965,6 +965,11 @@ export class OllamaBackend implements AgentBackend {
     const keepalive = onActivity ? setInterval(onActivity, 5000) : null;
     let res: Response;
     try {
+      // Capture the model BEFORE the async boundary. The thunk below is re-invoked
+      // after a rate-limit backoff, and re-reading `this.model` there sends the retried
+      // request to whatever the user switched to during the wait — while the notice they
+      // already saw names the old one. One turn, two models, no way to tell from the log.
+      const model = this.model;
       // A 429 that names a bounded wait is waited out here rather than ending the
       // turn: this endpoint serves every OpenAI-compatible provider (moonshot,
       // glm, minimax, openrouter, …), several of which limit by requests-per-
@@ -978,7 +983,7 @@ export class OllamaBackend implements AgentBackend {
               method: "POST",
               headers: { "content-type": "application/json", ...this.authHeaders() },
               body: JSON.stringify({
-                model: this.model,
+                model,
                 messages: toOpenAiMessages(messages),
                 tools,
                 tool_choice: "auto",
@@ -1004,7 +1009,7 @@ export class OllamaBackend implements AgentBackend {
               method: "POST",
               headers: { "content-type": "application/json" },
               body: JSON.stringify({
-                model: this.model,
+                model,
                 messages: toOllamaMessages(messages),
                 tools,
                 stream: true,
@@ -1018,7 +1023,7 @@ export class OllamaBackend implements AgentBackend {
               }),
               signal,
             }),
-        { model: this.model, label: "ollama-backend", signal, onActivity },
+        { model, label: "ollama-backend", signal, onActivity },
       );
     } finally {
       if (keepalive) clearInterval(keepalive);

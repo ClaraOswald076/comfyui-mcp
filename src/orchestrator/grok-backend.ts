@@ -1412,6 +1412,11 @@ export class GrokDirectBackend extends OllamaBackend {
     const keepalive = onActivity ? setInterval(onActivity, 5000) : null;
     let res: Response;
     try {
+      // Capture the model BEFORE the async boundary. The thunk below is re-invoked
+      // after a rate-limit backoff, and re-reading `this.model` there sends the retried
+      // request to whatever the user switched to during the wait — while the notice they
+      // already saw names the old one. One turn, two models, no way to tell from the log.
+      const model = this.model;
       // 429s are waited out when xAI names a bounded window; every other status
       // falls through to the error below unchanged (orchestrator/rate-limit.ts).
       res = yield* sendWithRateLimitRetry(
@@ -1424,7 +1429,7 @@ export class GrokDirectBackend extends OllamaBackend {
               authorization: `Bearer ${this.accessToken}`,
             },
             body: JSON.stringify({
-              model: this.model,
+              model,
               instructions,
               input,
               tools: grokToolsToResponses(tools),
@@ -1433,7 +1438,7 @@ export class GrokDirectBackend extends OllamaBackend {
             }),
             signal,
           }),
-        { model: this.model, label: "grok-backend", signal, onActivity },
+        { model, label: "grok-backend", signal, onActivity },
       );
     } finally {
       if (keepalive) clearInterval(keepalive);

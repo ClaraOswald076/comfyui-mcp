@@ -199,6 +199,11 @@ export class ChatGptOAuthBackend extends OllamaBackend {
     const keepalive = onActivity ? setInterval(onActivity, 5000) : null;
     let res: Response;
     try {
+      // Capture the model BEFORE the async boundary. The thunk below is re-invoked
+      // after a rate-limit backoff, and re-reading `this.model` there sends the retried
+      // request to whatever the user switched to during the wait — while the notice they
+      // already saw names the old one. One turn, two models, no way to tell from the log.
+      const model = this.model;
       // 429s are waited out when the window is bounded and named; every other
       // status falls through unchanged (orchestrator/rate-limit.ts).
       res = yield* sendWithRateLimitRetry(
@@ -211,7 +216,7 @@ export class ChatGptOAuthBackend extends OllamaBackend {
               ...this.codexAuthHeaders(),
             },
             body: JSON.stringify({
-              model: this.model,
+              model,
               instructions,
               input,
               tools: toResponsesTools(tools),
@@ -220,7 +225,7 @@ export class ChatGptOAuthBackend extends OllamaBackend {
             }),
             signal,
           }),
-        { model: this.model, label: "chatgpt-oauth-backend", signal, onActivity },
+        { model, label: "chatgpt-oauth-backend", signal, onActivity },
       );
     } finally {
       if (keepalive) clearInterval(keepalive);
@@ -389,7 +394,17 @@ export class ChatGptOAuthBackend extends OllamaBackend {
             yield r.value;
           }
         } catch (err) {
-          if (!abort.signal.aborted && !imagesStripped && this.turnHistory.some((m) => m.images?.length)) {
+          // A RateLimitError is NOT an image rejection. Without this clause a 429 on any
+          // history carrying an image lands here, strips the images, tells the user this
+          // endpoint rejected image input, and then answers WITHOUT the image — a false
+          // explanation and a silently degraded answer, both from a rate limit the retry
+          // above already knows how to wait out. Let it through to the 429 handling.
+          if (
+            !abort.signal.aborted &&
+            !asRateLimitError(err) &&
+            !imagesStripped &&
+            this.turnHistory.some((m) => m.images?.length)
+          ) {
             imagesStripped = true;
             logger.warn(
               `[chatgpt-oauth-backend] image input rejected (${msgOf(err).slice(0, 200)}) — retrying without images`,
