@@ -29,6 +29,7 @@ import {
   parseContradictoryPromotedWidgetRefusal,
   parseSubgraphScopeRefusal,
   resolveInnerPromotedTarget,
+  validatePromotedSubgraphEnvelope,
 } from "../../orchestrator/promoted-widget.js";
 import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
 
@@ -85,13 +86,27 @@ function bridge(opts: {
   /** #2314: make the first subgraph read unavailable so a recovery test can
    *  continue into the existing post-refusal retry branch. */
   preflightSubgraph?: Record<string, unknown> | Error;
+  remappedWriteError?: string;
+  reconnectBeforeWrite?: boolean;
+  tabRebindBeforeWrite?: boolean;
 }) {
   const calls: Array<Record<string, unknown>> = [];
   let writes = 0;
   let subgraphReads = 0;
   let inSubgraph = false;
+  let connectionIdentity = { generation: 1, tabSessionId: "browser-tab-a" };
+  const beforeWrite = { mutate: undefined as (() => void) | undefined };
   const b = {
-    send: async (cmd: Record<string, unknown>) => {
+    send: async (
+      cmd: Record<string, unknown>,
+      sendOpts?: { beforeDispatch?: () => void },
+    ) => {
+      if (cmd.cmd === "graph_set_widget" && sendOpts?.beforeDispatch) {
+        const mutation = beforeWrite.mutate;
+        beforeWrite.mutate = undefined;
+        mutation?.();
+        sendOpts.beforeDispatch();
+      }
       calls.push({ ...cmd });
       if (cmd.cmd === "graph_set_widget") {
         writes += 1;
@@ -101,6 +116,7 @@ function bridge(opts: {
           throw new Error(STACK_DATA_CONTRADICTORY);
         }
         if (writes === 1 && opts.firstWriteError) throw new Error(opts.firstWriteError);
+        if (writes === 2 && opts.remappedWriteError) throw new Error(opts.remappedWriteError);
         if (
           writes === 1 &&
           opts.detailById &&
@@ -171,18 +187,31 @@ function bridge(opts: {
     tabs: () => [{ tab_id: TAB, title: "wf", connected_at: 0 }],
     resolveActiveTabId: () => TAB,
     tabCanMutateGraph: () => true,
-    tabConnectionIdentity: () => ({ generation: 1, tabSessionId: "browser-tab-a" }),
+    tabConnectionIdentity: () => connectionIdentity,
     tabExpectedNodeTypeFenceCapability: () => true,
     tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
   } as unknown as PanelToolCtx["bridge"];
-  return { b, calls };
+  if (opts.reconnectBeforeWrite) {
+    beforeWrite.mutate = () => {
+      // The same browser tab returns after a reconnect: its session id is
+      // stable, but the connection generation advances.
+      connectionIdentity = { generation: 2, tabSessionId: "browser-tab-a" };
+    };
+  } else if (opts.tabRebindBeforeWrite) {
+    beforeWrite.mutate = () => {
+      // A second browser tab for the same workflow keeps the workflow route
+      // but has a different receiver session.
+      connectionIdentity = { generation: 1, tabSessionId: "browser-tab-b" };
+    };
+  }
+  return { b, calls, beforeWrite };
 }
 
 async function setWidget(
   args: { node_id: number | string; widget: string; value: number | string },
   opts: Parameters<typeof bridge>[0] = {},
 ) {
-  const { b, calls } = bridge(opts);
+  const { b, calls, beforeWrite } = bridge(opts);
   const ctx = makePanelToolCtx(b, TAB, new WorkflowTargetStore());
   const def = buildPanelToolDefs().find((d) => d.name === "panel_set_widget");
   if (!def) throw new Error("panel_set_widget is not registered");
@@ -268,8 +297,8 @@ describe("panel_set_widget promoted inner dynamic-combo child (#2299)", () => {
         firstWrite: "contradict",
         firstWriteError: DYNAMIC_CHILD_CONTRADICTORY,
         innerWrite: "ok",
-        subgraph: DYNAMIC_SUBGRAPH,
-        preflightSubgraph: {
+        preflightSubgraph: new Error("preflight unavailable"),
+        subgraph: {
           ...DYNAMIC_SUBGRAPH,
           nodes: [
             {
@@ -378,6 +407,7 @@ describe("panel_set_widget promoted inner LC123 regional prompt (#2305)", () => 
         firstWrite: "contradict",
         firstWriteError: ANIMA_CONTRADICTORY,
         innerWrite: "ok",
+        preflightSubgraph: new Error("preflight unavailable"),
         subgraph: {
           ...ANIMA_SUBGRAPH,
           nodes: [
@@ -518,7 +548,7 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
       },
       undefined,
     ],
-  ] as const)("keeps a safe %s promoted write successful on the container", async (
+  ] as const)("keeps a safe %s promoted write successful via the inner node", async (
     _name,
     widget,
     subgraph,
@@ -541,16 +571,11 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
     );
     expect(isError).toBe(false);
     expect(calls.some((c) => c.cmd === "graph_get_subgraph")).toBe(true);
-    if (widget === "stack_data") {
-      expect(calls.map((c) => c.cmd)).toContain("graph_enter_subgraph");
-      expect(calls.map((c) => c.cmd)).toContain("graph_exit_subgraph");
-    } else {
-      expect(calls.map((c) => c.cmd)).not.toContain("graph_enter_subgraph");
-      expect(calls.map((c) => c.cmd)).not.toContain("graph_exit_subgraph");
-    }
+    expect(calls.map((c) => c.cmd)).toContain("graph_enter_subgraph");
+    expect(calls.map((c) => c.cmd)).toContain("graph_exit_subgraph");
     const writes = calls.filter((c) => c.cmd === "graph_set_widget");
     expect(writes).toHaveLength(1);
-    expect(writes[0]).toMatchObject({ node_id: 78, widget });
+    expect(writes[0]).toMatchObject({ node_id: 76, widget });
   });
 
   it("keeps a successful container write when promotion preflight is unavailable", async () => {
@@ -570,12 +595,81 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
     ]);
   });
 
+  it("refuses when the promotion relinks after classification", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
+      {
+        firstWrite: "ok",
+        // The first read classified a safe inner node; the confirmation read
+        // observes a relink to the known-bad regional-canvas node.
+        preflightSubgraph: SAFE_ANIMA_SUBGRAPH,
+        subgraph: ANIMA_SUBGRAPH,
+        detailById: ANIMA_IDENTITY_BY_ID,
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/mapping changed or became unverifiable|inner node type changed/);
+    expect(calls.filter((c) => c.cmd === "graph_get_subgraph")).toHaveLength(2);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(0);
+    expect(calls.map((c) => c.cmd)).not.toContain("graph_enter_subgraph");
+  });
+
+  it.each([
+    ["stale owner", { ...SAFE_ANIMA_SUBGRAPH, subgraph_of: { node_id: 79 } }],
+    ["wrong node count", { ...SAFE_ANIMA_SUBGRAPH, node_count: 2 }],
+  ])("refuses a %s envelope before writing the container", async (_name, subgraph) => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
+      { firstWrite: "ok", subgraph },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/malformed, stale, or incomplete ownership envelope/);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(0);
+  });
+
+  it("refuses when the bound panel reconnects before the inner dispatch", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
+      {
+        firstWrite: "ok",
+        subgraph: SAFE_ANIMA_SUBGRAPH,
+        detailById: SAFE_ANIMA_IDENTITY_BY_ID,
+        reconnectBeforeWrite: true,
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/session or connection changed|No graph_set_widget was dispatched/);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(0);
+    expect(calls).toEqual(expect.arrayContaining([{ cmd: "graph_exit_subgraph" }]));
+  });
+
+  it("refuses when the same-workflow panel tab is rebound before the inner dispatch", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
+      {
+        firstWrite: "ok",
+        subgraph: SAFE_ANIMA_SUBGRAPH,
+        detailById: SAFE_ANIMA_IDENTITY_BY_ID,
+        tabRebindBeforeWrite: true,
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/session or connection changed|No graph_set_widget was dispatched/);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(0);
+    expect(calls).toEqual(expect.arrayContaining([{ cmd: "graph_exit_subgraph" }]));
+  });
+
   it("re-runs the guards for a case-only remapped container widget", async () => {
     const { text, isError, calls } = await setWidget(
       { node_id: 78, widget: "Quality_Prompt", value: "masterpiece" },
       {
         firstWrite: "contradict",
         firstWriteError: ANIMA_CONTRADICTORY,
+        remappedWriteError: ANIMA_CONTRADICTORY,
         subgraph: ANIMA_SUBGRAPH,
         detailById: ANIMA_IDENTITY_BY_ID,
         preflightSubgraph: new Error("preflight unavailable"),
@@ -585,7 +679,7 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
     expect(isError).toBe(true);
     expect(text).toContain("animaPrompts");
     const writes = calls.filter((c) => c.cmd === "graph_set_widget");
-    expect(writes).toHaveLength(1);
+    expect(writes).toHaveLength(2);
     expect(writes[0]).toMatchObject({ node_id: 78, widget: "Quality_Prompt" });
   });
 
@@ -661,14 +755,14 @@ describe("parseContradictoryPromotedWidgetRefusal", () => {
 
 describe("resolveInnerPromotedTarget", () => {
   it("maps width to the unique EmptyLatentImage inner node", () => {
-    expect(resolveInnerPromotedTarget(SUBGRAPH, "width")).toEqual({
+    expect(resolveInnerPromotedTarget(SUBGRAPH, "width", 78)).toEqual({
       innerNodeId: 76,
       widget: "width",
     });
   });
 
   it("maps seed to the unique KSampler inner node", () => {
-    expect(resolveInnerPromotedTarget(SUBGRAPH, "seed")).toEqual({
+    expect(resolveInnerPromotedTarget(SUBGRAPH, "seed", 78)).toEqual({
       innerNodeId: 75,
       widget: "seed",
     });
@@ -682,15 +776,41 @@ describe("resolveInnerPromotedTarget", () => {
         { id: 99, widgets: { width: 512 } },
       ],
     };
-    expect(resolveInnerPromotedTarget(ambiguous, "width")).toBeNull();
+    expect(resolveInnerPromotedTarget(ambiguous, "width", 78)).toBeNull();
   });
 
   it("refuses to guess from a truncated inner list", () => {
-    expect(resolveInnerPromotedTarget({ ...SUBGRAPH, truncated: true }, "width")).toBeNull();
+    expect(resolveInnerPromotedTarget({ ...SUBGRAPH, truncated: true }, "width", 78)).toBeNull();
   });
 
   it("returns null when no inner node owns the widget", () => {
-    expect(resolveInnerPromotedTarget(SUBGRAPH, "denoise")).toBeNull();
+    expect(resolveInnerPromotedTarget(SUBGRAPH, "denoise", 78)).toBeNull();
+  });
+
+  it("rejects an envelope owned by a different outer node", () => {
+    expect(
+      validatePromotedSubgraphEnvelope(
+        { ...SUBGRAPH, subgraph_of: { node_id: 79, title: "stale" } },
+        78,
+      ),
+    ).toBeNull();
+    expect(
+      resolveInnerPromotedTarget(
+        { ...SUBGRAPH, subgraph_of: { node_id: 79, title: "stale" } },
+        "width",
+        78,
+      ),
+    ).toBeNull();
+  });
+
+  it.each([
+    ["missing subgraph_of", { ...SUBGRAPH, subgraph_of: undefined }],
+    ["wrong node_count", { ...SUBGRAPH, node_count: 1 }],
+    ["non-integer node_count", { ...SUBGRAPH, node_count: "2" }],
+    ["truncated envelope", { ...SUBGRAPH, truncated: true }],
+  ])("rejects a %s instead of trusting its inner mapping", (_name, malformed) => {
+    expect(validatePromotedSubgraphEnvelope(malformed, 78)).toBeNull();
+    expect(resolveInnerPromotedTarget(malformed, "width", 78)).toBeNull();
   });
 });
 
@@ -716,14 +836,15 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
       "graph_query",
       "graph_set_widget",
       "graph_get_subgraph",
+      "graph_get_subgraph",
       "graph_enter_subgraph",
       "graph_query",
       "graph_set_widget",
       "graph_exit_subgraph",
     ]);
     expect(calls[3]).toMatchObject({ expected_node_type: "OtherLoraLoader" });
-    expect(calls[7]).toMatchObject({ expected_node_type: "OtherLoraLoader" });
-    expect(text).toMatch(/inner widget this promotion lists/);
+    expect(calls[8]).toMatchObject({ expected_node_type: "OtherLoraLoader" });
+    expect(text).toMatch(/validated promoted inner widget/);
   });
 
   it("refuses a promoted inner retry when the post-enter identity is stale", async () => {
@@ -748,12 +869,13 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
       "graph_query",
       "graph_set_widget",
       "graph_get_subgraph",
+      "graph_get_subgraph",
       "graph_enter_subgraph",
       "graph_query",
       "graph_exit_subgraph",
     ]);
     expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(1);
-    expect(text).toMatch(/post-enter identity probe did not verify/);
+    expect(text).toMatch(/different node_id|No inner graph_set_widget/);
   });
 
   it("refuses a promoted inner DaSiWa stack write without a second mutation", async () => {
@@ -778,12 +900,13 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
       "graph_query",
       "graph_set_widget",
       "graph_get_subgraph",
+      "graph_get_subgraph",
       "graph_enter_subgraph",
       "graph_query",
       "graph_exit_subgraph",
     ]);
     expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(1);
-    expect(text).toMatch(/promoted inner node 76 was identified as DaSiWa_LTX2LoraLoader/);
+    expect(text).toMatch(/cannot set "stack_data" on DaSiWa_LTX2LoraLoader/);
     expect(text).toMatch(/No inner graph_set_widget was dispatched/);
   });
 
@@ -893,6 +1016,7 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
       { node_id: 78, widget: "width", value: 1024 },
       {
         subgraph: {
+          subgraph_of: { node_id: 78, title: "Container" },
           node_count: 2,
           nodes: [
             { id: 76, widgets: { width: 1920 } },
@@ -914,7 +1038,7 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
       { subgraph: { ...SUBGRAPH, truncated: true } },
     );
     expect(isError).toBe(true);
-    expect(text).toMatch(/did not uniquely identify/);
+    expect(text).toMatch(/malformed, stale, or incomplete ownership envelope/);
     expect(calls.map((c) => c.cmd)).not.toContain("graph_enter_subgraph");
   });
 

@@ -120,6 +120,7 @@ import {
   parseSubgraphScopeRefusal,
   parseUnpromotedControlPersistRemedy,
   resolveInnerPromotedTarget,
+  validatePromotedSubgraphEnvelope,
   type UnpromotedControlPersistRemedy,
 } from "./promoted-widget.js";
 import { includeRequestedCreateGroupMembers } from "./create-group-membership.js";
@@ -6220,9 +6221,7 @@ async function refuseKnownBadWriteBeforeDispatch(
   nodeId: unknown,
   widget: string,
 ): Promise<ToolResult | null> {
-  const directBlocked = await refuseKnownBadWidgetWrite(ctx, nodeId, widget);
-  if (directBlocked) return directBlocked;
-  return refuseKnownBadPromotedWidgetWrite(ctx, nodeId, widget);
+  return refuseKnownBadWidgetWrite(ctx, nodeId, widget);
 }
 
 function mayHaveKnownBadPromotedWidget(widget: string): boolean {
@@ -6248,120 +6247,171 @@ function mayHaveKnownBadPromotedWidget(widget: string): boolean {
  * identity fence inside the inner scope; Anima and dynamic-combo retain their
  * existing fail-open behavior when their specific inner evidence is unavailable.
  */
-async function refuseKnownBadPromotedWidgetWrite(
+type PromotedWriteBinding = {
+  tabId: string;
+  identity: { generation: number; tabSessionId: string };
+};
+
+type PromotedWritePlan = {
+  kind: "promoted-write";
+  outerNodeId: number | string;
+  inner: { innerNodeId: number | string; widget: string };
+  innerNodeType: string;
+  binding: PromotedWriteBinding;
+};
+
+type PromotedWritePreflight = PromotedWritePlan | ToolResult | null;
+
+function promotedEnvelopeCarriesEvidence(payload: Record<string, unknown> | null): boolean {
+  if (!payload) return false;
+  return ["subgraph_of", "node_count", "nodes", "truncated"].some((key) =>
+    Object.prototype.hasOwnProperty.call(payload, key),
+  );
+}
+
+function promotedMatchCount(payload: Record<string, unknown>, widget: string): number {
+  const nodes = payload.nodes;
+  if (!Array.isArray(nodes)) return 0;
+  let matches = 0;
+  for (const raw of nodes) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const widgets = (raw as Record<string, unknown>).widgets;
+    if (!widgets || typeof widgets !== "object" || Array.isArray(widgets)) continue;
+    if (
+      Object.keys(widgets as Record<string, unknown>).some(
+        (name) => name === widget || name.toLowerCase() === widget.toLowerCase(),
+      )
+    ) {
+      matches += 1;
+    }
+  }
+  return matches;
+}
+
+function currentPromotedBindingError(
+  ctx: PanelToolCtx,
+  binding: PromotedWriteBinding,
+): string | null {
+  if (ctx.tabId !== binding.tabId) return "the panel tab was rebound";
+  let current: { generation: number; tabSessionId: string } | undefined;
+  try {
+    current = ctx.panelConnectionIdentity?.();
+  } catch {
+    return "the panel connection identity became unreadable";
+  }
+  if (!isUsablePanelConnectionIdentity(current)) {
+    return "the panel connection identity became unavailable";
+  }
+  if (!samePanelConnectionIdentity(binding.identity, current)) {
+    return "the panel session or connection changed";
+  }
+  return null;
+}
+
+function promotedWriteRefusal(widget: string, reason: string): ToolResult {
+  return fail(
+    `panel_set_widget refused the promoted "${widget}" write because ${reason}. ` +
+      `No graph_set_widget was dispatched; retry only after the panel binding and ` +
+      `subgraph mapping are stable.`,
+  );
+}
+
+/**
+ * #2314 — inspect a promoted target before the first write. A valid mapping is
+ * not permission to write the wrapper: the plan carries the receiver identity,
+ * inner node id, and inner type to an inner write whose final dispatch fence
+ * checks the receiver again. A later promotion relink therefore cannot redirect
+ * an apparently safe container write onto a known-bad inner.
+ *
+ * An unavailable graph_get_subgraph remains the pre-existing fail-open case: it
+ * supplies no promotion classification. A successful response with promotion
+ * fields that are malformed, stale, truncated, or ambiguous fails closed.
+ */
+async function preparePromotedWidgetWrite(
   ctx: PanelToolCtx,
   nodeId: unknown,
   widget: string,
-): Promise<ToolResult | null> {
+): Promise<PromotedWritePreflight> {
   if (!mayHaveKnownBadPromotedWidget(widget)) return null;
 
+  const tabBefore = ctx.tabId;
+  const hasIdentityApi = typeof ctx.panelConnectionIdentity === "function";
+  let identityBefore: { generation: number; tabSessionId: string } | undefined;
+  if (hasIdentityApi) {
+    try {
+      identityBefore = ctx.panelConnectionIdentity?.();
+    } catch {
+      return promotedWriteRefusal(widget, "the panel connection identity could not be read");
+    }
+  }
+
   const sub = await ctx.call({ cmd: "graph_get_subgraph", node_id: nodeId });
+  // Preserve #2299's unavailable-preflight fail-open behavior exactly: an
+  // unavailable read does not classify the write as promoted.
   if (sub.isError) return null;
   const payload = parseToolResultJson(sub);
-  const inner = resolveInnerPromotedTarget(payload, widget);
-  if (!inner) return null;
+  // Some lightweight test seams return the ordinary write envelope for every
+  // command. It carries no subgraph claim, so it is not promotion evidence.
+  if (!promotedEnvelopeCarriesEvidence(payload)) return null;
+  if (!payload) return null;
+  if (!hasIdentityApi) {
+    return promotedWriteRefusal(widget, "the receiver identity was unavailable while the mapping was read");
+  }
+  if (!isUsablePanelConnectionIdentity(identityBefore)) {
+    return promotedWriteRefusal(widget, "the panel connection identity was unavailable");
+  }
 
-  const nodes = payload?.nodes;
-  if (!Array.isArray(nodes)) return null;
+  let identityAfter: { generation: number; tabSessionId: string } | undefined;
+  try {
+    identityAfter = ctx.panelConnectionIdentity?.();
+  } catch {
+    return promotedWriteRefusal(widget, "the panel connection identity became unreadable while the mapping was read");
+  }
+  if (ctx.tabId !== tabBefore || !isUsablePanelConnectionIdentity(identityAfter)) {
+    return promotedWriteRefusal(widget, "the panel tab or connection changed while the mapping was read");
+  }
+  if (!samePanelConnectionIdentity(identityBefore, identityAfter)) {
+    return promotedWriteRefusal(widget, "the panel session or connection changed while the mapping was read");
+  }
+
+  const envelope = validatePromotedSubgraphEnvelope(payload, nodeId as number | string);
+  if (!envelope) {
+    return promotedWriteRefusal(
+      widget,
+      "graph_get_subgraph returned a malformed, stale, or incomplete ownership envelope",
+    );
+  }
+  const inner = resolveInnerPromotedTarget(payload, widget, nodeId as number | string);
+  if (!inner) {
+    const matches = promotedMatchCount(payload, widget);
+    return matches === 0
+      ? null
+      : promotedWriteRefusal(widget, `the envelope mapped it ambiguously to ${matches} inner nodes`);
+  }
+
   const targetId = canonicalQueriedNodeId(inner.innerNodeId);
-  const innerNode = nodes.find((candidate) => {
-    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
-    const candidateId = canonicalQueriedNodeId((candidate as Record<string, unknown>).id);
+  const innerNode = envelope.nodes.find((candidate) => {
+    const candidateId = canonicalQueriedNodeId(candidate.id);
     return candidateId !== null && candidateId === targetId;
   });
-  if (!innerNode || typeof innerNode !== "object" || Array.isArray(innerNode)) return null;
-
-  // The DaSiWa guard is deliberately stronger than a type classification from
-  // graph_get_subgraph: it authenticates the live node id, tab identity, and the
-  // panel's atomic expected-node-type fence. Preserve that contract for a
-  // promoted stack candidate instead of trusting the listing as a write fence.
-  if (inner.widget === DASIWA_STACK_WIDGET) {
-    return refusePromotedDaSiWaStackWrite(ctx, nodeId, inner.innerNodeId);
+  if (!innerNode || !targetId) {
+    return promotedWriteRefusal(widget, "the envelope did not retain the mapped inner node identity");
+  }
+  const innerNodeType = innerNode.type;
+  if (typeof innerNodeType !== "string" || innerNodeType.length === 0) {
+    return promotedWriteRefusal(widget, "the mapped inner node had no verifiable type fence");
+  }
+  if (ctx.tabExpectedNodeTypeFenceCapability?.() !== true) {
+    return promotedWriteRefusal(widget, "the receiving panel lacks the atomic inner-node write fence");
   }
 
-  const identity = parseQueriedNodeIdentityRow(innerNode);
-  if (!identity) {
-    return null;
-  }
-
-  let blocked: ToolResult | null = null;
-  if (isAnimaRegionalPromptWidget(inner.widget)) {
-    if (ANIMA_REGIONAL_CANVAS_TYPES.has(identity.type)) {
-      blocked = animaRegionalPromptRefusal(identity.type, inner.widget);
-    }
-  } else if (inner.widget.includes(".")) {
-    blocked = dynamicComboSubWidgetRefusalFromDetail(
-      parseVerifiedQueriedNodeDetail({ nodes: [innerNode] }),
-      inner.widget,
-    );
-  }
-
-  return blocked
-    ? appendToolResultText(
-        blocked,
-        `\n\n(The addressed widget is promoted from node ${inner.innerNodeId} "${inner.widget}"; ` +
-          `the container write was refused before dispatch. No graph_set_widget was dispatched.)`,
-      )
-    : null;
-}
-
-/** Keep the DaSiWa promoted path on its existing live identity fence. The
- * subgraph listing only establishes which inner node to inspect; it is never
- * used as the final type proof for a mutation. */
-async function refusePromotedDaSiWaStackWrite(
-  ctx: PanelToolCtx,
-  containerNodeId: unknown,
-  innerNodeId: number | string,
-): Promise<ToolResult | null> {
-  let entered = false;
-  try {
-    const enter = await ctx.call(
-      { cmd: "graph_enter_subgraph", node_id: containerNodeId },
-      15000,
-    );
-    if (enter.isError) {
-      return daSiWaIdentityRefusal(
-        `the promoted inner node ${innerNodeId} could not be live-verified because ` +
-          `panel_enter_subgraph failed (${textOfToolResult(enter)})`,
-      );
-    }
-    entered = true;
-
-    const blocked = await refuseDaSiWaStackWrite(ctx, innerNodeId, DASIWA_STACK_WIDGET);
-    const exit = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
-    entered = false;
-    if (blocked) {
-      return appendToolResultText(
-        blocked,
-        `\n\n(The addressed stack widget is promoted from node ${innerNodeId}; ` +
-          `the container write was refused before dispatch. No graph_set_widget was dispatched.` +
-          (exit.isError
-            ? ` panel_exit_subgraph also FAILED — the caller scope may still be inside ` +
-              `the subgraph. Call panel_exit_subgraph. (${textOfToolResult(exit)})`
-            : ""),
-      );
-    }
-    if (exit.isError) {
-      return daSiWaIdentityRefusal(
-        `the promoted inner node ${innerNodeId} was checked, but panel_exit_subgraph ` +
-          `failed before the container write (${textOfToolResult(exit)})`,
-      );
-    }
-    return null;
-  } catch (error) {
-    return daSiWaIdentityRefusal(
-      `the promoted inner node ${innerNodeId} could not be live-verified before dispatch: ` +
-        `${error instanceof Error ? error.message : String(error)}`,
-    );
-  } finally {
-    if (entered) {
-      try {
-        await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
-      } catch {
-        // Preserve the refusal. The caller can explicitly recover the scope.
-      }
-    }
-  }
+  return {
+    kind: "promoted-write",
+    outerNodeId: nodeId as number | string,
+    inner,
+    innerNodeType,
+    binding: { tabId: tabBefore, identity: identityAfter },
+  };
 }
 
 function daSiWaStackRefusal(type: string): ToolResult {
@@ -12477,10 +12527,16 @@ export function makePanelToolCtx(
     cmd: Record<string, unknown>,
     timeoutMs?: number,
     onDispatchedRid?: (rid: string) => void,
+    beforeDispatch?: () => void,
   ): Promise<unknown> => {
     const target = workflowTargets?.get(ctx.tabId);
     const routed = target ? withWorkflowTarget(cmd, target) : cmd;
-    return bridge.send(routed as { cmd: string }, { tabId: ctx.tabId, timeoutMs, onDispatchedRid });
+    return bridge.send(routed as { cmd: string }, {
+      tabId: ctx.tabId,
+      timeoutMs,
+      onDispatchedRid,
+      beforeDispatch,
+    });
   };
 
   const callOnce = async (
@@ -12529,11 +12585,10 @@ export function makePanelToolCtx(
       // so they are dispatched on the bounded budget above instead.
       const blocked = graphCmdBlockedByRunningPrompt(cmd);
       if (blocked) return fail(blocked);
-      // A caller may hold a target/generation fence across the reachability wait.
-      // Run it synchronously in the final gap before sendRouted: an async check here
-      // would reopen the exact retarget window this guard closes.
-      beforeDispatch?.();
-      const firstTry = ok(await sendRouted(cmd, timeoutMs, observeRid));
+      // The bridge owns the graph lane and re-resolves the live connection after
+      // waiting. Pass the fence through so it runs at the actual socket dispatch,
+      // not before that retarget window.
+      const firstTry = ok(await sendRouted(cmd, timeoutMs, observeRid, beforeDispatch));
       // panel#1097 — a guard-domain command that SUCCEEDS is the evidence that the
       // switch is over, whichever attempt lands it. Without this an ordinary
       // first-attempt success left the old run in place, and a later unrelated
@@ -12617,8 +12672,7 @@ export function makePanelToolCtx(
           await awaitReachable();
           ensureReachable(); // rebinds a current-mode session onto the reconnected tab
           holdTab = ctx.tabId;
-          beforeDispatch?.();
-          const retried = ok(await sendRouted(cmd, timeoutMs, observeRid));
+          const retried = ok(await sendRouted(cmd, timeoutMs, observeRid, beforeDispatch));
           // Cleared HERE and nowhere else, and only when the failure this retried
           // was a SWITCH refusal. Clearing on every routed success let an unguarded
           // status read wipe the evidence while graph commands stayed refused
@@ -16618,8 +16672,18 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         );
         if (blocked) return blocked;
 
+        const promotedPreflight = await preparePromotedWidgetWrite(
+          ctx,
+          args.node_id,
+          args.widget as string,
+        );
+        if (promotedPreflight && "content" in promotedPreflight) return promotedPreflight;
+        const promotedPlan = promotedPreflight && promotedPreflight.kind === "promoted-write"
+          ? promotedPreflight
+          : null;
+
         let expectedNodeType: string | undefined;
-        if (args.widget === DASIWA_STACK_WIDGET) {
+        if (!promotedPlan && args.widget === DASIWA_STACK_WIDGET) {
           const daSiWaFence = await verifyDaSiWaStackWriteFence(ctx, args.node_id);
           if (daSiWaFence && "content" in daSiWaFence) return daSiWaFence;
           expectedNodeType = daSiWaFence?.expectedNodeType;
@@ -16640,6 +16704,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           nodeId: unknown,
           widget: string,
           targetExpectedNodeType: string | undefined = expectedNodeType,
+          beforeDispatch?: () => void,
         ): Promise<ToolResult> =>
           stripVerifiedLastObservedSchemaNote(
             summarizeSetWidgetEcho(
@@ -16661,6 +16726,8 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                     : {}),
                 },
                 OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+                undefined,
+                beforeDispatch,
               ),
               echoFull,
             ),
@@ -16674,6 +16741,156 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           if (blocked) return blocked;
           return write(nodeId, widget, targetExpectedNodeType);
         };
+
+        const writePromotedInner = async (plan: PromotedWritePlan): Promise<ToolResult> => {
+          let entered = false;
+          const leave = async (): Promise<ToolResult> => {
+            const exit = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+            entered = false;
+            return exit;
+          };
+          try {
+            const initialBindingError = currentPromotedBindingError(ctx, plan.binding);
+            if (initialBindingError) return promotedWriteRefusal(args.widget as string, initialBindingError);
+
+            // Re-read the ownership envelope immediately before entering. This
+            // catches a promotion relink after the classification read; the
+            // inner write below then addresses the verified node directly.
+            const confirmation = await ctx.call({
+              cmd: "graph_get_subgraph",
+              node_id: plan.outerNodeId,
+            });
+            if (confirmation.isError) {
+              return promotedWriteRefusal(
+                args.widget as string,
+                "the final promoted mapping read was unavailable",
+              );
+            }
+            const confirmedPayload = parseToolResultJson(confirmation);
+            const confirmedEnvelope = validatePromotedSubgraphEnvelope(
+              confirmedPayload,
+              plan.outerNodeId,
+            );
+            const confirmedInner = confirmedEnvelope
+              ? resolveInnerPromotedTarget(
+                  confirmedPayload,
+                  args.widget as string,
+                  plan.outerNodeId,
+                )
+              : null;
+            if (
+              !confirmedEnvelope ||
+              !confirmedInner ||
+              canonicalQueriedNodeId(confirmedInner.innerNodeId) !==
+                canonicalQueriedNodeId(plan.inner.innerNodeId) ||
+              confirmedInner.widget !== plan.inner.widget
+            ) {
+              return promotedWriteRefusal(
+                args.widget as string,
+                "the promoted inner mapping changed or became unverifiable before the write",
+              );
+            }
+            const confirmedNode = confirmedEnvelope.nodes.find(
+              (candidate) =>
+                canonicalQueriedNodeId(candidate.id) ===
+                canonicalQueriedNodeId(plan.inner.innerNodeId),
+            );
+            if (!confirmedNode || confirmedNode.type !== plan.innerNodeType) {
+              return promotedWriteRefusal(
+                args.widget as string,
+                "the promoted inner node type changed before the write",
+              );
+            }
+            const afterMappingError = currentPromotedBindingError(ctx, plan.binding);
+            if (afterMappingError) return promotedWriteRefusal(args.widget as string, afterMappingError);
+
+            const enter = await ctx.call(
+              { cmd: "graph_enter_subgraph", node_id: plan.outerNodeId },
+              15000,
+            );
+            if (enter.isError) {
+              return promotedWriteRefusal(
+                args.widget as string,
+                `panel_enter_subgraph failed (${textOfToolResult(enter)})`,
+              );
+            }
+            entered = true;
+            const afterEnterError = currentPromotedBindingError(ctx, plan.binding);
+            if (afterEnterError) {
+              const exited = await leave();
+              return appendToolResultText(
+                promotedWriteRefusal(args.widget as string, afterEnterError),
+                exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : "",
+              );
+            }
+
+            const innerBlocked = await refuseKnownBadWidgetWrite(
+              ctx,
+              plan.inner.innerNodeId,
+              plan.inner.widget,
+            );
+            if (innerBlocked) {
+              const exited = await leave();
+              return appendToolResultText(
+                innerBlocked,
+                `\n\n(The promoted inner node ${plan.inner.innerNodeId} owns "${plan.inner.widget}"; ` +
+                `the write was refused before dispatch. No inner graph_set_widget was dispatched.` +
+                  (isAnimaRegionalPromptWidget(plan.inner.widget)
+                    ? " This promoted inner widget is an LC123 regional-canvas prompt."
+                    : "") +
+                  (exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : ""),
+              );
+            }
+
+            const written = await write(
+              plan.inner.innerNodeId,
+              plan.inner.widget,
+              plan.innerNodeType,
+              () => {
+                const error = currentPromotedBindingError(ctx, plan.binding);
+                if (error) {
+                  throw new Error(
+                    `Refusing promoted inner graph_set_widget: ${error}. No graph_set_widget was dispatched.`,
+                  );
+                }
+              },
+            );
+            const exited = await leave();
+            if (written.isError) {
+              return appendToolResultText(
+                written,
+                `\n\n(Tried the promoted inner mapping node ${plan.inner.innerNodeId} ` +
+                  `"${plan.inner.widget}" and it FAILED: ${textOfToolResult(written)})`,
+              );
+            }
+            return appendToolResultText(
+              written,
+              `\n\n(Applied via the validated promoted inner widget: node ${plan.inner.innerNodeId} ` +
+                `"${plan.inner.widget}". The container was not written.)` +
+                (exited.isError
+                  ? ` panel_exit_subgraph then FAILED — call panel_exit_subgraph. (${textOfToolResult(exited)})`
+                  : ""),
+            );
+          } catch (error) {
+            if (entered) {
+              try {
+                await leave();
+              } catch {
+                // Preserve the refusal below.
+              }
+            }
+            return promotedWriteRefusal(
+              args.widget as string,
+              error instanceof Error ? error.message : String(error),
+            );
+          }
+        };
+
+        if (promotedPlan) {
+          const promotedWritten = await writePromotedInner(promotedPlan);
+          if (!promotedWritten.isError) markPanelSchemaReady(panelSchemaKey(ctx));
+          return promotedWritten;
+        }
         let first = await write(args.node_id, args.widget as string);
         if (!first.isError) {
           markPanelSchemaReady(panelSchemaKey(ctx));
@@ -16842,6 +17059,48 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           }
         }
 
+        const recoveryPreflight = await preparePromotedWidgetWrite(
+          ctx,
+          args.node_id,
+          refusal.widget,
+        );
+        if (recoveryPreflight && "content" in recoveryPreflight) {
+          return appendToolResultText(
+            first,
+            `\n\n${textOfToolResult(recoveryPreflight)}`,
+          );
+        }
+        if (recoveryPreflight && recoveryPreflight.kind === "promoted-write") {
+          const promotedWritten = await writePromotedInner(recoveryPreflight);
+          if (!promotedWritten.isError) {
+            return persistUnpromotedControlAfterGenerate(promotedWritten, ctx, args.node_id);
+          }
+          return appendToolResultText(first, `\n\n${textOfToolResult(promotedWritten)}`);
+        }
+
+        const recoveryTabId = ctx.tabId;
+        let recoveryIdentity: { generation: number; tabSessionId: string } | undefined;
+        const recoveryBinding: PromotedWriteBinding | null =
+          typeof ctx.panelConnectionIdentity === "function"
+            ? (() => {
+                const identity = ctx.panelConnectionIdentity?.();
+                return isUsablePanelConnectionIdentity(identity)
+                  ? { tabId: recoveryTabId, identity }
+                  : null;
+              })()
+            : null;
+        if (typeof ctx.panelConnectionIdentity === "function") {
+          recoveryIdentity = recoveryBinding?.identity;
+          if (!isUsablePanelConnectionIdentity(recoveryIdentity)) {
+            return appendToolResultText(
+              first,
+              `\n\n${textOfToolResult(promotedWriteRefusal(
+                refusal.widget,
+                "the panel connection identity was unavailable before the inner mapping read",
+              ))}`,
+            );
+          }
+        }
         const sub = await ctx.call({ cmd: "graph_get_subgraph", node_id: args.node_id });
         if (sub.isError) {
           return appendToolResultText(
@@ -16851,7 +17110,35 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               `${textOfToolResult(sub)})`,
           );
         }
-        const inner = resolveInnerPromotedTarget(parseToolResultJson(sub), refusal.widget);
+        if (recoveryIdentity) {
+          const recoveryBindingError = recoveryBinding
+            ? currentPromotedBindingError(ctx, recoveryBinding)
+            : null;
+          if (recoveryBindingError) {
+            return appendToolResultText(
+              first,
+              `\n\n${textOfToolResult(promotedWriteRefusal(refusal.widget, recoveryBindingError))}`,
+            );
+          }
+        }
+        const recoveryPayload = parseToolResultJson(sub);
+        const recoveryEnvelope = validatePromotedSubgraphEnvelope(
+          recoveryPayload,
+          args.node_id as number | string,
+        );
+        if (promotedEnvelopeCarriesEvidence(recoveryPayload) && !recoveryEnvelope) {
+          return appendToolResultText(
+            first,
+            `\n\n(The panel listed "${refusal.widget}" as promoted while refusing it. ` +
+              `graph_get_subgraph returned a malformed, stale, or incomplete ownership ` +
+              `envelope, so the inner write was not retried.)`,
+          );
+        }
+        const inner = resolveInnerPromotedTarget(
+          recoveryPayload,
+          refusal.widget,
+          args.node_id as number | string,
+        );
         if (!inner) {
           return appendToolResultText(
             first,
@@ -16871,8 +17158,19 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             first,
             `\n\n(The panel listed "${refusal.widget}" as promoted while refusing it. ` +
               `Resolved it to inner node ${inner.innerNodeId} but panel_enter_subgraph FAILED: ` +
-              `${textOfToolResult(entered)})`,
+            `${textOfToolResult(entered)})`,
           );
+        }
+        if (recoveryBinding) {
+          const afterEnterBindingError = currentPromotedBindingError(ctx, recoveryBinding);
+          if (afterEnterBindingError) {
+            const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+            return appendToolResultText(
+              first,
+              `\n\n${textOfToolResult(promotedWriteRefusal(refusal.widget, afterEnterBindingError))}` +
+                (exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : ""),
+            );
+          }
         }
 
         let innerExpectedNodeType: string | undefined;
@@ -16988,7 +17286,21 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           );
         }
 
-        const written = await write(inner.innerNodeId, inner.widget, innerExpectedNodeType);
+        const written = await write(
+          inner.innerNodeId,
+          inner.widget,
+          innerExpectedNodeType,
+          recoveryBinding
+            ? () => {
+                const error = currentPromotedBindingError(ctx, recoveryBinding);
+                if (error) {
+                  throw new Error(
+                    `Refusing promoted inner graph_set_widget: ${error}. No graph_set_widget was dispatched.`,
+                  );
+                }
+              }
+            : undefined,
+        );
         const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
         if (!written.isError) {
           const via =

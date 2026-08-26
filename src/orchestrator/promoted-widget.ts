@@ -28,6 +28,12 @@ export type InnerPromotedTarget = {
   widget: string;
 };
 
+export type PromotedSubgraphEnvelope = {
+  nodes: Array<Record<string, unknown>>;
+  nodeId: string;
+  nodeCount: number;
+};
+
 export type AmbiguousPromotedWidgetRefusal = {
   nodeId: string;
   widget: string;
@@ -151,6 +157,64 @@ function innerNodeId(node: Record<string, unknown>): number | string | null {
   return null;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function isNodeId(value: unknown): value is number | string {
+  return (
+    (typeof value === "number" && Number.isFinite(value)) ||
+    (typeof value === "string" && value.trim() !== "")
+  );
+}
+
+/**
+ * Validate the ownership and completeness claims made by graph_get_subgraph.
+ * A node list is useful for a promoted write only when it names the wrapper the
+ * caller asked about and contains exactly the advertised number of inner nodes.
+ * The panel currently emits `truncated:false` for complete reads, but omission
+ * remains accepted for older compatible replies; any asserted truncation is not.
+ */
+export function validatePromotedSubgraphEnvelope(
+  subgraph: Record<string, unknown> | null | undefined,
+  ownerNodeId: number | string,
+): PromotedSubgraphEnvelope | null {
+  if (!isRecord(subgraph)) return null;
+  if (subgraph.truncated !== undefined && subgraph.truncated !== false) return null;
+
+  const owner = subgraph.subgraph_of;
+  if (
+    !isRecord(owner) ||
+    !isNodeId(owner.node_id) ||
+    !isNodeId(ownerNodeId) ||
+    !sameNodeId(owner.node_id, ownerNodeId)
+  ) {
+    return null;
+  }
+
+  const nodeCount = subgraph.node_count;
+  const nodes = subgraph.nodes;
+  if (
+    !Number.isSafeInteger(nodeCount) ||
+    (nodeCount as number) < 0 ||
+    !Array.isArray(nodes) ||
+    nodes.length !== nodeCount
+  ) {
+    return null;
+  }
+
+  const normalized: Array<Record<string, unknown>> = [];
+  for (const raw of nodes) {
+    if (!isRecord(raw) || innerNodeId(raw) == null) return null;
+    normalized.push(raw);
+  }
+  return {
+    nodes: normalized,
+    nodeId: stripNodeId(String(owner.node_id)),
+    nodeCount: nodeCount as number,
+  };
+}
+
 /**
  * Map a displayed promoted name to the unique inner node that owns a widget
  * of that name. `graph_get_subgraph` does not ship a reliable promotion
@@ -160,16 +224,18 @@ function innerNodeId(node: Record<string, unknown>): number | string | null {
 export function resolveInnerPromotedTarget(
   subgraph: Record<string, unknown> | null | undefined,
   displayedWidget: string,
+  ownerNodeId?: number | string,
 ): InnerPromotedTarget | null {
-  if (!subgraph || typeof subgraph !== "object") return null;
-  if (subgraph.truncated === true) return null;
-  const nodes = subgraph.nodes;
-  if (!Array.isArray(nodes)) return null;
+  const envelope =
+    ownerNodeId === undefined
+      ? isRecord(subgraph) && subgraph.truncated !== true && Array.isArray(subgraph.nodes)
+        ? { nodes: subgraph.nodes.filter(isRecord) }
+        : null
+      : validatePromotedSubgraphEnvelope(subgraph, ownerNodeId);
+  if (!envelope) return null;
 
   const hits: InnerPromotedTarget[] = [];
-  for (const raw of nodes) {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
-    const node = raw as Record<string, unknown>;
+  for (const node of envelope.nodes) {
     const id = innerNodeId(node);
     if (id == null) continue;
     const matched = matchListedName(displayedWidget, widgetNamesOnInner(node));

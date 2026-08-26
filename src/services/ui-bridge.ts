@@ -5060,7 +5060,16 @@ export class UiBridge {
     }
   }
 
-  async send(cmd: BridgeCommand, opts: { tabId?: string; timeoutMs?: number; onDispatchedRid?: (rid: string) => void } = {}): Promise<unknown> {
+  async send(
+    cmd: BridgeCommand,
+    opts: {
+      tabId?: string;
+      timeoutMs?: number;
+      onDispatchedRid?: (rid: string) => void;
+      /** Synchronous fence at the final live-connection dispatch boundary. */
+      beforeDispatch?: () => void;
+    } = {},
+  ): Promise<unknown> {
     // #357: read (idempotent) ops get a more tolerant default so a busy-but-alive
     // panel main thread (e.g. Preview3D loading a large FBX) isn't declared frozen;
     // mutating ops keep the tight default. An explicit opts.timeoutMs always wins.
@@ -5553,6 +5562,18 @@ export class UiBridge {
         }
         return Promise.reject(
           markDispatched(new Error(`Panel tab ${live.tabId.slice(0, 8)} is not open`), false),
+        );
+      }
+      // This is the last synchronous point after the graph lane has waited and
+      // the receiver has been re-resolved. A handler-side callback run before
+      // bridge.send() cannot fence a reconnect or same-workflow tab rebind in
+      // that interval. A throwing callback is a pre-dispatch refusal: no frame
+      // has been written and no mutation can have landed.
+      try {
+        opts.beforeDispatch?.();
+      } catch (err) {
+        return Promise.reject(
+          markDispatched(err instanceof Error ? err : new Error(String(err)), false),
         );
       }
       return new Promise((resolve, reject) => {
