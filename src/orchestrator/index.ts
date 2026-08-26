@@ -5374,13 +5374,29 @@ export async function runPanelOrchestrator(): Promise<void> {
             ? ev.completion_key
             : null;
         const alreadyKnown =
-          completionKey !== null && RunCompletions.hasCompletionReceipt(completionKey);
+          completionKey !== null &&
+          typeof ev.prompt_id === "string" &&
+          RunCompletions.hasCompletionReceipt(completionKey, {
+            promptId: ev.prompt_id,
+            key: event.tab_id,
+            conversation: agentKeyFor(event.tab_id),
+          });
         const entry = alreadyKnown
           ? null
           : RunCompletions.record(event.tab_id, evForTab as CompletionPayload, {
               conversation: agentKeyFor(event.tab_id),
             });
-        if (completionKey && typeof ev.prompt_id === "string" && ev.prompt_id.length > 0) {
+        const receiptAccepted =
+          completionKey !== null &&
+          typeof ev.prompt_id === "string" &&
+          ev.prompt_id.length > 0 &&
+          RunCompletions.acceptsCompletionReceipt(
+            completionKey,
+            ev.prompt_id,
+            event.tab_id,
+            agentKeyFor(event.tab_id),
+          );
+        if (receiptAccepted) {
           bridge.push(
             {
               type: "ack",
