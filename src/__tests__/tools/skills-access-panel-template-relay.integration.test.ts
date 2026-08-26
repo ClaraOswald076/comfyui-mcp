@@ -39,6 +39,7 @@ vi.mock("../../services/manifest.js", () => ({
 
 import { registerSkillsAccessTools } from "../../tools/skills-access.js";
 import { startPanelTemplateRelayServer } from "../../services/panel-template-relay.js";
+import { createPanelTemplateRelayWiring } from "../../orchestrator/index.js";
 
 const SECRET = "b".repeat(64);
 const servers: Array<{ close(): Promise<void> }> = [];
@@ -104,6 +105,53 @@ describe("list_packs -> panel template relay production boundary (#2196)", () =>
       source_count: 1,
       template_count: 1,
       templates: { "panel-pack": [{ name: "live-template" }] },
+    });
+    expect(state.headlessCalls).toBe(0);
+  });
+  // #2382/#2385 REGRESSION PIN. 0.52.135 dropped "localhost" from the relay's
+  // loopback set, so this exact call returned "The connected panel template
+  // relay failed (NO_PANEL_ORIGIN)." instead of the index for every user whose
+  // ComfyUI is served at http://localhost:<port>. The headless COMFYUI_URL path
+  // is fail-closed once a panel route exists, so there was nothing to fall back
+  // to. This drives the REAL orchestrator wiring, not a hand-written origin
+  // resolver, because the defect lived in what that wiring authorizes.
+  it("serves list_templates through the relay when the panel is served at localhost", async () => {
+    const panel = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ "panel-pack": [{ name: "localhost-template" }] }));
+    });
+    const boundOrigin = await listen(panel);
+    servers.push({ close: () => closeServer(panel) });
+    const port = new URL(boundOrigin).port;
+    const localhostOrigin = `http://localhost:${port}`;
+    state.baseUrl = `${localhostOrigin}/comfyapi`;
+
+    const bridge = {
+      canReach: () => true,
+      resolveFailure: () => undefined,
+      resolveSharedTabId: () => "tab-1",
+      tabServerOrigin: () => localhostOrigin,
+    };
+    const relay = await startPanelTemplateRelayServer({
+      bridge,
+      ...createPanelTemplateRelayWiring({
+        bridge,
+        currentTarget: () => state.baseUrl,
+        currentTargetGeneration: () => 0,
+        secrets: new Map([[SECRET, "orchestrator::codex"]]),
+      }),
+    });
+    servers.push(relay);
+    process.env.COMFYUI_MCP_RELAY_SECRET = SECRET;
+    process.env.COMFYUI_MCP_TEMPLATE_RELAY_URL = relay.endpointUrl;
+
+    const result = await listPacksHandler()({ action: "list_templates" });
+    const text = result.content.map((block) => block.text).join(" ");
+    expect(text).not.toContain("NO_PANEL_ORIGIN");
+    expect(JSON.parse(text)).toMatchObject({
+      source_count: 1,
+      template_count: 1,
+      templates: { "panel-pack": [{ name: "localhost-template" }] },
     });
     expect(state.headlessCalls).toBe(0);
   });

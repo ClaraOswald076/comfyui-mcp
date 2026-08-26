@@ -108,7 +108,7 @@ describe("orchestrator panel template relay wiring (#2196)", () => {
     expect(wiring.resolveAllowedPanelOrigin("tab-1", target)).toBeUndefined();
     expect(wiring.resolvePanelUrl("tab-1", target)).toBeUndefined();
 
-    for (const origin of ["http://127.0.0.1:8188", "http://[::1]:8188"]) {
+    for (const origin of ["http://127.0.0.1:8188", "http://[::1]:8188", "http://localhost:8188"]) {
       target = `${origin}/comfyapi`;
       observedOrigin = origin;
       expect(wiring.resolveAllowedPanelOrigin("tab-1", target)).toBe(origin);
@@ -127,18 +127,22 @@ describe("orchestrator panel template relay wiring (#2196)", () => {
     await expect(requestPanelTemplateIndex()).rejects.toMatchObject({ code: "NO_PANEL_ORIGIN" });
   });
 
-  it("refuses an exact localhost match before fetch can resolve another loopback listener", async () => {
+  // #2382/#2385. Dropping "localhost" from LOOPBACK_HOSTS made this whole
+  // request fail NO_PANEL_ORIGIN, which shipped in 0.52.135. The mixed-name
+  // case below is the part that must stay refused: it is a genuine mismatch,
+  // not merely a name.
+  it("serves a localhost-served panel and still refuses a mixed localhost/127.0.0.1 pair", async () => {
     let panelRequests = 0;
     const panel = createServer((_req, res) => {
       panelRequests += 1;
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ "unexpected-pack": [{ name: "wrong-listener" }] }));
+      res.end(JSON.stringify({ "panel-pack": [{ name: "localhost-template" }] }));
     });
     const panelOrigin = await listen(panel);
     servers.push({ close: () => closeServer(panel) });
     const port = new URL(panelOrigin).port;
-    const target = `http://localhost:${port}/comfyapi`;
-    const observedOrigin = `http://localhost:${port}`;
+    let target = `http://localhost:${port}/comfyapi`;
+    let observedOrigin = `http://localhost:${port}`;
     const bridge = {
       canReach: () => true,
       resolveFailure: () => undefined,
@@ -151,15 +155,27 @@ describe("orchestrator panel template relay wiring (#2196)", () => {
       currentTargetGeneration: () => 0,
       secrets: new Map([[SECRET, "orchestrator::codex"]]),
     });
-    expect(wiring.resolveAllowedPanelOrigin("tab-1", target)).toBeUndefined();
-    expect(wiring.resolvePanelUrl("tab-1", target)).toBeUndefined();
+    expect(wiring.resolveAllowedPanelOrigin("tab-1", target)).toBe(observedOrigin);
+    expect(wiring.resolvePanelUrl("tab-1", target)).toBe(`${observedOrigin}/comfyapi/api/workflow_templates`);
 
     const relay = await startPanelTemplateRelayServer({ bridge, ...wiring });
     servers.push(relay);
     process.env.COMFYUI_MCP_RELAY_SECRET = SECRET;
     process.env.COMFYUI_MCP_TEMPLATE_RELAY_URL = relay.endpointUrl;
+    await expect(requestPanelTemplateIndex()).resolves.toMatchObject({
+      "panel-pack": [{ name: "localhost-template" }],
+    });
+    expect(panelRequests).toBe(1);
+
+    // The observed Origin and the configured target must still be the SAME
+    // name. A browser on localhost with the target set to 127.0.0.1 is refused
+    // exactly as before, and never reaches the panel.
+    observedOrigin = `http://localhost:${port}`;
+    target = `http://127.0.0.1:${port}/comfyapi`;
+    expect(wiring.resolveAllowedPanelOrigin("tab-1", target)).toBeUndefined();
+    expect(wiring.resolvePanelUrl("tab-1", target)).toBeUndefined();
     await expect(requestPanelTemplateIndex()).rejects.toMatchObject({ code: "NO_PANEL_ORIGIN" });
-    expect(panelRequests).toBe(0);
+    expect(panelRequests).toBe(1);
   });
 
   it("rejects a stale in-flight response after retargeting and still serves the current target", async () => {

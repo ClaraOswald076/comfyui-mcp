@@ -21,10 +21,29 @@ export const PANEL_TEMPLATE_RELAY_HTTP_PATH = "/__comfyui_mcp_panel_template_rel
 
 const ID_RE = /^[A-Za-z0-9_-]{16,80}$/;
 const HEX_RE = /^[a-f0-9]{64}$/;
-// A hostname does not identify which loopback listener a browser reached. Keep
-// relay destinations pinned to literal addresses so fetch cannot independently
-// resolve `localhost` to a different process or address family.
-const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1"]);
+// `localhost` is a NAME, not a listener identity, so an exact origin match does
+// not prove the later fetch reaches the socket the browser is on (#2382). It is
+// still accepted here, because refusing it costs more than it buys:
+//
+//   - Refusing it (#2385, shipped in 0.52.135) took `list_packs
+//     action:"list_templates"` from working to erroring for every user whose
+//     ComfyUI is served at `http://localhost:<port>` — an ordinary setup, and
+//     the panel Origin is the browser's. The relay declines, and
+//     `listWorkflowTemplatesAction` deliberately does not fall back to
+//     COMFYUI_URL once a panel route exists, so the action has no path left.
+//   - The non-adversarial hazard it was meant to prevent does not occur on a
+//     supported runtime. Node >=20 connects with Happy Eyeballs
+//     (`autoSelectFamily`), so `fetch("http://localhost:<port>")` reaches a
+//     127.0.0.1-only OR a ::1-only listener; measured on Node 24.16.0 against
+//     both single-family binds. There is no "resolved the wrong family and the
+//     fetch failed" case to fix.
+//   - What remains is a second local process squatting the other loopback
+//     family, which one-machine/one-trust-domain puts out of scope.
+//
+// So the destination stays loopback-only, and `localhost` stays usable. A
+// mixed pair (`localhost` observed vs `127.0.0.1` configured, or vice versa)
+// is still refused below by the exact-origin equality.
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 
 export interface PanelTemplateRelayRequest {
   version: typeof PANEL_TEMPLATE_RELAY_VERSION;
