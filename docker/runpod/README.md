@@ -273,6 +273,16 @@ Notes:
   been audited — do that before adding them.
 * `/post_start.sh` pre-creates the matching subfolders under `/workspace/models`
   so they exist on a cold volume.
+* **This file does not reach a node pack's OWN installer.** It adds *search* paths;
+  it does not move `folder_paths.models_dir`, which is what Impact Pack's and Impact
+  Subpack's `install.py` derive their download directory from (Subpack has no
+  `folder_paths` fallback at all). So `post_start.sh` also exports
+  `COMFYUI_MODEL_PATH=/workspace/models` before launching ComfyUI - pack installers
+  read that first, and Manager runs them as children of the ComfyUI process, so they
+  inherit it. Without it, installing Impact Subpack drops `face_yolov8m.pt` into
+  `/opt/ComfyUI/models/ultralytics/bbox` and Impact Pack drops `sam_vit_b_01ec64.pth`
+  into `/opt/ComfyUI/models/sams`, both on the ephemeral layer. ComfyUI core never
+  reads `COMFYUI_MODEL_PATH`, so this redirects only the packs' installers.
 
 ### Warm model volume (skip the cold HF pull)
 

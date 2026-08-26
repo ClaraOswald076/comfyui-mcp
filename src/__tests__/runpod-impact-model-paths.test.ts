@@ -100,6 +100,28 @@ describe("the RunPod image maps Impact Pack's model categories onto the volume (
     );
   });
 
+  it("points the node packs' OWN installers at the volume too", () => {
+    // The yaml adds SEARCH paths; it does not move `folder_paths.models_dir`, and that is
+    // what both packs' install.py resolve their download directory from. Impact Subpack's
+    // has no folder_paths fallback at all (install.py:15-17), so with COMFYUI_MODEL_PATH
+    // unset it writes face_yolov8m.pt to the image layer no matter what this yaml maps —
+    // every mapping above can be correct and the file still dies on the next rebuild.
+    const exported = postStartSrc.search(/^export COMFYUI_MODEL_PATH="\$\{MODELS_DIR\}"\r?$/m);
+    expect(exported, "post_start.sh must export COMFYUI_MODEL_PATH at top level").toBeGreaterThan(
+      -1,
+    );
+
+    // Ordering IS the mechanism, so assert on it rather than on the line's existence:
+    // MODELS_DIR must already be set, and the export must happen before ComfyUI launches,
+    // since Manager runs pack installers as children of that process and they inherit it.
+    const modelsDir = postStartSrc.search(/^MODELS_DIR=/m);
+    const launch = postStartSrc.search(/^nohup .*main\.py/m);
+    expect(modelsDir, "MODELS_DIR assignment not found").toBeGreaterThan(-1);
+    expect(launch, "ComfyUI launch line not found").toBeGreaterThan(-1);
+    expect(modelsDir).toBeLessThan(exported);
+    expect(exported).toBeLessThan(launch);
+  });
+
   it("documents the same category set it ships", () => {
     // README.md embeds a full copy of the yaml under "Model paths". That copy is what a
     // maintainer reads when adding the NEXT category, so a stale one does not just mislead —
