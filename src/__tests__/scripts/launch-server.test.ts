@@ -257,19 +257,28 @@ describe("rescue deadline tracks the CLIENT's budget (#1447)", () => {
     const { coldStartDeadlineMs, RESCUE_BUDGET_FRACTION, DEFAULT_CLIENT_BUDGET_MS, RESCUE_MIN_MS, RESCUE_MAX_MS } =
       launcher;
     const cached = (env: Record<string, string | undefined>) => coldStartDeadlineMs(env, { cachedInstall: true });
-    expect(cached({ MCP_TIMEOUT: "20000" })).toBe(20000 * RESCUE_BUDGET_FRACTION);
+    expect(cached({ MCP_TIMEOUT: "5000" })).toBe(5000 * RESCUE_BUDGET_FRACTION);
     // …and it must leave the client real margin, never spend the whole budget.
-    expect(cached({ MCP_TIMEOUT: "20000" })).toBeLessThan(20000);
-    expect(cached({ MCP_TIMEOUT: "10000" })).toBe(4000);
+    expect(cached({ MCP_TIMEOUT: "5000" })).toBeLessThan(5000);
+    expect(cached({ MCP_TIMEOUT: "10000" })).toBe(RESCUE_MAX_MS);
     // A tightened budget rescues SOONER — the direction that matters.
     expect(cached({ MCP_TIMEOUT: "5000" })).toBeLessThan(cached({ MCP_TIMEOUT: "20000" }));
-    // No budget stated → the documented default.
-    expect(cached({})).toBe(DEFAULT_CLIENT_BUDGET_MS * RESCUE_BUDGET_FRACTION);
+    // No budget stated → the cap, never the assumed default's full share. Two
+    // gate rounds pushed on the same thing from opposite sides: a deadline
+    // derived from a budget we only ASSUME can outlive the budget we got. The
+    // cap is what makes the assumption cheap.
+    expect(cached({})).toBe(RESCUE_MAX_MS);
+    expect(cached({})).toBeLessThan(DEFAULT_CLIENT_BUDGET_MS * RESCUE_BUDGET_FRACTION);
     // Junk is not a budget.
     for (const bad of ["", "soon", "-1", "0", "NaN", undefined]) {
-      expect(cached({ MCP_TIMEOUT: bad })).toBe(DEFAULT_CLIENT_BUDGET_MS * RESCUE_BUDGET_FRACTION);
+      expect(cached({ MCP_TIMEOUT: bad })).toBe(RESCUE_MAX_MS);
     }
     expect(cached({ MCP_TIMEOUT: "600000" })).toBe(RESCUE_MAX_MS);
+    // With MCP_TIMEOUT unset, the deadline must still fit inside any client
+    // budget worth calling one — including budgets far below what we assume.
+    for (const realBudget of [10000, 15000, 30000]) {
+      expect(cached({}) + launcher.npmProbeTimeoutMs({})).toBeLessThan(realBudget);
+    }
     // Round-2 gate: a floor that can OUTLIVE the budget is not a floor, it is
     // a way to miss the deadline. At MCP_TIMEOUT=1000 a 1500 ms floor would
     // have scheduled the rescue after the client had already given up.
@@ -279,10 +288,10 @@ describe("rescue deadline tracks the CLIENT's budget (#1447)", () => {
       expect(cached({ MCP_TIMEOUT: String(budget) })).toBeLessThan(budget);
     }
     expect(cached({ MCP_TIMEOUT: "100" })).toBeLessThan(RESCUE_MIN_MS);
-    // The measured warm-npx handshake is ~1.2 s (7.0 s once, when npx updated
-    // first). The cached deadline must sit well clear of that or it would swap
-    // a healthy server's real serverInfo for the stand-in on every launch.
-    expect(cached({})).toBeGreaterThan(8000);
+    // The measured warm-npx handshake is ~1.2 s. The cached deadline must stay
+    // well clear of that or it would swap a healthy server's real serverInfo
+    // for the stand-in on every launch — the reason this branch exists at all.
+    expect(cached({})).toBeGreaterThan(1200 * 2.5);
   });
 
   it("with NOTHING cached it rescues at the floor — independent of the budget we assume", () => {

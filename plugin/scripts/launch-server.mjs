@@ -141,8 +141,24 @@ export const DEFAULT_CLIENT_BUDGET_MS = 30000;
 export const RESCUE_BUDGET_FRACTION = 0.4;
 /** Nothing cached: rescue this soon, or sooner if the budget is tighter still. */
 export const RESCUE_MIN_MS = 1500;
-/** Something cached: wait at most this long for the real handshake. */
-export const RESCUE_MAX_MS = 12000;
+/**
+ * Something cached: wait at most this long for the real handshake.
+ *
+ * This was 12 s, derived from DEFAULT_CLIENT_BUDGET_MS — and two separate gate
+ * rounds pushed on the same thing from different sides: a deadline computed
+ * from a budget we only ASSUME is a deadline that can outlive the budget we
+ * actually got. The assumption is not free, so it is worth as little as
+ * possible.
+ *
+ * 4 s is what the measurements say it can safely be. Warm-npx handshakes here
+ * are 1.2 s, 1.2 s, 1.2 s — better than 3x of margin, so healthy launches still
+ * keep their own `serverInfo` and instructions. The one 7.0 s observation was
+ * npx UPDATING to a newer release first, which is an install racing the
+ * handshake, i.e. exactly what the rescue is for. And 4 s leaves room under any
+ * client budget of 10 s or more, so the assumed default no longer has to be
+ * right for the fix to work.
+ */
+export const RESCUE_MAX_MS = 4000;
 
 /**
  * Is there already an unpacked comfyui-mcp under npm's `_npx` cache?
@@ -187,10 +203,12 @@ export function cachedNpxInstallExists(npmCacheStdout, { readdir = readdirSync, 
  *
  * SOMETHING CACHED — npx has a tree and is about to exec it. Measured warm-npx
  * handshakes on this machine: 1.2 s, 1.2 s, 1.2 s, and 7.0 s once when npx
- * updated to a newer release first. Those must stay TRANSPARENT, because
- * rescuing them would swap the server's real `serverInfo` and instructions for
- * a stand-in on a launch that was going to succeed. So this branch gets the
- * generous deadline, bounded by the client's own budget.
+ * updated to a newer release first. The 1.2 s launches must stay TRANSPARENT,
+ * because rescuing them would swap the server's real `serverInfo` and
+ * instructions for a stand-in on a launch that was going to succeed. So this
+ * branch waits longer — 4 s, still comfortably clear of 1.2 s — and the 7.0 s
+ * case is rescued, which is right: an npx update is an install racing the
+ * handshake, the very thing this exists for.
  *
  * MCP_TIMEOUT is that budget and it is VISIBLE to us — verified by measurement:
  * a server launched by `MCP_TIMEOUT=17000 claude …` reads
