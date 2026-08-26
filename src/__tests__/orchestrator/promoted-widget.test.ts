@@ -95,27 +95,78 @@ function bridge(opts: {
   remappedWriteError?: string;
   reconnectBeforeWrite?: boolean;
   tabRebindBeforeWrite?: boolean;
-  ownerRebindBeforeWrite?: boolean;
+  authoritativeScopeRead?: boolean;
+  ownerNavigationAfterFinalQuery?: boolean;
   omitWorkflowUuid?: boolean;
   workflowUuid?: string;
 }) {
   const calls: Array<Record<string, unknown>> = [];
   let writes = 0;
   let subgraphReads = 0;
+  let postEnterGraphQueries = 0;
+  let authoritativeScopeReads = 0;
   let inSubgraph = false;
   const workflowUuid = opts.workflowUuid ?? "workflow-a";
   let currentOwnerNodeId = 78;
   let connectionIdentity = { generation: 1, tabSessionId: "browser-tab-a" };
+  let observedPromotedScope: {
+    known: true;
+    scope: "root" | "subgraph";
+    ownerNodeId: string | null;
+    workflowUuid?: string;
+  } | { known: false; reason: string } = {
+    known: false,
+    reason: "no current panel graph-scope witness has been observed",
+  };
   const beforeWrite = { mutate: undefined as (() => void) | undefined };
   const currentViewing = () => ({
     scope: inSubgraph ? "subgraph" : "root",
     ...(inSubgraph ? { owner_node_id: currentOwnerNodeId } : {}),
     ...(opts.omitWorkflowUuid ? {} : { workflow_uuid: workflowUuid }),
   });
-  const withCurrentViewing = (value: Record<string, unknown>): Record<string, unknown> =>
-    Object.prototype.hasOwnProperty.call(value, "viewing")
+  const withCurrentViewing = (value: Record<string, unknown>): Record<string, unknown> => {
+    const result = Object.prototype.hasOwnProperty.call(value, "viewing")
       ? value
       : { ...value, viewing: currentViewing() };
+    const viewing = result.viewing;
+    if (viewing && typeof viewing === "object" && !Array.isArray(viewing)) {
+      const identity = viewing as Record<string, unknown>;
+      const rawOwner = identity.owner_node_id;
+      const rawWorkflowUuid = identity.workflow_uuid;
+      if (
+        (identity.scope === "root" || identity.scope === "subgraph") &&
+        (rawOwner === undefined || rawOwner === null || typeof rawOwner === "number" || typeof rawOwner === "string") &&
+        (rawWorkflowUuid === undefined || typeof rawWorkflowUuid === "string")
+      ) {
+        observedPromotedScope = {
+          known: true,
+          scope: identity.scope,
+          ownerNodeId: rawOwner == null ? null : String(rawOwner),
+          ...(rawWorkflowUuid !== undefined ? { workflowUuid: rawWorkflowUuid } : {}),
+        };
+      } else {
+        observedPromotedScope = {
+          known: false,
+          reason: "the panel returned malformed current-view metadata",
+        };
+      }
+    }
+    return result;
+  };
+  const afterGraphQuery = (value: Record<string, unknown>, wantId: string | null) => {
+    const result = withCurrentViewing(value);
+    if (
+      inSubgraph &&
+      wantId &&
+      opts.ownerNavigationAfterFinalQuery &&
+      postEnterGraphQueries++ === 2
+    ) {
+      // The final mapping query answered for owner A. Navigation happens before
+      // the handler's fresh authoritative scope read, leaving the cache stale.
+      currentOwnerNodeId = 79;
+    }
+    return result;
+  };
   const b = {
     send: async (
       cmd: Record<string, unknown>,
@@ -191,15 +242,16 @@ function bridge(opts: {
           inSubgraph && wantId ? opts.postEnterGraphQueryById?.[wantId] : undefined;
         if (postEnter !== undefined) {
           if (postEnter instanceof Error) throw postEnter;
-          return withCurrentViewing(postEnter);
+          return afterGraphQuery(postEnter, wantId);
         }
         if (opts.detailById && wantId && opts.detailById[wantId] !== undefined) {
-          return withCurrentViewing(opts.detailById[wantId]);
+          return afterGraphQuery(opts.detailById[wantId], wantId);
         }
-        if (opts.stackDataIdentity && !inSubgraph) return withCurrentViewing(opts.stackDataIdentity);
+        if (opts.stackDataIdentity && !inSubgraph) return afterGraphQuery(opts.stackDataIdentity, wantId);
         if (opts.stackDataIdentity && inSubgraph) {
-          return withCurrentViewing(
+          return afterGraphQuery(
             opts.stackDataInnerIdentity ?? { nodes: [{ id: 76, type: "OtherLoraLoader" }] },
+            wantId,
           );
         }
         if (inSubgraph && wantId) {
@@ -209,10 +261,10 @@ function bridge(opts: {
             candidate && typeof candidate === "object" && String(candidate.id) === wantId,
           );
           if (node && typeof node.type === "string") {
-            return withCurrentViewing({ nodes: [{ id: node.id, type: node.type }] });
+            return afterGraphQuery({ nodes: [{ id: node.id, type: node.type }] }, wantId);
           }
         }
-        return withCurrentViewing(
+        return afterGraphQuery(
           opts.promotedDetail ?? {
             nodes: [
               {
@@ -224,6 +276,7 @@ function bridge(opts: {
               },
             ],
           },
+          wantId,
         );
       }
       if (cmd.cmd === "refresh_nodes") return opts.refreshNodes ?? { refreshed: true };
@@ -236,12 +289,25 @@ function bridge(opts: {
     resolveActiveTabId: () => TAB,
     tabCanMutateGraph: () => true,
     tabConnectionIdentity: () => connectionIdentity,
-    promotedScopeFor: () => ({
-      known: true,
-      scope: inSubgraph ? "subgraph" : "root",
-      ownerNodeId: inSubgraph ? String(currentOwnerNodeId) : null,
-      ...(opts.omitWorkflowUuid ? {} : { workflowUuid }),
-    }),
+    promotedScopeFor: () => observedPromotedScope,
+    ...(opts.authoritativeScopeRead
+      ? {
+          readPromotedScope: async () => {
+            // This is the test seam for UiBridge.readPromotedScope: unlike the
+            // cached getter above, it samples the live current view after the
+            // race navigation has happened.
+            authoritativeScopeReads += 1;
+            const ownerNodeId = inSubgraph ? String(currentOwnerNodeId) : null;
+            observedPromotedScope = {
+              known: true,
+              scope: inSubgraph ? "subgraph" : "root",
+              ownerNodeId,
+              ...(opts.omitWorkflowUuid ? {} : { workflowUuid }),
+            };
+            return observedPromotedScope;
+          },
+        }
+      : {}),
     tabExpectedNodeTypeFenceCapability: () => true,
     tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
     workflowUuidFor: () => ({ known: true, uuid: workflowUuid }),
@@ -258,22 +324,26 @@ function bridge(opts: {
       // but has a different receiver session.
       connectionIdentity = { generation: 1, tabSessionId: "browser-tab-b" };
     };
-  } else if (opts.ownerRebindBeforeWrite) {
-    beforeWrite.mutate = () => {
-      // Same workflow, same browser-tab session, different open subgraph. The
-      // inner id/type deliberately remain colliding; only the owner witness
-      // distinguishes the receiver at the final dispatch fence.
-      currentOwnerNodeId = 79;
-    };
   }
-  return { b, calls, beforeWrite };
+  return {
+    b,
+    calls,
+    beforeWrite,
+    get authoritativeScopeReads() {
+      return authoritativeScopeReads;
+    },
+    get postEnterGraphQueries() {
+      return postEnterGraphQueries;
+    },
+  };
 }
 
 async function setWidget(
   args: { node_id: number | string; widget: string; value: number | string },
   opts: Parameters<typeof bridge>[0] = {},
 ) {
-  const { b, calls, beforeWrite } = bridge(opts);
+  const harness = bridge(opts);
+  const { b, calls, beforeWrite } = harness;
   const ctx = makePanelToolCtx(b, TAB, new WorkflowTargetStore());
   const def = buildPanelToolDefs().find((d) => d.name === "panel_set_widget");
   if (!def) throw new Error("panel_set_widget is not registered");
@@ -282,6 +352,8 @@ async function setWidget(
     text: res.content.map((c) => (c as { text?: string }).text ?? "").join(" "),
     isError: res.isError === true,
     calls,
+    authoritativeScopeReads: harness.authoritativeScopeReads,
+    postEnterGraphQueries: harness.postEnterGraphQueries,
   };
 }
 
@@ -739,20 +811,23 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
     expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(0);
   });
 
-  it("refuses an owner A to owner B navigation at the final dispatch fence", async () => {
-    const { text, isError, calls } = await setWidget(
+  it("refuses owner A to owner B navigation after the final query at the authoritative write fence", async () => {
+    const { text, isError, calls, authoritativeScopeReads, postEnterGraphQueries } = await setWidget(
       { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
       {
         firstWrite: "ok",
         subgraph: SAFE_ANIMA_SUBGRAPH,
         detailById: SAFE_ANIMA_IDENTITY_BY_ID,
-        ownerRebindBeforeWrite: true,
+        authoritativeScopeRead: true,
+        ownerNavigationAfterFinalQuery: true,
       },
     );
 
     expect(isError).toBe(true);
     expect(text).toMatch(/current subgraph owner changed|unverifiable/);
     expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(0);
+    expect(authoritativeScopeReads).toBe(1);
+    expect(postEnterGraphQueries).toBe(3);
   });
 
   it("keeps a valid same-owner write when workflow_uuid is unavailable", async () => {
@@ -762,6 +837,7 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
         firstWrite: "ok",
         subgraph: SAFE_ANIMA_SUBGRAPH,
         detailById: SAFE_ANIMA_IDENTITY_BY_ID,
+        authoritativeScopeRead: true,
         omitWorkflowUuid: true,
       },
     );

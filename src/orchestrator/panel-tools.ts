@@ -6373,6 +6373,34 @@ function currentPromotedScopeError(
   return null;
 }
 
+/** Perform a fresh current-view read for the promoted receiver. The bridge
+ * cache remains useful for the synchronous dispatch callback, but it is not
+ * authoritative across the final graph_query -> graph_set_widget window. */
+async function authoritativePromotedScopeError(
+  ctx: PanelToolCtx,
+  expected: PromotedScopeWitness,
+  innerNodeId: number | string,
+): Promise<string | null> {
+  const readScope = (ctx.bridge as unknown as BridgeProbe).readPromotedScope;
+  if (typeof readScope !== "function") return currentPromotedScopeError(ctx, expected, true);
+
+  let observed: TabPromotedScopeRead;
+  try {
+    observed = await readScope.call(ctx.bridge, ctx.tabId, innerNodeId);
+  } catch {
+    return "the receiving panel current-view scope became unreadable";
+  }
+  if (
+    observed.known !== true ||
+    observed.scope !== "subgraph" ||
+    observed.ownerNodeId !== expected.ownerNodeId ||
+    (expected.workflowUuid !== undefined && observed.workflowUuid !== expected.workflowUuid)
+  ) {
+    return "the receiving panel current subgraph owner changed or became unverifiable";
+  }
+  return null;
+}
+
 function promotedWriteRefusal(widget: string, reason: string): ToolResult {
   return fail(
     `panel_set_widget refused the promoted "${widget}" write because ${reason}. ` +
@@ -12347,6 +12375,7 @@ interface BridgeProbe {
   refreshWorkflowUuid?: (tabId: string, workflowUuid: string) => boolean;
   workflowUuidFor?: (tabId: string) => TabWorkflowUuidRead;
   promotedScopeFor?: (tabId: string) => TabPromotedScopeRead;
+  readPromotedScope?: (tabId: string, innerNodeId: number | string) => Promise<TabPromotedScopeRead>;
   lastFenceRefusal?: (tabId: string) => string | undefined;
   isHeadless?: (tabId: string) => boolean;
   canReach?: (tabId: string) => boolean;
@@ -17052,6 +17081,24 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               );
             }
 
+            // The preceding graph_query updates the bridge's scope cache, but
+            // that cache can remain on owner A if the user navigates to owner B
+            // before this write is dispatched. Take a fresh authoritative view
+            // read at the write boundary so the final synchronous callback is
+            // never the first place we discover a stale owner witness.
+            const authoritativeScopeError = await authoritativePromotedScopeError(
+              ctx,
+              plan.scope,
+              plan.inner.innerNodeId,
+            );
+            if (authoritativeScopeError) {
+              const exited = await leave();
+              return appendToolResultText(
+                promotedWriteRefusal(args.widget as string, authoritativeScopeError),
+                exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : "",
+              );
+            }
+
             const written = await write(
               plan.inner.innerNodeId,
               plan.inner.widget,
@@ -17613,6 +17660,19 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               ),
             )}` +
               (exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : ""),
+          );
+        }
+
+        const authoritativeRecoveryScopeError = recoveryScope
+          ? await authoritativePromotedScopeError(ctx, recoveryScope, inner.innerNodeId)
+          : "the promoted recovery scope was unavailable";
+        if (authoritativeRecoveryScopeError) {
+          const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+          return appendToolResultText(
+            first,
+            `\n\n${textOfToolResult(
+              promotedWriteRefusal(refusal.widget, authoritativeRecoveryScopeError),
+            )}` + (exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : ""),
           );
         }
 

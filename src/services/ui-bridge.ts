@@ -3862,6 +3862,35 @@ export class UiBridge {
     );
   }
 
+  /** Read the current panel view from the live graph immediately before a
+   *  promoted write. `promotedScopeFor` is intentionally only a cached witness
+   *  for synchronous dispatch fences; this method performs the authoritative
+   *  current-view probe and never treats that cache as a substitute. */
+  async readPromotedScope(tabId: string, innerNodeId: number | string): Promise<TabPromotedScopeRead> {
+    try {
+      const result = await this.send(
+        {
+          cmd: "graph_query",
+          ids: [innerNodeId],
+          fields: "compact",
+          limit: 1,
+        },
+        { tabId },
+      );
+      return (
+        this.parsePromotedScopeResult(result) ?? {
+          known: false,
+          reason: "the panel current-view query returned no structured scope identity",
+        }
+      );
+    } catch (err) {
+      return {
+        known: false,
+        reason: err instanceof Error ? err.message : String(err ?? "unknown error"),
+      };
+    }
+  }
+
   /** #884 P0 — inject the orchestrator's turn-target pin (see the field doc and
    *  resolveTarget's scope branch). */
   setScopeTargetResolver(fn: (scopeId: string) => string | null | undefined): void {
@@ -5679,24 +5708,29 @@ export class UiBridge {
   /** Record only the panel's structured current-view witness. This is a cache
    * of an authenticated panel reply, not caller-supplied command metadata. */
   private notePromotedScope(tabId: string, result: unknown): void {
-    if (!result || typeof result !== "object" || Array.isArray(result)) return;
+    const parsed = this.parsePromotedScopeResult(result);
+    if (parsed) this.promotedScopes.set(tabId, parsed);
+  }
+
+  /** Parse only structured `viewing` metadata. `undefined` means the command
+   * did not publish a scope witness and must not overwrite the cache. */
+  private parsePromotedScopeResult(result: unknown): TabPromotedScopeRead | undefined {
+    if (!result || typeof result !== "object" || Array.isArray(result)) return undefined;
     const payload = result as Record<string, unknown>;
-    if (!Object.prototype.hasOwnProperty.call(payload, "viewing")) return;
+    if (!Object.prototype.hasOwnProperty.call(payload, "viewing")) return undefined;
     const viewing = payload.viewing;
     if (!viewing || typeof viewing !== "object" || Array.isArray(viewing)) {
-      this.promotedScopes.set(tabId, {
+      return {
         known: false,
         reason: "the panel returned malformed current-view metadata",
-      });
-      return;
+      };
     }
     const identity = viewing as Record<string, unknown>;
     if (identity.scope !== "root" && identity.scope !== "subgraph") {
-      this.promotedScopes.set(tabId, {
+      return {
         known: false,
         reason: "the panel returned an unknown current-view scope",
-      });
-      return;
+      };
     }
     const rawOwner = identity.owner_node_id;
     let ownerNodeId: string | null = null;
@@ -5705,11 +5739,10 @@ export class UiBridge {
         (typeof rawOwner !== "number" || !Number.isSafeInteger(rawOwner)) &&
         (typeof rawOwner !== "string" || rawOwner.length === 0)
       ) {
-        this.promotedScopes.set(tabId, {
+        return {
           known: false,
           reason: "the panel returned a malformed current-view owner",
-        });
-        return;
+        };
       }
       ownerNodeId = String(rawOwner);
     }
@@ -5718,18 +5751,17 @@ export class UiBridge {
       rawWorkflowUuid !== undefined &&
       (typeof rawWorkflowUuid !== "string" || rawWorkflowUuid.length === 0)
     ) {
-      this.promotedScopes.set(tabId, {
+      return {
         known: false,
         reason: "the panel returned a malformed current-view workflow identity",
-      });
-      return;
+      };
     }
-    this.promotedScopes.set(tabId, {
+    return {
       known: true,
       scope: identity.scope,
       ownerNodeId,
       ...(rawWorkflowUuid !== undefined ? { workflowUuid: rawWorkflowUuid } : {}),
-    });
+    };
   }
 
   /** Write one attempt of a command to a live socket and arm its reply timer.
