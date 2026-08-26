@@ -82,13 +82,13 @@ import type {
   TabWorkflowUuidRead,
 } from "../services/ui-bridge.js";
 import {
+  panelVersionForCapability,
   requiredPanelVersion,
   SEMVER_RE,
   LATE_ASK_TTL_MS,
   tabIncarnationSlot,
   SHOW_MEDIA_KIND_MIN_PANEL_VERSION,
   showMediaItemsPanelCannotPaint,
-  BRIDGE_CAPABILITY_MIN_PANEL_VERSION,
 } from "../services/ui-bridge.js";
 import { compareSemver } from "../services/self-update.js";
 import { describeInstallPanelAction } from "../services/panel-recovery.js";
@@ -6619,18 +6619,87 @@ async function authoritativePromotedScopeError(
   return { error, observed };
 }
 
-function promotedWriteRefusal(
-  widget: string,
-  reason: string,
-  options?: { capabilityName?: string },
-): ToolResult {
-  const remedy =
-    options?.capabilityName === "enforces_expected_scope_graph_identity_at_write"
-      ? `This session requires panel >= ${BRIDGE_CAPABILITY_MIN_PANEL_VERSION.enforces_expected_scope_graph_identity_at_write} for promoted widget writes. Update your panel, then retry.`
-      : `Retry only after the panel binding and subgraph mapping are stable.`;
+/** A refusal a retry can legitimately clear. Anything caused by the panel BUILD
+ * goes through {@link promotedPanelBuildRefusal} instead — #2365 carved the
+ * first of those out with a `capabilityName` option on this function, and that
+ * option is gone because every capability call site now uses the dedicated
+ * path, which also names the advertised version and a route that works. */
+function promotedWriteRefusal(widget: string, reason: string): ToolResult {
   return fail(
     `panel_set_widget refused the promoted "${widget}" write because ${reason}. ` +
-      `No graph_set_widget was dispatched; ${remedy}`,
+      `No graph_set_widget was dispatched; retry only after the panel binding and ` +
+      `subgraph mapping are stable.`,
+  );
+}
+
+/**
+ * panel#1859 — the same refusal, for the one cause a retry can never reach.
+ *
+ * MCP 0.52.129 shipped the #2314 promoted-write fence; the panel build that
+ * satisfies it shipped twenty minutes later in 0.15.101. Every user in between
+ * got {@link promotedWriteRefusal}'s "retry only after the panel binding and
+ * subgraph mapping are stable" for a condition that is a JS bundle on disk. The
+ * reporter retried five times, re-issued panel_set_workflow_target (which
+ * answered `already_current`), and hard-refreshed the tab; none of that
+ * replaces the bundle, so the loop had no exit.
+ *
+ * So this says what is actually wrong, rules out the three things a caller
+ * would otherwise try next, and names a route to the value that works today.
+ * The refusal itself is unchanged — a pre-0.15.101 panel genuinely cannot
+ * enforce the fence, and loosening it would reopen #2314.
+ */
+function promotedPanelBuildRefusal(
+  ctx: PanelToolCtx,
+  nodeId: unknown,
+  widget: string,
+  reason: string,
+  capability: string,
+): ToolResult {
+  // A fence capability reads `false` for TWO different facts: this hello did
+  // not advertise it, or resolveTarget threw and there was no hello at all. Only
+  // the first is about the bundle on disk. If the receiver cannot be resolved,
+  // the honest answer is the transient one — telling someone whose tab just
+  // dropped to update and hard-refresh is the same unreachable advice this
+  // whole change exists to remove, and would be worse than what it replaced
+  // because the wording below is emphatic that retrying cannot help.
+  //
+  // Read in the SAME synchronous turn as the capability that sent us here, with
+  // no await between, so run-to-completion means both saw one connection.
+  if (ctx.tabReceiverResolvable?.() !== true) {
+    return promotedWriteRefusal(
+      widget,
+      "the receiving panel could not be resolved while its promoted-write fence " +
+        "capabilities were read, so whether this is a stale binding or an " +
+        "out-of-date panel build is not decidable from here",
+    );
+  }
+  const floor = panelVersionForCapability(capability);
+  const advertised = tabAdvertisedPanelVersion(ctx);
+  const update = describeInstallPanelAction(
+    "update",
+    "update the ComfyUI-MCP panel via ComfyUI Manager",
+  );
+  // Never interpolate the caller's raw node_id: it is untrusted argument shape.
+  // A container id that will not canonicalize is dropped from the sentence
+  // rather than echoed, which leaves the route stated but unparameterized.
+  const canonicalId = canonicalQueriedNodeId(nodeId);
+  const enterArg = canonicalId ? `node_id: ${canonicalId}` : "the container's node_id";
+  return fail(
+    `panel_set_widget refused the promoted "${widget}" write because the connected ` +
+      `panel build ${reason}. No graph_set_widget was dispatched.\n` +
+      `This is a panel BUILD skew, not a transient binding state. Retrying, ` +
+      `panel_set_workflow_target, and reloading the ComfyUI tab all leave the same ` +
+      `bundle running, so none of them can clear it.` +
+      (advertised ? ` This tab announced panel ${advertised}.` : "") +
+      ` A promoted-container write needs ${floor ? `panel ≥${floor}` : "a newer panel build"}. ` +
+      `${update}, then HARD-REFRESH the browser tab (Ctrl+Shift+R, or Cmd+Shift+R on ` +
+      `macOS); a restart alone leaves the tab running cached old JS.\n` +
+      `Until then the value is still reachable by hand: ` +
+      `panel_enter_subgraph(${enterArg}), then panel_set_widget on the ` +
+      `inner node that owns "${widget}". If the write does not stick because the ` +
+      `container's promoted rail holds the value, un-promote it first ` +
+      `(panel_promote_widget with demote:true), write the inner node, and re-promote — ` +
+      `that is the sequence panel#1859 reported as clearing it.`,
   );
 }
 
@@ -6743,16 +6812,24 @@ async function preparePromotedWidgetWrite(
       "graph_get_subgraph returned a malformed, stale, or incomplete ownership envelope",
     );
   }
-  // Check for required scope-identity fence capability early: if the panel doesn't
-  // support it, the scope witness cannot be extracted, and the real issue is the panel
-  // version, not a transient staleness. This guard comes before scope extraction so the
-  // error message correctly names the constraint (missing capability) rather than the
-  // symptom (missing viewing field).
+  // panel#1859 — ask the HELLO before reading the witness out of the envelope.
+  // A build that never advertised this fence also never writes
+  // `subgraph_of.graph_identity` (both landed in panel 0.15.101; v0.15.85
+  // replies with a bare `subgraph_of: { node_id, title }`), so diagnosing it as
+  // a missing field describes the symptom while the cause is the bundle on
+  // disk. This ordering is #2365's idea, kept.
+  //
+  // It also narrows the branch below to its true meaning: a receiver that DID
+  // advertise the fence and still failed to publish the identity is an
+  // inconsistent reply, which a retry can legitimately clear.
   if (ctx.tabExpectedScopeGraphIdentityFenceCapability?.() !== true) {
-    return promotedWriteRefusal(
+    return promotedPanelBuildRefusal(
+      ctx,
+      nodeId,
       widget,
-      "the receiving panel lacks the atomic promoted graph-identity write fence",
-      { capabilityName: "enforces_expected_scope_graph_identity_at_write" },
+      "does not advertise the atomic promoted graph-identity write fence, so it " +
+        "cannot publish the target graph identity a promoted write is fenced on",
+      "enforces_expected_scope_graph_identity_at_write",
     );
   }
   const scope = promotedScopeWitnessFromEnvelope(envelope);
@@ -6829,18 +6906,31 @@ async function preparePromotedWidgetWrite(
     const terminalBlocked = refuseKnownBadPromotedTerminal(inner.terminal);
     if (terminalBlocked) return terminalBlocked;
   }
+  // panel#1859 — these three are capability skew, exactly like the missing
+  // graph identity above: the hello either advertises the fence or it does not,
+  // and a caller cannot change that by trying again.
   if (ctx.tabExpectedNodeTypeFenceCapability?.() !== true) {
-    return promotedWriteRefusal(widget, "the receiving panel lacks the atomic inner-node write fence");
+    return promotedPanelBuildRefusal(
+      ctx,
+      nodeId,
+      widget,
+      "does not advertise the atomic inner-node write fence",
+      "enforces_expected_node_type_at_write",
+    );
   }
-  // Scope graph-identity fence capability was checked earlier (before scope extraction).
-  // If we reach this point, the capability was confirmed present. Legacy panels do not publish a parent-rail witness and retain the
+  // The graph-identity fence is checked before the scope witness above (#2365),
+  // so reaching here means the hello advertised it.
+  // Legacy panels do not publish a parent-rail witness and retain the
   // established same-name recovery contract. A current witness-capable panel
   // must advertise the synchronous final rail re-resolution before MCP sends
   // the inner/shared-subgraph write.
   if (publishesCompleteTerminalWitness && ctx.tabPromotedParentRailFenceCapability?.() !== true) {
-    return promotedWriteRefusal(
+    return promotedPanelBuildRefusal(
+      ctx,
+      nodeId,
       widget,
-      "the receiving panel lacks the atomic promoted parent-rail write fence",
+      "does not advertise the atomic promoted parent-rail write fence",
+      "enforces_promoted_parent_rail_at_write",
     );
   }
 
@@ -12928,6 +13018,11 @@ export interface PanelToolCtx {
   /** Whether the currently bound panel re-resolves the promoted parent rail
    * synchronously at the final graph_set_widget mutation boundary. */
   tabPromotedParentRailFenceCapability?: () => boolean;
+  /** panel#1859 — whether the receiver can be resolved at all, so a `false`
+   * from the three fence capabilities above can be read as "this build does not
+   * advertise it" rather than "there was no hello to read". Only used to pick
+   * the WORDING of a refusal; the refusals themselves stay fail-closed. */
+  tabReceiverResolvable?: () => boolean;
   /**
    * The same question TRI-STATE, for code that must REPORT the answer rather than
    * gate on it. `tabCanMutateGraph` fails closed (an unreadable probe becomes
@@ -14426,6 +14521,12 @@ export function makePanelToolCtx(
   ctx.tabPromotedParentRailFenceCapability = () =>
     typeof bridge.tabPromotedParentRailFenceCapability === "function" &&
     bridge.tabPromotedParentRailFenceCapability(ctx.tabId);
+  // Absent on a bridge that does not implement it, which reads as "cannot
+  // prove the receiver is there" — the conservative direction, since it only
+  // ever softens a refusal's wording away from blaming the panel build.
+  ctx.tabReceiverResolvable = () =>
+    typeof bridge.tabReceiverResolvable === "function" &&
+    bridge.tabReceiverResolvable(ctx.tabId);
   ctx.tabGraphMutationCapability = () => bridge.tabGraphMutationCapability(ctx.tabId);
   return ctx;
 }
