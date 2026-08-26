@@ -153,7 +153,6 @@ describe("orchestrator panel template relay wiring (#2196)", () => {
     });
     expect(wiring.resolveAllowedPanelOrigin("tab-1", target)).toBeUndefined();
     expect(wiring.resolvePanelUrl("tab-1", target)).toBeUndefined();
-
     const relay = await startPanelTemplateRelayServer({ bridge, ...wiring });
     servers.push(relay);
     process.env.COMFYUI_MCP_RELAY_SECRET = SECRET;

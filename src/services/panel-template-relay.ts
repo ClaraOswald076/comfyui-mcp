@@ -561,6 +561,9 @@ export async function startPanelTemplateRelayServer(
               options.bridge.resolveFailure?.(auth.agentKey) === "ambiguous" ? "AMBIGUOUS_REQUESTER" : "NO_LIVE_PANEL",
             );
           } else if (!panelUrl) {
+            // Any configured relay refusal is authoritative. Returning a
+            // sentinel here would let the child fall through to a stale
+            // getComfyUIBaseUrl() target after a mid-turn retarget.
             response = failureResponse(request.requestId, "NO_PANEL_ORIGIN");
           } else {
             try {
@@ -665,6 +668,12 @@ export async function requestPanelTemplateIndex(): Promise<Record<string, unknow
     throw new PanelTemplateRelayError("The connected panel template relay is unavailable.", code, httpResponse.status >= 500);
   }
   const response = validateResponse(decoded, request.requestId, secret);
+  // `undefined` is reserved for a child with no authenticated relay environment.
+  // Once a relay is configured, an unauthorizable panel origin is a refusal, not
+  // permission to fall through to getComfyUIBaseUrl(): during a target retarget
+  // that URL can still name stale target A while the relay has already observed
+  // target B. Keep this failure typed so the list_packs caller returns an honest
+  // unknown/error result without issuing a second fetch.
   if (response.ok === false) responseFailureMessage(response);
   const age = Date.now() - response.updated;
   if (
