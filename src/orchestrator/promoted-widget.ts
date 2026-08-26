@@ -17,6 +17,8 @@
  * among several inners that share the name, and never from a truncated read.
  */
 
+import { isNodeIdString, normalizeNodeId } from "./node-id.js";
+
 export type ContradictoryPromotedWidgetRefusal = {
   nodeId: string;
   widget: string;
@@ -152,9 +154,7 @@ function widgetNamesOnInner(node: Record<string, unknown>): string[] {
 
 function innerNodeId(node: Record<string, unknown>): number | string | null {
   const id = node.id;
-  if (typeof id === "number" && Number.isFinite(id)) return id;
-  if (typeof id === "string" && id.trim() !== "") return id;
-  return null;
+  return isNodeId(id) ? id : null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -162,10 +162,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isNodeId(value: unknown): value is number | string {
-  return (
-    (typeof value === "number" && Number.isFinite(value)) ||
-    (typeof value === "string" && value.trim() !== "")
-  );
+  if (typeof value === "number") return Number.isSafeInteger(value);
+  if (typeof value !== "string" || !isNodeIdString(value)) return false;
+  const normalized = normalizeNodeId(value);
+  return typeof normalized === "string" || Number.isSafeInteger(normalized);
 }
 
 /**

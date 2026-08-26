@@ -6414,6 +6414,57 @@ async function preparePromotedWidgetWrite(
   };
 }
 
+type PromotedMappingProof = {
+  inner: { innerNodeId: number | string; widget: string };
+  innerNodeType: string;
+};
+
+/** Re-read the ownership envelope for a previously classified promoted write.
+ * This is deliberately strict: after entering the subgraph, or immediately
+ * before a legacy retry, the old inner id is not permission to trust a relinked
+ * wrapper. */
+async function recheckPromotedInnerMapping(
+  ctx: PanelToolCtx,
+  outerNodeId: number | string,
+  widget: string,
+  expectedInner: { innerNodeId: number | string; widget: string },
+): Promise<PromotedMappingProof | ToolResult> {
+  const confirmation = await ctx.call({
+    cmd: "graph_get_subgraph",
+    node_id: outerNodeId,
+  });
+  if (confirmation.isError) {
+    return promotedWriteRefusal(
+      widget,
+      "the promoted mapping read was unavailable before the write",
+    );
+  }
+  const payload = parseToolResultJson(confirmation);
+  const envelope = validatePromotedSubgraphEnvelope(payload, outerNodeId);
+  const inner = envelope
+    ? resolveInnerPromotedTarget(payload, widget, outerNodeId)
+    : null;
+  if (
+    !envelope ||
+    !inner ||
+    canonicalQueriedNodeId(inner.innerNodeId) !== canonicalQueriedNodeId(expectedInner.innerNodeId) ||
+    inner.widget !== expectedInner.widget
+  ) {
+    return promotedWriteRefusal(
+      widget,
+      "the promoted inner mapping changed or became unverifiable before the write",
+    );
+  }
+  const targetId = canonicalQueriedNodeId(inner.innerNodeId);
+  const innerNode = envelope.nodes.find(
+    (candidate) => canonicalQueriedNodeId(candidate.id) === targetId,
+  );
+  if (!innerNode || !targetId || typeof innerNode.type !== "string" || innerNode.type.length === 0) {
+    return promotedWriteRefusal(widget, "the mapped inner node lost its verifiable type fence");
+  }
+  return { inner, innerNodeType: innerNode.type };
+}
+
 function daSiWaStackRefusal(type: string): ToolResult {
   return fail(
     `panel_set_widget cannot set "${DASIWA_STACK_WIDGET}" on ${type}. ` +
@@ -16732,17 +16783,23 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               echoFull,
             ),
           );
+        let writePromotedInner: (plan: PromotedWritePlan) => Promise<ToolResult>;
         const guardedWrite = async (
           nodeId: unknown,
           widget: string,
           targetExpectedNodeType: string | undefined = expectedNodeType,
         ): Promise<ToolResult> => {
+          const promotedRetry = await preparePromotedWidgetWrite(ctx, nodeId, widget);
+          if (promotedRetry && "content" in promotedRetry) return promotedRetry;
+          if (promotedRetry && promotedRetry.kind === "promoted-write") {
+            return writePromotedInner(promotedRetry);
+          }
           const blocked = await refuseKnownBadWriteBeforeDispatch(ctx, nodeId, widget);
           if (blocked) return blocked;
           return write(nodeId, widget, targetExpectedNodeType);
         };
 
-        const writePromotedInner = async (plan: PromotedWritePlan): Promise<ToolResult> => {
+        writePromotedInner = async (plan: PromotedWritePlan): Promise<ToolResult> => {
           let entered = false;
           const leave = async (): Promise<ToolResult> => {
             const exit = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
@@ -16754,48 +16811,15 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             if (initialBindingError) return promotedWriteRefusal(args.widget as string, initialBindingError);
 
             // Re-read the ownership envelope immediately before entering. This
-            // catches a promotion relink after the classification read; the
-            // inner write below then addresses the verified node directly.
-            const confirmation = await ctx.call({
-              cmd: "graph_get_subgraph",
-              node_id: plan.outerNodeId,
-            });
-            if (confirmation.isError) {
-              return promotedWriteRefusal(
-                args.widget as string,
-                "the final promoted mapping read was unavailable",
-              );
-            }
-            const confirmedPayload = parseToolResultJson(confirmation);
-            const confirmedEnvelope = validatePromotedSubgraphEnvelope(
-              confirmedPayload,
+            // catches a promotion relink after the classification read.
+            const beforeEnterMapping = await recheckPromotedInnerMapping(
+              ctx,
               plan.outerNodeId,
+              args.widget as string,
+              plan.inner,
             );
-            const confirmedInner = confirmedEnvelope
-              ? resolveInnerPromotedTarget(
-                  confirmedPayload,
-                  args.widget as string,
-                  plan.outerNodeId,
-                )
-              : null;
-            if (
-              !confirmedEnvelope ||
-              !confirmedInner ||
-              canonicalQueriedNodeId(confirmedInner.innerNodeId) !==
-                canonicalQueriedNodeId(plan.inner.innerNodeId) ||
-              confirmedInner.widget !== plan.inner.widget
-            ) {
-              return promotedWriteRefusal(
-                args.widget as string,
-                "the promoted inner mapping changed or became unverifiable before the write",
-              );
-            }
-            const confirmedNode = confirmedEnvelope.nodes.find(
-              (candidate) =>
-                canonicalQueriedNodeId(candidate.id) ===
-                canonicalQueriedNodeId(plan.inner.innerNodeId),
-            );
-            if (!confirmedNode || confirmedNode.type !== plan.innerNodeType) {
+            if ("content" in beforeEnterMapping) return beforeEnterMapping;
+            if (beforeEnterMapping.innerNodeType !== plan.innerNodeType) {
               return promotedWriteRefusal(
                 args.widget as string,
                 "the promoted inner node type changed before the write",
@@ -16824,6 +16848,30 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               );
             }
 
+            const afterEnterMapping = await recheckPromotedInnerMapping(
+              ctx,
+              plan.outerNodeId,
+              args.widget as string,
+              plan.inner,
+            );
+            if ("content" in afterEnterMapping) {
+              const exited = await leave();
+              return appendToolResultText(
+                afterEnterMapping,
+                exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : "",
+              );
+            }
+            if (afterEnterMapping.innerNodeType !== plan.innerNodeType) {
+              const exited = await leave();
+              return appendToolResultText(
+                promotedWriteRefusal(
+                  args.widget as string,
+                  "the promoted inner node type changed after entering the subgraph",
+                ),
+                exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : "",
+              );
+            }
+
             const innerBlocked = await refuseKnownBadWidgetWrite(
               ctx,
               plan.inner.innerNodeId,
@@ -16842,10 +16890,34 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               );
             }
 
+            const finalMapping = await recheckPromotedInnerMapping(
+              ctx,
+              plan.outerNodeId,
+              args.widget as string,
+              plan.inner,
+            );
+            if ("content" in finalMapping) {
+              const exited = await leave();
+              return appendToolResultText(
+                finalMapping,
+                exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : "",
+              );
+            }
+            if (finalMapping.innerNodeType !== plan.innerNodeType) {
+              const exited = await leave();
+              return appendToolResultText(
+                promotedWriteRefusal(
+                  args.widget as string,
+                  "the promoted inner node type changed immediately before the write",
+                ),
+                exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : "",
+              );
+            }
+
             const written = await write(
               plan.inner.innerNodeId,
               plan.inner.widget,
-              plan.innerNodeType,
+              finalMapping.innerNodeType,
               () => {
                 const error = currentPromotedBindingError(ctx, plan.binding);
                 if (error) {
@@ -17148,6 +17220,26 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               `truncated inner list, would target the wrong node.)`,
           );
         }
+        const recoveryInnerId = canonicalQueriedNodeId(inner.innerNodeId);
+        const recoveryInnerNode = recoveryEnvelope?.nodes.find(
+          (candidate) => canonicalQueriedNodeId(candidate.id) === recoveryInnerId,
+        );
+        const recoveryInnerNodeType = recoveryInnerNode?.type;
+        if (
+          !recoveryInnerId ||
+          typeof recoveryInnerNodeType !== "string" ||
+          recoveryInnerNodeType.length === 0
+        ) {
+          return appendToolResultText(
+            first,
+            `\n\n${textOfToolResult(
+              promotedWriteRefusal(
+                refusal.widget,
+                "the recovery envelope did not retain a verifiable inner node type",
+              ),
+            )}`,
+          );
+        }
 
         const entered = await ctx.call(
           { cmd: "graph_enter_subgraph", node_id: args.node_id },
@@ -17158,7 +17250,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             first,
             `\n\n(The panel listed "${refusal.widget}" as promoted while refusing it. ` +
               `Resolved it to inner node ${inner.innerNodeId} but panel_enter_subgraph FAILED: ` +
-            `${textOfToolResult(entered)})`,
+              `${textOfToolResult(entered)})`,
           );
         }
         if (recoveryBinding) {
@@ -17173,7 +17265,35 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           }
         }
 
-        let innerExpectedNodeType: string | undefined;
+        const legacyAfterEnterMapping = await recheckPromotedInnerMapping(
+          ctx,
+          args.node_id as number | string,
+          refusal.widget,
+          inner,
+        );
+        if ("content" in legacyAfterEnterMapping) {
+          const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+          return appendToolResultText(
+            first,
+            `\n\n${textOfToolResult(legacyAfterEnterMapping)}` +
+              (exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : ""),
+          );
+        }
+        if (legacyAfterEnterMapping.innerNodeType !== recoveryInnerNodeType) {
+          const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+          return appendToolResultText(
+            first,
+            `\n\n${textOfToolResult(
+              promotedWriteRefusal(
+                refusal.widget,
+                "the promoted inner node type changed after entering the subgraph",
+              ),
+            )}` +
+              (exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : ""),
+          );
+        }
+
+        let innerExpectedNodeType: string | undefined = legacyAfterEnterMapping.innerNodeType;
         if (expectedNodeType !== undefined) {
           // The inner mapping was discovered before an awaited enter. Re-query
           // the addressed inner node after entering so the stack_data write gets
@@ -17286,10 +17406,51 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           );
         }
 
+        if (recoveryBinding) {
+          const beforeDispatchBindingError = currentPromotedBindingError(ctx, recoveryBinding);
+          if (beforeDispatchBindingError) {
+            const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+            return appendToolResultText(
+              first,
+              `\n\n${textOfToolResult(
+                promotedWriteRefusal(refusal.widget, beforeDispatchBindingError),
+              )}` +
+                (exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : ""),
+            );
+          }
+        }
+        const legacyFinalMapping = await recheckPromotedInnerMapping(
+          ctx,
+          args.node_id as number | string,
+          refusal.widget,
+          inner,
+        );
+        if ("content" in legacyFinalMapping) {
+          const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+          return appendToolResultText(
+            first,
+            `\n\n${textOfToolResult(legacyFinalMapping)}` +
+              (exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : ""),
+          );
+        }
+        if (legacyFinalMapping.innerNodeType !== recoveryInnerNodeType) {
+          const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+          return appendToolResultText(
+            first,
+            `\n\n${textOfToolResult(
+              promotedWriteRefusal(
+                refusal.widget,
+                "the promoted inner node type changed immediately before the write",
+              ),
+            )}` +
+              (exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : ""),
+          );
+        }
+
         const written = await write(
           inner.innerNodeId,
           inner.widget,
-          innerExpectedNodeType,
+          legacyFinalMapping.innerNodeType,
           recoveryBinding
             ? () => {
                 const error = currentPromotedBindingError(ctx, recoveryBinding);

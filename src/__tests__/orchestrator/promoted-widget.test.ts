@@ -86,6 +86,10 @@ function bridge(opts: {
   /** #2314: make the first subgraph read unavailable so a recovery test can
    *  continue into the existing post-refusal retry branch. */
   preflightSubgraph?: Record<string, unknown> | Error;
+  recoveryPreflightSubgraph?: Record<string, unknown> | Error;
+  subgraphAfterEnter?: Record<string, unknown> | Error;
+  objectInfoRefusal?: boolean;
+  refreshNodes?: Record<string, unknown>;
   remappedWriteError?: string;
   reconnectBeforeWrite?: boolean;
   tabRebindBeforeWrite?: boolean;
@@ -115,6 +119,9 @@ function bridge(opts: {
         if (writes === 1 && opts.stackDataIdentity && opts.firstWrite !== "ok") {
           throw new Error(STACK_DATA_CONTRADICTORY);
         }
+        if (writes === 1 && opts.objectInfoRefusal) {
+          throw new Error("no usable /object_info was available for this widget write");
+        }
         if (writes === 1 && opts.firstWriteError) throw new Error(opts.firstWriteError);
         if (writes === 2 && opts.remappedWriteError) throw new Error(opts.remappedWriteError);
         if (
@@ -142,6 +149,14 @@ function bridge(opts: {
         if (subgraphReads === 1 && opts.preflightSubgraph !== undefined) {
           if (opts.preflightSubgraph instanceof Error) throw opts.preflightSubgraph;
           return opts.preflightSubgraph;
+        }
+        if (subgraphReads === 2 && opts.recoveryPreflightSubgraph !== undefined) {
+          if (opts.recoveryPreflightSubgraph instanceof Error) throw opts.recoveryPreflightSubgraph;
+          return opts.recoveryPreflightSubgraph;
+        }
+        if (inSubgraph && opts.subgraphAfterEnter !== undefined) {
+          if (opts.subgraphAfterEnter instanceof Error) throw opts.subgraphAfterEnter;
+          return opts.subgraphAfterEnter;
         }
         if (opts.subgraph instanceof Error) throw opts.subgraph;
         return opts.subgraph ?? SUBGRAPH;
@@ -179,6 +194,7 @@ function bridge(opts: {
           }
         );
       }
+      if (cmd.cmd === "refresh_nodes") return opts.refreshNodes ?? { refreshed: true };
       return { ok: true };
     },
     push: () => 1,
@@ -679,8 +695,167 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
     expect(isError).toBe(true);
     expect(text).toContain("animaPrompts");
     const writes = calls.filter((c) => c.cmd === "graph_set_widget");
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatchObject({ node_id: 78, widget: "Quality_Prompt" });
+  });
+
+  it("routes a successful case-only remapped retry through the inner plan", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "Quality_Prompt", value: "masterpiece" },
+      {
+        firstWrite: "contradict",
+        firstWriteError: ANIMA_CONTRADICTORY,
+        preflightSubgraph: new Error("preflight unavailable"),
+        subgraph: SAFE_ANIMA_SUBGRAPH,
+        detailById: SAFE_ANIMA_IDENTITY_BY_ID,
+      },
+    );
+
+    expect(isError).toBe(false);
+    expect(text).toMatch(/validated promoted inner widget/);
+    const writes = calls.filter((c) => c.cmd === "graph_set_widget");
     expect(writes).toHaveLength(2);
     expect(writes[0]).toMatchObject({ node_id: 78, widget: "Quality_Prompt" });
+    expect(writes[1]).toMatchObject({ node_id: 76, widget: "quality_prompt" });
+    expect(calls.filter((c) => c.cmd === "graph_set_widget" && c.node_id === 78)).toHaveLength(1);
+  });
+
+  it("routes a successful scope retry through the promoted inner guards", async () => {
+    const { isError, calls } = await setWidget(
+      { node_id: 188, widget: "quality_prompt", value: "masterpiece" },
+      {
+        scopeLost: true,
+        preflightSubgraph: new Error("preflight unavailable"),
+        subgraph: {
+          ...SAFE_ANIMA_SUBGRAPH,
+          subgraph_of: { node_id: 188, title: "Container" },
+        },
+        detailById: {
+          "188": { nodes: [{ id: 188, type: "SubgraphNode" }] },
+          "76": SAFE_ANIMA_IDENTITY_BY_ID["76"],
+        },
+      },
+    );
+
+    expect(isError).toBe(false);
+    const writes = calls.filter((c) => c.cmd === "graph_set_widget");
+    expect(writes).toHaveLength(2);
+    expect(writes[0]).toMatchObject({ node_id: 188, widget: "quality_prompt" });
+    expect(writes[1]).toMatchObject({ node_id: 76, widget: "quality_prompt" });
+  });
+
+  it("routes a successful object-info retry through the promoted inner guards", async () => {
+    const { isError, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
+      {
+        firstWriteError: "no usable /object_info was available for this widget write",
+        preflightSubgraph: new Error("preflight unavailable"),
+        subgraph: SAFE_ANIMA_SUBGRAPH,
+        detailById: SAFE_ANIMA_IDENTITY_BY_ID,
+        refreshNodes: { refreshed: true },
+      },
+    );
+
+    expect(isError).toBe(false);
+    const writes = calls.filter((c) => c.cmd === "graph_set_widget");
+    expect(writes).toHaveLength(2);
+    expect(writes[0]).toMatchObject({ node_id: 78, widget: "quality_prompt" });
+    expect(writes[1]).toMatchObject({ node_id: 76, widget: "quality_prompt" });
+  });
+
+  it("refuses a known-bad Anima write on an object-info retry", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
+      {
+        firstWriteError: "no usable /object_info was available for this widget write",
+        preflightSubgraph: new Error("preflight unavailable"),
+        subgraph: ANIMA_SUBGRAPH,
+        detailById: ANIMA_IDENTITY_BY_ID,
+        refreshNodes: { refreshed: true },
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/animaPrompts/);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(1);
+  });
+
+  it("refuses a known-bad dynamic child on a scope retry", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 188, widget: "model.prompt", value: "a long prompt" },
+      {
+        scopeLost: true,
+        preflightSubgraph: new Error("preflight unavailable"),
+        subgraph: {
+          ...DYNAMIC_SUBGRAPH,
+          subgraph_of: { node_id: 188, title: "Container" },
+        },
+        detailById: {
+          "188": { nodes: [{ id: 188, type: "SubgraphNode" }] },
+          "76": DYNAMIC_DETAIL_BY_ID["76"],
+        },
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/dynamic-combo/);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(1);
+  });
+
+  it("refuses a known-bad DaSiWa write on a case-remap retry", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "Stack_Data", value: "NEW" },
+      {
+        firstWriteError: STACK_DATA_CONTRADICTORY,
+        preflightSubgraph: new Error("preflight unavailable"),
+        subgraph: {
+          subgraph_of: { node_id: 78, title: "Container" },
+          node_count: 1,
+          nodes: [{ id: 76, type: "DaSiWa_LTX2LoraLoader", widgets: { stack_data: "old" } }],
+        },
+        stackDataIdentity: { nodes: [{ id: 78, type: "OtherLoraLoader" }] },
+        stackDataInnerIdentity: { nodes: [{ id: 76, type: "DaSiWa_LTX2LoraLoader" }] },
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/DaSiWa_LTX2LoraLoader/);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(1);
+  });
+
+  it("refuses a promoted retry when the mapping relinks after enter", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
+      {
+        firstWriteError: ANIMA_CONTRADICTORY,
+        preflightSubgraph: new Error("preflight unavailable"),
+        subgraph: SAFE_ANIMA_SUBGRAPH,
+        subgraphAfterEnter: ANIMA_SUBGRAPH,
+        detailById: SAFE_ANIMA_IDENTITY_BY_ID,
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/mapping changed or became unverifiable|type changed after entering/);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(1);
+  });
+
+  it("refuses the legacy recovery when its post-enter mapping relinks", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
+      {
+        firstWriteError: ANIMA_CONTRADICTORY,
+        preflightSubgraph: new Error("preflight unavailable"),
+        recoveryPreflightSubgraph: new Error("recovery preflight unavailable"),
+        subgraph: SAFE_ANIMA_SUBGRAPH,
+        subgraphAfterEnter: ANIMA_SUBGRAPH,
+        detailById: SAFE_ANIMA_IDENTITY_BY_ID,
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/mapping changed or became unverifiable|type changed after entering/);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(1);
   });
 
 });
@@ -808,6 +983,7 @@ describe("resolveInnerPromotedTarget", () => {
     ["wrong node_count", { ...SUBGRAPH, node_count: 1 }],
     ["non-integer node_count", { ...SUBGRAPH, node_count: "2" }],
     ["truncated envelope", { ...SUBGRAPH, truncated: true }],
+    ["malformed inner node id", { ...SUBGRAPH, nodes: [{ ...SUBGRAPH.nodes[0], id: "not-a-node" }, SUBGRAPH.nodes[1]] }],
   ])("rejects a %s instead of trusting its inner mapping", (_name, malformed) => {
     expect(validatePromotedSubgraphEnvelope(malformed, 78)).toBeNull();
     expect(resolveInnerPromotedTarget(malformed, "width", 78)).toBeNull();
@@ -838,12 +1014,14 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
       "graph_get_subgraph",
       "graph_get_subgraph",
       "graph_enter_subgraph",
+      "graph_get_subgraph",
       "graph_query",
+      "graph_get_subgraph",
       "graph_set_widget",
       "graph_exit_subgraph",
     ]);
     expect(calls[3]).toMatchObject({ expected_node_type: "OtherLoraLoader" });
-    expect(calls[8]).toMatchObject({ expected_node_type: "OtherLoraLoader" });
+    expect(calls[10]).toMatchObject({ expected_node_type: "OtherLoraLoader" });
     expect(text).toMatch(/validated promoted inner widget/);
   });
 
@@ -871,6 +1049,7 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
       "graph_get_subgraph",
       "graph_get_subgraph",
       "graph_enter_subgraph",
+      "graph_get_subgraph",
       "graph_query",
       "graph_exit_subgraph",
     ]);
@@ -902,6 +1081,7 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
       "graph_get_subgraph",
       "graph_get_subgraph",
       "graph_enter_subgraph",
+      "graph_get_subgraph",
       "graph_query",
       "graph_exit_subgraph",
     ]);
@@ -961,11 +1141,13 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
       "graph_set_widget",
       "graph_get_subgraph",
       "graph_enter_subgraph",
+      "graph_get_subgraph",
+      "graph_get_subgraph",
       "graph_set_widget",
       "graph_exit_subgraph",
     ]);
     expect(calls[0]).toMatchObject({ node_id: 78, widget: "width", value: 1024 });
-    expect(calls[3]).toMatchObject({ node_id: 76, widget: "width", value: 1024 });
+    expect(calls[5]).toMatchObject({ node_id: 76, widget: "width", value: 1024 });
     expect(text).toMatch(/inner widget this promotion lists: node 76 "width"/);
     expect(text).not.toMatch(/is not a promoted widget/);
   });
@@ -1075,6 +1257,8 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
       "graph_set_widget",
       "graph_get_subgraph",
       "graph_enter_subgraph",
+      "graph_get_subgraph",
+      "graph_get_subgraph",
       "graph_set_widget",
       "graph_exit_subgraph",
     ]);
