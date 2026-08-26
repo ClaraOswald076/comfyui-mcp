@@ -198,10 +198,10 @@ So SSH + Jupyter + nginx come from the base; **our hook adds everything else**.
 ## Model paths (`extra_model_paths.yaml`)
 
 `extra_model_paths.yaml` is baked at `/opt/ComfyUI/extra_model_paths.yaml` and
-loaded via `--extra-model-paths-config`. It maps **every** model category to a
-subfolder under `/workspace/models`, with `is_default: true` so the volume is the
-**primary** (download) location — i.e. Manager's install-model writes there and
-the files persist.
+loaded via `--extra-model-paths-config`. It maps every model category **this
+image knows about** to a subfolder under `/workspace/models`, with
+`is_default: true` so the volume is the **primary** (download) location — i.e.
+Manager's install-model writes there and the files persist.
 
 ```yaml
 comfyui_mcp_volume:
@@ -239,6 +239,12 @@ comfyui_mcp_volume:
     geometry_estimation: models/geometry_estimation/
     optical_flow: models/optical_flow/
     detection: models/detection/
+
+    # registered by the node packs themselves, not by ComfyUI core:
+    ultralytics: models/ultralytics/          # Impact Subpack
+    ultralytics_bbox: models/ultralytics/bbox/
+    ultralytics_segm: models/ultralytics/segm/
+    sams: models/sams/                       # Impact Pack (SAMLoader)
 ```
 
 Notes:
@@ -255,6 +261,16 @@ Notes:
 * The category **keys** match ComfyUI's `folder_names_and_paths` keys (verified
   against `master`'s `folder_paths.py`). The category list mirrors the example's
   full set; harmless if a future ComfyUI renames one.
+* **Custom node packs register their own categories, and those are NOT in ComfyUI's
+  example.** A category absent from this file has no `/workspace` entry at all, so
+  `/opt/ComfyUI/models/<cat>` stays its only path and downloads land on the ephemeral
+  image layer - no error, just gone after the next rebuild (#2302). Adding the key is
+  sufficient and order-independent: packs register via a helper that calls
+  `add_model_folder_path` **without** `is_default`, i.e. it appends behind whatever this
+  file already put at the front. Impact Pack also registers `onnx` (read from its
+  source, deliberately left out of #2302's fix as it is a deprecated provider);
+  `insightface`, `facerestore_models` and `rembg` are the same shape but have NOT
+  been audited — do that before adding them.
 * `/post_start.sh` pre-creates the matching subfolders under `/workspace/models`
   so they exist on a cold volume.
 

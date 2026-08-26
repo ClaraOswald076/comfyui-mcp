@@ -32,6 +32,7 @@ const postStartSrc = readFileSync(
   new URL("../../docker/runpod/post_start.sh", import.meta.url),
   "utf-8",
 );
+const readmeSrc = readFileSync(new URL("../../docker/runpod/README.md", import.meta.url), "utf-8");
 
 const block = (parseYaml(yamlSrc) as Record<string, Record<string, unknown>>)
   .comfyui_mcp_volume;
@@ -97,5 +98,19 @@ describe("the RunPod image maps Impact Pack's model categories onto the volume (
     expect(missing, "extra_model_paths.yaml maps these, post_start.sh never mkdirs them").toEqual(
       [],
     );
+  });
+
+  it("documents the same category set it ships", () => {
+    // README.md embeds a full copy of the yaml under "Model paths". That copy is what a
+    // maintainer reads when adding the NEXT category, so a stale one does not just mislead —
+    // it reproduces this bug. Compare key sets, not text: the README annotates its copy with
+    // inline comments and those must stay free to change.
+    const fenced = readmeSrc.match(/```yaml\r?\n(comfyui_mcp_volume:[\s\S]*?)```/);
+    expect(fenced, "README.md no longer embeds a ```yaml comfyui_mcp_volume block").not.toBe(null);
+
+    const documented = (
+      parseYaml((fenced as RegExpMatchArray)[1]) as Record<string, Record<string, unknown>>
+    ).comfyui_mcp_volume;
+    expect(Object.keys(documented).sort()).toEqual(Object.keys(block).sort());
   });
 });
