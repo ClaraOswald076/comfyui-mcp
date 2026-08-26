@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.128] - 2026-08-26
+
+### MCP
+
+#### Fixed
+- cover ChatGPT image-history recovery and bounded retry behavior (#2224)
+- recognize ComfyUI health errors and OOMs from the actual log format (#2352)
+
 ## [0.52.127] - 2026-08-25
 
 ### MCP
