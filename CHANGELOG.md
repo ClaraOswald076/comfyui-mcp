@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.122] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- preserve panel_run completion receipts across delayed prompts, teardown, and restart (#1824)
+
 ## [0.52.121] - 2026-08-25
 
 ### MCP
