@@ -7,8 +7,9 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
  * The list_packs child cannot reach the panel bridge directly. It sends only a
  * capability-bound request to the orchestrator; the orchestrator resolves the
  * live panel tab and fetches the fixed /api/workflow_templates route from that
- * tab's server-observed loopback origin. No configured ComfyUI credentials or
- * caller-supplied URL crosses this boundary.
+ * tab's server-observed origin, but only when it is the current ComfyUI target.
+ * No configured ComfyUI credentials or caller-supplied URL crosses this
+ * boundary.
  */
 export const PANEL_TEMPLATE_RELAY_VERSION = 1;
 export const PANEL_TEMPLATE_RELAY_TIMEOUT_MS = 8_000;
@@ -20,6 +21,7 @@ export const PANEL_TEMPLATE_RELAY_HTTP_PATH = "/__comfyui_mcp_panel_template_rel
 
 const ID_RE = /^[A-Za-z0-9_-]{16,80}$/;
 const HEX_RE = /^[a-f0-9]{64}$/;
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 
 export interface PanelTemplateRelayRequest {
   version: typeof PANEL_TEMPLATE_RELAY_VERSION;
@@ -62,11 +64,20 @@ export interface PanelTemplateRelayResolvedAgent {
   secret: string;
 }
 
+export interface PanelTemplateRelayTarget {
+  url: string;
+  generation: number;
+}
+
 export interface PanelTemplateRelayServerOptions {
   bridge: PanelTemplateRelayBridge;
   resolvePanelAgent: (request: PanelTemplateRelayRequest) => PanelTemplateRelayResolvedAgent | undefined;
   resolvePanelTab: (agentKey: string) => string | undefined;
-  resolvePanelUrl: (tabId: string) => string | undefined;
+  /** Captures the authoritative target identity for this request. */
+  resolveCurrentTarget: () => PanelTemplateRelayTarget;
+  resolvePanelUrl: (tabId: string, currentTarget: string) => string | undefined;
+  /** Must return undefined unless the tab's origin is authorized for currentTarget. */
+  resolveAllowedPanelOrigin: (tabId: string, currentTarget: string) => string | undefined;
 }
 
 export interface PanelTemplateRelayServer {
@@ -215,6 +226,7 @@ function errorMessage(error: string): string {
     "NO_PANEL_ORIGIN",
     "PANEL_FETCH_FAILED",
     "STALE_REQUEST",
+    "STALE_TARGET",
     "TIMEOUT",
   ]);
   return known.has(error) ? error : "PANEL_FETCH_FAILED";
@@ -380,19 +392,65 @@ function readRequestBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
-function safePanelTemplateUrl(raw: string | undefined): URL | undefined {
+function parsedHttpOrigin(raw: string | undefined): { origin: string; protocol: string; host: string; port: string } | undefined {
+  if (!raw) return undefined;
+  try {
+    const url = new URL(raw);
+    if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password) return undefined;
+    return {
+      origin: url.origin,
+      protocol: url.protocol,
+      host: url.hostname.toLowerCase().replace(/^\[|\]$/g, ""),
+      port: url.port,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function httpOrigin(raw: string | undefined): string | undefined {
+  return parsedHttpOrigin(raw)?.origin;
+}
+
+/**
+ * A panel origin is usable only when it is a loopback listener and corroborates
+ * the current target. The server-observed Origin is metadata, not authentication:
+ * a native client can forge it on the tokenless loopback bridge. Keeping the
+ * fetch destination loopback-only prevents that metadata, or the client-steerable
+ * active target, from authorizing a remote fetch. URL.origin also canonicalizes
+ * default ports and host casing.
+ */
+export function currentPanelTemplateOrigin(
+  panelOrigin: string | undefined,
+  currentTarget: string | undefined,
+): string | undefined {
+  const observed = parsedHttpOrigin(panelOrigin);
+  const target = parsedHttpOrigin(currentTarget);
+  if (!observed || !target) return undefined;
+  const exactLoopbackOrigin =
+    LOOPBACK_HOSTS.has(observed.host) &&
+    LOOPBACK_HOSTS.has(target.host) &&
+    observed.protocol === target.protocol &&
+    observed.port === target.port &&
+    observed.origin === target.origin;
+  return exactLoopbackOrigin ? observed.origin : undefined;
+}
+
+function safePanelTemplateUrl(raw: string | undefined, allowedOrigin: string | undefined): URL | undefined {
   if (!raw) return undefined;
   try {
     const url = new URL(raw);
     const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    const normalizedAllowedOrigin = allowedOrigin === undefined ? undefined : httpOrigin(allowedOrigin);
     if (
       (url.protocol !== "http:" && url.protocol !== "https:") ||
-      !new Set(["localhost", "127.0.0.1", "::1"]).has(host) ||
       url.username ||
       url.password ||
       url.search ||
       url.hash ||
-      !url.pathname.endsWith("/api/workflow_templates")
+      !url.pathname.endsWith("/api/workflow_templates") ||
+      !normalizedAllowedOrigin ||
+      url.origin !== normalizedAllowedOrigin
     ) return undefined;
     return url;
   } catch {
@@ -414,7 +472,7 @@ async function fetchPanelIndex(url: URL, deadlineAt: number): Promise<string> {
     throw new PanelTemplateRelayError("The connected panel could not fetch the workflow-template index.", "PANEL_FETCH_FAILED");
   }
   if (response.url) {
-    const finalUrl = safePanelTemplateUrl(response.url);
+    const finalUrl = safePanelTemplateUrl(response.url, url.origin);
     if (!finalUrl || finalUrl.origin !== url.origin || finalUrl.pathname !== url.pathname) {
       throw new PanelTemplateRelayError("The panel template relay refused a response from another origin.", "PANEL_FETCH_FAILED");
     }
@@ -485,11 +543,16 @@ export async function startPanelTemplateRelayServer(
         if (now - request.createdAt < -5_000 || now - request.createdAt > PANEL_TEMPLATE_RELAY_STALE_MS || now >= requestDeadline(request)) {
           response = failureResponse(request.requestId, now >= requestDeadline(request) ? "TIMEOUT" : "STALE_REQUEST");
         } else {
+          const targetAtStart = options.resolveCurrentTarget();
           const panelTab = options.resolvePanelTab(auth.agentKey);
-          const panelUrl = panelTab && options.bridge.canReach(panelTab)
-            ? safePanelTemplateUrl(options.resolvePanelUrl(panelTab))
+          const panelReachable = panelTab ? options.bridge.canReach(panelTab) : false;
+          const allowedOrigin = panelTab && panelReachable
+            ? options.resolveAllowedPanelOrigin(panelTab, targetAtStart.url)
             : undefined;
-          if (!panelTab || !options.bridge.canReach(panelTab)) {
+          const panelUrl = panelTab && panelReachable
+            ? safePanelTemplateUrl(options.resolvePanelUrl(panelTab, targetAtStart.url), allowedOrigin)
+            : undefined;
+          if (!panelTab || !panelReachable) {
             response = failureResponse(
               request.requestId,
               options.bridge.resolveFailure?.(auth.agentKey) === "ambiguous" ? "AMBIGUOUS_REQUESTER" : "NO_LIVE_PANEL",
@@ -498,11 +561,19 @@ export async function startPanelTemplateRelayServer(
             response = failureResponse(request.requestId, "NO_PANEL_ORIGIN");
           } else {
             try {
+              const body = await withinDeadline(fetchPanelIndex(panelUrl, requestDeadline(request)), requestDeadline(request));
+              const targetNow = options.resolveCurrentTarget();
+              if (targetNow.url !== targetAtStart.url || targetNow.generation !== targetAtStart.generation) {
+                throw new PanelTemplateRelayError(
+                  "The ComfyUI target changed while the panel template index was being fetched.",
+                  "STALE_TARGET",
+                );
+              }
               response = {
                 version: PANEL_TEMPLATE_RELAY_VERSION,
                 requestId: request.requestId,
                 ok: true,
-                body: await withinDeadline(fetchPanelIndex(panelUrl, requestDeadline(request)), requestDeadline(request)),
+                body,
                 updated: Date.now(),
               };
             } catch (error) {

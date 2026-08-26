@@ -115,10 +115,12 @@ import {
 } from "../services/panel-image-relay.js";
 import {
   startPanelTemplateRelayServer,
+  currentPanelTemplateOrigin,
   verifyPanelTemplateRelayCapability,
   type PanelTemplateRelayResolvedAgent,
   type PanelTemplateRelayServer,
   type PanelTemplateRelayRequest,
+  type PanelTemplateRelayTarget,
 } from "../services/panel-template-relay.js";
 import { logger } from "../utils/logger.js";
 import { listDownloadJobs } from "../services/download-jobs.js";
@@ -206,7 +208,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { registerAllTools } from "../tools/index.js";
 import { tryInstallRetiredNameRedirect } from "../tools/retired-redirect.js";
-import { config, isForceRemoteFlagSet, isLoopbackHost, detectLocalComfyUIPath, setComfyuiTarget, onComfyuiTargetChanged, isTargetingLocal, isTargetingLocalOrLan, isTargetingPod, getComfyUIBaseUrl, getLocalComfyuiUrl, rescopeLocalTargetFile, getComfyUIAuthHeaders } from "../config.js";
+import { config, isForceRemoteFlagSet, isLoopbackHost, detectLocalComfyUIPath, setComfyuiTarget, onComfyuiTargetChanged, isTargetingLocal, isTargetingLocalOrLan, isTargetingPod, getComfyUIBaseUrl, getComfyuiTargetGeneration, getLocalComfyuiUrl, rescopeLocalTargetFile, getComfyUIAuthHeaders } from "../config.js";
 import { normalizeInstallPathEnv } from "../utils/install-path-env.js";
 import {
   AGENT_IDENTITY_ENV,
@@ -944,6 +946,64 @@ export function armStartupDeadline(
   // Never hold the event loop open on this timer's account.
   timer.unref?.();
   return () => clearTimeout(timer);
+}
+
+export interface PanelTemplateRelayWiring {
+  resolvePanelAgent: (request: PanelTemplateRelayRequest) => PanelTemplateRelayResolvedAgent | undefined;
+  resolvePanelTab: (agentKey: string) => string | undefined;
+  resolveCurrentTarget: () => PanelTemplateRelayTarget;
+  resolvePanelUrl: (tabId: string, currentTarget: string) => string | undefined;
+  resolveAllowedPanelOrigin: (tabId: string, currentTarget: string) => string | undefined;
+}
+
+/**
+ * The production closures for the child template relay. Keep authorization,
+ * scope-to-tab routing, and current-target origin selection together so tests
+ * can exercise the same wiring that the orchestrator gives the relay server.
+ */
+export function createPanelTemplateRelayWiring(options: {
+  bridge: Pick<UiBridge, "resolveSharedTabId" | "tabServerOrigin">;
+  currentTarget: () => string;
+  currentTargetGeneration: () => number;
+  secrets: ReadonlyMap<string, string>;
+}): PanelTemplateRelayWiring {
+  const resolvePanelAgent = (
+    request: PanelTemplateRelayRequest,
+  ): PanelTemplateRelayResolvedAgent | undefined => {
+    for (const [secret, agentKey] of options.secrets) {
+      if (verifyPanelTemplateRelayCapability(secret, request)) return { agentKey, secret };
+    }
+    return undefined;
+  };
+  const panelTabOf = (key: string): string => {
+    const i = key.lastIndexOf("::");
+    return i >= 0 ? key.slice(0, i) : key;
+  };
+  const resolvePanelTab = (tabId: string): string | undefined =>
+    isScopeAddress(tabId) ? options.bridge.resolveSharedTabId(tabId) : panelTabOf(tabId);
+  const resolveCurrentTarget = (): PanelTemplateRelayTarget => ({
+    url: options.currentTarget(),
+    generation: options.currentTargetGeneration(),
+  });
+  const resolveAllowedPanelOrigin = (tabId: string, currentTarget: string): string | undefined =>
+    currentPanelTemplateOrigin(options.bridge.tabServerOrigin(tabId), currentTarget);
+  const resolvePanelUrl = (tabId: string, currentTarget: string): string | undefined => {
+    const origin = currentPanelTemplateOrigin(options.bridge.tabServerOrigin(tabId), currentTarget);
+    if (!origin) return undefined;
+    try {
+      const basePath = new URL(currentTarget).pathname.replace(/\/+$/, "");
+      return `${origin}${basePath}/api/workflow_templates`;
+    } catch {
+      return undefined;
+    }
+  };
+  return {
+    resolvePanelAgent,
+    resolvePanelTab,
+    resolveCurrentTarget,
+    resolvePanelUrl,
+    resolveAllowedPanelOrigin,
+  };
 }
 
 export async function runPanelOrchestrator(): Promise<void> {
@@ -1777,14 +1837,6 @@ export async function runPanelOrchestrator(): Promise<void> {
     }
     return undefined;
   };
-  const panelTemplateRelayAgentFor = (
-    request: PanelTemplateRelayRequest,
-  ): PanelTemplateRelayResolvedAgent | undefined => {
-    for (const [secret, agentKey] of panelImageRelaySecrets) {
-      if (verifyPanelTemplateRelayCapability(secret, request)) return { agentKey, secret };
-    }
-    return undefined;
-  };
   // The scope/backend halves of a composite key. Neither half contains "::", so
   // split on the LAST separator.
   const panelTabOf = (key: string): string => {
@@ -1799,6 +1851,12 @@ export async function runPanelOrchestrator(): Promise<void> {
   // bridge's pinned shared-tab mapping before dispatching authenticated relay commands.
   const scopeToRealTab = (tabId: string): string | undefined =>
     isScopeAddress(tabId) ? bridge.resolveSharedTabId(tabId) : panelTabOf(tabId);
+  const panelTemplateRelayWiring = createPanelTemplateRelayWiring({
+    bridge,
+    currentTarget: getComfyUIBaseUrl,
+    currentTargetGeneration: getComfyuiTargetGeneration,
+    secrets: panelImageRelaySecrets,
+  });
   let panelImageRelayServer: PanelImageRelayServer | undefined;
   let panelImageRelayEndpoint: string | undefined;
   try {
@@ -1815,25 +1873,12 @@ export async function runPanelOrchestrator(): Promise<void> {
       `[panel-orchestrator] authenticated panel image relay unavailable: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
-  const panelTemplateRelayUrlFor = (tabId: string): string | undefined => {
-    const origin = bridge.tabServerOrigin(tabId);
-    if (!origin) return undefined;
-    try {
-      const configured = new URL(getComfyUIBaseUrl());
-      const basePath = configured.pathname.replace(/\/+$/, "");
-      return `${origin}${basePath}/api/workflow_templates`;
-    } catch {
-      return undefined;
-    }
-  };
   let panelTemplateRelayServer: PanelTemplateRelayServer | undefined;
   let panelTemplateRelayEndpoint: string | undefined;
   try {
     panelTemplateRelayServer = await startPanelTemplateRelayServer({
       bridge,
-      resolvePanelAgent: panelTemplateRelayAgentFor,
-      resolvePanelTab: scopeToRealTab,
-      resolvePanelUrl: panelTemplateRelayUrlFor,
+      ...panelTemplateRelayWiring,
     });
     panelTemplateRelayEndpoint = panelTemplateRelayServer.endpointUrl;
   } catch (error) {
