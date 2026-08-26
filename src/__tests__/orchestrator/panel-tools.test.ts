@@ -375,6 +375,12 @@ describe("panel-tools: panel_set_widget Anima regional textarea (#1658)", () => 
             }
             return { content: [{ type: "text" as const, text: JSON.stringify(queryReply, null, 2) }] };
           }
+          if (cmd.cmd === "graph_get_subgraph") {
+            return {
+              isError: true,
+              content: [{ type: "text" as const, text: "Error: Node 2768 (KSampler) is not a subgraph" }],
+            };
+          }
           return { content: [{ type: "text" as const, text: JSON.stringify(SET_OK, null, 2) }] };
         },
       } as unknown as PanelToolCtx,
@@ -494,6 +500,12 @@ describe("panel-tools: panel_set_widget V3 dynamic-combo sub-widgets (#2299)", (
         cmds.push(String(cmd.cmd));
         if (cmd.cmd === "graph_query") {
           return { content: [{ type: "text" as const, text: JSON.stringify(detail, null, 2) }] };
+        }
+        if (cmd.cmd === "graph_get_subgraph") {
+          return {
+            isError: true,
+            content: [{ type: "text" as const, text: "Error: Node 23 (OrdinaryNode) is not a subgraph" }],
+          };
         }
         return { content: [{ type: "text" as const, text: JSON.stringify(SET_OK, null, 2) }] };
       },
@@ -798,6 +810,12 @@ describe("panel-tools: panel_set_widget DaSiWa stack_data (#2107)", () => {
             return reply as ToolResult;
           }
           return { content: [{ type: "text" as const, text: JSON.stringify(reply, null, 2) }] };
+        }
+        if (cmd.cmd === "graph_get_subgraph") {
+          return {
+            isError: true,
+            content: [{ type: "text" as const, text: "Error: Node 2571 (OtherLoraLoader) is not a subgraph" }],
+          };
         }
         return {
           content: [
