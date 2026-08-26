@@ -10,7 +10,7 @@ import { errorText } from "./error-text.js";
 import type { AgentEvent, BackendStartOptions, ModelChoice, NeutralTurn } from "./agent-backend.js";
 import { CHATGPT_CAPABILITIES, stampTurn } from "./agent-backend.js";
 import { resolveOpenAICodexOAuth } from "../services/code-provider-auth.js";
-import { OllamaBackend, type OllamaBackendDeps } from "./ollama-backend.js";
+import { OllamaBackend, imagePayloadBudgetBytes, type OllamaBackendDeps } from "./ollama-backend.js";
 
 const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 const CHATGPT_SYSTEM_PROMPT = [
@@ -139,6 +139,10 @@ function historyToCodexInput(messages: TurnMessage[]): CodexInputItem[] {
   return items;
 }
 
+function formatByteBudget(bytes: number): string {
+  return bytes >= 1024 * 1024 ? `${Math.round(bytes / (1024 * 1024))} MB` : `${bytes} bytes`;
+}
+
 /** ChatGPT direct OAuth backend — Codex Responses SSE + shared 6-tool router. */
 export class ChatGptOAuthBackend extends OllamaBackend {
   readonly id = "chatgpt" as const;
@@ -178,6 +182,49 @@ export class ChatGptOAuthBackend extends OllamaBackend {
       authorization: `Bearer ${this.accessToken}`,
       "chatgpt-account-id": this.accountId,
     };
+  }
+
+  /**
+   * Bring the request's inline image bytes under the budget BEFORE sending (#2224).
+   *
+   * Like the OllamaBackend fix, drops whole messages' images OLDEST-FIRST so the
+   * most recent image the user is asking about stays in context.
+   *
+   * Returns what was removed so the caller can tell the user. ChatGptOAuthBackend
+   * does not track mediaDelivered like OllamaBackend does (the Responses API
+   * doesn't provide request-level success feedback the same way), so
+   * undeliveredImages is always 0 here.
+   */
+  private trimCodexImagePayloadToBudget(): {
+    droppedImages: number;
+    undeliveredImages: number;
+    budget: number;
+    bytesBefore: number;
+  } {
+    const budget = imagePayloadBudgetBytes();
+    const sizeOf = (m: TurnMessage) => (m.images ?? []).reduce((n, b64) => n + b64.length, 0);
+    let bytesBefore = 0;
+    for (const m of this.turnHistory) bytesBefore += sizeOf(m);
+    if (bytesBefore <= budget) return { droppedImages: 0, undeliveredImages: 0, budget, bytesBefore };
+
+    let remaining = bytesBefore;
+    let droppedImages = 0;
+    for (const m of this.turnHistory) {
+      if (remaining <= budget) break;
+      const count = m.images?.length ?? 0;
+      if (!count) continue;
+      remaining -= sizeOf(m);
+      droppedImages += count;
+      delete m.images;
+      delete m.imageMimes;
+      // ChatGptOAuthBackend doesn't distinguish delivery state like OllamaBackend,
+      // so all dropped images are treated the same — they were accumulated from
+      // earlier turns and are being dropped to fit the budget.
+      m.content +=
+        `\n[note: the ${count} image(s) attached to this message were removed to keep the request under the endpoint's image limit (${formatByteBudget(budget)}). ` +
+        `If you need me to look at a specific image, re-attach just that one or start a fresh chat to clear what has built up.]`;
+    }
+    return { droppedImages, undeliveredImages: 0, budget, bytesBefore };
   }
 
   private async *codexResponsesStream(
@@ -352,6 +399,20 @@ export class ChatGptOAuthBackend extends OllamaBackend {
       }
     }
     this.turnHistory.push(userMsg);
+
+    // #2224 — trim the accumulated image payload BEFORE the first request,
+    // so a session that grew images across multiple turns stays under the budget.
+    const trimmed = this.trimCodexImagePayloadToBudget();
+    if (trimmed.droppedImages) {
+      logger.warn(
+        `[chatgpt-oauth-backend] inline images (${trimmed.bytesBefore} b64 bytes) exceeded the ${trimmed.budget}-byte request budget — dropped ${trimmed.droppedImages} oldest-first`,
+      );
+      yield {
+        type: "assistant",
+        text: `📦 This conversation's images add up to more than the endpoint accepts in one request, so I dropped the oldest ${trimmed.droppedImages} image(s) to get under the limit. ` +
+          `If you need me to look at a specific image, re-attach just that one or start a fresh chat to clear what has built up.`,
+      };
+    }
 
     let resultEmitted = false;
     let imagesStripped = false;
