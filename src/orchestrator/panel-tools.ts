@@ -6419,11 +6419,11 @@ type PromotedMappingProof = {
   innerNodeType: string;
 };
 
-/** Re-read the ownership envelope for a previously classified promoted write.
- * This is deliberately strict: after entering the subgraph, or immediately
- * before a legacy retry, the old inner id is not permission to trust a relinked
- * wrapper. */
-async function recheckPromotedInnerMapping(
+/** Re-read the ownership envelope for a previously classified promoted write
+ * while the wrapper is still in the current graph. This is deliberately strict:
+ * after entering the subgraph the wrapper id is no longer queryable, so all
+ * post-entry fences must use the captured inner target in the now-current graph. */
+async function recheckPromotedOuterMapping(
   ctx: PanelToolCtx,
   outerNodeId: number | string,
   widget: string,
@@ -6463,6 +6463,50 @@ async function recheckPromotedInnerMapping(
     return promotedWriteRefusal(widget, "the mapped inner node lost its verifiable type fence");
   }
   return { inner, innerNodeType: innerNode.type };
+}
+
+/** Recheck a captured promoted receiver after graph_enter_subgraph.
+ *
+ * graph_get_subgraph resolves ids in the currently viewed graph. Once the
+ * wrapper has been entered, its outer id is intentionally unavailable; using
+ * it here would refuse every valid promoted write in production. The captured
+ * inner id is the production-valid receiver token for the entered graph. A
+ * strict one-row graph_query proves that the current graph still contains that
+ * exact id and type before the known-bad guards and again immediately before
+ * graph_set_widget.
+ */
+async function recheckPromotedInnerTarget(
+  ctx: PanelToolCtx,
+  expectedInner: { innerNodeId: number | string; widget: string },
+  expectedNodeType: string,
+  widget: string,
+): Promise<PromotedMappingProof | ToolResult> {
+  const probe = await ctx.call({
+    cmd: "graph_query",
+    ids: [expectedInner.innerNodeId],
+    fields: "compact",
+    limit: 1,
+  });
+  if (probe.isError) {
+    return promotedWriteRefusal(
+      widget,
+      "the promoted inner receiver could not be queried in the entered graph",
+    );
+  }
+  const identity = parseVerifiedQueriedNodeIdentity(parseToolResultJson(probe));
+  const expectedId = canonicalQueriedNodeId(expectedInner.innerNodeId);
+  if (
+    !identity ||
+    !expectedId ||
+    identity.id !== expectedId ||
+    identity.type !== expectedNodeType
+  ) {
+    return promotedWriteRefusal(
+      widget,
+      "the captured promoted inner receiver changed or became unverifiable in the entered graph",
+    );
+  }
+  return { inner: expectedInner, innerNodeType: identity.type };
 }
 
 function daSiWaStackRefusal(type: string): ToolResult {
@@ -16812,7 +16856,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
 
             // Re-read the ownership envelope immediately before entering. This
             // catches a promotion relink after the classification read.
-            const beforeEnterMapping = await recheckPromotedInnerMapping(
+            const beforeEnterMapping = await recheckPromotedOuterMapping(
               ctx,
               plan.outerNodeId,
               args.widget as string,
@@ -16848,11 +16892,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               );
             }
 
-            const afterEnterMapping = await recheckPromotedInnerMapping(
+            const afterEnterMapping = await recheckPromotedInnerTarget(
               ctx,
-              plan.outerNodeId,
-              args.widget as string,
               plan.inner,
+              plan.innerNodeType,
+              args.widget as string,
             );
             if ("content" in afterEnterMapping) {
               const exited = await leave();
@@ -16890,11 +16934,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               );
             }
 
-            const finalMapping = await recheckPromotedInnerMapping(
+            const finalMapping = await recheckPromotedInnerTarget(
               ctx,
-              plan.outerNodeId,
-              args.widget as string,
               plan.inner,
+              plan.innerNodeType,
+              args.widget as string,
             );
             if ("content" in finalMapping) {
               const exited = await leave();
@@ -17265,11 +17309,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           }
         }
 
-        const legacyAfterEnterMapping = await recheckPromotedInnerMapping(
+        const legacyAfterEnterMapping = await recheckPromotedInnerTarget(
           ctx,
-          args.node_id as number | string,
-          refusal.widget,
           inner,
+          recoveryInnerNodeType,
+          refusal.widget,
         );
         if ("content" in legacyAfterEnterMapping) {
           const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
@@ -17419,11 +17463,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             );
           }
         }
-        const legacyFinalMapping = await recheckPromotedInnerMapping(
+        const legacyFinalMapping = await recheckPromotedInnerTarget(
           ctx,
-          args.node_id as number | string,
-          refusal.widget,
           inner,
+          innerExpectedNodeType ?? recoveryInnerNodeType,
+          refusal.widget,
         );
         if ("content" in legacyFinalMapping) {
           const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);

@@ -87,7 +87,9 @@ function bridge(opts: {
    *  continue into the existing post-refusal retry branch. */
   preflightSubgraph?: Record<string, unknown> | Error;
   recoveryPreflightSubgraph?: Record<string, unknown> | Error;
-  subgraphAfterEnter?: Record<string, unknown> | Error;
+  /** #2314: graph_get_subgraph cannot resolve the outer wrapper after entry;
+   * post-entry fences must use a current-graph query of the captured inner id. */
+  postEnterGraphQueryById?: Record<string, Record<string, unknown> | Error>;
   objectInfoRefusal?: boolean;
   refreshNodes?: Record<string, unknown>;
   remappedWriteError?: string;
@@ -154,10 +156,7 @@ function bridge(opts: {
           if (opts.recoveryPreflightSubgraph instanceof Error) throw opts.recoveryPreflightSubgraph;
           return opts.recoveryPreflightSubgraph;
         }
-        if (inSubgraph && opts.subgraphAfterEnter !== undefined) {
-          if (opts.subgraphAfterEnter instanceof Error) throw opts.subgraphAfterEnter;
-          return opts.subgraphAfterEnter;
-        }
+        if (inSubgraph) throw new Error("No node with id 78 in the current graph");
         if (opts.subgraph instanceof Error) throw opts.subgraph;
         return opts.subgraph ?? SUBGRAPH;
       }
@@ -173,12 +172,28 @@ function bridge(opts: {
       }
       if (cmd.cmd === "graph_query") {
         const wantId = Array.isArray(cmd.ids) && cmd.ids.length ? String(cmd.ids[0]) : null;
+        const postEnter =
+          inSubgraph && wantId ? opts.postEnterGraphQueryById?.[wantId] : undefined;
+        if (postEnter !== undefined) {
+          if (postEnter instanceof Error) throw postEnter;
+          return postEnter;
+        }
         if (opts.detailById && wantId && opts.detailById[wantId] !== undefined) {
           return opts.detailById[wantId];
         }
         if (opts.stackDataIdentity && !inSubgraph) return opts.stackDataIdentity;
         if (opts.stackDataIdentity && inSubgraph) {
           return opts.stackDataInnerIdentity ?? { nodes: [{ id: 76, type: "OtherLoraLoader" }] };
+        }
+        if (inSubgraph && wantId) {
+          const subgraph = opts.subgraph && !(opts.subgraph instanceof Error) ? opts.subgraph : SUBGRAPH;
+          const nodes = Array.isArray(subgraph.nodes) ? subgraph.nodes : [];
+          const node = nodes.find((candidate) =>
+            candidate && typeof candidate === "object" && String(candidate.id) === wantId,
+          );
+          if (node && typeof node.type === "string") {
+            return { nodes: [{ id: node.id, type: node.type }] };
+          }
         }
         return (
           opts.promotedDetail ?? {
@@ -726,13 +741,9 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
       {
         scopeLost: true,
         preflightSubgraph: new Error("preflight unavailable"),
-        subgraph: {
-          ...SAFE_ANIMA_SUBGRAPH,
-          subgraph_of: { node_id: 188, title: "Container" },
-        },
+        subgraph: new Error("outer wrapper is unavailable after navigation"),
         detailById: {
-          "188": { nodes: [{ id: 188, type: "SubgraphNode" }] },
-          "76": SAFE_ANIMA_IDENTITY_BY_ID["76"],
+          "188": SAFE_ANIMA_IDENTITY_BY_ID["76"],
         },
       },
     );
@@ -741,7 +752,7 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
     const writes = calls.filter((c) => c.cmd === "graph_set_widget");
     expect(writes).toHaveLength(2);
     expect(writes[0]).toMatchObject({ node_id: 188, widget: "quality_prompt" });
-    expect(writes[1]).toMatchObject({ node_id: 76, widget: "quality_prompt" });
+    expect(writes[1]).toMatchObject({ node_id: 188, widget: "quality_prompt" });
   });
 
   it("routes a successful object-info retry through the promoted inner guards", async () => {
@@ -786,13 +797,35 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
       {
         scopeLost: true,
         preflightSubgraph: new Error("preflight unavailable"),
-        subgraph: {
-          ...DYNAMIC_SUBGRAPH,
-          subgraph_of: { node_id: 188, title: "Container" },
-        },
+        subgraph: new Error("outer wrapper is unavailable after navigation"),
         detailById: {
-          "188": { nodes: [{ id: 188, type: "SubgraphNode" }] },
-          "76": DYNAMIC_DETAIL_BY_ID["76"],
+          "188": {
+            nodes: [
+              {
+                id: 188,
+                type: "OrdinaryNode",
+                widgets: { "model.prompt": "" },
+                inputs: [
+                  { name: "model.prompt", type: "STRING" },
+                ],
+              },
+            ],
+          },
+        },
+        postEnterGraphQueryById: {
+          "188": {
+            nodes: [
+              {
+                id: 188,
+                type: "MinimaxHailuo03TextToVideoNode",
+                widgets: { model: "text-to-video", "model.prompt": "" },
+                inputs: [
+                  { name: "model", type: "COMFY_DYNAMICCOMBO_V3" },
+                  { name: "model.prompt", type: "STRING" },
+                ],
+              },
+            ],
+          },
         },
       },
     );
@@ -830,13 +863,13 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
         firstWriteError: ANIMA_CONTRADICTORY,
         preflightSubgraph: new Error("preflight unavailable"),
         subgraph: SAFE_ANIMA_SUBGRAPH,
-        subgraphAfterEnter: ANIMA_SUBGRAPH,
+        postEnterGraphQueryById: { "76": ANIMA_IDENTITY_BY_ID["76"] },
         detailById: SAFE_ANIMA_IDENTITY_BY_ID,
       },
     );
 
     expect(isError).toBe(true);
-    expect(text).toMatch(/mapping changed or became unverifiable|type changed after entering/);
+    expect(text).toMatch(/mapping changed or became unverifiable|type changed after entering|captured promoted inner receiver/);
     expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(1);
   });
 
@@ -848,13 +881,13 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
         preflightSubgraph: new Error("preflight unavailable"),
         recoveryPreflightSubgraph: new Error("recovery preflight unavailable"),
         subgraph: SAFE_ANIMA_SUBGRAPH,
-        subgraphAfterEnter: ANIMA_SUBGRAPH,
+        postEnterGraphQueryById: { "76": ANIMA_IDENTITY_BY_ID["76"] },
         detailById: SAFE_ANIMA_IDENTITY_BY_ID,
       },
     );
 
     expect(isError).toBe(true);
-    expect(text).toMatch(/mapping changed or became unverifiable|type changed after entering/);
+    expect(text).toMatch(/mapping changed or became unverifiable|type changed after entering|captured promoted inner receiver/);
     expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(1);
   });
 
@@ -1014,9 +1047,9 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
       "graph_get_subgraph",
       "graph_get_subgraph",
       "graph_enter_subgraph",
-      "graph_get_subgraph",
       "graph_query",
-      "graph_get_subgraph",
+      "graph_query",
+      "graph_query",
       "graph_set_widget",
       "graph_exit_subgraph",
     ]);
@@ -1049,12 +1082,11 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
       "graph_get_subgraph",
       "graph_get_subgraph",
       "graph_enter_subgraph",
-      "graph_get_subgraph",
       "graph_query",
       "graph_exit_subgraph",
     ]);
     expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(1);
-    expect(text).toMatch(/different node_id|No inner graph_set_widget/);
+    expect(text).toMatch(/different node_id|captured promoted inner receiver|No inner graph_set_widget/);
   });
 
   it("refuses a promoted inner DaSiWa stack write without a second mutation", async () => {
@@ -1081,7 +1113,7 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
       "graph_get_subgraph",
       "graph_get_subgraph",
       "graph_enter_subgraph",
-      "graph_get_subgraph",
+      "graph_query",
       "graph_query",
       "graph_exit_subgraph",
     ]);
@@ -1133,7 +1165,7 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
     expect(text).toMatch(/route was re-entered and the write was retried once/i);
   });
 
-  it("the reporter's case: refuse → get_subgraph → enter → set inner → exit", async () => {
+  it("uses the captured inner target after navigation when the outer id is unavailable", async () => {
     const { text, isError, calls } = await setWidget({ node_id: 78, widget: "width", value: 1024 });
 
     expect(isError).toBe(false);
@@ -1141,13 +1173,24 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
       "graph_set_widget",
       "graph_get_subgraph",
       "graph_enter_subgraph",
-      "graph_get_subgraph",
-      "graph_get_subgraph",
+      "graph_query",
+      "graph_query",
       "graph_set_widget",
       "graph_exit_subgraph",
     ]);
     expect(calls[0]).toMatchObject({ node_id: 78, widget: "width", value: 1024 });
     expect(calls[5]).toMatchObject({ node_id: 76, widget: "width", value: 1024 });
+    // Production seam: the outer wrapper is queried only before entry. Both
+    // post-entry fences query the captured inner receiver in the current graph.
+    expect(calls.filter((c) => c.cmd === "graph_get_subgraph")).toHaveLength(1);
+    expect(
+      calls.filter(
+        (c) =>
+          c.cmd === "graph_query" &&
+          Array.isArray(c.ids) &&
+          String((c.ids as unknown[])[0]) === "76",
+      ),
+    ).toHaveLength(2);
     expect(text).toMatch(/inner widget this promotion lists: node 76 "width"/);
     expect(text).not.toMatch(/is not a promoted widget/);
   });
@@ -1257,8 +1300,8 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
       "graph_set_widget",
       "graph_get_subgraph",
       "graph_enter_subgraph",
-      "graph_get_subgraph",
-      "graph_get_subgraph",
+      "graph_query",
+      "graph_query",
       "graph_set_widget",
       "graph_exit_subgraph",
     ]);
