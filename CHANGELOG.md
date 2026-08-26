@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.131] - 2026-08-26
+
+### MCP
+
+#### Fixed
+- guard promoted widget capability and name the version requirement (#2365)
+
+
 ## [0.52.130] - 2026-08-26
 
 ### MCP
