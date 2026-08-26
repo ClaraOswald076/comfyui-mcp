@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createServer, type Server } from "node:http";
 import {
   PanelTemplateRelayError,
-  ambiguousLoopbackNameOrigin,
   currentPanelTemplateOrigin,
   requestPanelTemplateIndex,
   startPanelTemplateRelayServer,
@@ -217,39 +216,14 @@ describe("authenticated panel template relay (#2196)", () => {
     await expect(requestPanelTemplateIndex()).resolves.toBeUndefined();
   });
 
-  it("separates an identical ambiguous loopback name from a genuine origin mismatch (#2382)", () => {
-    // Identical on both sides -> decline, so the caller may continue headless
-    // against what is provably the same origin string.
-    expect(ambiguousLoopbackNameOrigin("http://localhost:8188", "http://localhost:8188/comfyapi")).toBe(true);
-    expect(ambiguousLoopbackNameOrigin("http://localhost:8188", "http://localhost:8188")).toBe(true);
-    // A MIXED pair is a real mismatch and must stay a hard refusal, never a
-    // decline: the two operands do not name the same thing.
-    expect(ambiguousLoopbackNameOrigin("http://localhost:8188", "http://127.0.0.1:8188/comfyapi")).toBe(false);
-    expect(ambiguousLoopbackNameOrigin("http://127.0.0.1:8188", "http://localhost:8188/comfyapi")).toBe(false);
-    expect(ambiguousLoopbackNameOrigin("http://localhost:8189", "http://localhost:8188/comfyapi")).toBe(false);
-    // Same name and port, different scheme, is still a mismatch: degrading would
-    // send the caller to a COMFYUI_URL that is not the origin the panel is on.
-    expect(ambiguousLoopbackNameOrigin("https://localhost:8188", "http://localhost:8188/comfyapi")).toBe(false);
-    expect(ambiguousLoopbackNameOrigin("http://localhost:8188", "https://localhost:8188/comfyapi")).toBe(false);
-    expect(ambiguousLoopbackNameOrigin("https://localhost:8188", "https://localhost:8188/comfyapi")).toBe(true);
-    // Literal loopback addresses are authorized outright, never declined.
-    expect(ambiguousLoopbackNameOrigin("http://127.0.0.1:8188", "http://127.0.0.1:8188/comfyapi")).toBe(false);
-    expect(ambiguousLoopbackNameOrigin("http://[::1]:8188", "http://[::1]:8188/comfyapi")).toBe(false);
-    // Nothing off-loopback may ever be treated as a benign decline.
-    expect(ambiguousLoopbackNameOrigin("https://remote.example", "https://remote.example/comfyapi")).toBe(false);
-    expect(ambiguousLoopbackNameOrigin("https://localhost.evil.example", "https://localhost.evil.example/x")).toBe(false);
-    expect(ambiguousLoopbackNameOrigin(undefined, "http://localhost:8188")).toBe(false);
-    expect(ambiguousLoopbackNameOrigin("http://localhost:8188", undefined)).toBe(false);
-  });
-
   it("only authorizes a loopback origin corroborated by the current target", () => {
     expect(currentPanelTemplateOrigin("https://remote.example:443", "https://remote.example/comfyapi")).toBeUndefined();
     expect(currentPanelTemplateOrigin("http://127.0.0.1:8188", "http://127.0.0.1:8188/comfyapi")).toBe("http://127.0.0.1:8188");
     expect(currentPanelTemplateOrigin("http://[::1]:8188", "http://[::1]:8188/comfyapi")).toBe("http://[::1]:8188");
-    // `localhost` never authorizes a relay fetch: it names a family, not a
-    // listener (#2382). It is DECLINED rather than failed — see
-    // ambiguousLoopbackNameOrigin below.
-    expect(currentPanelTemplateOrigin("http://localhost:8188", "http://localhost:8188/comfyapi")).toBeUndefined();
+    // An exact `localhost` pair stays authorized (#2382). Refusing it removed
+    // the relay for localhost-served users without closing a reachable hazard —
+    // see the LOOPBACK_HOSTS comment for the Happy-Eyeballs measurement.
+    expect(currentPanelTemplateOrigin("http://localhost:8188", "http://localhost:8188/comfyapi")).toBe("http://localhost:8188");
     expect(currentPanelTemplateOrigin("http://localhost:8188", "http://127.0.0.1:8188/comfyapi")).toBeUndefined();
     expect(currentPanelTemplateOrigin("http://[::1]:8188", "http://127.0.0.1:8188/comfyapi")).toBeUndefined();
     expect(currentPanelTemplateOrigin("http://localhost:8188", "http://[::1]:8188/comfyapi")).toBeUndefined();
