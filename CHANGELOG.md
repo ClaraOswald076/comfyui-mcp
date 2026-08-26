@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.126] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- explain local model-listing refusal when a first-time comfyuiPath recovery occurs (#2338)
+
 ## [0.52.125] - 2026-08-25
 
 ### MCP
