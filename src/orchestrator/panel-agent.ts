@@ -479,6 +479,8 @@ export class PanelAgent {
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   /** Guards against a trip firing twice / racing a real result for one turn. */
   private idleTripped = false;
+  /** One "waiting out a rate limit" line per turn (see the rate_limit case). */
+  private rateLimitSurfaced = false;
   /** A provider-native, non-user-cancel recovery is attempted at most once per turn. */
   private stallRecoverySteered = false;
   /** Tool calls started (item/started) but not yet ended (item/completed). A tool
@@ -1771,6 +1773,7 @@ export class PanelAgent {
       // it's meant to catch, so onTurnStalled() would no-op. (handleEvent's later
       // `busy = true` becomes a harmless no-op.) Also shows "working" immediately.
       this.errorSurfaced = false; // fresh turn → its failure (if any) is unreported
+      this.rateLimitSurfaced = false; // …and its first rate-limit wait is unannounced
       this.interruptRequested = false; // a stale interrupt can't mute THIS turn's failure
       this.busy = true;
       // Snapshot the model this turn runs on, so a live setModel mid-turn can't let
@@ -2266,6 +2269,26 @@ export class PanelAgent {
         }
         break;
       }
+      case "rate_limit": {
+        // The provider asked us to slow down and the backend is waiting the
+        // window out. NOT a failure: the turn is still in flight and its result
+        // will arrive normally, so this neither ends the turn nor spends the
+        // once-per-turn error slot — a rate limit that swallowed the slot would
+        // silence the first genuine error after it.
+        this.busy = true;
+        this.deps.onTurn?.(this.tabId, "working");
+        // ONE line per turn. A 3-req/min limiter can 429 several rounds of the
+        // same turn, and a bubble per retry would bury the conversation under
+        // status about itself. The first one already says what is happening.
+        if (ev.message && !this.rateLimitSurfaced) {
+          this.rateLimitSurfaced = true;
+          this.deps.onSay(this.tabId, ev.message);
+        }
+        logger.info(
+          `[panel-agent ${this.short()}] rate limited${ev.retryInMs ? ` — waiting ${Math.round(ev.retryInMs / 1000)}s` : ""}`,
+        );
+        break;
+      }
       case "error": {
         // A backend-reported turn error (codex/gemini/grok emit these before
         // their error result). Without this case the message fell through
@@ -2294,10 +2317,16 @@ export class PanelAgent {
           // self-contained. Framing it as "turn failed … nothing was lost, try
           // again" would be two lies (it didn't fail; something may have been
           // DONE) and would invite a destructive duplicate retry.
+          // A RATE LIMIT is a turn failure — it takes the slot — but its message
+          // is already a finished sentence that names the model, the reason and
+          // the remedy. Wrapping it in "The <model> turn failed: …" would say the
+          // model twice and bury the one actionable fact behind two prefixes, and
+          // the generic tail would offer "check the terminal" for a condition the
+          // terminal has nothing to add to.
           this.deps.onSay(
             this.tabId,
-            ev.unverifiedCompletion || ev.outcomeUnknown
-              ? `⚠️ ${detail}`
+            ev.unverifiedCompletion || ev.outcomeUnknown || ev.rateLimit
+              ? `⚠️ ${detail.replace(/^⚠️\s*/, "")}`
               : `⚠️ The ${this.model} turn failed: ${detail}\n\nNothing was lost — try again, switch models from the composer picker, or check the terminal running the orchestrator for more detail.`,
           );
         }
