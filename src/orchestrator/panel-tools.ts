@@ -130,6 +130,7 @@ import {
   resolveInnerPromotedTarget,
   validatePromotedSubgraphEnvelope,
   type PromotedScopeWitness,
+  type PromotedTerminalWitness,
   type UnpromotedControlPersistRemedy,
 } from "./promoted-widget.js";
 import { includeRequestedCreateGroupMembers } from "./create-group-membership.js";
@@ -6221,6 +6222,48 @@ async function refuseKnownBadWidgetWrite(
   return refuseDaSiWaStackWrite(ctx, nodeId, widget);
 }
 
+/** Apply the same three known-bad guards to the terminal concrete endpoint
+ * published by the receiver. The terminal is not in MCP's current graph after
+ * entering the outer container, so this decision uses the panel's authenticated
+ * value-free identity/shape witness rather than a second graph_query that could
+ * resolve a graph-local id in the wrong scope. */
+function refuseKnownBadPromotedTerminal(
+  terminal: PromotedTerminalWitness,
+): ToolResult | null {
+  if (ANIMA_REGIONAL_CANVAS_TYPES.has(terminal.nodeType) && isAnimaRegionalPromptWidget(terminal.widget)) {
+    return animaRegionalPromptRefusal(terminal.nodeType, terminal.widget);
+  }
+  const dynamic = dynamicComboSubWidgetRefusalFromDetail(
+    {
+      id: String(terminal.nodeId),
+      type: terminal.nodeType,
+      inputs: terminal.inputs,
+      widgets: null,
+    },
+    terminal.widget,
+  );
+  if (dynamic) return dynamic;
+  if (terminal.nodeType === DASIWA_LTX2_LORA_LOADER && terminal.widget === DASIWA_STACK_WIDGET) {
+    return daSiWaStackRefusal(terminal.nodeType);
+  }
+  return null;
+}
+
+function samePromotedTerminal(
+  left: PromotedTerminalWitness | undefined,
+  right: PromotedTerminalWitness | undefined,
+  includeDepth = true,
+): boolean {
+  if (!left || !right) return left === right;
+  return (
+    canonicalQueriedNodeId(left.nodeId) === canonicalQueriedNodeId(right.nodeId) &&
+    left.nodeType === right.nodeType &&
+    left.widget === right.widget &&
+    (!includeDepth || left.chainDepth === right.chainDepth) &&
+    JSON.stringify(left.inputs) === JSON.stringify(right.inputs)
+  );
+}
+
 /** Run the known-bad set against the node id that is about to be written, then
  * inspect a uniquely mapped promoted inner node when the addressed node is a
  * subgraph container. Keep promotion handling separate from the direct helper
@@ -6266,8 +6309,13 @@ type PromotedWritePlan = {
   outerNodeId: number | string;
   inner: { innerNodeId: number | string; widget: string };
   innerNodeType: string;
+  terminal?: PromotedTerminalWitness;
   scope: PromotedScopeWitness;
   binding: PromotedWriteBinding;
+};
+
+type PromotedExpectedScope = PromotedScopeWitness & {
+  terminal?: PromotedTerminalWitness;
 };
 
 type PromotedWritePreflight = PromotedWritePlan | ToolResult | null;
@@ -6528,7 +6576,12 @@ async function preparePromotedWidgetWrite(
     const matches = promotedMatchCount(payload, widget);
     return matches === 0
       ? null
-      : promotedWriteRefusal(widget, `the envelope mapped it ambiguously to ${matches} inner nodes`);
+      : promotedWriteRefusal(
+          widget,
+          matches === 1
+            ? "the terminal promotion endpoint was missing, malformed, or unresolved"
+            : `the envelope mapped it ambiguously to ${matches} inner nodes`,
+        );
   }
 
   const targetId = canonicalQueriedNodeId(inner.innerNodeId);
@@ -6542,6 +6595,16 @@ async function preparePromotedWidgetWrite(
   const innerNodeType = innerNode.type;
   if (typeof innerNodeType !== "string" || innerNodeType.length === 0) {
     return promotedWriteRefusal(widget, "the mapped inner node had no verifiable type fence");
+  }
+  if (innerNode.is_subgraph === true && !inner.terminal) {
+    return promotedWriteRefusal(
+      widget,
+      "the receiver did not publish a terminal witness for the nested promotion chain",
+    );
+  }
+  if (inner.terminal) {
+    const terminalBlocked = refuseKnownBadPromotedTerminal(inner.terminal);
+    if (terminalBlocked) return terminalBlocked;
   }
   if (ctx.tabExpectedNodeTypeFenceCapability?.() !== true) {
     return promotedWriteRefusal(widget, "the receiving panel lacks the atomic inner-node write fence");
@@ -6558,6 +6621,7 @@ async function preparePromotedWidgetWrite(
     outerNodeId: nodeId as number | string,
     inner,
     innerNodeType,
+    ...(inner.terminal ? { terminal: inner.terminal } : {}),
     scope,
     binding: { tabId: tabBefore, identity: identityAfter },
   };
@@ -6566,6 +6630,7 @@ async function preparePromotedWidgetWrite(
 type PromotedMappingProof = {
   inner: { innerNodeId: number | string; widget: string };
   innerNodeType: string;
+  terminal?: PromotedTerminalWitness;
 };
 
 /** Re-read the ownership envelope for a previously classified promoted write
@@ -6578,6 +6643,7 @@ async function recheckPromotedOuterMapping(
   widget: string,
   expectedInner: { innerNodeId: number | string; widget: string },
   expectedScope: PromotedScopeWitness,
+  expectedTerminal?: PromotedTerminalWitness,
 ): Promise<PromotedMappingProof | ToolResult> {
   const confirmation = await ctx.call({
     cmd: "graph_get_subgraph",
@@ -6602,7 +6668,8 @@ async function recheckPromotedOuterMapping(
     observedScope.ownerNodeId !== expectedScope.ownerNodeId ||
     !inner ||
     canonicalQueriedNodeId(inner.innerNodeId) !== canonicalQueriedNodeId(expectedInner.innerNodeId) ||
-    inner.widget !== expectedInner.widget
+    inner.widget !== expectedInner.widget ||
+    !samePromotedTerminal(inner.terminal, expectedTerminal)
   ) {
     return promotedWriteRefusal(
       widget,
@@ -6618,7 +6685,11 @@ async function recheckPromotedOuterMapping(
   if (!innerNode || !targetId || typeof innerNode.type !== "string" || innerNode.type.length === 0) {
     return promotedWriteRefusal(widget, "the mapped inner node lost its verifiable type fence");
   }
-  return { inner, innerNodeType: innerNode.type };
+  return {
+    inner,
+    innerNodeType: innerNode.type,
+    ...(inner.terminal ? { terminal: inner.terminal } : {}),
+  };
 }
 
 /** Recheck a captured promoted receiver after graph_enter_subgraph.
@@ -6637,6 +6708,7 @@ async function recheckPromotedInnerTarget(
   expectedNodeType: string,
   widget: string,
   expectedScope: PromotedScopeWitness,
+  expectedTerminal?: PromotedTerminalWitness,
 ): Promise<PromotedMappingProof | ToolResult> {
   const probe = await ctx.call({
     cmd: "graph_query",
@@ -6670,7 +6742,34 @@ async function recheckPromotedInnerTarget(
       "the captured promoted inner receiver changed or became unverifiable in the entered graph",
     );
   }
-  return { inner: expectedInner, innerNodeType: identity.type };
+  if (expectedTerminal && expectedTerminal.chainDepth > 0) {
+    const nested = await ctx.call({
+      cmd: "graph_get_subgraph",
+      node_id: expectedInner.innerNodeId,
+    });
+    if (nested.isError) {
+      return promotedWriteRefusal(
+        widget,
+        "the nested promoted terminal could not be resolved in the entered graph",
+      );
+    }
+    const nestedPayload = parseToolResultJson(nested);
+    const nestedEnvelope = validatePromotedSubgraphEnvelope(
+      nestedPayload,
+      expectedInner.innerNodeId,
+    );
+    const nestedInner = nestedEnvelope
+      ? resolveInnerPromotedTarget(nestedPayload, expectedInner.widget, expectedInner.innerNodeId)
+      : null;
+    if (!nestedInner?.terminal || !samePromotedTerminal(nestedInner.terminal, expectedTerminal, false)) {
+      return promotedWriteRefusal(
+        widget,
+        "the nested promoted terminal mapping changed or became unverifiable after entering",
+      );
+    }
+    return { inner: expectedInner, innerNodeType: identity.type, terminal: expectedTerminal };
+  }
+  return { inner: expectedInner, innerNodeType: identity.type, ...(expectedTerminal ? { terminal: expectedTerminal } : {}) };
 }
 
 function daSiWaStackRefusal(type: string): ToolResult {
@@ -16972,7 +17071,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           widget: string,
           targetExpectedNodeType: string | undefined = expectedNodeType,
           beforeDispatch?: () => void,
-          targetExpectedScope?: PromotedScopeWitness,
+          targetExpectedScope?: PromotedExpectedScope,
         ): Promise<ToolResult> =>
           stripVerifiedLastObservedSchemaNote(
             summarizeSetWidgetEcho(
@@ -16997,6 +17096,17 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                           graph_identity: targetExpectedScope.graphIdentity,
                           ...(targetExpectedScope.workflowUuid !== undefined
                             ? { workflow_uuid: targetExpectedScope.workflowUuid }
+                            : {}),
+                          ...(targetExpectedScope.terminal
+                            ? {
+                                terminal: {
+                                  node_id: targetExpectedScope.terminal.nodeId,
+                                  type: targetExpectedScope.terminal.nodeType,
+                                  widget: targetExpectedScope.terminal.widget,
+                                  inputs: targetExpectedScope.terminal.inputs,
+                                  chain_depth: targetExpectedScope.terminal.chainDepth,
+                                },
+                              }
                             : {}),
                         },
                       }
@@ -17047,6 +17157,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               args.widget as string,
               plan.inner,
               plan.scope,
+              plan.terminal,
             );
             if ("content" in beforeEnterMapping) return beforeEnterMapping;
             if (beforeEnterMapping.innerNodeType !== plan.innerNodeType) {
@@ -17084,6 +17195,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               plan.innerNodeType,
               args.widget as string,
               plan.scope,
+              plan.terminal,
             );
             if ("content" in afterEnterMapping) {
               const exited = await leave();
@@ -17101,6 +17213,19 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 ),
                 exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : "",
               );
+            }
+
+            if (plan.terminal) {
+              const terminalBlocked = refuseKnownBadPromotedTerminal(
+                afterEnterMapping.terminal ?? plan.terminal,
+              );
+              if (terminalBlocked) {
+                const exited = await leave();
+                return appendToolResultText(
+                  terminalBlocked,
+                  exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : "",
+                );
+              }
             }
 
             const innerBlocked = await refuseKnownBadWidgetWrite(
@@ -17127,6 +17252,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               plan.innerNodeType,
               args.widget as string,
               plan.scope,
+              plan.terminal,
             );
             if ("content" in finalMapping) {
               const exited = await leave();
@@ -17144,6 +17270,19 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 ),
                 exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : "",
               );
+            }
+
+            if (plan.terminal) {
+              const terminalBlocked = refuseKnownBadPromotedTerminal(
+                finalMapping.terminal ?? plan.terminal,
+              );
+              if (terminalBlocked) {
+                const exited = await leave();
+                return appendToolResultText(
+                  terminalBlocked,
+                  exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : "",
+                );
+              }
             }
 
             // The preceding graph_query updates the bridge's scope cache, but
@@ -17187,7 +17326,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                   );
                 }
               },
-              plan.scope,
+              {
+                ...plan.scope,
+                ...(plan.terminal ? { terminal: plan.terminal } : {}),
+              },
             );
             const exited = await leave();
             if (written.isError) {
@@ -17537,6 +17679,22 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           );
         }
 
+        if (recoveryInnerNode?.is_subgraph === true && !inner.terminal) {
+          return appendToolResultText(
+            first,
+            `\n\n${textOfToolResult(
+              promotedWriteRefusal(
+                refusal.widget,
+                "the receiver did not publish a terminal witness for the nested promotion chain",
+              ),
+            )}`,
+          );
+        }
+        if (inner.terminal) {
+          const terminalBlocked = refuseKnownBadPromotedTerminal(inner.terminal);
+          if (terminalBlocked) return appendToolResultText(first, `\n\n${textOfToolResult(terminalBlocked)}`);
+        }
+
         const entered = await ctx.call(
           { cmd: "graph_enter_subgraph", node_id: args.node_id },
           15000,
@@ -17567,6 +17725,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           recoveryInnerNodeType,
           refusal.widget,
           recoveryScope!,
+          inner.terminal,
         );
         if ("content" in legacyAfterEnterMapping) {
           const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
@@ -17588,6 +17747,19 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             )}` +
               (exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : ""),
           );
+        }
+        if (inner.terminal) {
+          const terminalBlocked = refuseKnownBadPromotedTerminal(
+            legacyAfterEnterMapping.terminal ?? inner.terminal,
+          );
+          if (terminalBlocked) {
+            const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+            return appendToolResultText(
+              first,
+              `\n\n${textOfToolResult(terminalBlocked)}` +
+                (exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : ""),
+            );
+          }
         }
 
         let innerExpectedNodeType: string | undefined = legacyAfterEnterMapping.innerNodeType;
@@ -17722,6 +17894,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           innerExpectedNodeType ?? recoveryInnerNodeType,
           refusal.widget,
           recoveryScope!,
+          inner.terminal,
         );
         if ("content" in legacyFinalMapping) {
           const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
@@ -17743,6 +17916,19 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             )}` +
               (exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : ""),
           );
+        }
+        if (inner.terminal) {
+          const terminalBlocked = refuseKnownBadPromotedTerminal(
+            legacyFinalMapping.terminal ?? inner.terminal,
+          );
+          if (terminalBlocked) {
+            const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+            return appendToolResultText(
+              first,
+              `\n\n${textOfToolResult(terminalBlocked)}` +
+                (exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : ""),
+            );
+          }
         }
 
         const authoritativeRecoveryScope = recoveryScope
@@ -17786,7 +17972,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           inner.widget,
           legacyFinalMapping.innerNodeType,
           recoveryBeforeDispatch,
-          recoveryScope ?? undefined,
+          recoveryScope
+            ? { ...recoveryScope, ...(inner.terminal ? { terminal: inner.terminal } : {}) }
+            : undefined,
         );
         const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
         if (!written.isError) {

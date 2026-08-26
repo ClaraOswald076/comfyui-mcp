@@ -72,6 +72,7 @@ function bridge(opts: {
   remappedWrite?: Outcome;
   innerWrite?: Outcome;
   subgraph?: Record<string, unknown> | Error;
+  nestedSubgraph?: Record<string, unknown> | Error;
   enterFails?: boolean;
   exitFails?: boolean;
   ambiguous?: boolean;
@@ -115,6 +116,7 @@ function bridge(opts: {
 }) {
   const calls: Array<Record<string, unknown>> = [];
   let writes = 0;
+  let mutations = 0;
   let subgraphReads = 0;
   let postEnterGraphQueries = 0;
   let authoritativeScopeReads = 0;
@@ -274,6 +276,7 @@ function bridge(opts: {
               : (opts.remappedWrite ?? "contradict");
         if (which === "contradict") throw new Error(CONTRADICTORY);
         if (which === "fail") throw new Error("inner write rejected");
+        mutations += 1;
         return { set: { node_id: cmd.node_id, widget: cmd.widget, value: cmd.value } };
       }
       if (cmd.cmd === "graph_get_subgraph") {
@@ -286,7 +289,11 @@ function bridge(opts: {
           if (opts.recoveryPreflightSubgraph instanceof Error) throw opts.recoveryPreflightSubgraph;
           return withCurrentViewing(opts.recoveryPreflightSubgraph);
         }
-        if (inSubgraph) throw new Error("No node with id 78 in the current graph");
+        if (inSubgraph) {
+          if (opts.nestedSubgraph instanceof Error) throw opts.nestedSubgraph;
+          if (opts.nestedSubgraph) return withCurrentViewing(opts.nestedSubgraph);
+          throw new Error("No node with id 78 in the current graph");
+        }
         if (opts.subgraph instanceof Error) throw opts.subgraph;
         const subgraph = opts.subgraph ?? SUBGRAPH;
         return subgraph instanceof Error ? subgraph : withCurrentViewing(subgraph);
@@ -416,6 +423,9 @@ function bridge(opts: {
     get writesApplied() {
       return writes;
     },
+    get mutations() {
+      return mutations;
+    },
   };
 }
 
@@ -436,6 +446,7 @@ async function setWidget(
     authoritativeScopeReads: harness.authoritativeScopeReads,
     postEnterGraphQueries: harness.postEnterGraphQueries,
     writesApplied: harness.writesApplied,
+    mutations: harness.mutations,
   };
 }
 
@@ -653,6 +664,168 @@ const SAFE_ANIMA_IDENTITY_BY_ID = {
   "78": ANIMA_IDENTITY_BY_ID["78"],
   "76": { nodes: [{ id: 76, type: "PrimitiveStringMultiline" }] },
 };
+
+/** The outer read lists only B. The receiver's terminal witness proves that
+ * B's own promoted rail continues to the concrete endpoint, so MCP can apply
+ * the three known-bad guards to the node the panel will actually mutate. */
+function nestedTerminalSubgraph(
+  widget: string,
+  terminal: { nodeId: number; nodeType: string; inputs: Array<Record<string, string>> },
+) {
+  return {
+    subgraph_of: { node_id: 78, title: "Nested container" },
+    node_count: 1,
+    nodes: [
+      {
+        id: 188,
+        type: "SubgraphB",
+        is_subgraph: true,
+        widgets: { [widget]: "old" },
+      },
+    ],
+    promoted_terminals: [
+      {
+        widget,
+        immediate_node_id: 188,
+        immediate_widget: widget,
+        terminal_node_id: terminal.nodeId,
+        terminal_node_type: terminal.nodeType,
+        terminal_widget: widget,
+        terminal_inputs: terminal.inputs,
+        chain_depth: 1,
+      },
+    ],
+  };
+}
+
+const NESTED_TERMINAL_CASES = [
+  {
+    name: "Anima regional prompt",
+    widget: "quality_prompt",
+    value: "masterpiece",
+    subgraph: nestedTerminalSubgraph("quality_prompt", {
+      nodeId: 2768,
+      nodeType: "AnimaRegionalCanvasInline",
+      inputs: [],
+    }),
+    firstWriteError: ANIMA_CONTRADICTORY,
+    message: /animaPrompts/,
+  },
+  {
+    name: "dynamic-combo STRING child",
+    widget: "model.prompt",
+    value: "a long prompt",
+    subgraph: nestedTerminalSubgraph("model.prompt", {
+      nodeId: 2769,
+      nodeType: "NestedConcreteNode",
+      inputs: [
+        { name: "model", type: "COMFY_DYNAMICCOMBO_V3" },
+        { name: "model.prompt", type: "STRING" },
+      ],
+    }),
+    firstWriteError: DYNAMIC_CHILD_CONTRADICTORY,
+    message: /dynamic-combo (?:sub-widget|child)/,
+  },
+  {
+    name: "DaSiWa stack",
+    widget: "stack_data",
+    value: "NEW",
+    subgraph: nestedTerminalSubgraph("stack_data", {
+      nodeId: 2770,
+      nodeType: "DaSiWa_LTX2LoraLoader",
+      inputs: [],
+    }),
+    firstWriteError: STACK_DATA_CONTRADICTORY,
+    message: /DaSiWa_LTX2LoraLoader/,
+  },
+] as const;
+
+const NESTED_SAFE_SUBGRAPH = nestedTerminalSubgraph("quality_prompt", {
+  nodeId: 2768,
+  nodeType: "PrimitiveStringMultiline",
+  inputs: [],
+});
+const NESTED_SAFE_INNER_SUBGRAPH = {
+  subgraph_of: { node_id: 188, title: "Nested B" },
+  node_count: 1,
+  nodes: [{ id: 2768, type: "PrimitiveStringMultiline", widgets: { quality_prompt: "old" } }],
+  promoted_terminals: [
+    {
+      widget: "quality_prompt",
+      immediate_node_id: 2768,
+      immediate_widget: "quality_prompt",
+      terminal_node_id: 2768,
+      terminal_node_type: "PrimitiveStringMultiline",
+      terminal_widget: "quality_prompt",
+      terminal_inputs: [],
+      chain_depth: 0,
+    },
+  ],
+};
+
+describe("panel_set_widget nested promoted terminal guards (#2314)", () => {
+  it("rechecks a safe A-to-B-to-concrete endpoint after entry and before dispatch", async () => {
+    const { text, isError, calls, mutations } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "new" },
+      {
+        firstWrite: "ok",
+        subgraph: NESTED_SAFE_SUBGRAPH,
+        nestedSubgraph: NESTED_SAFE_INNER_SUBGRAPH,
+      },
+    );
+    expect(isError).toBe(false);
+    expect(mutations).toBe(1);
+    expect(text).toMatch(/validated promoted inner widget/);
+    expect(calls.filter((c) => c.cmd === "graph_get_subgraph")).toHaveLength(4);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toEqual([
+      expect.objectContaining({ node_id: 188, widget: "quality_prompt" }),
+    ]);
+  });
+
+  it.each(NESTED_TERMINAL_CASES)("refuses the nested terminal before a successful write", async ({
+    widget,
+    value,
+    subgraph,
+    message,
+  }) => {
+    const { text, isError, calls, mutations } = await setWidget(
+      { node_id: 78, widget, value },
+      { firstWrite: "ok", subgraph },
+    );
+    expect(isError).toBe(true);
+    expect(text).toMatch(message);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(0);
+    expect(mutations).toBe(0);
+    expect(calls.map((c) => c.cmd)).not.toContain("graph_enter_subgraph");
+  });
+
+  it.each(NESTED_TERMINAL_CASES)("refuses the nested terminal on the legacy recovery path", async ({
+    widget,
+    value,
+    subgraph,
+    firstWriteError,
+    message,
+  }) => {
+    const { text, isError, calls, mutations } = await setWidget(
+      { node_id: 78, widget, value },
+      {
+        firstWrite: "contradict",
+        firstWriteError,
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
+        subgraph,
+      },
+    );
+    expect(isError).toBe(true);
+    expect(text).toMatch(message);
+    expect(mutations).toBe(0);
+    // Legacy recovery may have made its one contradictory outer attempt before
+    // the terminal witness was read; it must never dispatch the inner/container
+    // success path, and the simulated bridge records zero actual mutations.
+    expect(calls.filter((c) => c.cmd === "graph_set_widget").length).toBeLessThanOrEqual(1);
+    expect(calls.map((c) => c.cmd)).not.toContain("graph_enter_subgraph");
+    expect(text).toMatch(/No inner graph_set_widget was dispatched|not retried|not applied|Do not retry|No graph_set_widget was dispatched/i);
+  });
+});
 
 describe("panel_set_widget promoted container success guards (#2314)", () => {
   it.each([
@@ -1425,6 +1598,73 @@ describe("resolveInnerPromotedTarget", () => {
 
   it("returns null when no inner node owns the widget", () => {
     expect(resolveInnerPromotedTarget(SUBGRAPH, "denoise", 78)).toBeNull();
+  });
+
+  it("retains a validated terminal concrete witness for a nested promotion", () => {
+    const nested = {
+      ...SUBGRAPH,
+      nodes: [{ id: 188, type: "SubgraphB", is_subgraph: true, widgets: { width: 1920 } }, SUBGRAPH.nodes[1]],
+      promoted_terminals: [
+        {
+          widget: "width",
+          immediate_node_id: 188,
+          immediate_widget: "width",
+          terminal_node_id: 2768,
+          terminal_node_type: "KSampler",
+          terminal_widget: "steps",
+          terminal_inputs: [{ name: "steps", type: "INT" }],
+          chain_depth: 1,
+        },
+      ],
+    };
+    expect(resolveInnerPromotedTarget(nested, "width", 78)).toEqual({
+      innerNodeId: 188,
+      widget: "width",
+      terminal: {
+        nodeId: 2768,
+        nodeType: "KSampler",
+        widget: "steps",
+        inputs: [{ name: "steps", type: "INT" }],
+        chainDepth: 1,
+      },
+    });
+  });
+
+  it.each([
+    ["malformed terminal shape", { terminal_node_id: 2768, terminal_node_type: "KSampler", terminal_widget: "steps", chain_depth: 1 }],
+    ["depth-limited terminal", { terminal_node_id: 2768, terminal_node_type: "KSampler", terminal_widget: "steps", terminal_inputs: [], chain_depth: 17 }],
+  ])("rejects a %s nested terminal envelope", (_name, terminal) => {
+    const nested = {
+      ...SUBGRAPH,
+      nodes: [{ id: 188, type: "SubgraphB", is_subgraph: true, widgets: { width: 1920 } }, SUBGRAPH.nodes[1]],
+      promoted_terminals: [
+        {
+          widget: "width",
+          immediate_node_id: 188,
+          immediate_widget: "width",
+          ...terminal,
+        },
+      ],
+    };
+    expect(validatePromotedSubgraphEnvelope(nested, 78)).toBeNull();
+    expect(resolveInnerPromotedTarget(nested, "width", 78)).toBeNull();
+  });
+
+  it("accepts an explicit unresolved terminal marker but never resolves it", () => {
+    const nested = {
+      ...SUBGRAPH,
+      nodes: [{ id: 188, type: "SubgraphB", is_subgraph: true, widgets: { width: 1920 } }, SUBGRAPH.nodes[1]],
+      promoted_terminals: [
+        {
+          widget: "width",
+          immediate_node_id: 188,
+          immediate_widget: "width",
+          error: "promotion chain is cyclic",
+        },
+      ],
+    };
+    expect(validatePromotedSubgraphEnvelope(nested, 78)).not.toBeNull();
+    expect(resolveInnerPromotedTarget(nested, "width", 78)).toBeNull();
   });
 
   it("rejects an envelope owned by a different outer node", () => {

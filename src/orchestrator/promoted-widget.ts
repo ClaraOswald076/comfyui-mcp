@@ -28,6 +28,30 @@ export type ContradictoryPromotedWidgetRefusal = {
 export type InnerPromotedTarget = {
   innerNodeId: number | string;
   widget: string;
+  /** Terminal concrete endpoint supplied by a receiver that can recursively
+   * resolve nested promotion chains. Omitted for legacy one-hop envelopes. */
+  terminal?: PromotedTerminalWitness;
+};
+
+export type PromotedTerminalInput = {
+  name: string;
+  type?: string;
+};
+
+export type PromotedTerminalWitness = {
+  nodeId: number | string;
+  nodeType: string;
+  widget: string;
+  inputs: PromotedTerminalInput[];
+  chainDepth: number;
+};
+
+type PromotedTerminalEntry = {
+  widget: string;
+  immediateNodeId?: number | string;
+  immediateWidget?: string;
+  terminal?: PromotedTerminalWitness;
+  error?: string;
 };
 
 export type PromotedViewingIdentity = {
@@ -53,6 +77,7 @@ export type PromotedSubgraphEnvelope = {
   /** Identity of the target graph reached by entering this wrapper. */
   targetGraphIdentity?: string;
   viewing?: PromotedViewingIdentity;
+  promotedTerminals?: PromotedTerminalEntry[];
 };
 
 export type AmbiguousPromotedWidgetRefusal = {
@@ -285,13 +310,78 @@ export function validatePromotedSubgraphEnvelope(
     if (!isRecord(raw) || innerNodeId(raw) == null) return null;
     normalized.push(raw);
   }
+  const promotedTerminals = Object.prototype.hasOwnProperty.call(subgraph, "promoted_terminals")
+    ? parsePromotedTerminalEntries(subgraph.promoted_terminals)
+    : undefined;
+  if (Object.prototype.hasOwnProperty.call(subgraph, "promoted_terminals") && !promotedTerminals) {
+    return null;
+  }
   return {
     nodes: normalized,
     nodeId: stripNodeId(String(owner.node_id)),
     nodeCount: nodeCount as number,
     ...(targetGraphIdentity !== undefined ? { targetGraphIdentity } : {}),
     ...(viewing ? { viewing } : {}),
+    ...(promotedTerminals ? { promotedTerminals } : {}),
   };
+}
+
+function parsePromotedTerminalEntries(value: unknown): PromotedTerminalEntry[] | null {
+  if (!Array.isArray(value)) return null;
+  const entries: PromotedTerminalEntry[] = [];
+  for (const raw of value) {
+    if (!isRecord(raw) || typeof raw.widget !== "string" || raw.widget.length === 0) return null;
+    const immediateNodeId = raw.immediate_node_id;
+    if (immediateNodeId !== undefined && !isNodeId(immediateNodeId)) return null;
+    const immediateWidget = raw.immediate_widget;
+    if (immediateWidget !== undefined && (typeof immediateWidget !== "string" || immediateWidget.length === 0)) {
+      return null;
+    }
+    const error = raw.error;
+    if (error !== undefined && (typeof error !== "string" || error.length === 0)) return null;
+    const terminalRaw = raw.terminal_node_id === undefined && raw.terminal_node_type === undefined
+      ? undefined
+      : raw;
+    let terminal: PromotedTerminalWitness | undefined;
+    if (terminalRaw) {
+      if (error !== undefined || immediateNodeId === undefined || immediateWidget === undefined) return null;
+      if (!isNodeId(terminalRaw.terminal_node_id)) return null;
+      if (typeof terminalRaw.terminal_node_type !== "string" || terminalRaw.terminal_node_type.length === 0) {
+        return null;
+      }
+      if (typeof terminalRaw.terminal_widget !== "string" || terminalRaw.terminal_widget.length === 0) {
+        return null;
+      }
+      const chainDepth = terminalRaw.chain_depth;
+      if (!Number.isSafeInteger(chainDepth) || (chainDepth as number) < 0 || (chainDepth as number) > 16) {
+        return null;
+      }
+      if (!Array.isArray(terminalRaw.terminal_inputs)) return null;
+      const inputs: PromotedTerminalInput[] = [];
+      for (const input of terminalRaw.terminal_inputs) {
+        if (!isRecord(input) || typeof input.name !== "string" || input.name.length === 0) return null;
+        if (input.type !== undefined && typeof input.type !== "string") return null;
+        inputs.push({ name: input.name, ...(input.type !== undefined ? { type: input.type } : {}) });
+      }
+      terminal = {
+        nodeId: terminalRaw.terminal_node_id,
+        nodeType: terminalRaw.terminal_node_type,
+        widget: terminalRaw.terminal_widget,
+        inputs,
+        chainDepth: chainDepth as number,
+      };
+    } else if (error === undefined) {
+      return null;
+    }
+    entries.push({
+      widget: raw.widget,
+      ...(immediateNodeId !== undefined ? { immediateNodeId } : {}),
+      ...(immediateWidget !== undefined ? { immediateWidget } : {}),
+      ...(terminal ? { terminal } : {}),
+      ...(error !== undefined ? { error } : {}),
+    });
+  }
+  return entries;
 }
 
 /** Extract the target owner and workflow identity from a validated promotion
@@ -354,7 +444,21 @@ export function resolveInnerPromotedTarget(
     const matched = matchListedName(displayedWidget, widgetNamesOnInner(node));
     if (matched) hits.push({ innerNodeId: id, widget: matched });
   }
-  return hits.length === 1 ? hits[0] : null;
+  if (hits.length !== 1) return null;
+  const promotedTerminals =
+    "promotedTerminals" in envelope ? envelope.promotedTerminals : undefined;
+  if (promotedTerminals !== undefined) {
+    const hit = hits[0];
+    const terminalEntries = promotedTerminals.filter(
+      (entry) =>
+        entry.widget.toLowerCase() === displayedWidget.toLowerCase() &&
+        (entry.immediateNodeId === undefined || sameNodeId(entry.immediateNodeId, hit.innerNodeId)) &&
+        (entry.immediateWidget === undefined || entry.immediateWidget.toLowerCase() === hit.widget.toLowerCase()),
+    );
+    if (terminalEntries.length !== 1 || !terminalEntries[0].terminal || terminalEntries[0].error) return null;
+    return { ...hit, terminal: terminalEntries[0].terminal };
+  }
+  return hits[0];
 }
 
 /** True when the refusal listed `requestedWidget` as promoted. */
