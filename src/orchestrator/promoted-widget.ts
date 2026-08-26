@@ -437,6 +437,40 @@ export function resolveInnerPromotedTarget(
       : validatePromotedSubgraphEnvelope(subgraph, ownerNodeId);
   if (!envelope) return null;
 
+  const promotedTerminals =
+    "promotedTerminals" in envelope ? envelope.promotedTerminals : undefined;
+  if (promotedTerminals !== undefined) {
+    // Current panels publish the authoritative alias -> immediate -> terminal
+    // relation. Prefer it over the legacy same-name scan: renamed outer and
+    // intermediate aliases are valid addresses, while the inner node summary
+    // intentionally contains only the concrete widget's programmatic name.
+    const entries = promotedTerminals.filter(
+      (entry) => entry.widget.toLowerCase() === displayedWidget.toLowerCase(),
+    );
+    if (entries.length !== 1) return null;
+    const entry = entries[0];
+    if (
+      entry.error ||
+      !entry.terminal ||
+      entry.immediateNodeId === undefined ||
+      !entry.immediateWidget
+    ) {
+      return null;
+    }
+    const immediateId = canonicalPromotedNodeId(entry.immediateNodeId);
+    if (!immediateId) return null;
+    const immediateNode = envelope.nodes.find((node) => {
+      const candidateId = innerNodeId(node);
+      return candidateId !== null && canonicalPromotedNodeId(candidateId) === immediateId;
+    });
+    if (!immediateNode) return null;
+    return {
+      innerNodeId: entry.immediateNodeId,
+      widget: entry.immediateWidget,
+      terminal: entry.terminal,
+    };
+  }
+
   const hits: InnerPromotedTarget[] = [];
   for (const node of envelope.nodes) {
     const id = innerNodeId(node);
@@ -445,19 +479,6 @@ export function resolveInnerPromotedTarget(
     if (matched) hits.push({ innerNodeId: id, widget: matched });
   }
   if (hits.length !== 1) return null;
-  const promotedTerminals =
-    "promotedTerminals" in envelope ? envelope.promotedTerminals : undefined;
-  if (promotedTerminals !== undefined) {
-    const hit = hits[0];
-    const terminalEntries = promotedTerminals.filter(
-      (entry) =>
-        entry.widget.toLowerCase() === displayedWidget.toLowerCase() &&
-        (entry.immediateNodeId === undefined || sameNodeId(entry.immediateNodeId, hit.innerNodeId)) &&
-        (entry.immediateWidget === undefined || entry.immediateWidget.toLowerCase() === hit.widget.toLowerCase()),
-    );
-    if (terminalEntries.length !== 1 || !terminalEntries[0].terminal || terminalEntries[0].error) return null;
-    return { ...hit, terminal: terminalEntries[0].terminal };
-  }
   return hits[0];
 }
 

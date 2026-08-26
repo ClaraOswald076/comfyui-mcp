@@ -232,6 +232,10 @@ interface Conn {
    * to a graph, so the older owner/workflow-only fence is insufficient for a
    * same-id cross-graph navigation. */
   enforcesExpectedScopeGraphIdentityAtWrite: boolean;
+  /** True only when THIS hello advertises that graph_get_subgraph publishes
+   * the complete renamed-promotion alias -> terminal witness consumed by the
+   * orchestrator before a promoted write. */
+  publishesPromotedTerminalWitnesses: boolean;
   /** True when THIS hello advertises that the panel understands `agent_note` — a frame
    *  delivered to the AGENT ONLY and never rendered as a chat bubble.
    *
@@ -3043,6 +3047,9 @@ export class UiBridge {
           enforcesExpectedScopeGraphIdentityAtWrite:
             (msg as { enforces_expected_scope_graph_identity_at_write?: unknown })
               .enforces_expected_scope_graph_identity_at_write === true,
+          publishesPromotedTerminalWitnesses:
+            (msg as { publishes_promoted_terminal_witnesses?: unknown })
+              .publishes_promoted_terminal_witnesses === true,
           // Re-read per hello like the stamps above: a reconnect can be a different build.
           acceptsAgentNotes:
             (msg as { accepts_agent_notes?: unknown }).accepts_agent_notes === true,
@@ -3618,6 +3625,16 @@ export class UiBridge {
   tabExpectedNodeTypeFenceCapability(tabId: string): boolean {
     try {
       return this.resolveTarget(tabId).enforcesExpectedNodeTypeAtWrite === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Whether THIS connected panel publishes the complete renamed-promotion
+   * terminal witness required for alias-independent promoted-write preflight. */
+  tabPromotedTerminalWitnessCapability(tabId: string): boolean {
+    try {
+      return this.resolveTarget(tabId).publishesPromotedTerminalWitnesses === true;
     } catch {
       return false;
     }

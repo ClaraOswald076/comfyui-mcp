@@ -108,6 +108,9 @@ function bridge(opts: {
   /** #2314 P1: emulate an old receiver that does not atomically enforce the
    * stable graph identity carried by expected_scope. */
   scopeGraphIdentityFence?: boolean;
+  /** #2314 P1: emulate a current receiver that publishes the recursive
+   * renamed-promotion terminal witness. */
+  promotedTerminalWitnesses?: boolean;
   /** Receiver navigation to another graph with the SAME owner/workflow and
    * colliding inner ids. Only graph_identity may distinguish this target. */
   receiverGraphIdentityCollisionAfterMcpFence?: boolean;
@@ -387,6 +390,7 @@ function bridge(opts: {
       : {}),
     tabExpectedNodeTypeFenceCapability: () => true,
     tabExpectedScopeGraphIdentityFenceCapability: () => opts.scopeGraphIdentityFence !== false,
+    tabPromotedTerminalWitnessCapability: () => opts.promotedTerminalWitnesses === true,
     tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
     workflowUuidFor: () => ({ known: true, uuid: workflowUuid }),
   } as unknown as PanelToolCtx["bridge"];
@@ -1630,6 +1634,39 @@ describe("resolveInnerPromotedTarget", () => {
     });
   });
 
+  it("resolves renamed outer and immediate aliases from the terminal witness", () => {
+    const renamed = {
+      ...SUBGRAPH,
+      nodes: [
+        { id: 188, type: "SubgraphB", is_subgraph: true, widgets: { prompt_b: "old" } },
+        SUBGRAPH.nodes[1],
+      ],
+      promoted_terminals: [
+        {
+          widget: "prompt_alias",
+          immediate_node_id: 188,
+          immediate_widget: "prompt_b",
+          terminal_node_id: 2768,
+          terminal_node_type: "AnimaRegionalCanvasInline",
+          terminal_widget: "quality_prompt",
+          terminal_inputs: [{ name: "quality_prompt", type: "STRING" }],
+          chain_depth: 1,
+        },
+      ],
+    };
+    expect(resolveInnerPromotedTarget(renamed, "prompt_alias", 78)).toEqual({
+      innerNodeId: 188,
+      widget: "prompt_b",
+      terminal: {
+        nodeId: 2768,
+        nodeType: "AnimaRegionalCanvasInline",
+        widget: "quality_prompt",
+        inputs: [{ name: "quality_prompt", type: "STRING" }],
+        chainDepth: 1,
+      },
+    });
+  });
+
   it.each([
     ["malformed terminal shape", { terminal_node_id: 2768, terminal_node_type: "KSampler", terminal_widget: "steps", chain_depth: 1 }],
     ["depth-limited terminal", { terminal_node_id: 2768, terminal_node_type: "KSampler", terminal_widget: "steps", terminal_inputs: [], chain_depth: 17 }],
@@ -1696,6 +1733,38 @@ describe("resolveInnerPromotedTarget", () => {
 });
 
 describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
+  it("refuses a renamed nested terminal before the first container write (#2314 P1)", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "prompt_alias", value: "unsafe" },
+      {
+        promotedTerminalWitnesses: true,
+        subgraph: {
+          ...SUBGRAPH,
+          nodes: [
+            { id: 188, type: "SubgraphB", is_subgraph: true, widgets: { prompt_b: "old" } },
+            SUBGRAPH.nodes[1],
+          ],
+          promoted_terminals: [
+            {
+              widget: "prompt_alias",
+              immediate_node_id: 188,
+              immediate_widget: "prompt_b",
+              terminal_node_id: 2768,
+              terminal_node_type: "AnimaRegionalCanvasInline",
+              terminal_widget: "quality_prompt",
+              terminal_inputs: [{ name: "quality_prompt", type: "STRING" }],
+              chain_depth: 1,
+            },
+          ],
+        },
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/AnimaRegionalCanvasInline/);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
+  });
+
   it("does not carry the outer node-type fence into a promoted inner retry (#2107)", async () => {
     const { text, isError, calls } = await setWidget(
       { node_id: 78, widget: "stack_data", value: "NEW" },

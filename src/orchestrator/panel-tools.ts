@@ -6507,7 +6507,16 @@ async function preparePromotedWidgetWrite(
   nodeId: unknown,
   widget: string,
 ): Promise<PromotedWritePreflight> {
-  if (!mayHaveKnownBadPromotedWidget(widget)) return null;
+  // The recursive terminal witness is only actionable when the receiver
+  // advertises that it publishes that witness. Older panels retain their
+  // established known-bad recovery path rather than being mistaken for a
+  // bundle that can classify renamed promotion aliases.
+  if (
+    ctx.tabPromotedTerminalWitnessCapability?.() !== true &&
+    !mayHaveKnownBadPromotedWidget(widget)
+  ) {
+    return null;
+  }
 
   const tabBefore = ctx.tabId;
   const hasIdentityApi = typeof ctx.panelConnectionIdentity === "function";
@@ -6534,6 +6543,17 @@ async function preparePromotedWidgetWrite(
       widget,
       "graph_get_subgraph returned no definitive non-promoted or ownership result",
     );
+  }
+  // The recursive alias mapping is the current receiver's proof that this
+  // graph_get_subgraph response can classify renamed promotions. Legacy
+  // envelopes have no terminal relation; leave their established refusal/
+  // recovery path in charge rather than treating a same-name inner hit as a
+  // complete authorization proof.
+  if (
+    !Object.prototype.hasOwnProperty.call(payload, "promoted_terminals") &&
+    !mayHaveKnownBadPromotedWidget(widget)
+  ) {
+    return null;
   }
   if (!hasIdentityApi) {
     return promotedWriteRefusal(widget, "the receiver identity was unavailable while the mapping was read");
@@ -6569,20 +6589,19 @@ async function preparePromotedWidgetWrite(
       "graph_get_subgraph did not publish a verifiable workflow and viewing-scope identity",
     );
   }
-  const scopeError = currentPromotedScopeError(ctx, scope);
-  if (scopeError) return promotedWriteRefusal(widget, scopeError);
   const inner = resolveInnerPromotedTarget(payload, widget, nodeId as number | string);
   if (!inner) {
     const matches = promotedMatchCount(payload, widget);
-    return matches === 0
-      ? null
-      : promotedWriteRefusal(
-          widget,
-          matches === 1
-            ? "the terminal promotion endpoint was missing, malformed, or unresolved"
-            : `the envelope mapped it ambiguously to ${matches} inner nodes`,
-        );
+    if (matches === 0) return null;
+    return promotedWriteRefusal(
+      widget,
+      matches === 1
+        ? "the terminal promotion endpoint was missing, malformed, or unresolved"
+        : `the envelope mapped it ambiguously to ${matches} inner nodes`,
+    );
   }
+  const scopeError = currentPromotedScopeError(ctx, scope);
+  if (scopeError) return promotedWriteRefusal(widget, scopeError);
 
   const targetId = canonicalQueriedNodeId(inner.innerNodeId);
   const innerNode = envelope.nodes.find((candidate) => {
@@ -12654,6 +12673,9 @@ export interface PanelToolCtx {
    * expected_scope at the synchronous mutation boundary. Real contexts provide
    * this; omitted/false is a fail-closed answer for promoted writes (#2314 P1). */
   tabExpectedScopeGraphIdentityFenceCapability?: () => boolean;
+  /** Whether the currently bound panel publishes the complete renamed-promotion
+   * alias -> terminal witness needed for alias-independent preflight (#2314 P1). */
+  tabPromotedTerminalWitnessCapability?: () => boolean;
   /**
    * The same question TRI-STATE, for code that must REPORT the answer rather than
    * gate on it. `tabCanMutateGraph` fails closed (an unreadable probe becomes
@@ -14076,6 +14098,9 @@ export function makePanelToolCtx(
     bridge.tabExpectedNodeTypeFenceCapability(ctx.tabId);
   ctx.tabExpectedScopeGraphIdentityFenceCapability = () =>
     bridge.tabExpectedScopeGraphIdentityFenceCapability(ctx.tabId);
+  ctx.tabPromotedTerminalWitnessCapability = () =>
+    typeof bridge.tabPromotedTerminalWitnessCapability === "function" &&
+    bridge.tabPromotedTerminalWitnessCapability(ctx.tabId);
   ctx.tabGraphMutationCapability = () => bridge.tabGraphMutationCapability(ctx.tabId);
   return ctx;
 }
