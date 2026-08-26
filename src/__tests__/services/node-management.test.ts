@@ -1515,11 +1515,18 @@ describe("node-management service", () => {
       // against that potentially different local install. The live server must
       // be unreachable to force this refusal, otherwise the dev box's ComfyUI
       // would allow cm-cli to proceed. The test controls this via the
-      // liveServerSnapshot mock.
+      // liveServerSnapshot mock to ensure it works on both CI (no ComfyUI)
+      // and dev boxes (with ComfyUI running on :8188).
       config.comfyuiPath = undefined;
       delete process.env.COMFYUI_PATH;
       savedDefault.value = "/saved/ws";
       liveServerSnapshot.value = { reachable: false };
+      // Stub fetch to prevent connecting to the real ComfyUI on the dev box.
+      // With live server unreachable, the code will fall back to Manager HTTP,
+      // which will fail with ECONNREFUSED, triggering NodeManagementError.
+      vi.stubGlobal("fetch", vi.fn(async () => {
+        throw new Error("ECONNREFUSED");
+      }));
 
       await expect(
         installCustomNode({
