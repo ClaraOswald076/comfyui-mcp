@@ -186,17 +186,31 @@ function parseWaitFromProse(text: string): number | null {
  */
 export function sanitizeDetail(raw: string, max = 200): string {
   const masked = redactTokens(raw)
-    // UUID-shaped ids FIRST, with any prefix attached. Their hyphens defeat both
-    // rules below: the longest unbroken run inside a UUID is 12 characters, so the
-    // bare-run rule never fires, and the prefixed rule matches only the TAIL —
-    // which is worse than missing it outright, because
-    // `550e8400-e29b-41d4-a716-<redacted>` reads as sanitized while 24 of its 36
-    // characters shipped. A partial redaction nobody re-checks is the dangerous
-    // shape here, so this runs before anything can produce one.
-    .replace(
-      /\b(?:([A-Za-z][A-Za-z0-9]{1,12})[-_])?[A-Za-z0-9]{0,32}[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}[A-Za-z0-9]{0,32}\b/g,
-      (_m, prefix: string | undefined) => (prefix ? `${prefix}-<redacted>` : "<redacted>"),
-    )
+    // A UUID anywhere in a token redacts the WHOLE token. Not the UUID, not the
+    // UUID-plus-a-recognised-prefix — the entire run of non-space characters it
+    // sits in.
+    //
+    // Every earlier version of this rule tried to PRESERVE the vendor prefix, so it
+    // had to know exactly where the prefix ended, and four separate reviews each
+    // found a different way for that to be wrong: the UUID missed entirely, then a
+    // prefix glued on with no separator, then a prefix with no digit in it (#2313),
+    // then `tenant_account_<uuid>` — where `_` is a word character, so \b offers no
+    // anchor inside the run and the optional single 2-13 character prefix segment
+    // cannot span it (#2333). Each fix was correct about its own case and left the
+    // class open.
+    //
+    // The failure mode is always the same and is worse than missing the id: the
+    // prefixed rule below then matches the UUID's own TAIL, and
+    // `tenant_account_550e8400-e29b-41d4-a716-<redacted>` ships 24 of 36 characters
+    // while READING as sanitized. Nobody re-checks a redaction that already looks
+    // done.
+    //
+    // \S has no such boundary to defeat: it does not care whether the separator is
+    // `-`, `_`, or nothing at all. The cost is the `org-` hint on a separated
+    // prefix, which is worth losing — it is the thing that caused all four leaks,
+    // and a rate-limit sentence is readable without it. A token is delimited by
+    // whitespace, so an explanatory sentence is untouched: every space ends a run.
+    .replace(/\S*[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\S*/g, "<redacted>")
     // prefixed opaque identifiers: org-…, cak-…, key_…, acct-…
     .replace(/\b([A-Za-z][A-Za-z0-9]{1,12}[-_])[A-Za-z0-9]{10,}\b/g, "$1<redacted>")
     // bare long runs (an id that came without a prefix). LENGTH is the whole
