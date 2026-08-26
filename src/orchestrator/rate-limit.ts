@@ -240,17 +240,11 @@ export function sanitizeDetail(raw: string, max = 200): string {
     // E-mail addresses FIRST: the local part may itself look like a bare id, but
     // #2294's contract is to mask the whole address atomically.
     .replace(/\b[\w.+-]+@[\w-]+\.[\w.]+\b/g, "<redacted>")
-    // UUID-shaped ids next, before the other identifier rules. The boundary is
-    // deliberately non-alphanumeric instead of `\b`: `_` is a word character,
-    // and `tenant_account_<uuid>` must be consumed as one value rather than
-    // leaving a partial UUID for the next rule to redact.
-    .replace(
-      /(^|[^A-Za-z0-9])((?:(?:[A-Za-z][A-Za-z0-9]{0,12}[-_])+)?[A-Za-z0-9]{0,32}[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}[A-Za-z0-9]{0,32})(?=$|[^A-Za-z0-9])/g,
-      (_m, boundary: string, value: string) => {
-        const prefix = firstIdentifierPrefix(value);
-        return `${boundary}${prefix ? `${prefix}<redacted>` : "<redacted>"}`;
-      },
-    )
+    // A UUID anywhere in a token redacts the WHOLE token. Not the UUID, not the
+    // UUID-plus-a-recognised-prefix: the entire run of non-space characters it
+    // sits in. `\S` has no boundary to be defeated by, so segmented, glued, and
+    // multi-prefix forms cannot leave a partial UUID for the next rule.
+    .replace(/\S*[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\S*/g, "<redacted>")
     // Prefixed and segmented opaque identifiers: org-…, org_…_…, cak-…, key_…,
     // and long wrapper/value forms. The entire atom is matched before replacing
     // it, so no later rule can turn a segmented value into a misleading partial.

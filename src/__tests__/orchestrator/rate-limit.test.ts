@@ -224,27 +224,33 @@ describe("sanitizeDetail", () => {
   // only the TAIL. The second case below is the dangerous one — it used to come back as
   // "550e8400-e29b-41d4-a716-<redacted>", which READS as sanitized while 24 of its 36
   // characters shipped. Nobody re-checks a redaction that already looks done.
-  it("redacts a UUID-shaped account id whole, with or without a vendor prefix", () => {
-    const prefixed = sanitizeDetail("org-12345678-1234-1234-1234-123456789012 reached its limit");
-    expect(prefixed).not.toContain("12345678");
-    expect(prefixed).not.toContain("123456789012");
-    expect(prefixed).toContain("org-");
-
-    const bare = sanitizeDetail("account 550e8400-e29b-41d4-a716-446655440000 limit");
-    // No FRAGMENT survives — asserting only on the full string would pass on the partial.
+  // Every shape below has defeated a previous version of this rule. They are kept
+  // together because the lesson is the CLASS, not any one of them: each earlier fix
+  // preserved the vendor prefix, so it had to know where the prefix ended, and each
+  // review found a new way for that to be wrong. The rule no longer tries.
+  it.each([
+    ["bare", "account 550e8400-e29b-41d4-a716-446655440000 limit"],
+    ["hyphen prefix", "org-550e8400-e29b-41d4-a716-446655440000 reached its limit"],
+    ["glued prefix (gate round 2)", "org550e8400-e29b-41d4-a716-446655440000 hit its cap"],
+    ["single-char prefix (#2333)", "x_550e8400-e29b-41d4-a716-446655440000 rate limited"],
+    ["two segments (#2333)", "x_y_550e8400-e29b-41d4-a716-446655440000 rate limited"],
+    ["the reported case (#2333)", "tenant_account_550e8400-e29b-41d4-a716-446655440000 rate limited"],
+    ["uppercase hex", "ACCT_550E8400-E29B-41D4-A716-446655440000 limited"],
+  ])("leaves no fragment of a UUID-shaped id: %s", (_name, input) => {
+    const out = sanitizeDetail(input);
+    // Asserting on the whole string would PASS on a partial redaction — which is the
+    // exact defect: `…-a716-<redacted>` reads as sanitized while 24 of 36 chars ship.
+    // Every segment must be gone, case-insensitively.
     for (const part of ["550e8400", "e29b", "41d4", "a716", "446655440000"]) {
-      expect(bare).not.toContain(part);
+      expect(out.toUpperCase()).not.toContain(part.toUpperCase());
     }
-    expect(bare).toContain("account");
+    expect(out).toContain("<redacted>");
+  });
 
-    // Gate round 2: a prefix GLUED to the uuid with no separator slipped past the
-    // optional-prefix group and left the same misleading partial one layer down.
-    const glued = sanitizeDetail("org550e8400-e29b-41d4-a716-446655440000 hit its cap");
-    for (const part of ["org550e8400", "550e8400", "e29b", "41d4", "a716", "446655440000"]) {
-      expect(glued).not.toContain(part);
-    }
-    expect(glued).toContain("hit its cap");
-    expect(bare).toContain("limit");
+  it("keeps the surrounding sentence, which is why the message is shown at all", () => {
+    expect(sanitizeDetail("account 550e8400-e29b-41d4-a716-446655440000 limit")).toBe(
+      "account <redacted> limit",
+    );
   });
 
   it("still leaves hyphenated prose and header names alone", () => {
