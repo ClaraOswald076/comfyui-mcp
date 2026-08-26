@@ -312,7 +312,8 @@ export function gaveUpNotice(
   if (verdict.kind === "quota") {
     return (
       `⚠️ ${model} rejected the request: the account is out of quota or credit${because}. ` +
-      `Retrying will not help — top up or change plan with the provider, or switch models from the composer picker.`
+      `Retrying will not help — top up or change plan with the provider, or switch models from the composer picker. ` +
+      `The turn stopped part-way, so if it had already started changing the graph, check the canvas before you resend.`
     );
   }
   if (attempts > 0) {

@@ -198,10 +198,15 @@ describe("gaveUpNotice", () => {
     expect(line).toContain("composer picker");
   });
 
-  it("a quota wall keeps its own remedy and does not gain the retry advice", () => {
+  it("a quota wall keeps its own remedy AND still warns the turn stopped part-way", () => {
+    // Gate round 3: the partial-turn warning was added to the two retryable branches and
+    // not to this one. A quota 429 arrives at the same point in the tool loop and leaves
+    // the same half-applied graph — and this branch actively tells the user to top up and
+    // resend, so it is the branch where the omission does the most damage.
     const line = gaveUpNotice("m", { kind: "quota", detail: "out of credit" }, 0);
     expect(line).toMatch(/Retrying will not help/i);
     expect(line).not.toMatch(/nothing was lost/i);
+    expect(line).toMatch(/check the canvas before you resend/i);
   });
 });
 
