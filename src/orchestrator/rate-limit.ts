@@ -189,41 +189,55 @@ const EXPLICIT_ALPHA_IDENTIFIER_LABEL =
   /(?:^|[\s"'([{])(?:account|acct|user|workspace|token|key)(?:[_-](?:id|identifier)|\s+(?:id|identifier))\b\s*["']?\s*(?:[:=]\s*)?["'([{]?\s*$/i;
 const DIRECT_ALPHA_IDENTIFIER_LABEL =
   /(?:^|[.!?;]\s*|(?:your|the)[\s-]+)(?:account|acct|user|tenant|plan)\s*(?:[,;.!?:=]\s*[\[({]?|[-_]+\s*[\[({]?|\s+)$/i;
-const GENERIC_ALPHA_IDENTIFIER_CONTEXT = /(?:\b(?:for|from|of|tenant|plan)\s*|[\[({]\s*)$/i;
-const IDENTIFIER_STATUS = /^\s+(?:is|was|has|had|reached|exceeded|exhausted|limited|invalid|expired|blocked|disabled)\b/i;
-const NATURAL_LANGUAGE_ALPHA_RUNS = new Set([
-  "compartmentalization",
-  "counterrevolutionary",
-  "internationalization",
-  "nondeterministically",
-  "uncharacteristically",
+const DIRECT_ALPHA_IDENTIFIER_WRAPPER =
+  /(?:^|[.!?;]\s*|(?:your|the)[\s-]+)(?:account|user)\s*(?:[,;.!?:=]\s*|[-_]+\s*)?[\[({]\s*$/i;
+type AlphaRunClassification = "identifier" | "prose";
+type AlphaRunBoundary = "bare-prose" | "lexical-label-prose";
+
+// There is no reliable morphology or vowel heuristic that can distinguish a
+// minted all-alpha id from an English word. Keep the small prose exception
+// explicit and table-driven; explicit labels and wrappers never use it.
+const ALPHA_RUN_CLASSIFICATION: ReadonlyMap<string, ReadonlySet<AlphaRunBoundary>> = new Map([
+  ["compartmentalization", new Set(["bare-prose", "lexical-label-prose"])],
+  ["counterrevolutionary", new Set(["bare-prose"])],
+  ["internationalization", new Set(["bare-prose"])],
+  ["nondeterministically", new Set(["bare-prose"])],
+  ["uncharacteristically", new Set(["bare-prose", "lexical-label-prose"])],
 ]);
 
-function isNaturalLanguageAlphaRun(run: string): boolean {
-  return NATURAL_LANGUAGE_ALPHA_RUNS.has(run.split(/[-_]+/, 1)[0].toLowerCase());
+function classifyAlphaRun(run: string, boundary: AlphaRunBoundary = "bare-prose"): AlphaRunClassification {
+  const base = run.split(/[-_]+/, 1)[0].toLowerCase();
+  return ALPHA_RUN_CLASSIFICATION.get(base)?.has(boundary) ? "prose" : "identifier";
+}
+
+function isNaturalLanguageAlphaRun(run: string, boundary: AlphaRunBoundary = "bare-prose"): boolean {
+  return classifyAlphaRun(run, boundary) === "prose";
 }
 
 function isExplicitIdentifierValue(run: string): boolean {
   return /^(?:account|acct|user|workspace|token|key)(?:[_-](?:id|identifier))[-_]/i.test(run);
 }
 
-function hasAlphaIdentifierContext(input: string, offset: number, run: string): boolean {
+function hasExplicitAlphaIdentifierBoundary(input: string, offset: number): boolean {
   const before = input.slice(Math.max(0, offset - 96), offset);
-  if (EXPLICIT_ALPHA_IDENTIFIER_LABEL.test(before)) return true;
-
-  const after = input.slice(offset + run.length);
-  const afterClosingPunctuation = after.replace(/^\s*[\])}]+/, "");
-  const terminal =
-    !afterClosingPunctuation.trim() ||
-    /^[\s]*[.,;!?]/.test(after) ||
-    IDENTIFIER_STATUS.test(afterClosingPunctuation);
-  if (!terminal) return false;
-
-  return DIRECT_ALPHA_IDENTIFIER_LABEL.test(before) || GENERIC_ALPHA_IDENTIFIER_CONTEXT.test(before);
+  const withoutJsonQuotes = before.replace(/\\?["']/g, "");
+  return (
+    EXPLICIT_ALPHA_IDENTIFIER_LABEL.test(before) ||
+    EXPLICIT_ALPHA_IDENTIFIER_LABEL.test(withoutJsonQuotes) ||
+    DIRECT_ALPHA_IDENTIFIER_WRAPPER.test(before) ||
+    DIRECT_ALPHA_IDENTIFIER_WRAPPER.test(withoutJsonQuotes)
+  );
 }
 
 function firstIdentifierPrefix(run: string): string {
-  const prefix = run.match(/^[A-Za-z][A-Za-z0-9]{0,12}[-_]/)?.[0] ?? "";
+  const explicitLabelPrefix = run.match(
+    /^(?:(?:the|your)[-_])?(?:account|acct|user|workspace|token|key)[-_]+(?:id|identifier)[-_]+/i,
+  )?.[0];
+  if (explicitLabelPrefix) return explicitLabelPrefix;
+  const labelPrefix = run.match(
+    /^(?:(?:the|your)[-_])?(?:account|acct|user|workspace|token|key)(?:[-_]+(?:id|identifier))?[-_]+/i,
+  )?.[0];
+  const prefix = labelPrefix ?? run.match(/^[A-Za-z][A-Za-z0-9]{0,12}[-_]+/)?.[0] ?? "";
   // A UUID glued directly to a vendor word (org550e8400-...) has no safe
   // prefix boundary. Preserving that whole digit-bearing fragment would defeat
   // the atomic UUID replacement, so only retain alphabetic prefix segments.
@@ -232,7 +246,11 @@ function firstIdentifierPrefix(run: string): string {
 
 function preserveNaturalLanguagePrefixedRun(run: string): boolean {
   if (isExplicitIdentifierValue(run)) return false;
-  return isNaturalLanguageAlphaRun(run);
+  const prefix = run.match(
+    /^(?:(?:the|your)[-_])?(?:account|user)[-_]+/i,
+  )?.[0];
+  if (!prefix) return isNaturalLanguageAlphaRun(run);
+  return isNaturalLanguageAlphaRun(run.slice(prefix.length), "lexical-label-prose");
 }
 
 export function sanitizeDetail(raw: string, max = 200): string {
@@ -245,22 +263,27 @@ export function sanitizeDetail(raw: string, max = 200): string {
     // sits in. `\S` has no boundary to be defeated by, so segmented, glued, and
     // multi-prefix forms cannot leave a partial UUID for the next rule.
     .replace(/\S*[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\S*/g, "<redacted>")
-    // Prefixed and segmented opaque identifiers: org-…, org_…_…, cak-…, key_…,
-    // and long wrapper/value forms. The entire atom is matched before replacing
-    // it, so no later rule can turn a segmented value into a misleading partial.
-    .replace(
-      /(^|[^A-Za-z0-9])(((?:[A-Za-z][A-Za-z0-9]{0,12}[-_])+)[A-Za-z0-9]{10,}(?:[-_]+[A-Za-z0-9]+)*)(?=$|[^A-Za-z0-9])/g,
-      (_m, boundary: string, run: string) =>
-        preserveNaturalLanguagePrefixedRun(run)
-          ? `${boundary}${run}`
-          : `${boundary}${firstIdentifierPrefix(run)}<redacted>`,
-    )
     // Machine-labelled values are identifiers even when their alphabetic
     // payload happens to be an English word. This also handles JSON-like
     // `account_id: "..."` forms that are shorter than the bare-run threshold.
     .replace(
-      /((?:account|acct|user|workspace|token|key)(?:[_-](?:id|identifier)|\s+(?:id|identifier))\b\s*["']?\s*[:=]\s*["'([{]?\s*)([A-Za-z0-9]{10,}(?:[-_]+[A-Za-z0-9]+)*)(?=$|[^A-Za-z0-9])/gi,
+      /((?:account|acct|user|workspace|token|key)(?:[_-]+(?:id|identifier)|\s+(?:id|identifier))\s*["']?\s*[:=]\s*["'([{]?\s*)([A-Za-z0-9]{10,}(?:[-_]+[A-Za-z0-9]+)*)(?=$|[^A-Za-z0-9])/gi,
       (_m, label: string) => `${label}<redacted>`,
+    )
+    // Prefixed and segmented opaque identifiers: org-…, org_…_…, cak-…, key_…,
+    // and long wrapper/value forms. The entire atom is matched before replacing
+    // it, so no later rule can turn a segmented value into a misleading partial.
+    // The underscore label form can wrap its value directly: account_identifier_[…].
+    .replace(
+      /((?:account|acct|user|workspace|token|key)(?:[_-]+(?:id|identifier))[_-]+)([\[({])\s*[A-Za-z0-9]{10,}(?=\s*[\])}])/gi,
+      (_m, label: string, opening: string) => `${label}${opening}<redacted>`,
+    )
+    .replace(
+      /(^|[^A-Za-z0-9])(?!(?:account|acct|user|workspace|token|key)(?:[_-]+(?:id|identifier))(?=\s*["']?\s*[:=])|(?:account|acct|user|workspace|token|key)(?:[_-]+(?:id|identifier))[_-]+\s*[\[({])(((?:[A-Za-z][A-Za-z0-9]{0,12}[-_])+)[A-Za-z0-9]{10,}(?:[-_]+[A-Za-z0-9]+)*)(?=$|[^A-Za-z0-9])/g,
+      (_m, boundary: string, run: string) =>
+        preserveNaturalLanguagePrefixedRun(run)
+          ? `${boundary}${run}`
+          : `${boundary}${firstIdentifierPrefix(run)}<redacted>`,
     )
     // Long segmented values whose first segment is itself longer than a normal
     // prefix (for example qavexidopulnertiskym_extra) are still one atom.
@@ -269,15 +292,11 @@ export function sanitizeDetail(raw: string, max = 200): string {
       (_m, boundary: string, run: string) =>
         preserveNaturalLanguagePrefixedRun(run) ? `${boundary}${run}` : `${boundary}<redacted>`,
     )
-    // Bare long runs: digits are an opaque shape by themselves. An all-alpha
-    // run is masked only in an identifier/status context, with ordinary prose
-    // words explicitly retained. Explicit machine labels (account_id, user_id,
-    // and their JSON-like forms) are always handled by that context check.
+    // Bare long runs are identifiers unless the explicit prose table recognizes
+    // a bare prose boundary. Structured labels and wrappers override that table.
     .replace(/\b[A-Za-z0-9]{20,}\b/g, (run, offset, input: string) => {
-      if (/\d/.test(run)) return "<redacted>";
-      return !isNaturalLanguageAlphaRun(run) && hasAlphaIdentifierContext(input, offset, run)
-        ? "<redacted>"
-        : run;
+      if (!hasExplicitAlphaIdentifierBoundary(input, offset) && isNaturalLanguageAlphaRun(run)) return run;
+      return "<redacted>";
     });
   return masked.replace(/\s+/g, " ").trim().slice(0, max);
 }

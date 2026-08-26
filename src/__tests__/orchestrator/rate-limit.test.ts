@@ -46,6 +46,15 @@ describe("classifyRateLimit", () => {
     expect(v?.retryAfterMs).toBe(1000);
   });
 
+  it("sanitizes a high-vowel labeled bare id in fallback detail", () => {
+    const v = classifyRateLimit(
+      429,
+      h(),
+      JSON.stringify({ error: { message: "account qavexidopulnertiskym is limited" } }),
+    );
+    expect(v?.detail).toBe("account <redacted> is limited");
+  });
+
   it("prefers Retry-After over the prose, in seconds or as a date", () => {
     expect(classifyRateLimit(429, h({ "retry-after": "20" }), KIMI_429)?.retryAfterMs).toBe(20_000);
     const soon = new Date(Date.now() + 30_000).toUTCString();
@@ -166,6 +175,178 @@ describe("sanitizeDetail", () => {
     }
   });
 
+  it("redacts low-diversity all-alphabetic account identifiers", () => {
+    expect(sanitizeDetail("account aeiouaeiouaeiouaeiou is limited")).toBe("account <redacted> is limited");
+  });
+
+  it("redacts all-alphabetic identifiers with structured labels", () => {
+    expect(sanitizeDetail("account_id=abcdefghijklmnopqrstuv")).toBe("account_id=<redacted>");
+    expect(sanitizeDetail("user_id qavexidopulnertiskym is limited")).toBe("user_id <redacted> is limited");
+  });
+
+  it("redacts user-labeled identifiers for terminal statuses", () => {
+    for (const label of ["user", "the user", "your user"]) {
+      for (const status of ["disabled", "blocked", "expired"]) {
+        expect(sanitizeDetail(`${label} abcdefghijklmnopqrstuv is ${status}`)).toBe(
+          `${label} <redacted> is ${status}`,
+        );
+      }
+    }
+  });
+
+  it("redacts punctuation-wrapped and bracketed labels", () => {
+    expect(sanitizeDetail("account: abcdefghijklmnopqrstuv is limited")).toBe(
+      "account: <redacted> is limited",
+    );
+    expect(sanitizeDetail("account (abcdefghijklmnopqrstuv) is limited")).toBe(
+      "account (<redacted>) is limited",
+    );
+    expect(sanitizeDetail("account: [abcdefghijklmnopqrstuv] is limited")).toBe(
+      "account: [<redacted>] is limited",
+    );
+    expect(sanitizeDetail("account=[abcdefghijklmnopqrstuv]")).toBe("account=[<redacted>]");
+    expect(sanitizeDetail("user: [abcdefghijklmnopqrstuv] is disabled")).toBe(
+      "user: [<redacted>] is disabled",
+    );
+    expect(sanitizeDetail("account_id=[abcdefghijklmnopqrstuv]")).toBe("account_id=[<redacted>]");
+  });
+
+  it("redacts a hyphen-attached identifier atomically", () => {
+    expect(sanitizeDetail("account qavexidopulnertiskym-extra-more is limited")).toBe(
+      "account <redacted> is limited",
+    );
+    expect(sanitizeDetail("account qavexidopulnertiskymtion is limited")).toBe(
+      "account <redacted> is limited",
+    );
+    expect(sanitizeDetail("account qavexidopulnertisktion is limited")).toBe(
+      "account <redacted> is limited",
+    );
+    expect(sanitizeDetail("account qavexidopulnertiskymaeiotion is limited")).toBe(
+      "account <redacted> is limited",
+    );
+    expect(sanitizeDetail("account qavexidopulnertiskym_extra_more is limited")).toBe(
+      "account <redacted> is limited",
+    );
+    expect(sanitizeDetail("account qavexidopulnertiskym--extra--more is limited")).toBe(
+      "account <redacted> is limited",
+    );
+    expect(sanitizeDetail("wrapper_qavexidopulnertiskym_suffix")).toBe("wrapper_<redacted>");
+    expect(sanitizeDetail("wrapper--qavexidopulnertiskym--suffix")).toBe("wrapper--<redacted>");
+  });
+
+  it("redacts punctuation, hyphen labels, and composite labels atomically", () => {
+    expect(sanitizeDetail("account, abcdefghijklmnopqrstuv")).toBe("account, <redacted>");
+    expect(sanitizeDetail("account.abcdefghijklmnopqrstuv")).toBe("account.<redacted>");
+    expect(sanitizeDetail("account!abcdefghijklmnopqrstuv")).toBe("account!<redacted>");
+    expect(sanitizeDetail("account?abcdefghijklmnopqrstuv")).toBe("account?<redacted>");
+    expect(sanitizeDetail("account--abcdefghijklmnopqrstuv")).toBe("account--<redacted>");
+    expect(sanitizeDetail("account-[abcdefghijklmnopqrstuv]")).toBe("account-[<redacted>]");
+    expect(sanitizeDetail("account_[abcdefghijklmnopqrstuv]")).toBe("account_[<redacted>]");
+    expect(sanitizeDetail("the-user-abcdefghijklmnopqrstuv")).toBe("the-user-<redacted>");
+    expect(sanitizeDetail("the-user_abcdefghijklmnopqrstuv")).toBe("the-user_<redacted>");
+    expect(sanitizeDetail("your-user-abcdefghijklmnopqrstuv")).toBe("your-user-<redacted>");
+    expect(sanitizeDetail("your-user_abcdefghijklmnopqrstuv")).toBe("your-user_<redacted>");
+    expect(sanitizeDetail("account_abcdefghijklmnopqrstuv")).toBe("account_<redacted>");
+    expect(sanitizeDetail("user_abcdefghijklmnopqrstuv")).toBe("user_<redacted>");
+    expect(sanitizeDetail("account_identifier_abcdefghijklmnopqrstuv")).toBe(
+      "account_identifier_<redacted>",
+    );
+    expect(sanitizeDetail("account_identifier_[abcdefghijklmnopqrstuv]")).toBe(
+      "account_identifier_[<redacted>]",
+    );
+    expect(sanitizeDetail("account_identifier-abcdefghijklmnopqrstuv")).toBe(
+      "account_identifier-<redacted>",
+    );
+    expect(sanitizeDetail("account_identifier=abcdefghijklmnopqrstuv")).toBe(
+      "account_identifier=<redacted>",
+    );
+  });
+
+  it("uses the explicit alpha-run table across identifier boundaries", () => {
+    const alphaId = "aeiouaeiouaeiouaeiotion";
+    const cases = [
+      [`account ${alphaId} is limited`, "account <redacted> is limited"],
+      [`user ${alphaId} is blocked`, "user <redacted> is blocked"],
+      [`account_id=${alphaId}`, "account_id=<redacted>"],
+      [`user_id ${alphaId} is limited`, "user_id <redacted> is limited"],
+      [`account_${alphaId}`, "account_<redacted>"],
+      [`acct_${alphaId}`, "acct_<redacted>"],
+      [`org-${alphaId}`, "org-<redacted>"],
+      [`wrapper_${alphaId}_suffix`, "wrapper_<redacted>"],
+      [`account-[${alphaId}]`, "account-[<redacted>]"],
+      ["account counterrevolutionary is limited", "account counterrevolutionary is limited"],
+      ["account compartmentalization_v2 is limited", "account compartmentalization_v2 is limited"],
+    ] as const;
+
+    for (const [input, expected] of cases) {
+      expect(sanitizeDetail(input)).toBe(expected);
+    }
+  });
+
+  it("does not let prose exceptions exempt explicit identifier shapes", () => {
+    const proseLookingId = "counterrevolutionary";
+    const cases = [
+      [`account_id=${proseLookingId}`, "account_id=<redacted>"],
+      [`user_id ${proseLookingId} is limited`, "user_id <redacted> is limited"],
+      [`account_${proseLookingId}`, "account_<redacted>"],
+      [`acct-${proseLookingId}`, "acct-<redacted>"],
+      [`wrapper_${proseLookingId}_suffix`, "wrapper_<redacted>"],
+      [`account-[${proseLookingId}]`, "account-[<redacted>]"],
+      [`account (${proseLookingId})`, "account (<redacted>)"],
+    ] as const;
+
+    for (const [input, expected] of cases) {
+      expect(sanitizeDetail(input)).toBe(expected);
+    }
+  });
+
+  it("masks prose-looking ids behind quoted JSON-like labels", () => {
+    const proseLookingId = "counterrevolutionary";
+    const cases = [
+      [`{"account_id":"${proseLookingId}"}`, `{"account_id":"<redacted>"}`],
+      [`{"user_id" : "${proseLookingId}"}`, `{"user_id" : "<redacted>"}`],
+      [`{"account_id":${proseLookingId}}`, `{"account_id":<redacted>}`],
+      [`{"outer":{"account_id":"${proseLookingId}"}}`, `{"outer":{"account_id":"<redacted>"}}`],
+      [
+        `{ "payload": { "user_id": [ "${proseLookingId}" ] } }`,
+        `{ "payload": { "user_id": [ "<redacted>" ] } }`,
+      ],
+      [`{"details":{"user_id":("${proseLookingId}")}}`, `{"details":{"user_id":("<redacted>")}}`],
+    ] as const;
+
+    for (const [input, expected] of cases) {
+      expect(sanitizeDetail(input)).toBe(expected);
+    }
+  });
+
+  it("leaves long ordinary prose words readable", () => {
+    expect(sanitizeDetail("compartmentalization_v2")).toBe("compartmentalization_v2");
+    expect(sanitizeDetail("account compartmentalization policy")).toBe("account compartmentalization policy");
+    expect(sanitizeDetail("the user uncharacteristically exceeded the limit")).toBe(
+      "the user uncharacteristically exceeded the limit",
+    );
+    expect(sanitizeDetail("account compartmentalization is limited")).toBe(
+      "account compartmentalization is limited",
+    );
+    expect(sanitizeDetail("account: compartmentalization policy")).toBe("account: compartmentalization policy");
+    expect(sanitizeDetail("the user: uncharacteristically exceeded")).toBe(
+      "the user: uncharacteristically exceeded",
+    );
+    expect(sanitizeDetail("user-uncharacteristically")).toBe("user-uncharacteristically");
+    expect(sanitizeDetail("account-compartmentalization")).toBe("account-compartmentalization");
+    expect(sanitizeDetail("user_uncharacteristically")).toBe("user_uncharacteristically");
+    expect(sanitizeDetail("account_compartmentalization")).toBe("account_compartmentalization");
+    expect(sanitizeDetail("account compartmentalization_v2 is limited")).toBe(
+      "account compartmentalization_v2 is limited",
+    );
+    expect(sanitizeDetail("account internationalization is limited")).toBe(
+      "account internationalization is limited",
+    );
+    expect(sanitizeDetail("account nondeterministically is limited")).toBe(
+      "account nondeterministically is limited",
+    );
+  });
+
   it("leaves an ordinary sentence readable", () => {
     const out = sanitizeDetail("Rate limit reached for gpt-4o in organization on requests per min (RPM): Limit 500");
     expect(out).toContain("requests per min");
@@ -217,6 +398,12 @@ describe("sanitizeDetail", () => {
 
   it("redacts an email address", () => {
     expect(sanitizeDetail("quota for art@example.com exhausted")).not.toContain("art@example.com");
+  });
+
+  it("masks a long email local part as one address", () => {
+    expect(sanitizeDetail("quota for abcdefghijklmnopqrstuv@example.com exhausted")).toBe(
+      "quota for <redacted> exhausted",
+    );
   });
 
   // Hyphens defeated both shape rules: the longest unbroken run inside a UUID is 12
