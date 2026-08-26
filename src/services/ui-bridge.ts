@@ -221,6 +221,12 @@ interface Conn {
    * Re-read per hello and fail closed when absent: an older panel would silently
    * ignore the field and leave the node-replacement fence unenforced. */
   enforcesExpectedNodeTypeAtWrite: boolean;
+  /** True only when THIS hello advertises that the panel validates an optional
+   * expected_scope (promoted owner/workflow witness) at the synchronous
+   * graph_set_widget write boundary. Re-read per hello and fail closed when
+   * absent: an older panel would silently ignore receiver identity and could
+   * write a same-id node after navigation. */
+  enforcesExpectedScopeAtWrite: boolean;
   /** True when THIS hello advertises that the panel understands `agent_note` — a frame
    *  delivered to the AGENT ONLY and never rendered as a chat bubble.
    *
@@ -355,6 +361,9 @@ export const BRIDGE_CAPABILITY_MIN_PANEL_VERSION: Readonly<Record<string, string
   // #2107 — graph_set_widget's optional expected_node_type fence shipped with
   // the panel-side write-boundary check.
   enforces_expected_node_type_at_write: "0.15.58",
+  // #2314 — promoted inner writes carry an expected owner/workflow witness that
+  // the panel validates immediately before mutating the current graph.
+  enforces_expected_scope_at_write: "0.15.97",
 };
 
 /**
@@ -1542,6 +1551,14 @@ function expectedNodeTypeFenceRefusal(tabId: string): Error {
     `graph_set_widget was refused before dispatch because panel tab ${tabId} ` +
       `does not advertise the atomic expected-node-type write fence. Update the ` +
       `panel to 0.15.58+ and hard-refresh the browser tab.`,
+  );
+}
+
+function expectedScopeFenceRefusal(tabId: string): Error {
+  return new Error(
+    `graph_set_widget was refused before dispatch because panel tab ${tabId} ` +
+      `does not advertise the atomic promoted-scope write fence. Update the ` +
+      `panel to 0.15.97+ and hard-refresh the browser tab.`,
   );
 }
 
@@ -2998,6 +3015,8 @@ export class UiBridge {
             (msg as { enforces_workflow_stamp_at_write?: unknown }).enforces_workflow_stamp_at_write === true,
           enforcesExpectedNodeTypeAtWrite:
             (msg as { enforces_expected_node_type_at_write?: unknown }).enforces_expected_node_type_at_write === true,
+          enforcesExpectedScopeAtWrite:
+            (msg as { enforces_expected_scope_at_write?: unknown }).enforces_expected_scope_at_write === true,
           // Re-read per hello like the stamps above: a reconnect can be a different build.
           acceptsAgentNotes:
             (msg as { accepts_agent_notes?: unknown }).accepts_agent_notes === true,
@@ -3846,6 +3865,17 @@ export class UiBridge {
       return { generation: conn.helloGeneration, tabSessionId: conn.tabSessionId };
     } catch {
       return undefined;
+    }
+  }
+
+  /** Whether THIS connected panel enforces graph_set_widget's optional
+   * expected promoted owner/workflow witness at the actual mutation boundary
+   * (#2314). */
+  tabExpectedScopeFenceCapability(tabId: string): boolean {
+    try {
+      return this.resolveTarget(tabId).enforcesExpectedScopeAtWrite === true;
+    } catch {
+      return false;
     }
   }
 
@@ -5219,6 +5249,22 @@ export class UiBridge {
       );
       return Promise.reject(markCapabilityRefusal(refusal));
     }
+    // #2314 — an expected_scope is meaningful only when the receiving panel
+    // compares it against its LIVE current graph at the synchronous mutation
+    // boundary. An older panel silently ignoring this optional field could
+    // write a colliding inner node after receiver navigation, so refuse before
+    // dispatch.
+    if (
+      cmd.cmd === "graph_set_widget" &&
+      Object.prototype.hasOwnProperty.call(cmd, "expected_scope") &&
+      !conn.enforcesExpectedScopeAtWrite
+    ) {
+      const refusal = markDispatched(
+        expectedScopeFenceRefusal(conn.tabId),
+        false,
+      );
+      return Promise.reject(markCapabilityRefusal(refusal));
+    }
     // #570 P0c — FAIL CLOSED for a command that mutates the ACTIVE workflow/canvas (every
     // graph_* mutator, plus path-less workflow_save/save_as/rename/close) when the resolved
     // panel does NOT enforce the per-command workflow-instance stamp. Such a panel would
@@ -5616,6 +5662,15 @@ export class UiBridge {
       ) {
         return Promise.reject(
           markCapabilityRefusal(markDispatched(expectedNodeTypeFenceRefusal(live.tabId), false)),
+        );
+      }
+      if (
+        cmd.cmd === "graph_set_widget" &&
+        Object.prototype.hasOwnProperty.call(cmd, "expected_scope") &&
+        !live.enforcesExpectedScopeAtWrite
+      ) {
+        return Promise.reject(
+          markCapabilityRefusal(markDispatched(expectedScopeFenceRefusal(live.tabId), false)),
         );
       }
       if (live.sock.readyState !== WebSocket.OPEN) {

@@ -16931,6 +16931,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           widget: string,
           targetExpectedNodeType: string | undefined = expectedNodeType,
           beforeDispatch?: () => void,
+          targetExpectedScope?: PromotedScopeWitness,
         ): Promise<ToolResult> =>
           stripVerifiedLastObservedSchemaNote(
             summarizeSetWidgetEcho(
@@ -16946,6 +16947,17 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                   // and supplies that node's own type.
                   ...(targetExpectedNodeType
                     ? { expected_node_type: targetExpectedNodeType }
+                    : {}),
+                  ...(targetExpectedScope
+                    ? {
+                        expected_scope: {
+                          scope: "subgraph",
+                          owner_node_id: targetExpectedScope.ownerNodeId,
+                          ...(targetExpectedScope.workflowUuid !== undefined
+                            ? { workflow_uuid: targetExpectedScope.workflowUuid }
+                            : {}),
+                        },
+                      }
                     : {}),
                   ...(args.defer_until_idle === true
                     ? { defer_until_idle: true, expected_value: args.expected_value }
@@ -17133,6 +17145,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                   );
                 }
               },
+              plan.scope,
             );
             const exited = await leave();
             if (written.isError) {
@@ -17692,33 +17705,35 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           );
         }
 
+        const recoveryBeforeDispatch = recoveryBinding
+          ? () => {
+              const error = currentPromotedBindingError(ctx, recoveryBinding);
+              if (error) {
+                throw new Error(
+                  `Refusing promoted inner graph_set_widget: ${error}. No graph_set_widget was dispatched.`,
+                );
+              }
+              const scopeError = recoveryScope
+                ? currentPromotedScopeError(
+                    ctx,
+                    recoveryScope,
+                    true,
+                    authoritativeRecoveryScope.observed,
+                  )
+                : "the promoted recovery scope was unavailable";
+              if (scopeError) {
+                throw new Error(
+                  `Refusing promoted inner graph_set_widget: ${scopeError}. No graph_set_widget was dispatched.`,
+                );
+              }
+            }
+          : undefined;
         const written = await write(
           inner.innerNodeId,
           inner.widget,
           legacyFinalMapping.innerNodeType,
-          recoveryBinding
-            ? () => {
-                const error = currentPromotedBindingError(ctx, recoveryBinding);
-                if (error) {
-                  throw new Error(
-                    `Refusing promoted inner graph_set_widget: ${error}. No graph_set_widget was dispatched.`,
-                  );
-                }
-                const scopeError = recoveryScope
-                  ? currentPromotedScopeError(
-                      ctx,
-                      recoveryScope,
-                      true,
-                      authoritativeRecoveryScope.observed,
-                    )
-                  : "the promoted recovery scope was unavailable";
-                if (scopeError) {
-                  throw new Error(
-                    `Refusing promoted inner graph_set_widget: ${scopeError}. No graph_set_widget was dispatched.`,
-                  );
-                }
-              }
-            : undefined,
+          recoveryBeforeDispatch,
+          recoveryScope ?? undefined,
         );
         const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
         if (!written.isError) {

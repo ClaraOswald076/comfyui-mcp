@@ -97,7 +97,9 @@ function bridge(opts: {
   tabRebindBeforeWrite?: boolean;
   authoritativeScopeRead?: boolean;
   ownerNavigationAfterFinalQuery?: boolean;
-  ownerNavigationAfterReadBeforeDispatch?: boolean;
+  /** Navigation after MCP's final synchronous callback but before the panel
+   * receiver evaluates the expected_scope envelope. */
+  receiverNavigationAfterMcpFence?: boolean;
   omitWorkflowUuid?: boolean;
   workflowUuid?: string;
 }) {
@@ -106,9 +108,6 @@ function bridge(opts: {
   let subgraphReads = 0;
   let postEnterGraphQueries = 0;
   let authoritativeScopeReads = 0;
-  let authoritativeScopeWitness:
-    | { known: true; scope: "root" | "subgraph"; ownerNodeId: string | null; workflowUuid?: string }
-    | undefined;
   let inSubgraph = false;
   const workflowUuid = opts.workflowUuid ?? "workflow-a";
   let currentOwnerNodeId = 78;
@@ -179,11 +178,35 @@ function bridge(opts: {
       if (cmd.cmd === "graph_set_widget" && sendOpts?.beforeDispatch) {
         const mutation = beforeWrite.mutate;
         beforeWrite.mutate = undefined;
-        mutation?.();
-        sendOpts.beforeDispatch();
+        if (opts.receiverNavigationAfterMcpFence) {
+          // The MCP callback is the last synchronous server-side check. The
+          // browser can navigate after it returns and before the receiver
+          // handler applies the frame; this is the architectural race the
+          // expected_scope envelope must fence.
+          sendOpts.beforeDispatch();
+          mutation?.();
+        } else {
+          mutation?.();
+          sendOpts.beforeDispatch();
+        }
       }
       calls.push({ ...cmd });
       if (cmd.cmd === "graph_set_widget") {
+        const expectedScope = cmd.expected_scope;
+        if (expectedScope !== undefined) {
+          if (!expectedScope || typeof expectedScope !== "object" || Array.isArray(expectedScope)) {
+            throw new Error("graph_set_widget expected_scope must be a structured subgraph witness");
+          }
+          const expected = expectedScope as Record<string, unknown>;
+          const actualOwner = inSubgraph ? String(currentOwnerNodeId) : null;
+          if (
+            expected.scope !== "subgraph" ||
+            String(expected.owner_node_id) !== actualOwner ||
+            (expected.workflow_uuid !== undefined && expected.workflow_uuid !== workflowUuid)
+          ) {
+            throw new Error("graph_set_widget promoted receiver changed before dispatch: Nothing was applied.");
+          }
+        }
         writes += 1;
         if (writes === 1 && opts.ambiguous) throw new Error(AMBIGUOUS);
         if (writes === 1 && opts.scopeLost) throw new Error(SCOPE_REFUSAL);
@@ -310,8 +333,6 @@ function bridge(opts: {
             };
             // Keep the cached reply as a separate value. The live result is
             // the witness the final callback must carry forward.
-            authoritativeScopeWitness = liveWitness;
-            observedPromotedScope = { ...liveWitness };
             return liveWitness;
           },
         }
@@ -332,16 +353,12 @@ function bridge(opts: {
       // but has a different receiver session.
       connectionIdentity = { generation: 1, tabSessionId: "browser-tab-b" };
     };
-  } else if (opts.ownerNavigationAfterReadBeforeDispatch) {
+  } else if (opts.receiverNavigationAfterMcpFence) {
     beforeWrite.mutate = () => {
-      // The live graph_query has already returned owner A. Navigation to owner
-      // B happens in the bridge's final dispatch seam, before the synchronous
-      // callback. Mutate the returned live witness to model the authoritative
-      // receiver token becoming stale in that window; the cached copy remains A.
+      // The live graph_query and MCP-side callback both saw owner A. Navigation
+      // to owner B happens only at the receiver boundary; no returned witness
+      // object is mutated because production navigation cannot do that.
       currentOwnerNodeId = 79;
-      if (authoritativeScopeWitness?.known) {
-        authoritativeScopeWitness.ownerNodeId = String(currentOwnerNodeId);
-      }
     };
   }
   return {
@@ -353,6 +370,9 @@ function bridge(opts: {
     },
     get postEnterGraphQueries() {
       return postEnterGraphQueries;
+    },
+    get writesApplied() {
+      return writes;
     },
   };
 }
@@ -373,6 +393,7 @@ async function setWidget(
     calls,
     authoritativeScopeReads: harness.authoritativeScopeReads,
     postEnterGraphQueries: harness.postEnterGraphQueries,
+    writesApplied: harness.writesApplied,
   };
 }
 
@@ -850,20 +871,21 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
   });
 
   it("uses the live scope witness at the normal final dispatch fence", async () => {
-    const { text, isError, calls, authoritativeScopeReads } = await setWidget(
+    const { text, isError, calls, authoritativeScopeReads, writesApplied } = await setWidget(
       { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
       {
         firstWrite: "ok",
         subgraph: SAFE_ANIMA_SUBGRAPH,
         detailById: SAFE_ANIMA_IDENTITY_BY_ID,
         authoritativeScopeRead: true,
-        ownerNavigationAfterReadBeforeDispatch: true,
+        receiverNavigationAfterMcpFence: true,
       },
     );
 
     expect(isError).toBe(true);
-    expect(text).toMatch(/current subgraph owner changed|unverifiable/);
-    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(0);
+    expect(text).toMatch(/promoted receiver changed|Nothing was applied/);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(1);
+    expect(writesApplied).toBe(0);
     expect(authoritativeScopeReads).toBe(1);
   });
 
@@ -983,7 +1005,7 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
   });
 
   it("refuses legacy recovery navigation after the live read before inner dispatch", async () => {
-    const { text, isError, calls, authoritativeScopeReads } = await setWidget(
+    const { text, isError, calls, authoritativeScopeReads, writesApplied } = await setWidget(
       { node_id: 78, widget: "Quality_Prompt", value: "masterpiece" },
       {
         firstWrite: "contradict",
@@ -992,13 +1014,17 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
         subgraph: SAFE_ANIMA_SUBGRAPH,
         detailById: SAFE_ANIMA_IDENTITY_BY_ID,
         authoritativeScopeRead: true,
-        ownerNavigationAfterReadBeforeDispatch: true,
+        receiverNavigationAfterMcpFence: true,
       },
     );
 
     expect(isError).toBe(true);
-    expect(text).toMatch(/current subgraph owner changed|unverifiable/);
-    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(1);
+    expect(text).toMatch(/promoted receiver changed|Nothing was applied/);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(2);
+    expect(writesApplied).toBe(1);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")[1]).toMatchObject({
+      expected_scope: { scope: "subgraph", owner_node_id: "78", workflow_uuid: "workflow-a" },
+    });
     expect(authoritativeScopeReads).toBe(1);
   });
 

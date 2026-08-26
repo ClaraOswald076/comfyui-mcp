@@ -163,6 +163,7 @@ function connectPanel(
             enforces_workflow_stamp: true,
             enforces_workflow_stamp_at_write: true,
             enforces_expected_node_type_at_write: true,
+            enforces_expected_scope_at_write: true,
             // The panel's sessionStorage-backed browser-tab identity: unique per
             // browser tab, stable across a reload (#486/#709).
             ...(opts.tabSessionId ? { tab_session_id: opts.tabSessionId } : {}),
@@ -3214,6 +3215,121 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     expect((caught as Error).message).toMatch(/atomic expected-node-type write fence/);
     expect(isCapabilityRefusal(caught)).toBe(true);
     expect(dispatchOutcomeOf(caught)).toBe(false);
+    modern.close();
+  });
+
+  it("FAILS CLOSED when expected_scope reaches a panel without #2314's receiver fence", async () => {
+    const old = new WebSocket(`ws://127.0.0.1:${port}`);
+    await new Promise<void>((res, rej) => {
+      old.on("open", () => {
+        old.send(
+          JSON.stringify({
+            type: "hello",
+            tab_id: "tmp:old-promoted-scope-fence",
+            title: "old promoted scope fence",
+            enforces_workflow_stamp: true,
+            enforces_workflow_stamp_at_write: true,
+            enforces_expected_node_type_at_write: true,
+            // Deliberately omit the #2314 receiver-side scope fence. The
+            // panel would otherwise ignore expected_scope and could write a
+            // colliding inner id after navigation.
+          }),
+        );
+        res();
+      });
+      old.on("error", rej);
+    });
+    await waitFor(() =>
+      expect(bridge.tabs().some((t) => t.tab_id === "tmp:old-promoted-scope-fence")).toBe(true),
+    );
+    expect(bridge.tabExpectedScopeFenceCapability("tmp:old-promoted-scope-fence")).toBe(false);
+    const caught = await bridge
+      .send(
+        {
+          cmd: "graph_set_widget",
+          node_id: 76,
+          widget: "quality_prompt",
+          value: "NEW",
+          expected_scope: {
+            scope: "subgraph",
+            owner_node_id: "78",
+            workflow_uuid: "workflow-a",
+          },
+        },
+        { tabId: "tmp:old-promoted-scope-fence" },
+      )
+      .then(
+        () => null,
+        (err) => err,
+      );
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toMatch(/atomic promoted-scope write fence.*0\.15\.97/i);
+    expect(isCapabilityRefusal(caught)).toBe(true);
+    expect(dispatchOutcomeOf(caught)).toBe(false);
+    old.close();
+  });
+
+  it("rechecks expected_scope capability after a graph-lane wait and reconnect", async () => {
+    const modern = await connectPanel("tmp:queued-promoted-scope", "queued");
+    await waitFor(() =>
+      expect(bridge.tabs().some((t) => t.tab_id === "tmp:queued-promoted-scope")).toBe(true),
+    );
+    const frames: Array<Record<string, unknown>> = [];
+    modern.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString()) as Record<string, unknown>;
+      if (msg.rid && msg.cmd) frames.push(msg);
+    });
+    const predecessor = bridge.send({ cmd: "graph_outline" } as never, {
+      tabId: "tmp:queued-promoted-scope",
+    });
+    await waitFor(() => expect(frames.some((frame) => frame.cmd === "graph_outline")).toBe(true));
+    const fenced = bridge.send(
+      {
+        cmd: "graph_set_widget",
+        node_id: 76,
+        widget: "quality_prompt",
+        value: "NEW",
+        expected_scope: {
+          scope: "subgraph",
+          owner_node_id: "78",
+          workflow_uuid: "workflow-a",
+        },
+      },
+      { tabId: "tmp:queued-promoted-scope" },
+    );
+
+    // A reconnect can re-hello on the same socket while the graph lane waits.
+    // The launch-time capability check must not let the optional envelope reach
+    // a downgraded panel that would ignore it.
+    modern.send(
+      JSON.stringify({
+        type: "hello",
+        tab_id: "tmp:queued-promoted-scope",
+        title: "old queued promoted-scope panel",
+        enforces_workflow_stamp: true,
+        enforces_workflow_stamp_at_write: true,
+        enforces_expected_node_type_at_write: true,
+      }),
+    );
+    await waitFor(() =>
+      expect(bridge.tabExpectedScopeFenceCapability("tmp:queued-promoted-scope")).toBe(false),
+    );
+    const first = frames.find((frame) => frame.cmd === "graph_outline");
+    const firstRid = first?.rid;
+    expect(firstRid).toBeTruthy();
+    if (!firstRid) throw new Error("graph_outline was not dispatched");
+    modern.send(JSON.stringify({ rid: firstRid, ok: true, result: {} }));
+    await predecessor;
+
+    const caught = await fenced.then(
+      () => null,
+      (err) => err,
+    );
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toMatch(/atomic promoted-scope write fence/);
+    expect(isCapabilityRefusal(caught)).toBe(true);
+    expect(dispatchOutcomeOf(caught)).toBe(false);
+    expect(frames.some((frame) => frame.cmd === "graph_set_widget")).toBe(false);
     modern.close();
   });
 
