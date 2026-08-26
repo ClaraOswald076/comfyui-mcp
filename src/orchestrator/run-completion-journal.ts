@@ -231,9 +231,9 @@ export interface JournalEntry {
   /** How many turns carried this completion and then ended without a provable
    *  ack. Bounds the replay loop — see release(). */
   carriedReleases?: number;
-  /** ID-LESS only: an identical completion was delivered recently, so this may be
-   *  the same frame re-sent. Delivered anyway (never swallowed) but FLAGGED, so
-   *  the agent doesn't double-count it. */
+  /** An identical completion was delivered recently, so this may be the same
+   *  frame re-sent. The scheduling fence consumes this marker before a second
+   *  agent turn; it is retained here so the journal's verdict cannot be lost. */
   possibleRepeat?: boolean;
   /** This entry's prompt id was queued AGAIN while it was still undelivered, so
    *  it belongs to the older run. Still delivered, but it can no longer be merged
@@ -371,6 +371,8 @@ export class RunCompletionJournalImpl {
   private forgottenOwnRuns = new Set<string>();
   /** token → entry (insertion-ordered, which is also delivery order). */
   private entries = new Map<string, JournalEntry>();
+  /** Entries suppressed by the scheduling callback during the current flush. */
+  private suppressedDuringDelivery = new Set<string>();
   /** (tab, run) pairs whose completion was ACKED — a bounded FIFO memo so a
    *  panel that re-sends the frame after the entry was removed can't produce a
    *  second delivery. */
@@ -865,11 +867,11 @@ export class RunCompletionJournalImpl {
    *    re-sent frame producing two turns (the agent double-reporting, or acting
    *    twice on one output), while a later genuinely different render — or the
    *    same content long afterwards — is still delivered.
-   * NEVER returns null: a completion is always journaled and always delivered.
-   * The most this does is COLLAPSE onto a twin that nobody has seen yet, or FLAG
-   * one as a possible repeat. Suppression was the source of every loss this file
-   * kept re-growing, because each proof it rested on is bounded and any expiry at
-   * the wrong moment turned a new run's result into a discarded "duplicate".
+   * NEVER returns null: a completion is always journaled. The most this does is
+   * COLLAPSE onto a twin that nobody has seen yet, or FLAG one as a possible
+   * repeat. The final scheduling boundary consumes that flag before creating a
+   * second agent turn; the journal itself never drops the event before that
+   * boundary, so a normal replay remains recoverable.
    */
   record(
     key: string,
@@ -979,7 +981,7 @@ export class RunCompletionJournalImpl {
       // Both cases fall back to the standing rule: duplicate over loss, each
       // delivered on its own and labelled UNDETERMINED.
       idUnprovable = idReused || gen === 0;
-      // ALREADY-DELIVERED IS A LABEL, NEVER A VETO.
+      // ALREADY-DELIVERED IS A JOURNAL VERDICT, NOT THE SCHEDULING VETO.
       //
       // This used to `return null` — suppressing the completion outright — and
       // that single decision produced defect after defect, because every proof it
@@ -989,18 +991,16 @@ export class RunCompletionJournalImpl {
       // swallowed: exactly the failure this whole file exists to prevent, and the
       // one the project's rules call worse than a duplicate.
       //
-      // So the journal now NEVER suppresses an identified completion. It delivers
-      // it FLAGGED as a possible repeat and lets the agent — which can read the
-      // prompt id, see the outputs, and call get_history — decide. No expiry can
-      // turn that into a loss, and the honest failure mode is a second turn
-      // saying "this may be the same render", not silence.
+      // The journal records it FLAGGED as a possible repeat. The orchestrator's
+      // scheduling boundary consumes that flag before creating another turn;
+      // this journal still retains the entry until that boundary handles it.
       if (
         !idUnprovable &&
         (this.delivered.has(deliveredKey(ownerOf(key, conversation), correlation.promptId, gen)) ||
           (settledTicket?.settled === true && ownsRun(settledTicket, key, conversation)))
       ) {
         logger.info(
-          `[run-completions] a completion for ${describe(correlation)} was already delivered to tab ${key.slice(0, 8)} — forwarding this one FLAGGED as a possible repeat (never suppressed)`,
+          `[run-completions] a completion for ${describe(correlation)} was already delivered to tab ${key.slice(0, 8)} — forwarding this one FLAGGED for the scheduling fence`,
         );
         alreadyDelivered = true;
       }
@@ -1073,7 +1073,7 @@ export class RunCompletionJournalImpl {
       idlessRepeat = repeatHint || twinJournaled;
       if (idlessRepeat) {
         logger.info(
-          `[run-completions] tab ${key.slice(0, 8)}: an id-less completion with identical content is already known — forwarding this one FLAGGED as a possible repeat (never merged, never suppressed: content is not identity)`,
+          `[run-completions] tab ${key.slice(0, 8)}: an id-less completion with identical content is already known — forwarding this one FLAGGED for the scheduling fence`,
         );
       }
     }
@@ -1203,9 +1203,10 @@ export class RunCompletionJournalImpl {
         ...(entry.possibleRepeat ? { possible_repeat: true } : {}),
       };
       const handedOff = inject(payload, entry.token);
+      const suppressed = this.suppressedDuringDelivery.delete(entry.token);
       this.noteAttempt(entry.token, handedOff);
       if (!handedOff) return { delivered, blockedOn: entry };
-      if (lost > 0) {
+      if (lost > 0 && !suppressed) {
         // CONSOLIDATE onto the entry; do NOT consider the disclosure spent yet.
         // A hand-off is not consumption: if this agent is stopped before its turn
         // runs, the entry is released and replayed, and the warning must go with
@@ -1425,6 +1426,24 @@ export class RunCompletionJournalImpl {
       }
     }
     entry.state = "pending";
+  }
+
+  /**
+   * Remove a duplicate at the scheduling boundary without settling a ticket.
+   * The durable completion fence has already proven that another entry for the
+   * same route/run was accepted, so this duplicate must not become another turn.
+   * A suppressed carrier is NOT a successful disclosure delivery: move any
+   * eviction count it carried back to the side map so a later non-suppressed
+   * entry resurfaces it.
+   */
+  suppress(token: string): void {
+    const entry = this.entries.get(token);
+    if (!entry) return;
+    this.suppressedDuringDelivery.add(token);
+    if ((entry.disclose ?? 0) > 0) {
+      this.dropped.set(entry.key, (this.dropped.get(entry.key) ?? 0) + entry.disclose!);
+    }
+    this.entries.delete(token);
   }
 
   /** Move every entry AND every open run ticket from `from` onto `to` — a panel
@@ -1677,6 +1696,7 @@ export class RunCompletionJournalImpl {
   reset(): void {
     this.tickets.clear();
     this.entries.clear();
+    this.suppressedDuringDelivery.clear();
     this.dropped.clear();
     this.delivered.clear();
     this.completionReceipts.clear();

@@ -29,6 +29,18 @@ const indexSrc = (): string =>
   readFileSync(new URL("../../orchestrator/index.ts", import.meta.url), "utf8");
 
 describe("#1789 — the history fallback is WIRED into the orchestrator, not merely available", () => {
+  it("SOURCE: completion fences remain reclaimable until the real turn ack", () => {
+    const src = indexSrc();
+    expect(src).toContain("onAccepted: (identity) => completionFenceTokens.set(token, identity)");
+    expect(src).not.toContain("replay: payload.replayed === true");
+    const ackAt = src.indexOf("function ackEventToken(");
+    expect(ackAt).toBeGreaterThan(-1);
+    const ackBlock = src.slice(ackAt, ackAt + 1500);
+    expect(ackBlock).toContain("completionFence.markDelivered(identity)");
+    expect(ackBlock).toContain("RunCompletions.ack(token)");
+    expect(ackBlock).toContain("completionFence.release(identity)");
+  });
+
   it("SOURCE: the orchestrator constructs the watchdog against the real journal", () => {
     const src = indexSrc();
     expect(src).toContain("createRunCompletionWatchdog({");
