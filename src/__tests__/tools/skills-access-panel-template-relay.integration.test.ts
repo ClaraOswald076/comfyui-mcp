@@ -4,6 +4,9 @@ import { createServer, type Server } from "node:http";
 const state = vi.hoisted(() => ({
   baseUrl: "http://127.0.0.1:8188",
   headlessCalls: 0,
+  headlessUrls: [] as string[],
+  /** When set, the headless COMFYUI_URL path answers with this index instead of throwing. */
+  headlessIndex: undefined as Record<string, unknown> | undefined,
 }));
 
 vi.mock("../../config.js", () => ({
@@ -12,9 +15,16 @@ vi.mock("../../config.js", () => ({
 }));
 
 vi.mock("../../comfyui/fetch.js", () => ({
-  comfyuiFetch: async () => {
+  comfyuiFetch: async (url: string) => {
     state.headlessCalls += 1;
-    throw new Error("the panel-backed path must not use COMFYUI_URL");
+    state.headlessUrls.push(url);
+    // Default: assert the panel-backed path never reaches COMFYUI_URL. Tests
+    // that EXPECT the headless path set state.headlessIndex first.
+    if (state.headlessIndex === undefined) throw new Error("the panel-backed path must not use COMFYUI_URL");
+    return new Response(JSON.stringify(state.headlessIndex), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
   },
 }));
 
@@ -73,6 +83,8 @@ afterEach(async () => {
   delete process.env.COMFYUI_MCP_RELAY_SECRET;
   delete process.env.COMFYUI_MCP_TEMPLATE_RELAY_URL;
   state.headlessCalls = 0;
+  state.headlessUrls = [];
+  state.headlessIndex = undefined;
   for (const server of servers.splice(0)) await server.close();
   vi.restoreAllMocks();
 });
@@ -108,23 +120,30 @@ describe("list_packs -> panel template relay production boundary (#2196)", () =>
     });
     expect(state.headlessCalls).toBe(0);
   });
-  // #2382/#2385 REGRESSION PIN. 0.52.135 dropped "localhost" from the relay's
-  // loopback set, so this exact call returned "The connected panel template
-  // relay failed (NO_PANEL_ORIGIN)." instead of the index for every user whose
-  // ComfyUI is served at http://localhost:<port>. The headless COMFYUI_URL path
-  // is fail-closed once a panel route exists, so there was nothing to fall back
-  // to. This drives the REAL orchestrator wiring, not a hand-written origin
-  // resolver, because the defect lived in what that wiring authorizes.
-  it("serves list_templates through the relay when the panel is served at localhost", async () => {
+  // #2382/#2385 REGRESSION PIN — the user-visible surface.
+  //
+  // 0.52.135 dropped "localhost" from the relay's loopback set, so this exact
+  // call returned "The connected panel template relay failed (NO_PANEL_ORIGIN)."
+  // instead of the index for every user whose ComfyUI is served at
+  // http://localhost:<port>, with no headless fallback to catch it.
+  //
+  // The relay still refuses to FETCH the ambiguous name — that part of the
+  // refusal is correct — but it now declines, so list_templates completes on
+  // the established headless path. Drives the REAL orchestrator wiring, because
+  // the defect lived in what that wiring authorizes.
+  it("completes list_templates headlessly when the panel is served at localhost", async () => {
+    let panelRequests = 0;
     const panel = createServer((_req, res) => {
+      panelRequests += 1;
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ "panel-pack": [{ name: "localhost-template" }] }));
+      res.end(JSON.stringify({ "wrong-listener": [{ name: "must-not-be-fetched" }] }));
     });
     const boundOrigin = await listen(panel);
     servers.push({ close: () => closeServer(panel) });
     const port = new URL(boundOrigin).port;
     const localhostOrigin = `http://localhost:${port}`;
-    state.baseUrl = `${localhostOrigin}/comfyapi`;
+    state.baseUrl = localhostOrigin;
+    state.headlessIndex = { "headless-pack": [{ name: "localhost-template" }] };
 
     const bridge = {
       canReach: () => true,
@@ -147,12 +166,15 @@ describe("list_packs -> panel template relay production boundary (#2196)", () =>
 
     const result = await listPacksHandler()({ action: "list_templates" });
     const text = result.content.map((block) => block.text).join(" ");
+    // The 0.52.135 symptom, verbatim, must not be what the user sees.
     expect(text).not.toContain("NO_PANEL_ORIGIN");
     expect(JSON.parse(text)).toMatchObject({
-      source_count: 1,
-      template_count: 1,
-      templates: { "panel-pack": [{ name: "localhost-template" }] },
+      templates: { "headless-pack": [{ name: "localhost-template" }] },
     });
-    expect(state.headlessCalls).toBe(0);
+    // It completed BECAUSE it degraded, against the same origin the panel is on.
+    expect(state.headlessCalls).toBe(1);
+    expect(state.headlessUrls).toEqual([`${localhostOrigin}/api/workflow_templates`]);
+    // And the ambiguous name was never relayed, so no other listener could answer.
+    expect(panelRequests).toBe(0);
   });
 });

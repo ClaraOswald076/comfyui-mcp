@@ -21,29 +21,23 @@ export const PANEL_TEMPLATE_RELAY_HTTP_PATH = "/__comfyui_mcp_panel_template_rel
 
 const ID_RE = /^[A-Za-z0-9_-]{16,80}$/;
 const HEX_RE = /^[a-f0-9]{64}$/;
-// `localhost` is a NAME, not a listener identity, so an exact origin match does
-// not prove the later fetch reaches the socket the browser is on (#2382). It is
-// still accepted here, because refusing it costs more than it buys:
+// Relay destinations are LITERAL loopback addresses only. A hostname does not
+// identify which listener a browser reached, so `localhost` must never become a
+// relay fetch target: Node >=20 connects with Happy Eyeballs, and with a second
+// process on the other loopback family that fetch can reach the wrong one
+// (#2382).
 //
-//   - Refusing it (#2385, shipped in 0.52.135) took `list_packs
-//     action:"list_templates"` from working to erroring for every user whose
-//     ComfyUI is served at `http://localhost:<port>` — an ordinary setup, and
-//     the panel Origin is the browser's. The relay declines, and
-//     `listWorkflowTemplatesAction` deliberately does not fall back to
-//     COMFYUI_URL once a panel route exists, so the action has no path left.
-//   - The non-adversarial hazard it was meant to prevent does not occur on a
-//     supported runtime. Node >=20 connects with Happy Eyeballs
-//     (`autoSelectFamily`), so `fetch("http://localhost:<port>")` reaches a
-//     127.0.0.1-only OR a ::1-only listener; measured on Node 24.16.0 against
-//     both single-family binds. There is no "resolved the wrong family and the
-//     fetch failed" case to fix.
-//   - What remains is a second local process squatting the other loopback
-//     family, which one-machine/one-trust-domain puts out of scope.
-//
-// So the destination stays loopback-only, and `localhost` stays usable. A
-// mixed pair (`localhost` observed vs `127.0.0.1` configured, or vice versa)
-// is still refused below by the exact-origin equality.
-const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
+// `localhost` is NOT simply refused, though — refusing it outright (#2385,
+// shipped in 0.52.135) took `list_packs action:"list_templates"` from working to
+// erroring for every user whose ComfyUI is served at `http://localhost:<port>`.
+// See AMBIGUOUS_LOOPBACK_NAMES: that case declines the RELAY and lets the caller
+// continue on its established headless path instead.
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1"]);
+
+// Loopback names that resolve to an address family rather than naming one. An
+// origin built from these cannot authorize a relay fetch, but it is also not an
+// error: see ambiguousLoopbackNameOrigin.
+const AMBIGUOUS_LOOPBACK_NAMES = new Set(["localhost"]);
 
 export interface PanelTemplateRelayRequest {
   version: typeof PANEL_TEMPLATE_RELAY_VERSION;
@@ -100,6 +94,11 @@ export interface PanelTemplateRelayServerOptions {
   resolvePanelUrl: (tabId: string, currentTarget: string) => string | undefined;
   /** Must return undefined unless the tab's origin is authorized for currentTarget. */
   resolveAllowedPanelOrigin: (tabId: string, currentTarget: string) => string | undefined;
+  /**
+   * True when the refusal is only an ambiguous loopback NAME identical on both
+   * sides, which the child reports as "no panel route" rather than a failure.
+   */
+  resolveAmbiguousLoopbackOrigin?: (tabId: string, currentTarget: string) => boolean;
 }
 
 export interface PanelTemplateRelayServer {
@@ -240,6 +239,7 @@ function validateResponse(value: unknown, requestId: string, secret: string): Re
 
 function errorMessage(error: string): string {
   const known = new Set([
+    "AMBIGUOUS_PANEL_ORIGIN",
     "AMBIGUOUS_REQUESTER",
     "BACKLOG_FULL",
     "HTTP_ERROR",
@@ -454,6 +454,37 @@ export function currentPanelTemplateOrigin(
   return exactLoopbackOrigin ? observed.origin : undefined;
 }
 
+/**
+ * True when the panel Origin and the configured target are the SAME ambiguous
+ * loopback name (`http://localhost:8188` on both sides).
+ *
+ * This is the one refusal that must not surface as an error. The relay cannot
+ * use the origin — `localhost` does not name a listener, so fetching it could
+ * reach a different process on the other loopback family (#2382). But because
+ * the two operands are byte-identical, the caller's headless COMFYUI_URL path
+ * points at *the same origin string the panel is on*, so degrading to it cannot
+ * "silently list a different server's templates" — the concern that makes the
+ * relay fail-closed everywhere else. By construction there is no other server.
+ *
+ * A MIXED pair (`localhost` observed vs `127.0.0.1` configured, or the reverse)
+ * is a genuine mismatch and stays a hard refusal.
+ */
+export function ambiguousLoopbackNameOrigin(
+  panelOrigin: string | undefined,
+  currentTarget: string | undefined,
+): boolean {
+  const observed = parsedHttpOrigin(panelOrigin);
+  const target = parsedHttpOrigin(currentTarget);
+  if (!observed || !target) return false;
+  return (
+    AMBIGUOUS_LOOPBACK_NAMES.has(observed.host) &&
+    AMBIGUOUS_LOOPBACK_NAMES.has(target.host) &&
+    observed.protocol === target.protocol &&
+    observed.port === target.port &&
+    observed.origin === target.origin
+  );
+}
+
 function safePanelTemplateUrl(raw: string | undefined, allowedOrigin: string | undefined): URL | undefined {
   if (!raw) return undefined;
   try {
@@ -580,7 +611,15 @@ export async function startPanelTemplateRelayServer(
               options.bridge.resolveFailure?.(auth.agentKey) === "ambiguous" ? "AMBIGUOUS_REQUESTER" : "NO_LIVE_PANEL",
             );
           } else if (!panelUrl) {
-            response = failureResponse(request.requestId, "NO_PANEL_ORIGIN");
+            // An identical ambiguous loopback name is a DECLINE, not a failure:
+            // the child turns AMBIGUOUS_PANEL_ORIGIN back into "no panel route"
+            // so list_templates continues headless instead of erroring (#2382).
+            response = failureResponse(
+              request.requestId,
+              options.resolveAmbiguousLoopbackOrigin?.(panelTab, targetAtStart.url)
+                ? "AMBIGUOUS_PANEL_ORIGIN"
+                : "NO_PANEL_ORIGIN",
+            );
           } else {
             try {
               const body = await withinDeadline(fetchPanelIndex(panelUrl, requestDeadline(request)), requestDeadline(request));
@@ -684,6 +723,10 @@ export async function requestPanelTemplateIndex(): Promise<Record<string, unknow
     throw new PanelTemplateRelayError("The connected panel template relay is unavailable.", code, httpResponse.status >= 500);
   }
   const response = validateResponse(decoded, request.requestId, secret);
+  // The relay declined an ambiguous loopback name rather than failing. That is
+  // "this child has no usable panel route" — the documented meaning of
+  // undefined — so the caller keeps its established headless path (#2382).
+  if (response.ok === false && response.error === "AMBIGUOUS_PANEL_ORIGIN") return undefined;
   if (response.ok === false) responseFailureMessage(response);
   const age = Date.now() - response.updated;
   if (

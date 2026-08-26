@@ -115,6 +115,7 @@ import {
 } from "../services/panel-image-relay.js";
 import {
   startPanelTemplateRelayServer,
+  ambiguousLoopbackNameOrigin,
   currentPanelTemplateOrigin,
   verifyPanelTemplateRelayCapability,
   type PanelTemplateRelayResolvedAgent,
@@ -954,6 +955,7 @@ export interface PanelTemplateRelayWiring {
   resolveCurrentTarget: () => PanelTemplateRelayTarget;
   resolvePanelUrl: (tabId: string, currentTarget: string) => string | undefined;
   resolveAllowedPanelOrigin: (tabId: string, currentTarget: string) => string | undefined;
+  resolveAmbiguousLoopbackOrigin: (tabId: string, currentTarget: string) => boolean;
 }
 
 /**
@@ -987,6 +989,11 @@ export function createPanelTemplateRelayWiring(options: {
   });
   const resolveAllowedPanelOrigin = (tabId: string, currentTarget: string): string | undefined =>
     currentPanelTemplateOrigin(options.bridge.tabServerOrigin(tabId), currentTarget);
+  // #2382 — separates "cannot authorize this origin" from "this origin is an
+  // ambiguous loopback NAME identical on both sides". Only the latter degrades
+  // to the headless path; everything else stays a hard relay failure.
+  const resolveAmbiguousLoopbackOrigin = (tabId: string, currentTarget: string): boolean =>
+    ambiguousLoopbackNameOrigin(options.bridge.tabServerOrigin(tabId), currentTarget);
   const resolvePanelUrl = (tabId: string, currentTarget: string): string | undefined => {
     const origin = currentPanelTemplateOrigin(options.bridge.tabServerOrigin(tabId), currentTarget);
     if (!origin) return undefined;
@@ -1003,6 +1010,7 @@ export function createPanelTemplateRelayWiring(options: {
     resolveCurrentTarget,
     resolvePanelUrl,
     resolveAllowedPanelOrigin,
+    resolveAmbiguousLoopbackOrigin,
   };
 }
 
