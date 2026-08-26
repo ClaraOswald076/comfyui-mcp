@@ -180,4 +180,114 @@ describe("recent_errors as a limit (#1146)", () => {
     expect(text).toMatch(/not requested/);
     expect(text).not.toMatch(/Traceback/);
   });
+
+  it("does not match normal log lines containing the word 'error' as a substring", async () => {
+    // Issue #2329: normal output like "0 errors found" or "no errors" gets matched
+    // by /error/i but should not be treated as actual error lines.
+    fetchApi.mockImplementation(async (path: string) =>
+      path === "/internal/logs"
+        ? new Response(
+            "startup ok\nImport check: 0 errors found\nModel load status: 0 errors\n[ERROR] Real error occurred here\nStartup: 0 errors during init\n",
+            { status: 200 }
+          )
+        : new Response(JSON.stringify([]), { status: 200 }),
+    );
+    const text = await runHealthCheck({ modelCategories: [], recentErrors: 10 });
+    // Should only match the real [ERROR] line, not the "0 errors" lines
+    expect(text).toMatch(/Real error occurred here/);
+    expect(text).toMatch(/Recent errors\*\* \(last 1\)/);
+    expect(text).not.toMatch(/0 errors found/);
+    expect(text).not.toMatch(/0 errors during/);
+  });
+
+  it("filters lines by actual error severity, not substring matching", async () => {
+    // Only lines with [ERROR], [EXCEPTION], or Traceback markers should be kept
+    fetchApi.mockImplementation(async (path: string) =>
+      path === "/internal/logs"
+        ? new Response(
+            [
+              "2026-08-25T20:00:00 [INFO] ComfyUI startup",
+              "2026-08-25T20:00:01 [INFO] Import successful: 0 errors",
+              "2026-08-25T20:00:02 [WARNING] Some warning message",
+              "2026-08-25T20:00:03 [ERROR] Connection error on port 8188",
+              "2026-08-25T20:00:04 [ERROR] Failed to load model",
+            ].join("\n"),
+            { status: 200 }
+          )
+        : new Response(JSON.stringify([]), { status: 200 }),
+    );
+    const text = await runHealthCheck({ modelCategories: [], recentErrors: 10 });
+    // Should only have 2 error lines
+    expect(text).toMatch(/Recent errors\*\* \(last 2\)/);
+    expect(text).toMatch(/Connection error/);
+    expect(text).toMatch(/Failed to load model/);
+    expect(text).not.toMatch(/0 errors/);
+    expect(text).not.toMatch(/Some warning/);
+  });
+
+  it("matches ERROR: prefix format without brackets", async () => {
+    // Python logging format: ERROR:root:message or ERROR:module:message
+    fetchApi.mockImplementation(async (path: string) =>
+      path === "/internal/logs"
+        ? new Response(
+            [
+              "2026-08-25T20:00:00 [INFO] startup",
+              "2026-08-25T20:00:01 DEBUG: Some debug info, 0 errors found",
+              "2026-08-25T20:00:02 ERROR:root:Failed to load model weights",
+              "2026-08-25T20:00:03 INFO: Model cached, 0 errors so far",
+              "2026-08-25T20:00:04 ERROR:comfyui.loader:Checkpoint not found",
+            ].join("\n"),
+            { status: 200 }
+          )
+        : new Response(JSON.stringify([]), { status: 200 }),
+    );
+    const text = await runHealthCheck({ modelCategories: [], recentErrors: 10 });
+    // Should only have 2 ERROR: lines, not the 0 errors or debug lines
+    expect(text).toMatch(/Recent errors\*\* \(last 2\)/);
+    expect(text).toMatch(/Failed to load model/);
+    expect(text).toMatch(/Checkpoint not found/);
+    expect(text).not.toMatch(/0 errors/);
+    expect(text).not.toMatch(/DEBUG/);
+  });
+
+  it("groups error marker with continuation lines before slicing", async () => {
+    // Regression: if we slice the lines array after adding continuations, we might
+    // return only a continuation line without its error marker.
+    fetchApi.mockImplementation(async (path: string) =>
+      path === "/internal/logs"
+        ? new Response(
+            [
+              "2026-08-25T20:00:00 [INFO] startup",
+              "Traceback (most recent call last):",
+              "  File a.py, line 1, in module",
+              "  File b.py, line 2, in func",
+              "  ValueError: invalid value",
+              "2026-08-25T20:00:01 [ERROR] Later error",
+            ].join("\n"),
+            { status: 200 }
+          )
+        : new Response(JSON.stringify([]), { status: 200 }),
+    );
+    const text = await runHealthCheck({ modelCategories: [], recentErrors: 1 });
+    // With recent_errors:1, should get the LAST error group, which is the simple [ERROR] line.
+    // NOT the continuation line "ValueError: invalid value" without its traceback context.
+    expect(text).toMatch(/Recent errors\*\* \(last 1\)/);
+    expect(text).toMatch(/Later error/);
+    expect(text).not.toMatch(/ValueError/);
+  });
+
+  it("handles non-string JSON responses from /internal/logs", async () => {
+    // If /internal/logs returns JSON that's not a string (e.g., {"error":"failed"}),
+    // we should not crash on text.split() but fall back to raw text.
+    fetchApi.mockImplementation(async (path: string) =>
+      path === "/internal/logs"
+        ? new Response(JSON.stringify({ error: "backend failure" }), { status: 200 })
+        : new Response(JSON.stringify([]), { status: 200 }),
+    );
+    const text = await runHealthCheck({ modelCategories: [], recentErrors: 10 });
+    // Should not crash and should report none found
+    expect(text).toMatch(/Recent errors/);
+    // The raw JSON object converted to string won't have error markers, so no errors found
+    expect(text).toMatch(/none in \/internal\/logs/);
+  });
 });
