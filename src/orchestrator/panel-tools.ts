@@ -16717,6 +16717,39 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           innerExpectedNodeType = innerIdentity.type;
         }
 
+        // #2299 — every pre-write guard above probed the OUTER scope, but this retry
+        // writes a DIFFERENT node: the promoted inner one. For a dynamic-combo child
+        // that is exactly the false success the guard exists to stop. The outer probe
+        // cannot see it and correctly falls open — the container exposes the promoted
+        // child but not the `model` PARENT, so the COMFY_DYNAMICCOMBO_V3 half of the
+        // shape is unprovable there. Only the inner node carries both halves.
+        //
+        // The stack_data fence above does re-query after entering, but it is gated on
+        // `expectedNodeType`, which is set only when the addressed widget IS stack_data
+        // — so it never runs for any other widget. This is the same re-probe for the
+        // dotted-child case, and the canvas is already inside the subgraph here, so
+        // `inner.innerNodeId` resolves.
+        const innerDynamicComboBlocked = await refuseDynamicComboSubWidgetWrite(
+          ctx,
+          inner.innerNodeId,
+          inner.widget,
+        );
+        if (innerDynamicComboBlocked) {
+          const exitedEarly = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
+          return appendToolResultText(
+            first,
+            `
+
+(The promoted inner node ${inner.innerNodeId} owns "${inner.widget}" as a ` +
+              `dynamic-combo child; ${textOfToolResult(innerDynamicComboBlocked)} ` +
+              `No inner graph_set_widget was dispatched.${
+                exitedEarly.isError
+                  ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exitedEarly)}`
+                  : ""
+              })`,
+          );
+        }
+
         const written = await write(inner.innerNodeId, inner.widget, innerExpectedNodeType);
         const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
         if (!written.isError) {

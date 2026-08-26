@@ -73,6 +73,10 @@ function bridge(opts: {
   promotedDetail?: Record<string, unknown>;
   stackDataIdentity?: Record<string, unknown>;
   stackDataInnerIdentity?: Record<string, unknown> | null;
+  /** #2299: graph_query detail keyed by the id the call asked for, so the outer
+   *  probe (which cannot prove the dynamic-combo shape) and the post-enter inner
+   *  probe (which can) return different rows. */
+  detailById?: Record<string, unknown>;
 }) {
   const calls: Array<Record<string, unknown>> = [];
   let writes = 0;
@@ -85,6 +89,7 @@ function bridge(opts: {
         if (writes === 1 && opts.ambiguous) throw new Error(AMBIGUOUS);
         if (writes === 1 && opts.scopeLost) throw new Error(SCOPE_REFUSAL);
         if (writes === 1 && opts.stackDataIdentity) throw new Error(STACK_DATA_CONTRADICTORY);
+        if (writes === 1 && opts.detailById) throw new Error(DYNAMIC_CHILD_CONTRADICTORY);
         const which =
           writes === 1
             ? (opts.firstWrite ?? "contradict")
@@ -111,6 +116,10 @@ function bridge(opts: {
       }
       if (cmd.cmd === "graph_query") {
         graphQueries += 1;
+        const wantId = Array.isArray(cmd.ids) && cmd.ids.length ? String(cmd.ids[0]) : null;
+        if (opts.detailById && wantId && opts.detailById[wantId] !== undefined) {
+          return opts.detailById[wantId];
+        }
         if (opts.stackDataIdentity && graphQueries <= 2) return opts.stackDataIdentity;
         if (opts.stackDataIdentity && graphQueries === 3) {
           return opts.stackDataInnerIdentity ?? { nodes: [{ id: 76, type: "OtherLoraLoader" }] };
@@ -159,6 +168,99 @@ async function setWidget(
     calls,
   };
 }
+
+// #2299 — a COMFY_DYNAMICCOMBO_V3 child promoted out of a subgraph. The write is
+// refused as "not promoted", recovery enters the subgraph and retries on the INNER
+// node — a node no pre-write guard ever probed.
+const DYNAMIC_CHILD_CONTRADICTORY =
+  `Cannot set widget on subgraph node 78: "model.prompt" is not a promoted widget on this subgraph ` +
+  `(promoted: model.prompt).`;
+
+const DYNAMIC_SUBGRAPH = {
+  subgraph_of: { node_id: 78, title: "H3" },
+  instance_widgets: { "model.prompt": "" },
+  node_count: 1,
+  nodes: [
+    {
+      id: 76,
+      type: "MinimaxHailuo03TextToVideoNode",
+      widgets: { model: "text-to-video", "model.prompt": "" },
+    },
+  ],
+};
+
+// Only the INNER node carries both halves of the shape. The container exposes the
+// promoted child but not the `model` parent, so id 190 here stands in for an outer
+// probe that cannot prove it and must fall open.
+const DYNAMIC_DETAIL_BY_ID = {
+  "78": { nodes: [{ id: 190, inputs: [{ slot: 0, name: "model.prompt" }] }] },
+  "76": {
+    nodes: [
+      {
+        id: 76,
+        type: "MinimaxHailuo03TextToVideoNode",
+        widgets: { model: "text-to-video", "model.prompt": "" },
+        inputs: [
+          { name: "model", type: "COMFY_DYNAMICCOMBO_V3" },
+          { name: "model.prompt", type: "STRING" },
+        ],
+      },
+    ],
+  },
+};
+
+describe("panel_set_widget promoted inner dynamic-combo child (#2299)", () => {
+  it("refuses the inner write instead of reporting a false success", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "model.prompt", value: "a long prompt" },
+      {
+        firstWrite: "contradict",
+        subgraph: DYNAMIC_SUBGRAPH,
+        detailById: DYNAMIC_DETAIL_BY_ID,
+      },
+    );
+    expect(isError).toBe(true);
+    expect(text).toContain("dynamic-combo");
+    expect(text).toContain("No inner graph_set_widget was dispatched");
+    // The recovery entered the subgraph and left it again...
+    expect(calls.some((c) => c.cmd === "graph_enter_subgraph")).toBe(true);
+    expect(calls.some((c) => c.cmd === "graph_exit_subgraph")).toBe(true);
+    // ...and the INNER node was never written. Only the outer attempt happened.
+    const writes = calls.filter((c) => c.cmd === "graph_set_widget");
+    expect(writes.every((c) => String(c.node_id) !== "76")).toBe(true);
+  });
+
+  it("still applies a promoted inner write when the inner node is NOT a dynamic combo", async () => {
+    const { isError, calls } = await setWidget(
+      { node_id: 78, widget: "model.prompt", value: "a long prompt" },
+      {
+        firstWrite: "contradict",
+        innerWrite: "ok",
+        subgraph: DYNAMIC_SUBGRAPH,
+        detailById: {
+          "78": DYNAMIC_DETAIL_BY_ID["78"],
+          // Same dotted name, ordinary STRING parent — not the #2299 shape.
+          "76": {
+            nodes: [
+              {
+                id: 76,
+                type: "OrdinaryNode",
+                widgets: { "model.prompt": "" },
+                inputs: [
+                  { name: "model", type: "STRING" },
+                  { name: "model.prompt", type: "STRING" },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    );
+    expect(isError).toBe(false);
+    const writes = calls.filter((c) => c.cmd === "graph_set_widget");
+    expect(writes.some((c) => String(c.node_id) === "76")).toBe(true);
+  });
+});
 
 describe("parseContradictoryPromotedWidgetRefusal", () => {
   it("the reporter's error is contradictory — width is listed as promoted", () => {
