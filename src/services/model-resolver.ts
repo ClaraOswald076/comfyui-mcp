@@ -463,6 +463,9 @@ export type ModelListingCoverage = {
   /** Set when neither path could run: no HTTP answer AND no local install path
    *  to scan, which is the exact shape that produced the false "no models". */
   noSourceAvailable?: boolean;
+  /** Set when the URL, mode, and generation stayed fixed while an initially
+   *  unknown local install path was filled in by orchestrator recovery (#2338). */
+  localPathRecovered?: true;
   /** Set when the ComfyUI target changed while this listing was in flight. Any
    *  names/paths collected before that change have been discarded. */
   targetChanged?: {
@@ -577,11 +580,22 @@ function refuseStaleModelListing(
 ): boolean {
   if (targetMatchesWitness(witness)) return false;
 
-  if (!coverage.targetChanged) {
-    coverage.targetChanged = {
-      startedBaseUrl: witness.baseUrl,
-      currentBaseUrl: getComfyUIBaseUrl(),
-    };
+  if (!coverage.localPathRecovered && !coverage.targetChanged) {
+    const currentBaseUrl = getComfyUIBaseUrl();
+    const localPathRecovered =
+      getComfyuiTargetGeneration() === witness.generation &&
+      currentBaseUrl === witness.baseUrl &&
+      isRemoteMode() === witness.remote &&
+      witness.localPath === undefined &&
+      config.comfyuiPath !== undefined;
+    if (localPathRecovered) {
+      coverage.localPathRecovered = true;
+    } else {
+      coverage.targetChanged = {
+        startedBaseUrl: witness.baseUrl,
+        currentBaseUrl,
+      };
+    }
   }
   coverage.answered.length = 0;
   coverage.unanswered.length = 0;

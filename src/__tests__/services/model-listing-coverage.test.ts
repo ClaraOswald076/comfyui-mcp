@@ -421,6 +421,31 @@ describe("#2319: list_local_models uses the target-aware listing service", () =>
     expect(coverage.usedFilesystem).toBe(false);
   });
 
+  it("#2338: records local path recovery without inventing a target change", async () => {
+    target.remote = false;
+    target.generation = 81;
+    target.baseUrl = "http://127.0.0.1:8188";
+    config.comfyuiPath = undefined;
+    const response = deferred<Response>();
+    getClient.mockReturnValue({ fetchApi });
+    fetchApi.mockReturnValue(response.promise);
+
+    const pending = listLocalModelsWithCoverage("checkpoints");
+    await Promise.resolve();
+
+    config.comfyuiPath = "/recovered-comfy";
+    response.resolve(
+      new Response(JSON.stringify(["stale-before-recovery.safetensors"]), { status: 200 }),
+    );
+
+    const { models, coverage } = await pending;
+
+    expect(models).toEqual([]);
+    expect(coverage.localPathRecovered).toBe(true);
+    expect(coverage.targetChanged).toBeUndefined();
+    expect(coverage.usedFilesystem).toBe(false);
+  });
+
   it("does not expose host files through the registered tool for a remote target", async () => {
     config.comfyuiPath = "/comfy";
     target.remote = true;
@@ -466,6 +491,31 @@ describe("#2319: list_local_models uses the target-aware listing service", () =>
     expect(text).toContain("No model names or paths from the stale target were returned");
     expect(text).not.toContain("stale-tool-model.safetensors");
     expect(text).not.toContain("/comfy/models/checkpoints/stale-tool-model.safetensors");
+    expect(text).not.toContain("install path was resolved");
+  });
+
+  it("#2338: explains path recovery through the registered tool without stale data", async () => {
+    config.comfyuiPath = undefined;
+    const response = deferred<Response>();
+    getClient.mockReturnValue({ fetchApi });
+    fetchApi.mockReturnValue(response.promise);
+
+    const pending = registeredListLocalModelsTool()({ action: "list", model_type: "checkpoints" });
+    await Promise.resolve();
+
+    config.comfyuiPath = "/recovered-comfy";
+    response.resolve(
+      new Response(JSON.stringify(["stale-recovery-model.safetensors"]), { status: 200 }),
+    );
+
+    const result = await pending;
+    const text = result.content[0].text;
+
+    expect(text).toContain("local ComfyUI install path was resolved while this listing was in progress");
+    expect(text).toContain("No model names or paths collected before the path was resolved were returned");
+    expect(text).not.toContain("target changed");
+    expect(text).not.toContain("stale-recovery-model.safetensors");
+    expect(text).not.toContain("/recovered-comfy/models/checkpoints/stale-recovery-model.safetensors");
   });
 });
 

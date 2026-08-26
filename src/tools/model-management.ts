@@ -1386,6 +1386,14 @@ export function describeEmptyModelListing(
   coverage: ModelListingCoverage,
 ): string {
   const scope = modelType ? `${modelType} models` : "local models";
+  if (coverage.localPathRecovered) {
+    return (
+      `Could not determine which ${scope} are installed because the local ComfyUI install path ` +
+      `was resolved while this listing was in progress. No model names or paths collected before ` +
+      `the path was resolved were returned. Retry list_local_models now that the local install path ` +
+      `is available.`
+    );
+  }
   if (coverage.targetChanged) {
     return (
       `Could not determine which ${scope} are installed because the connected ComfyUI target ` +
