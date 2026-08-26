@@ -36,6 +36,11 @@ export type CompletionFenceOptions = {
   maxEntries?: number;
 };
 
+export type CompletionFenceIdentityOptions = {
+  /** True only when the journal matched this prompt id to one exact run generation. */
+  journalProven?: boolean;
+};
+
 function usable(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.length <= MAX_ID_LENGTH;
 }
@@ -45,19 +50,21 @@ function usable(value: unknown): value is string {
  *
  * The route/session is deliberately outside the panel tab id: a stale frontend
  * reconnect gets a new tab address, but it is still the same agent conversation.
- * A panel completion key is preferred because it survives prompt-id reuse; older
- * panels fall back to ComfyUI's prompt id.
+ * A panel completion key is preferred because it survives prompt-id reuse. A
+ * prompt id is usable only when the journal proved the exact run generation;
+ * an unproven or reused prompt id is a bucket, not a stable identity.
  */
 export function completionFenceIdentity(
   route: string,
   payload: Pick<CompletionPayload, "prompt_id" | "completion_key">,
+  options: CompletionFenceIdentityOptions = {},
 ): string | null {
   const routeId = typeof route === "string" ? route.trim() : "";
   if (!routeId || routeId.length > MAX_ID_LENGTH) return null;
   if (usable(payload.completion_key)) {
     return JSON.stringify(["panel_run", routeId, "completion_key", payload.completion_key]);
   }
-  if (usable(payload.prompt_id)) {
+  if (options.journalProven === true && usable(payload.prompt_id)) {
     return JSON.stringify(["panel_run", routeId, "prompt_id", payload.prompt_id]);
   }
   return null;
@@ -82,10 +89,11 @@ function validEntry(value: unknown): value is FenceEntry {
  * Small, synchronous, atomic fence used immediately around agent scheduling.
  *
  * `seen` is written before the queue hand-off; `delivered` is written after the
- * manager accepts the event. Both states suppress a later replay. The journal
- * remains responsible for replaying a hand-off that the agent never consumed;
- * this fence is specifically responsible for preventing a stale frontend from
- * minting a second turn for the same completion.
+ * manager accepts the event. Only `delivered` suppresses a later replay. A
+ * persisted `seen` reservation is deliberately reclaimable: if the process
+ * crashes after the reservation but before injection, a restarted orchestrator
+ * must be able to retry the journal entry instead of treating an incomplete
+ * hand-off as proof that an agent received it.
  */
 export class RunCompletionIdempotencyFence {
   private readonly filePath: string;
@@ -114,7 +122,7 @@ export class RunCompletionIdempotencyFence {
     const previous = new Map(this.entries);
     this.prune(now);
     const existing = this.entries.get(identity);
-    if (existing && now - existing.at < this.ttlMs) {
+    if (existing?.state === "delivered" && now - existing.at < this.ttlMs) {
       return "duplicate";
     }
     this.entries.set(identity, { state: "seen", at: now });
@@ -205,6 +213,8 @@ export type ScheduleCompletionOptions = {
   token: string;
   /** True when the journal is replaying the same entry after a hand-off failed. */
   replay?: boolean;
+  /** True only for a prompt id matched to an exact, non-reused journal ticket. */
+  journalProven?: boolean;
   fence: RunCompletionIdempotencyFence;
   inject: () => boolean;
   suppress: (token: string) => void;
@@ -218,16 +228,9 @@ export type ScheduleCompletionOptions = {
  * new turn on every reconnect.
  */
 export function scheduleRunCompletion(options: ScheduleCompletionOptions): boolean {
-  const identity = completionFenceIdentity(options.route, options.payload);
-  // POSSIBLE_REPEAT is already a journal-level verdict. Persist a fence when
-  // possible, then remove the entry without ever asking the manager to create a
-  // turn. This remains fail-closed if an old panel supplied no stable identity.
-  if (options.payload.possible_repeat === true) {
-    if (identity && options.fence.claimResult(identity) === "claimed") options.fence.markDelivered(identity);
-    options.suppress(options.token);
-    options.log?.("suppressed a POSSIBLE_REPEAT before creating an agent turn");
-    return true;
-  }
+  const identity = completionFenceIdentity(options.route, options.payload, {
+    journalProven: options.journalProven,
+  });
   // A journal replay is the SAME completion whose queue hand-off was lost or
   // whose carrying turn ended before ack. It must be allowed through; the
   // durable fence only rejects a NEW entry for an identity already scheduled.
@@ -239,7 +242,11 @@ export function scheduleRunCompletion(options: ScheduleCompletionOptions): boole
   if (claim === "unavailable") return false;
   if (claim === "duplicate") {
     options.suppress(options.token);
-    options.log?.(`suppressed a replay for ${identity}`);
+    options.log?.(
+      options.payload.possible_repeat === true
+        ? `suppressed a POSSIBLE_REPEAT with a durable delivered fence for ${identity}`
+        : `suppressed a replay for ${identity}`,
+    );
     return true;
   }
   const handedOff = options.inject();

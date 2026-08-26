@@ -3120,6 +3120,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         payload,
         token,
         replay: payload.replayed === true,
+        journalProven: RunCompletions.isJournalProvenForScheduling(token),
         fence: completionFence,
         // #884 P0 — the injected turn carries the completion's ORIGIN tab, so it
         // pins/stamps there (show the render on the tab that ran it), never on

@@ -1434,6 +1434,23 @@ export class RunCompletionJournalImpl {
     this.entries.delete(token);
   }
 
+  /**
+   * Whether this entry has a journal proof strong enough to use prompt_id as a
+   * scheduling identity. Generation zero, reused ids, foreign correlations,
+   * and superseded entries are intentionally not proof: those completions may
+   * be distinct renders and must remain deliverable.
+   */
+  isJournalProvenForScheduling(token: string): boolean {
+    const entry = this.entries.get(token);
+    return Boolean(
+      entry &&
+        entry.correlation.status === "matched" &&
+        (entry.ticketSeq ?? 0) > 0 &&
+        entry.ambiguousId !== true &&
+        entry.superseded !== true,
+    );
+  }
+
   /** Move every entry AND every open run ticket from `from` onto `to` — a panel
    *  tab-id migration re-keys the agent, and both must move WITH it or a later
    *  completion for a run queued under the old id reads as foreign. This
