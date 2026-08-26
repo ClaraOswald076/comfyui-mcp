@@ -15,7 +15,7 @@ export const DEFAULT_COMPLETION_FENCE_TTL_MS = 6 * 60 * 60_000;
 /** Bound the persisted map even if a panel manufactures many distinct prompt ids. */
 export const DEFAULT_COMPLETION_FENCE_MAX_ENTRIES = 2048;
 
-type FenceState = "seen" | "delivered";
+type FenceState = "seen" | "accepted" | "delivered";
 
 export type CompletionFenceClaim = "claimed" | "duplicate" | "unavailable";
 
@@ -36,11 +36,6 @@ export type CompletionFenceOptions = {
   maxEntries?: number;
 };
 
-export type CompletionFenceIdentityOptions = {
-  /** True only when the journal matched this prompt id to one exact run generation. */
-  journalProven?: boolean;
-};
-
 function usable(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.length <= MAX_ID_LENGTH;
 }
@@ -50,22 +45,18 @@ function usable(value: unknown): value is string {
  *
  * The route/session is deliberately outside the panel tab id: a stale frontend
  * reconnect gets a new tab address, but it is still the same agent conversation.
- * A panel completion key is preferred because it survives prompt-id reuse. A
- * prompt id is usable only when the journal proved the exact run generation;
- * an unproven or reused prompt id is a bucket, not a stable identity.
+ * A panel completion key is the only identity durable across orchestrator
+ * restarts. Journal ticket generations are process-local, so prompt_id alone is
+ * never a fence key here.
  */
 export function completionFenceIdentity(
   route: string,
   payload: Pick<CompletionPayload, "prompt_id" | "completion_key">,
-  options: CompletionFenceIdentityOptions = {},
 ): string | null {
   const routeId = typeof route === "string" ? route.trim() : "";
   if (!routeId || routeId.length > MAX_ID_LENGTH) return null;
   if (usable(payload.completion_key)) {
     return JSON.stringify(["panel_run", routeId, "completion_key", payload.completion_key]);
-  }
-  if (options.journalProven === true && usable(payload.prompt_id)) {
-    return JSON.stringify(["panel_run", routeId, "prompt_id", payload.prompt_id]);
   }
   return null;
 }
@@ -78,7 +69,7 @@ function validEntry(value: unknown): value is FenceEntry {
   if (!value || typeof value !== "object") return false;
   const entry = value as Partial<FenceEntry>;
   return (
-    (entry.state === "seen" || entry.state === "delivered") &&
+    (entry.state === "seen" || entry.state === "accepted" || entry.state === "delivered") &&
     typeof entry.at === "number" &&
     Number.isFinite(entry.at) &&
     entry.at >= 0
@@ -88,12 +79,11 @@ function validEntry(value: unknown): value is FenceEntry {
 /**
  * Small, synchronous, atomic fence used immediately around agent scheduling.
  *
- * `seen` is written before the queue hand-off; `delivered` is written after the
- * manager accepts the event. Only `delivered` suppresses a later replay. A
- * persisted `seen` reservation is deliberately reclaimable: if the process
- * crashes after the reservation but before injection, a restarted orchestrator
- * must be able to retry the journal entry instead of treating an incomplete
- * hand-off as proof that an agent received it.
+ * `seen` is written before the queue hand-off; `accepted` is written after the
+ * manager accepts the event; `delivered` is written only from the journal's
+ * actual turn-ack hook. `accepted` is process-local suppression only: a fresh
+ * fence instance treats a persisted `accepted` or `seen` entry as reclaimable,
+ * so a restart cannot lose a completion that was queued but never read.
  */
 export class RunCompletionIdempotencyFence {
   private readonly filePath: string;
@@ -101,6 +91,8 @@ export class RunCompletionIdempotencyFence {
   private readonly ttlMs: number;
   private readonly maxEntries: number;
   private entries = new Map<string, FenceEntry>();
+  /** Reservations accepted by THIS orchestrator, but not yet turn-acked. */
+  private readonly active = new Set<string>();
 
   constructor(options: CompletionFenceOptions = {}) {
     this.filePath = options.path ?? defaultFencePath();
@@ -125,34 +117,65 @@ export class RunCompletionIdempotencyFence {
     if (existing?.state === "delivered" && now - existing.at < this.ttlMs) {
       return "duplicate";
     }
+    if (this.active.has(identity)) return "duplicate";
     this.entries.set(identity, { state: "seen", at: now });
     this.trim();
-    if (this.persist()) return "claimed";
+    if (this.persist()) {
+      this.active.add(identity);
+      return "claimed";
+    }
     this.entries = previous;
     return "unavailable";
   }
 
-  /** Mark a successfully accepted queue hand-off as delivered to the agent. */
+  /** Mark a successfully accepted queue hand-off, without claiming it was read. */
+  markAccepted(identity: string): boolean {
+    const entry = this.entries.get(identity);
+    if (!entry) return false;
+    const previous = entry.state;
+    entry.state = "accepted";
+    if (this.persist()) return true;
+    // The pre-injection `seen` write is still durable. Keep the local active
+    // reservation so a same-process stale frame cannot mint another turn; a
+    // restart will reclaim the persisted seen entry.
+    entry.state = previous;
+    return false;
+  }
+
+  /** Mark a queue hand-off delivered only after the agent turn actually acks it. */
   markDelivered(identity: string): boolean {
     const entry = this.entries.get(identity);
     if (!entry) return false;
     const previous = entry.state;
     entry.state = "delivered";
-    if (this.persist()) return true;
-    // Keep the already-written `seen` fence if the second write fails. It is
-    // still safer than allowing an un-fenced replay after a transient disk error.
+    if (this.persist()) {
+      this.active.delete(identity);
+      return true;
+    }
+    // Keep the already-written accepted/seen fence if the second write fails.
+    // It remains process-local suppression, while a restart can reclaim it.
     entry.state = previous;
     return false;
   }
 
   /** Remove a reservation when the manager refused the hand-off. */
   release(identity: string): boolean {
-    if (!this.entries.has(identity)) return true;
+    if (!this.entries.has(identity)) {
+      this.active.delete(identity);
+      return true;
+    }
     const previous = this.entries;
     this.entries = new Map(previous);
     this.entries.delete(identity);
-    if (this.persist()) return true;
+    if (this.persist()) {
+      this.active.delete(identity);
+      return true;
+    }
     this.entries = previous;
+    // Let a later retry re-attempt the durable release/claim. Keeping the
+    // in-memory reservation here would turn a persistence failure into a
+    // permanent same-process refusal.
+    this.active.delete(identity);
     return false;
   }
 
@@ -181,7 +204,10 @@ export class RunCompletionIdempotencyFence {
 
   private prune(now: number): void {
     for (const [identity, entry] of this.entries) {
-      if (now - entry.at >= this.ttlMs || now < entry.at) this.entries.delete(identity);
+      if (now - entry.at >= this.ttlMs || now < entry.at) {
+        this.entries.delete(identity);
+        this.active.delete(identity);
+      }
     }
     this.trim();
   }
@@ -191,6 +217,7 @@ export class RunCompletionIdempotencyFence {
       const oldest = this.entries.keys().next().value;
       if (oldest === undefined) break;
       this.entries.delete(oldest);
+      this.active.delete(oldest);
     }
   }
 
@@ -211,12 +238,10 @@ export type ScheduleCompletionOptions = {
   route: string;
   payload: CompletionPayload;
   token: string;
-  /** True when the journal is replaying the same entry after a hand-off failed. */
-  replay?: boolean;
-  /** True only for a prompt id matched to an exact, non-reused journal ticket. */
-  journalProven?: boolean;
   fence: RunCompletionIdempotencyFence;
   inject: () => boolean;
+  /** Bind the fence identity to the journal token until the real turn ack. */
+  onAccepted?: (identity: string) => void;
   suppress: (token: string) => void;
   log?: (message: string) => void;
 };
@@ -228,13 +253,7 @@ export type ScheduleCompletionOptions = {
  * new turn on every reconnect.
  */
 export function scheduleRunCompletion(options: ScheduleCompletionOptions): boolean {
-  const identity = completionFenceIdentity(options.route, options.payload, {
-    journalProven: options.journalProven,
-  });
-  // A journal replay is the SAME completion whose queue hand-off was lost or
-  // whose carrying turn ended before ack. It must be allowed through; the
-  // durable fence only rejects a NEW entry for an identity already scheduled.
-  if (options.replay === true) return options.inject();
+  const identity = completionFenceIdentity(options.route, options.payload);
   if (!identity) {
     return options.inject();
   }
@@ -250,7 +269,11 @@ export function scheduleRunCompletion(options: ScheduleCompletionOptions): boole
     return true;
   }
   const handedOff = options.inject();
-  if (handedOff) options.fence.markDelivered(identity);
-  else options.fence.release(identity);
+  if (handedOff) {
+    options.fence.markAccepted(identity);
+    options.onAccepted?.(identity);
+  } else {
+    options.fence.release(identity);
+  }
   return handedOff;
 }

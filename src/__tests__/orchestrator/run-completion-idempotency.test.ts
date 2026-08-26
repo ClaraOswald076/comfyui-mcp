@@ -8,7 +8,10 @@ import {
   RunCompletionIdempotencyFence,
   scheduleRunCompletion,
 } from "../../orchestrator/run-completion-idempotency.js";
-import { RunCompletionJournalImpl } from "../../orchestrator/run-completion-journal.js";
+import {
+  RunCompletionJournalImpl,
+  type CompletionPayload,
+} from "../../orchestrator/run-completion-journal.js";
 
 const tempDirs: string[] = [];
 
@@ -22,12 +25,69 @@ function stablePayload(promptId = "prompt-a", completionKey = `completion/${prom
   return { kind: "executed", prompt_id: promptId, completion_key: completionKey };
 }
 
+/** The real production ordering: deliverPending → scheduler → queue acceptance,
+ * then a later onEventDelivered/onEventUndelivered callback settles the fence. */
+function productionHarness(path = fencePath()) {
+  const journal = new RunCompletionJournalImpl();
+  const fence = new RunCompletionIdempotencyFence({ path, now: () => 100_000 });
+  const accepted = new Map<string, string>();
+  const injected: CompletionPayload[] = [];
+  const suppressed: string[] = [];
+  let accepts = true;
+
+  const deliver = () =>
+    journal.deliverPending("route/session", (payload, token) =>
+      scheduleRunCompletion({
+        route: "route/session",
+        payload,
+        token,
+        fence,
+        inject: () => {
+          injected.push(payload);
+          return accepts;
+        },
+        onAccepted: (identity) => accepted.set(token, identity),
+        suppress: (duplicateToken) => {
+          suppressed.push(duplicateToken);
+          journal.suppress(duplicateToken);
+        },
+      }),
+    );
+
+  const ack = (token: string) => {
+    const identity = accepted.get(token);
+    if (identity) fence.markDelivered(identity);
+    accepted.delete(token);
+    journal.ack(token);
+  };
+
+  const release = (token: string) => {
+    const identity = accepted.get(token);
+    if (identity) fence.release(identity);
+    accepted.delete(token);
+    journal.release(token);
+  };
+
+  return {
+    journal,
+    fence,
+    injected,
+    suppressed,
+    deliver,
+    ack,
+    release,
+    setAccepts: (value: boolean) => {
+      accepts = value;
+    },
+  };
+}
+
 afterEach(() => {
   while (tempDirs.length) rmSync(tempDirs.pop()!, { recursive: true, force: true });
 });
 
 describe("run completion scheduling idempotency (#2341)", () => {
-  it("uses a stable completion key first and requires journal proof for prompt ids", () => {
+  it("uses only a stable completion key as a durable identity", () => {
     const keyed = completionFenceIdentity("orchestrator::claude", {
       prompt_id: "prompt-a",
       completion_key: "route-session/prompt-a/generation-1",
@@ -35,54 +95,54 @@ describe("run completion scheduling idempotency (#2341)", () => {
     expect(keyed).toBe(
       JSON.stringify(["panel_run", "orchestrator::claude", "completion_key", "route-session/prompt-a/generation-1"]),
     );
-
     expect(completionFenceIdentity("orchestrator::claude", { prompt_id: "prompt-a" })).toBeNull();
-    const proven = completionFenceIdentity(
-      "orchestrator::claude",
-      { prompt_id: "prompt-a" },
-      { journalProven: true },
-    );
-    expect(proven).toBe(JSON.stringify(["panel_run", "orchestrator::claude", "prompt_id", "prompt-a"]));
+  });
+
+  it("does not suppress a prompt id after restart because journal proof is process-local", () => {
+    const path = fencePath();
+    const payload = { kind: "executed", prompt_id: "reused-after-restart", possible_repeat: true };
+    let injections = 0;
+
+    const first = new RunCompletionIdempotencyFence({ path, now: () => 10_000 });
     expect(
-      completionFenceIdentity("orchestrator::codex", { prompt_id: "prompt-a" }, { journalProven: true }),
-    ).not.toBe(proven);
+      scheduleRunCompletion({
+        route: "orchestrator::claude",
+        payload,
+        token: "before-restart",
+        fence: first,
+        inject: () => {
+          injections += 1;
+          return true;
+        },
+        suppress: () => undefined,
+      }),
+    ).toBe(true);
+
+    const afterRestart = new RunCompletionIdempotencyFence({ path, now: () => 10_000 });
+    expect(
+      scheduleRunCompletion({
+        route: "orchestrator::claude",
+        payload,
+        token: "after-restart",
+        fence: afterRestart,
+        inject: () => {
+          injections += 1;
+          return true;
+        },
+        suppress: () => undefined,
+      }),
+    ).toBe(true);
+    expect(injections).toBe(2);
   });
 
-  it("exposes journal proof only for an exact non-reused ticket generation", () => {
-    const journal = new RunCompletionJournalImpl();
-    journal.openRun("prompt-proven", { tabId: "tab-a", conversation: "orchestrator::claude" });
-    const matched = journal.record(
-      "orchestrator::claude",
-      { kind: "executed", prompt_id: "prompt-proven" },
-      { conversation: "orchestrator::claude" },
-    );
-    expect(journal.isJournalProvenForScheduling(matched.token)).toBe(true);
-
-    const foreign = journal.record(
-      "orchestrator::codex",
-      { kind: "executed", prompt_id: "prompt-proven" },
-      { conversation: "orchestrator::codex" },
-    );
-    expect(journal.isJournalProvenForScheduling(foreign.token)).toBe(false);
-
-    journal.openRun("prompt-reused", { tabId: "tab-a", conversation: "orchestrator::claude" });
-    journal.openRun("prompt-reused", { tabId: "tab-a", conversation: "orchestrator::claude" });
-    const reused = journal.record(
-      "orchestrator::claude",
-      { kind: "executed", prompt_id: "prompt-reused" },
-      { conversation: "orchestrator::claude" },
-    );
-    expect(journal.isJournalProvenForScheduling(reused.token)).toBe(false);
-  });
-
-  it("persists a delivered fence across a new orchestrator instance", () => {
-    let now = 10_000;
+  it("persists a delivered stable-key fence across a new orchestrator instance", () => {
+    let now = 20_000;
     const path = fencePath();
     const first = new RunCompletionIdempotencyFence({ path, now: () => now });
     const identity = completionFenceIdentity("orchestrator::claude", stablePayload())!;
 
     expect(first.claim(identity)).toBe(true);
-    expect(first.state(identity)).toBe("seen");
+    expect(first.markAccepted(identity)).toBe(true);
     expect(first.markDelivered(identity)).toBe(true);
     expect(first.state(identity)).toBe("delivered");
     expect(JSON.parse(readFileSync(path, "utf8")).entries[identity].state).toBe("delivered");
@@ -96,8 +156,98 @@ describe("run completion scheduling idempotency (#2341)", () => {
     expect(afterReconnect.state(identity)).toBe("seen");
   });
 
-  it("bounds retained identities and allows distinct routes and completions", () => {
-    let now = 20_000;
+  it("keeps accepted-but-unacked work reclaimable after a crash/restart", () => {
+    const path = fencePath();
+    const first = productionHarness(path);
+    const entry = first.journal.record(
+      "route/session",
+      { ...stablePayload("crash-before-ack", "completion/crash-before-ack"), possible_repeat: true },
+    );
+
+    expect(first.deliver().delivered).toBe(1);
+    const identity = completionFenceIdentity("route/session", entry.payload)!;
+    expect(first.fence.state(identity)).toBe("accepted");
+    expect(first.injected).toHaveLength(1);
+
+    // The accepted queue item was never read/acked before the orchestrator died.
+    const afterRestart = new RunCompletionIdempotencyFence({ path, now: () => 100_000 });
+    let reinjected = 0;
+    let suppressed = 0;
+    expect(
+      scheduleRunCompletion({
+        route: "route/session",
+        payload: entry.payload,
+        token: "recovered-after-crash",
+        fence: afterRestart,
+        inject: () => {
+          reinjected += 1;
+          return true;
+        },
+        suppress: () => {
+          suppressed += 1;
+        },
+      }),
+    ).toBe(true);
+    expect(reinjected).toBe(1);
+    expect(suppressed).toBe(0);
+  });
+
+  it("keeps the fence through refusal, replayed retry, stale frame, and actual ack", () => {
+    const harness = productionHarness();
+    const payload = { ...stablePayload("refusal-retry", "completion/refusal-retry"), possible_repeat: true };
+    const entry = harness.journal.record("route/session", payload);
+
+    harness.setAccepts(false);
+    expect(harness.deliver().blockedOn?.token).toBe(entry.token);
+    expect(harness.fence.state(completionFenceIdentity("route/session", payload)!)).toBeUndefined();
+
+    harness.setAccepts(true);
+    harness.release(entry.token);
+    expect(harness.deliver().delivered).toBe(1);
+    expect(harness.injected).toHaveLength(2);
+    expect(harness.injected[1].replayed).toBe(true);
+    const identity = completionFenceIdentity("route/session", payload)!;
+    expect(harness.fence.state(identity)).toBe("accepted");
+
+    // A stale panel frame must not mint a second turn while the retried item is
+    // accepted but not yet read/acked.
+    expect(
+      scheduleRunCompletion({
+        route: "route/session",
+        payload,
+        token: "stale-before-ack",
+        fence: harness.fence,
+        inject: () => {
+          harness.injected.push(payload);
+          return true;
+        },
+        suppress: (token) => harness.suppressed.push(token),
+      }),
+    ).toBe(true);
+    expect(harness.injected).toHaveLength(2);
+    expect(harness.suppressed).toEqual(["stale-before-ack"]);
+
+    harness.ack(entry.token);
+    expect(harness.fence.state(identity)).toBe("delivered");
+    expect(
+      scheduleRunCompletion({
+        route: "route/session",
+        payload,
+        token: "stale-after-ack",
+        fence: harness.fence,
+        inject: () => {
+          harness.injected.push(payload);
+          return true;
+        },
+        suppress: (token) => harness.suppressed.push(token),
+      }),
+    ).toBe(true);
+    expect(harness.injected).toHaveLength(2);
+    expect(harness.suppressed).toEqual(["stale-before-ack", "stale-after-ack"]);
+  });
+
+  it("bounds retained identities and keeps distinct stable completions separate", () => {
+    let now = 30_000;
     const path = fencePath();
     const fence = new RunCompletionIdempotencyFence({ path, now: () => now, maxEntries: 2 });
     const a = completionFenceIdentity("route-a", stablePayload("a", "a"))!;
@@ -114,163 +264,15 @@ describe("run completion scheduling idempotency (#2341)", () => {
     expect(fence.state(c)).toBe("seen");
   });
 
-  it("suppresses a duplicate after a durable hand-off, including a stale frontend", () => {
-    const path = fencePath();
-    const fence = new RunCompletionIdempotencyFence({ path, now: () => 30_000 });
-    const payload = { kind: "executed", prompt_id: "prompt-replayed" };
-    let injections = 0;
-    const suppressed: string[] = [];
-    const schedule = (token: string, route = "orchestrator::claude", promptId = payload.prompt_id) =>
-      scheduleRunCompletion({
-        route,
-        payload: { ...payload, prompt_id: promptId },
-        token,
-        journalProven: true,
-        fence,
-        inject: () => {
-          injections += 1;
-          return true;
-        },
-        suppress: (duplicateToken) => suppressed.push(duplicateToken),
-      });
-
-    expect(schedule("first")).toBe(true);
-    expect(schedule("stale-reconnect"), "same session + prompt must not create a second turn").toBe(true);
-    expect(injections).toBe(1);
-    expect(suppressed).toEqual(["stale-reconnect"]);
-
-    expect(schedule("different-session", "orchestrator::codex")).toBe(true);
-    expect(schedule("different-prompt", "orchestrator::claude", "prompt-distinct")).toBe(true);
-    expect(injections).toBe(3);
-  });
-
-  it("does not retain a refused hand-off as a false delivered fence", () => {
-    const path = fencePath();
-    const fence = new RunCompletionIdempotencyFence({ path, now: () => 40_000 });
-    const payload = stablePayload("prompt-retry", "completion/retry");
-    let accept = false;
-    let injections = 0;
-
-    const schedule = (token: string) =>
-      scheduleRunCompletion({
-        route: "orchestrator::claude",
-        payload,
-        token,
-        fence,
-        inject: () => {
-          injections += 1;
-          return accept;
-        },
-        suppress: () => undefined,
-      });
-
-    expect(schedule("refused")).toBe(false);
-    expect(fence.state(completionFenceIdentity("orchestrator::claude", payload)!)).toBeUndefined();
-    accept = true;
-    expect(schedule("retry")).toBe(true);
-    expect(injections).toBe(2);
-  });
-
-  it("allows the journal to replay the same hand-off after an agent teardown", () => {
-    const path = fencePath();
-    const fence = new RunCompletionIdempotencyFence({ path, now: () => 45_000 });
-    const identity = completionFenceIdentity("orchestrator::claude", stablePayload("prompt-replayed"))!;
-    let injections = 0;
-
-    expect(
-      scheduleRunCompletion({
-        route: "orchestrator::claude",
-        payload: stablePayload("prompt-replayed"),
-        token: "first",
-        fence,
-        inject: () => {
-          injections += 1;
-          return true;
-        },
-        suppress: () => undefined,
-      }),
-    ).toBe(true);
-    expect(
-      scheduleRunCompletion({
-        route: "orchestrator::claude",
-        payload: { ...stablePayload("prompt-replayed"), replayed: true },
-        token: "journal-replay",
-        replay: true,
-        fence,
-        inject: () => {
-          injections += 1;
-          return true;
-        },
-        suppress: () => undefined,
-      }),
-    ).toBe(true);
-
-    expect(injections).toBe(2);
-    expect(fence.state(identity)).toBe("delivered");
-  });
-
   it("injects POSSIBLE_REPEAT when there is no stable identity", () => {
-    const fence = new RunCompletionIdempotencyFence({ path: fencePath(), now: () => 50_000 });
+    const fence = new RunCompletionIdempotencyFence({ path: fencePath(), now: () => 40_000 });
     let injections = 0;
     let suppressed = 0;
-    const handled = scheduleRunCompletion({
-      route: "orchestrator::claude",
-      payload: { kind: "executed", possible_repeat: true },
-      token: "unkeyed-repeat",
-      fence,
-      inject: () => {
-        injections += 1;
-        return true;
-      },
-      suppress: () => {
-        suppressed += 1;
-      },
-    });
-
-    expect(handled).toBe(true);
-    expect(injections).toBe(1);
-    expect(suppressed).toBe(0);
-  });
-
-  it("does not use an ambiguous or unprovable prompt id as a repeat fallback", () => {
-    const fence = new RunCompletionIdempotencyFence({ path: fencePath(), now: () => 55_000 });
-    const payload = { kind: "executed", prompt_id: "reused-id", possible_repeat: true };
-    let injections = 0;
-    let suppressed = 0;
-
-    expect(completionFenceIdentity("orchestrator::claude", payload)).toBeNull();
     expect(
       scheduleRunCompletion({
         route: "orchestrator::claude",
-        payload,
-        token: "unprovable-repeat",
-        fence,
-        inject: () => {
-          injections += 1;
-          return true;
-        },
-        suppress: () => {
-          suppressed += 1;
-        },
-      }),
-    ).toBe(true);
-
-    expect(injections).toBe(1);
-    expect(suppressed).toBe(0);
-  });
-
-  it("suppresses POSSIBLE_REPEAT only after a stable completion was durably handed off", () => {
-    const path = fencePath();
-    const fence = new RunCompletionIdempotencyFence({ path, now: () => 60_000 });
-    const payload = { ...stablePayload("prompt-repeat", "completion/repeat"), possible_repeat: true };
-    let injections = 0;
-    let suppressed = 0;
-
-    expect(
-      scheduleRunCompletion({
-        route: "orchestrator::claude",
-        payload,
-        token: "first-repeat",
+        payload: { kind: "executed", possible_repeat: true },
+        token: "unkeyed-repeat",
         fence,
         inject: () => {
           injections += 1;
@@ -283,75 +285,19 @@ describe("run completion scheduling idempotency (#2341)", () => {
     ).toBe(true);
     expect(injections).toBe(1);
     expect(suppressed).toBe(0);
-
-    expect(
-      scheduleRunCompletion({
-        route: "orchestrator::claude",
-        payload,
-        token: "durable-repeat",
-        fence,
-        inject: () => {
-          injections += 1;
-          return true;
-        },
-        suppress: () => {
-          suppressed += 1;
-        },
-      }),
-    ).toBe(true);
-    expect(injections).toBe(1);
-    expect(suppressed).toBe(1);
-  });
-
-  it("reclaims a persisted seen reservation after a crash before injection", () => {
-    const now = 70_000;
-    const path = fencePath();
-    const first = new RunCompletionIdempotencyFence({ path, now: () => now });
-    const payload = { ...stablePayload("prompt-crash", "completion/crash"), possible_repeat: true };
-    const identity = completionFenceIdentity("orchestrator::claude", payload)!;
-
-    // Simulate the crash window after the durable reservation and before manager.injectEvent.
-    expect(first.claim(identity)).toBe(true);
-    expect(first.state(identity)).toBe("seen");
-    const afterRestart = new RunCompletionIdempotencyFence({ path, now: () => now });
-    expect(afterRestart.state(identity)).toBe("seen");
-
-    let injections = 0;
-    let suppressed = 0;
-    expect(
-      scheduleRunCompletion({
-        route: "orchestrator::claude",
-        payload,
-        token: "after-crash",
-        fence: afterRestart,
-        inject: () => {
-          injections += 1;
-          return true;
-        },
-        suppress: () => {
-          suppressed += 1;
-        },
-      }),
-    ).toBe(true);
-    expect(injections).toBe(1);
-    expect(suppressed).toBe(0);
-    expect(afterRestart.state(identity)).toBe("delivered");
   });
 
   it("keeps a possible repeat pending when the fence cannot become durable", () => {
     const fenceFileDirectory = mkdtempSync(join(tmpdir(), "cmcp-2341-unwritable-"));
     tempDirs.push(fenceFileDirectory);
-    const fence = new RunCompletionIdempotencyFence({
-      path: fenceFileDirectory,
-      now: () => 80_000,
-    });
+    const fence = new RunCompletionIdempotencyFence({ path: fenceFileDirectory, now: () => 50_000 });
     let injections = 0;
     let suppressed = 0;
 
     expect(
       scheduleRunCompletion({
         route: "orchestrator::claude",
-        payload: { ...stablePayload("prompt-no-durable-handoff", "completion/no-durable"), possible_repeat: true },
+        payload: { ...stablePayload("no-durable", "completion/no-durable"), possible_repeat: true },
         token: "no-durable-fence",
         fence,
         inject: () => {
@@ -365,5 +311,46 @@ describe("run completion scheduling idempotency (#2341)", () => {
     ).toBe(false);
     expect(injections).toBe(0);
     expect(suppressed).toBe(0);
+  });
+
+  it("retains dropped-completion disclosure when its carrier is fence-suppressed", () => {
+    const journal = new RunCompletionJournalImpl();
+    const fence = new RunCompletionIdempotencyFence({ path: fencePath(), now: () => 60_000 });
+    for (let i = 0; i < 40; i += 1) {
+      journal.record("route/session", stablePayload(`overflow-${i}`, `completion/overflow-${i}`));
+    }
+    const lost = journal.droppedFor("route/session");
+    expect(lost).toBeGreaterThan(0);
+    const carrier = journal.outstanding("route/session").find((entry) => (entry.disclose ?? 0) > 0);
+    expect(carrier).toBeDefined();
+    const carrierIdentity = completionFenceIdentity("route/session", carrier!.payload)!;
+    expect(fence.claim(carrierIdentity)).toBe(true);
+    expect(fence.markAccepted(carrierIdentity)).toBe(true);
+    expect(fence.markDelivered(carrierIdentity)).toBe(true);
+
+    const seen: Array<{ payload: CompletionPayload; token: string }> = [];
+    const suppressed = new Set<string>();
+    journal.deliverPending("route/session", (payload, token) => {
+      seen.push({ payload, token });
+      return scheduleRunCompletion({
+        route: "route/session",
+        payload,
+        token,
+        fence,
+        inject: () => true,
+        suppress: (duplicateToken) => {
+          suppressed.add(duplicateToken);
+          journal.suppress(duplicateToken);
+        },
+      });
+    });
+
+    const disclosed = seen.find(
+      ({ payload, token }) => payload.dropped_completions === lost && !suppressed.has(token),
+    );
+    expect(disclosed).toBeDefined();
+    expect(journal.droppedFor("route/session")).toBe(lost);
+    journal.ack(disclosed!.token);
+    expect(journal.droppedFor("route/session")).toBe(0);
   });
 });

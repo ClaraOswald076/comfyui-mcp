@@ -371,6 +371,8 @@ export class RunCompletionJournalImpl {
   private forgottenOwnRuns = new Set<string>();
   /** token → entry (insertion-ordered, which is also delivery order). */
   private entries = new Map<string, JournalEntry>();
+  /** Entries suppressed by the scheduling callback during the current flush. */
+  private suppressedDuringDelivery = new Set<string>();
   /** (tab, run) pairs whose completion was ACKED — a bounded FIFO memo so a
    *  panel that re-sends the frame after the entry was removed can't produce a
    *  second delivery. */
@@ -1201,9 +1203,10 @@ export class RunCompletionJournalImpl {
         ...(entry.possibleRepeat ? { possible_repeat: true } : {}),
       };
       const handedOff = inject(payload, entry.token);
+      const suppressed = this.suppressedDuringDelivery.delete(entry.token);
       this.noteAttempt(entry.token, handedOff);
       if (!handedOff) return { delivered, blockedOn: entry };
-      if (lost > 0) {
+      if (lost > 0 && !suppressed) {
         // CONSOLIDATE onto the entry; do NOT consider the disclosure spent yet.
         // A hand-off is not consumption: if this agent is stopped before its turn
         // runs, the entry is released and replayed, and the warning must go with
@@ -1429,26 +1432,18 @@ export class RunCompletionJournalImpl {
    * Remove a duplicate at the scheduling boundary without settling a ticket.
    * The durable completion fence has already proven that another entry for the
    * same route/run was accepted, so this duplicate must not become another turn.
+   * A suppressed carrier is NOT a successful disclosure delivery: move any
+   * eviction count it carried back to the side map so a later non-suppressed
+   * entry resurfaces it.
    */
   suppress(token: string): void {
-    this.entries.delete(token);
-  }
-
-  /**
-   * Whether this entry has a journal proof strong enough to use prompt_id as a
-   * scheduling identity. Generation zero, reused ids, foreign correlations,
-   * and superseded entries are intentionally not proof: those completions may
-   * be distinct renders and must remain deliverable.
-   */
-  isJournalProvenForScheduling(token: string): boolean {
     const entry = this.entries.get(token);
-    return Boolean(
-      entry &&
-        entry.correlation.status === "matched" &&
-        (entry.ticketSeq ?? 0) > 0 &&
-        entry.ambiguousId !== true &&
-        entry.superseded !== true,
-    );
+    if (!entry) return;
+    this.suppressedDuringDelivery.add(token);
+    if ((entry.disclose ?? 0) > 0) {
+      this.dropped.set(entry.key, (this.dropped.get(entry.key) ?? 0) + entry.disclose!);
+    }
+    this.entries.delete(token);
   }
 
   /** Move every entry AND every open run ticket from `from` onto `to` — a panel
@@ -1701,6 +1696,7 @@ export class RunCompletionJournalImpl {
   reset(): void {
     this.tickets.clear();
     this.entries.clear();
+    this.suppressedDuringDelivery.clear();
     this.dropped.clear();
     this.delivered.clear();
     this.completionReceipts.clear();

@@ -948,6 +948,8 @@ export function armStartupDeadline(
 
 export async function runPanelOrchestrator(): Promise<void> {
   const completionFence = new RunCompletionIdempotencyFence();
+  /** Stable completion keys held by accepted queue items until the real turn ack. */
+  const completionFenceTokens = new Map<string, string>();
   // Crash guard: the orchestrator is a long-lived background process the user
   // can't see. A stray rejection (e.g. a fire-and-forget push to a tab that
   // vanished mid-flight, or an SDK hiccup) must never silently kill it —
@@ -3119,8 +3121,6 @@ export async function runPanelOrchestrator(): Promise<void> {
         route: key,
         payload,
         token,
-        replay: payload.replayed === true,
-        journalProven: RunCompletions.isJournalProvenForScheduling(token),
         fence: completionFence,
         // #884 P0 — the injected turn carries the completion's ORIGIN tab, so it
         // pins/stamps there (show the render on the tab that ran it), never on
@@ -3130,6 +3130,7 @@ export async function runPanelOrchestrator(): Promise<void> {
             eventToken: token,
             mid: turnOrigins.mintInjectionOrigin(panelTabId),
           }),
+        onAccepted: (identity) => completionFenceTokens.set(token, identity),
         suppress: (duplicateToken) => RunCompletions.suppress(duplicateToken),
         log: (message) =>
           logger.info(
@@ -3206,12 +3207,35 @@ export async function runPanelOrchestrator(): Promise<void> {
     // #486 — the ask journal verifies WHICH agent instance is acking, so a
     // provider switch cannot let the new conversation certify the old one's
     // answer. Run completions have their own turn-marker gate and need none.
-    if (token.startsWith("aa")) AskAnswers.ack(token, from);
-    else RunCompletions.ack(token);
+    if (token.startsWith("aa")) {
+      AskAnswers.ack(token, from);
+      return;
+    }
+    const identity = completionFenceTokens.get(token);
+    if (identity && !completionFence.markDelivered(identity)) {
+      logger.warn(
+        `[panel-orchestrator] could not persist the delivered completion fence for ${token}; a restart may replay it (#2341)`,
+      );
+    }
+    if (identity) completionFenceTokens.delete(token);
+    RunCompletions.ack(token);
   }
   function releaseEventToken(token: string, carried: boolean): void {
-    if (token.startsWith("aa")) AskAnswers.release(token, { carried });
-    else RunCompletions.release(token, { carried });
+    if (token.startsWith("aa")) {
+      AskAnswers.release(token, { carried });
+      return;
+    }
+    // Release the scheduling reservation BEFORE re-arming the journal. The
+    // journal's release hook immediately flushes a replacement agent, so the
+    // replay must be able to reclaim the identity in the same call stack.
+    const identity = completionFenceTokens.get(token);
+    if (identity && !completionFence.release(identity)) {
+      logger.warn(
+        `[panel-orchestrator] could not release the completion fence for ${token}; replay remains durability-blocked (#2341)`,
+      );
+    }
+    if (identity) completionFenceTokens.delete(token);
+    RunCompletions.release(token, { carried });
   }
 
   // Flag the mobile mirror picker's "session attached" (green) dot from live agents.
