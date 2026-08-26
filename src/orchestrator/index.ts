@@ -274,6 +274,10 @@ import {
   type CompletionPayload,
 } from "./run-completion-journal.js";
 import {
+  RunCompletionIdempotencyFence,
+  scheduleRunCompletion,
+} from "./run-completion-idempotency.js";
+import {
   createRunCompletionWatchdog,
   resolveHistoryCompletionImages,
   resolveHistoryCompletionStatus,
@@ -943,6 +947,7 @@ export function armStartupDeadline(
 }
 
 export async function runPanelOrchestrator(): Promise<void> {
+  const completionFence = new RunCompletionIdempotencyFence();
   // Crash guard: the orchestrator is a long-lived background process the user
   // can't see. A stray rejection (e.g. a fire-and-forget push to a tab that
   // vanished mid-flight, or an SDK hiccup) must never silently kill it —
@@ -3110,10 +3115,26 @@ export async function runPanelOrchestrator(): Promise<void> {
   function flushRunCompletions(panelTabId: string): void {
     const key = agentKeyFor(panelTabId);
     const { blockedOn } = RunCompletions.deliverPending(panelTabId, (payload, token) =>
-      // #884 P0 — the injected turn carries the completion's ORIGIN tab, so it
-      // pins/stamps there (show the render on the tab that ran it), never on
-      // whatever tab is active (confirming-gate 2).
-      manager.injectEvent(key, payload, { eventToken: token, mid: turnOrigins.mintInjectionOrigin(panelTabId) }),
+      scheduleRunCompletion({
+        route: key,
+        payload,
+        token,
+        replay: payload.replayed === true,
+        fence: completionFence,
+        // #884 P0 — the injected turn carries the completion's ORIGIN tab, so it
+        // pins/stamps there (show the render on the tab that ran it), never on
+        // whatever tab is active (confirming-gate 2).
+        inject: () =>
+          manager.injectEvent(key, payload, {
+            eventToken: token,
+            mid: turnOrigins.mintInjectionOrigin(panelTabId),
+          }),
+        suppress: (duplicateToken) => RunCompletions.suppress(duplicateToken),
+        log: (message) =>
+          logger.info(
+            `[panel-orchestrator] tab ${panelTabId.slice(0, 8)} ${message} before creating another agent turn (#2341)`,
+          ),
+      }),
     );
     if (blockedOn) {
       logger.warn(
