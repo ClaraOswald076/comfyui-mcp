@@ -100,6 +100,9 @@ function bridge(opts: {
   /** Navigation after MCP's final synchronous callback but before the panel
    * receiver evaluates the expected_scope envelope. */
   receiverNavigationAfterMcpFence?: boolean;
+  /** Receiver navigation to another graph with the SAME owner/workflow and
+   * colliding inner ids. Only graph_identity may distinguish this target. */
+  receiverGraphIdentityCollisionAfterMcpFence?: boolean;
   omitWorkflowUuid?: boolean;
   workflowUuid?: string;
 }) {
@@ -111,12 +114,15 @@ function bridge(opts: {
   let inSubgraph = false;
   const workflowUuid = opts.workflowUuid ?? "workflow-a";
   let currentOwnerNodeId = 78;
+  let currentGraphIdentity = "graph:workflow-a-root";
+  const targetGraphIdentity = "graph:workflow-a-container-a";
   let connectionIdentity = { generation: 1, tabSessionId: "browser-tab-a" };
   let observedPromotedScope: {
     known: true;
     scope: "root" | "subgraph";
     ownerNodeId: string | null;
     workflowUuid?: string;
+    graphIdentity?: string;
   } | { known: false; reason: string } = {
     known: false,
     reason: "no current panel graph-scope witness has been observed",
@@ -125,27 +131,45 @@ function bridge(opts: {
   const currentViewing = () => ({
     scope: inSubgraph ? "subgraph" : "root",
     ...(inSubgraph ? { owner_node_id: currentOwnerNodeId } : {}),
+    graph_identity: currentGraphIdentity,
     ...(opts.omitWorkflowUuid ? {} : { workflow_uuid: workflowUuid }),
   });
   const withCurrentViewing = (value: Record<string, unknown>): Record<string, unknown> => {
-    const result = Object.prototype.hasOwnProperty.call(value, "viewing")
+    let result = Object.prototype.hasOwnProperty.call(value, "viewing")
       ? value
       : { ...value, viewing: currentViewing() };
+    const rawOwnerEnvelope = result.subgraph_of;
+    if (rawOwnerEnvelope && typeof rawOwnerEnvelope === "object" && !Array.isArray(rawOwnerEnvelope)) {
+      const owner = rawOwnerEnvelope as Record<string, unknown>;
+      if (!Object.prototype.hasOwnProperty.call(owner, "graph_identity")) {
+        result = { ...result, subgraph_of: { ...owner, graph_identity: targetGraphIdentity } };
+      }
+    }
+    const rawViewing = result.viewing;
+    if (rawViewing && typeof rawViewing === "object" && !Array.isArray(rawViewing)) {
+      const viewingValue = rawViewing as Record<string, unknown>;
+      if (!Object.prototype.hasOwnProperty.call(viewingValue, "graph_identity")) {
+        result = { ...result, viewing: { ...viewingValue, graph_identity: currentGraphIdentity } };
+      }
+    }
     const viewing = result.viewing;
     if (viewing && typeof viewing === "object" && !Array.isArray(viewing)) {
       const identity = viewing as Record<string, unknown>;
       const rawOwner = identity.owner_node_id;
       const rawWorkflowUuid = identity.workflow_uuid;
+      const rawGraphIdentity = identity.graph_identity;
       if (
         (identity.scope === "root" || identity.scope === "subgraph") &&
         (rawOwner === undefined || rawOwner === null || typeof rawOwner === "number" || typeof rawOwner === "string") &&
-        (rawWorkflowUuid === undefined || typeof rawWorkflowUuid === "string")
+        (rawWorkflowUuid === undefined || typeof rawWorkflowUuid === "string") &&
+        (rawGraphIdentity === undefined || typeof rawGraphIdentity === "string")
       ) {
         observedPromotedScope = {
           known: true,
           scope: identity.scope,
           ownerNodeId: rawOwner == null ? null : String(rawOwner),
           ...(rawWorkflowUuid !== undefined ? { workflowUuid: rawWorkflowUuid } : {}),
+          ...(rawGraphIdentity !== undefined ? { graphIdentity: rawGraphIdentity } : {}),
         };
       } else {
         observedPromotedScope = {
@@ -184,6 +208,12 @@ function bridge(opts: {
           // handler applies the frame; this is the architectural race the
           // expected_scope envelope must fence.
           sendOpts.beforeDispatch();
+          if (opts.receiverGraphIdentityCollisionAfterMcpFence) {
+            currentOwnerNodeId = 78;
+            currentGraphIdentity = "graph:workflow-a-container-b";
+          } else {
+            currentOwnerNodeId = 79;
+          }
           mutation?.();
         } else {
           mutation?.();
@@ -202,7 +232,8 @@ function bridge(opts: {
           if (
             expected.scope !== "subgraph" ||
             String(expected.owner_node_id) !== actualOwner ||
-            (expected.workflow_uuid !== undefined && expected.workflow_uuid !== workflowUuid)
+            (expected.workflow_uuid !== undefined && expected.workflow_uuid !== workflowUuid) ||
+            expected.graph_identity !== currentGraphIdentity
           ) {
             throw new Error("graph_set_widget promoted receiver changed before dispatch: Nothing was applied.");
           }
@@ -254,13 +285,15 @@ function bridge(opts: {
         return subgraph instanceof Error ? subgraph : withCurrentViewing(subgraph);
       }
       if (cmd.cmd === "graph_enter_subgraph") {
-        if (opts.enterFails) throw new Error("could not enter subgraph 78");
+      if (opts.enterFails) throw new Error("could not enter subgraph 78");
         inSubgraph = true;
+        currentGraphIdentity = targetGraphIdentity;
         return { scope: "subgraph", node_id: cmd.node_id };
       }
       if (cmd.cmd === "graph_exit_subgraph") {
         if (opts.exitFails) throw new Error("could not confirm exit");
         inSubgraph = false;
+        currentGraphIdentity = "graph:workflow-a-root";
         return { scope: "root" };
       }
       if (cmd.cmd === "graph_query") {
@@ -330,6 +363,7 @@ function bridge(opts: {
               scope: inSubgraph ? "subgraph" : "root",
               ownerNodeId,
               ...(opts.omitWorkflowUuid ? {} : { workflowUuid }),
+              graphIdentity: currentGraphIdentity,
             };
             // Keep the cached reply as a separate value. The live result is
             // the witness the final callback must carry forward.
@@ -797,6 +831,14 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
       "malformed viewing workflow identity",
       { ...SAFE_ANIMA_SUBGRAPH, viewing: { scope: "subgraph", owner_node_id: 78, workflow_uuid: 42 } },
     ],
+    [
+      "malformed viewing graph identity",
+      { ...SAFE_ANIMA_SUBGRAPH, viewing: { scope: "subgraph", owner_node_id: 78, graph_identity: "" } },
+    ],
+    [
+      "malformed target graph identity",
+      { ...SAFE_ANIMA_SUBGRAPH, subgraph_of: { node_id: 78, graph_identity: "" } },
+    ],
   ])("refuses a %s envelope before writing the container", async (_name, subgraph) => {
     const { text, isError, calls } = await setWidget(
       { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
@@ -817,7 +859,12 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
         detailById: SAFE_ANIMA_IDENTITY_BY_ID,
         postEnterGraphQueryById: {
           "76": {
-            viewing: { scope: "subgraph", owner_node_id: 79, workflow_uuid: "workflow-a" },
+            viewing: {
+              scope: "subgraph",
+              owner_node_id: 79,
+              workflow_uuid: "workflow-a",
+              graph_identity: "graph:workflow-a-container-a",
+            },
             nodes: [{ id: 76, type: "PrimitiveStringMultiline" }],
           },
         },
@@ -839,7 +886,12 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
         detailById: SAFE_ANIMA_IDENTITY_BY_ID,
         postEnterGraphQueryById: {
           "76": {
-            viewing: { scope: "subgraph", owner_node_id: 78, workflow_uuid: "workflow-b" },
+            viewing: {
+              scope: "subgraph",
+              owner_node_id: 78,
+              workflow_uuid: "workflow-b",
+              graph_identity: "graph:workflow-a-container-a",
+            },
             nodes: [{ id: 76, type: "PrimitiveStringMultiline" }],
           },
         },
@@ -887,6 +939,33 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
     expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(1);
     expect(writesApplied).toBe(0);
     expect(authoritativeScopeReads).toBe(1);
+  });
+
+  it("refuses a normal write when a same-id receiver graph changes after the MCP fence", async () => {
+    const { text, isError, calls, writesApplied } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
+      {
+        firstWrite: "ok",
+        subgraph: SAFE_ANIMA_SUBGRAPH,
+        detailById: SAFE_ANIMA_IDENTITY_BY_ID,
+        authoritativeScopeRead: true,
+        receiverNavigationAfterMcpFence: true,
+        receiverGraphIdentityCollisionAfterMcpFence: true,
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/promoted receiver changed|Nothing was applied/);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(1);
+    expect(calls.find((c) => c.cmd === "graph_set_widget")).toMatchObject({
+      expected_scope: {
+        scope: "subgraph",
+        owner_node_id: "78",
+        workflow_uuid: "workflow-a",
+        graph_identity: "graph:workflow-a-container-a",
+      },
+    });
+    expect(writesApplied).toBe(0);
   });
 
   it("keeps a valid same-owner write when workflow_uuid is unavailable", async () => {
@@ -1023,9 +1102,47 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
     expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(2);
     expect(writesApplied).toBe(1);
     expect(calls.filter((c) => c.cmd === "graph_set_widget")[1]).toMatchObject({
-      expected_scope: { scope: "subgraph", owner_node_id: "78", workflow_uuid: "workflow-a" },
+      expected_scope: {
+        scope: "subgraph",
+        owner_node_id: "78",
+        workflow_uuid: "workflow-a",
+        graph_identity: "graph:workflow-a-container-a",
+      },
     });
     expect(authoritativeScopeReads).toBe(1);
+  });
+
+  it("refuses a legacy retry when a same-id receiver graph changes after the MCP fence", async () => {
+    const { text, isError, calls, writesApplied } = await setWidget(
+      { node_id: 78, widget: "Quality_Prompt", value: "masterpiece" },
+      {
+        firstWrite: "contradict",
+        firstWriteError: ANIMA_CONTRADICTORY,
+        preflightSubgraph: new Error("preflight unavailable"),
+        subgraph: SAFE_ANIMA_SUBGRAPH,
+        detailById: SAFE_ANIMA_IDENTITY_BY_ID,
+        authoritativeScopeRead: true,
+        receiverNavigationAfterMcpFence: true,
+        receiverGraphIdentityCollisionAfterMcpFence: true,
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/promoted receiver changed|Nothing was applied/);
+    const writes = calls.filter((c) => c.cmd === "graph_set_widget");
+    expect(writes).toHaveLength(2);
+    expect(writes[1]).toMatchObject({
+      node_id: 76,
+      expected_scope: {
+        scope: "subgraph",
+        owner_node_id: "78",
+        workflow_uuid: "workflow-a",
+        graph_identity: "graph:workflow-a-container-a",
+      },
+    });
+    // The outer contradictory attempt is the only receiver-side application;
+    // the remapped inner write is refused by graph identity before apply.
+    expect(writesApplied).toBe(1);
   });
 
   it("routes a successful object-info retry through the promoted inner guards", async () => {

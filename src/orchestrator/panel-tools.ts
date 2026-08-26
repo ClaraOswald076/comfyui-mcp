@@ -6348,13 +6348,24 @@ function currentPromotedScopeError(
     }
     if (
       requireCurrentSubgraph &&
-      (scopeRead.scope !== "subgraph" || scopeRead.ownerNodeId !== expected.ownerNodeId)
+      (scopeRead.scope !== "subgraph" ||
+        scopeRead.ownerNodeId !== expected.ownerNodeId ||
+        scopeRead.graphIdentity !== expected.graphIdentity)
     ) {
-      return "the receiving panel current subgraph owner changed or became unverifiable";
+      return "the receiving panel current graph/subgraph identity changed or became unverifiable";
+    }
+    // Before graph_enter_subgraph the live query is correctly scoped to the
+    // parent/root graph, while expected.graphIdentity names the target graph
+    // carried in subgraph_of. Compare the graph token only once the receiver
+    // is actually in a subgraph (the authoritative/final fence requires that).
+    if (scopeRead.scope === "subgraph" && scopeRead.graphIdentity !== expected.graphIdentity) {
+      return "the receiving panel current graph identity changed or became unverifiable";
     }
     if (expected.workflowUuid !== undefined && scopeRead.workflowUuid !== expected.workflowUuid) {
       return "the receiving panel workflow scope changed or became unverifiable";
     }
+  } else {
+    return "the receiving panel current graph/subgraph identity became unverifiable";
   }
 
   // The workflow stamp remains an independent receiver fence. Its UUID is
@@ -16953,6 +16964,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                         expected_scope: {
                           scope: "subgraph",
                           owner_node_id: targetExpectedScope.ownerNodeId,
+                          graph_identity: targetExpectedScope.graphIdentity,
                           ...(targetExpectedScope.workflowUuid !== undefined
                             ? { workflow_uuid: targetExpectedScope.workflowUuid }
                             : {}),

@@ -35,18 +35,23 @@ export type PromotedViewingIdentity = {
   ownerNodeId: string | null;
   /** Older/current panels may omit this while the active workflow identity is unreadable. */
   workflowUuid?: string;
+  /** Object-keyed live graph identity. Required before a promoted write. */
+  graphIdentity?: string;
 };
 
 /** The stable scope witness carried from the promotion read to the inner write. */
 export type PromotedScopeWitness = {
   workflowUuid?: string;
   ownerNodeId: string;
+  graphIdentity: string;
 };
 
 export type PromotedSubgraphEnvelope = {
   nodes: Array<Record<string, unknown>>;
   nodeId: string;
   nodeCount: number;
+  /** Identity of the target graph reached by entering this wrapper. */
+  targetGraphIdentity?: string;
   viewing?: PromotedViewingIdentity;
 };
 
@@ -204,6 +209,13 @@ export function parsePromotedViewingIdentity(value: unknown): PromotedViewingIde
   if (workflowUuid !== undefined && (typeof workflowUuid !== "string" || workflowUuid.length === 0)) {
     return null;
   }
+  const graphIdentity = value.graph_identity;
+  if (
+    graphIdentity !== undefined &&
+    (typeof graphIdentity !== "string" || graphIdentity.length === 0 || graphIdentity.length > 256)
+  ) {
+    return null;
+  }
 
   const rawOwner = value.owner_node_id;
   let ownerNodeId: string | null = null;
@@ -215,6 +227,7 @@ export function parsePromotedViewingIdentity(value: unknown): PromotedViewingIde
     scope,
     ownerNodeId,
     ...(workflowUuid !== undefined ? { workflowUuid } : {}),
+    ...(graphIdentity !== undefined ? { graphIdentity } : {}),
   };
 }
 
@@ -246,6 +259,15 @@ export function validatePromotedSubgraphEnvelope(
   ) {
     return null;
   }
+  const targetGraphIdentity = owner.graph_identity;
+  if (
+    targetGraphIdentity !== undefined &&
+    (typeof targetGraphIdentity !== "string" ||
+      targetGraphIdentity.length === 0 ||
+      targetGraphIdentity.length > 256)
+  ) {
+    return null;
+  }
 
   const nodeCount = subgraph.node_count;
   const nodes = subgraph.nodes;
@@ -267,6 +289,7 @@ export function validatePromotedSubgraphEnvelope(
     nodes: normalized,
     nodeId: stripNodeId(String(owner.node_id)),
     nodeCount: nodeCount as number,
+    ...(targetGraphIdentity !== undefined ? { targetGraphIdentity } : {}),
     ...(viewing ? { viewing } : {}),
   };
 }
@@ -280,12 +303,13 @@ export function promotedScopeWitnessFromEnvelope(
 ): PromotedScopeWitness | null {
   if (!envelope?.viewing) return null;
   const ownerNodeId = canonicalPromotedNodeId(envelope.nodeId);
-  if (!ownerNodeId) return null;
+  if (!ownerNodeId || typeof envelope.targetGraphIdentity !== "string") return null;
   return {
     ...(envelope.viewing.workflowUuid !== undefined
       ? { workflowUuid: envelope.viewing.workflowUuid }
       : {}),
     ownerNodeId,
+    graphIdentity: envelope.targetGraphIdentity,
   };
 }
 
@@ -299,7 +323,8 @@ export function promotedViewingMatchesScope(
   return (
     viewing?.scope === "subgraph" &&
     viewing.ownerNodeId === expected.ownerNodeId &&
-    (expected.workflowUuid === undefined || viewing.workflowUuid === expected.workflowUuid)
+    (expected.workflowUuid === undefined || viewing.workflowUuid === expected.workflowUuid) &&
+    viewing.graphIdentity === expected.graphIdentity
   );
 }
 

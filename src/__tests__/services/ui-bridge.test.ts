@@ -164,6 +164,7 @@ function connectPanel(
             enforces_workflow_stamp_at_write: true,
             enforces_expected_node_type_at_write: true,
             enforces_expected_scope_at_write: true,
+            enforces_expected_scope_graph_identity_at_write: true,
             // The panel's sessionStorage-backed browser-tab identity: unique per
             // browser tab, stable across a reload (#486/#709).
             ...(opts.tabSessionId ? { tab_session_id: opts.tabSessionId } : {}),
@@ -651,6 +652,7 @@ describe("UiBridge (typed dispatch outcome — panel #442 defect 4)", () => {
                 scope: "subgraph",
                 owner_node_id: 78,
                 workflow_uuid: "11111111-1111-4111-8111-111111111111",
+                graph_identity: "graph:scope-a",
               },
               nodes: [{ id: 76, type: "PrimitiveStringMultiline" }],
             },
@@ -668,6 +670,7 @@ describe("UiBridge (typed dispatch outcome — panel #442 defect 4)", () => {
       scope: "subgraph",
       ownerNodeId: "78",
       workflowUuid: "11111111-1111-4111-8111-111111111111",
+      graphIdentity: "graph:scope-a",
     });
     a.close();
   });
@@ -687,6 +690,7 @@ describe("UiBridge (typed dispatch outcome — panel #442 defect 4)", () => {
                 scope: "subgraph",
                 owner_node_id: ownerNodeId,
                 workflow_uuid: "11111111-1111-4111-8111-111111111111",
+                graph_identity: "graph:scope-a",
               },
               nodes: [{ id: 76, type: "PrimitiveStringMultiline" }],
             },
@@ -707,6 +711,7 @@ describe("UiBridge (typed dispatch outcome — panel #442 defect 4)", () => {
       scope: "subgraph",
       ownerNodeId: "79",
       workflowUuid: "11111111-1111-4111-8111-111111111111",
+      graphIdentity: "graph:scope-a",
     });
     expect(bridge.promotedScopeFor("tab-scope-read-2314")).toMatchObject({ ownerNodeId: "79" });
     a.close();
@@ -3264,6 +3269,56 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       );
     expect(caught).toBeInstanceOf(Error);
     expect((caught as Error).message).toMatch(/atomic promoted-scope write fence.*0\.15\.97/i);
+    expect(isCapabilityRefusal(caught)).toBe(true);
+    expect(dispatchOutcomeOf(caught)).toBe(false);
+    old.close();
+  });
+
+  it("FAILS CLOSED when an old promoted fence lacks graph identity enforcement", async () => {
+    const old = new WebSocket(`ws://127.0.0.1:${port}`);
+    await new Promise<void>((res, rej) => {
+      old.on("open", () => {
+        old.send(
+          JSON.stringify({
+            type: "hello",
+            tab_id: "tmp:old-promoted-graph-identity",
+            title: "old promoted graph identity fence",
+            enforces_workflow_stamp: true,
+            enforces_workflow_stamp_at_write: true,
+            enforces_expected_node_type_at_write: true,
+            enforces_expected_scope_at_write: true,
+            // Deliberately omit the P1 graph-identity capability. The owner id
+            // is graph-local and cannot fence a same-id cross-graph navigation.
+          }),
+        );
+        res();
+      });
+      old.on("error", rej);
+    });
+    await waitFor(() =>
+      expect(bridge.tabs().some((t) => t.tab_id === "tmp:old-promoted-graph-identity")).toBe(true),
+    );
+    const caught = await bridge
+      .send(
+        {
+          cmd: "graph_set_widget",
+          node_id: 76,
+          widget: "quality_prompt",
+          value: "NEW",
+          expected_scope: {
+            scope: "subgraph",
+            owner_node_id: "78",
+            graph_identity: "graph:scope-a",
+          },
+        },
+        { tabId: "tmp:old-promoted-graph-identity" },
+      )
+      .then(
+        () => null,
+        (err) => err,
+      );
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toMatch(/graph-identity write fence.*0\.15\.97/i);
     expect(isCapabilityRefusal(caught)).toBe(true);
     expect(dispatchOutcomeOf(caught)).toBe(false);
     old.close();

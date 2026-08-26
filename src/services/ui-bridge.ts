@@ -227,6 +227,11 @@ interface Conn {
    * absent: an older panel would silently ignore receiver identity and could
    * write a same-id node after navigation. */
   enforcesExpectedScopeAtWrite: boolean;
+  /** True only when THIS hello advertises that expected_scope also carries and
+   * validates the stable live graph identity. Owner and wrapper ids are local
+   * to a graph, so the older owner/workflow-only fence is insufficient for a
+   * same-id cross-graph navigation. */
+  enforcesExpectedScopeGraphIdentityAtWrite: boolean;
   /** True when THIS hello advertises that the panel understands `agent_note` — a frame
    *  delivered to the AGENT ONLY and never rendered as a chat bubble.
    *
@@ -364,6 +369,9 @@ export const BRIDGE_CAPABILITY_MIN_PANEL_VERSION: Readonly<Record<string, string
   // #2314 — promoted inner writes carry an expected owner/workflow witness that
   // the panel validates immediately before mutating the current graph.
   enforces_expected_scope_at_write: "0.15.97",
+  // #2314 P1 — the promoted fence additionally validates the object-keyed live
+  // graph identity, which is distinct from graph-local owner/node ids.
+  enforces_expected_scope_graph_identity_at_write: "0.15.97",
 };
 
 /**
@@ -1098,6 +1106,7 @@ export type TabPromotedScopeRead =
       scope: "root" | "subgraph";
       ownerNodeId: string | null;
       workflowUuid?: string;
+      graphIdentity?: string;
     }
   | { known: false; reason: string };
 
@@ -1560,6 +1569,20 @@ function expectedScopeFenceRefusal(tabId: string): Error {
       `does not advertise the atomic promoted-scope write fence. Update the ` +
       `panel to 0.15.97+ and hard-refresh the browser tab.`,
   );
+}
+
+function expectedScopeGraphIdentityFenceRefusal(tabId: string): Error {
+  return new Error(
+    `graph_set_widget was refused before dispatch because panel tab ${tabId} ` +
+      `does not advertise the atomic promoted graph-identity write fence. Update the ` +
+      `panel to 0.15.97+ and hard-refresh the browser tab.`,
+  );
+}
+
+function commandCarriesExpectedGraphIdentity(cmd: BridgeCommand): boolean {
+  const scope = cmd.expected_scope;
+  return !!scope && typeof scope === "object" && !Array.isArray(scope) &&
+    Object.prototype.hasOwnProperty.call(scope, "graph_identity");
 }
 
 /** Normalize a syntactically valid HTTP(S) WebSocket handshake `Origin` into a
@@ -3017,6 +3040,9 @@ export class UiBridge {
             (msg as { enforces_expected_node_type_at_write?: unknown }).enforces_expected_node_type_at_write === true,
           enforcesExpectedScopeAtWrite:
             (msg as { enforces_expected_scope_at_write?: unknown }).enforces_expected_scope_at_write === true,
+          enforcesExpectedScopeGraphIdentityAtWrite:
+            (msg as { enforces_expected_scope_graph_identity_at_write?: unknown })
+              .enforces_expected_scope_graph_identity_at_write === true,
           // Re-read per hello like the stamps above: a reconnect can be a different build.
           acceptsAgentNotes:
             (msg as { accepts_agent_notes?: unknown }).accepts_agent_notes === true,
@@ -5265,6 +5291,17 @@ export class UiBridge {
       );
       return Promise.reject(markCapabilityRefusal(refusal));
     }
+    if (
+      cmd.cmd === "graph_set_widget" &&
+      commandCarriesExpectedGraphIdentity(cmd) &&
+      !conn.enforcesExpectedScopeGraphIdentityAtWrite
+    ) {
+      const refusal = markDispatched(
+        expectedScopeGraphIdentityFenceRefusal(conn.tabId),
+        false,
+      );
+      return Promise.reject(markCapabilityRefusal(refusal));
+    }
     // #570 P0c — FAIL CLOSED for a command that mutates the ACTIVE workflow/canvas (every
     // graph_* mutator, plus path-less workflow_save/save_as/rename/close) when the resolved
     // panel does NOT enforce the per-command workflow-instance stamp. Such a panel would
@@ -5673,6 +5710,17 @@ export class UiBridge {
           markCapabilityRefusal(markDispatched(expectedScopeFenceRefusal(live.tabId), false)),
         );
       }
+      if (
+        cmd.cmd === "graph_set_widget" &&
+        commandCarriesExpectedGraphIdentity(cmd) &&
+        !live.enforcesExpectedScopeGraphIdentityAtWrite
+      ) {
+        return Promise.reject(
+          markCapabilityRefusal(
+            markDispatched(expectedScopeGraphIdentityFenceRefusal(live.tabId), false),
+          ),
+        );
+      }
       if (live.sock.readyState !== WebSocket.OPEN) {
         if (opts.tabId && UiBridge.isMailboxable(cmd)) {
           this.storeMailbox(opts.tabId, cmd);
@@ -5811,11 +5859,24 @@ export class UiBridge {
         reason: "the panel returned a malformed current-view workflow identity",
       };
     }
+    const rawGraphIdentity = identity.graph_identity;
+    if (
+      rawGraphIdentity !== undefined &&
+      (typeof rawGraphIdentity !== "string" ||
+        rawGraphIdentity.length === 0 ||
+        rawGraphIdentity.length > 256)
+    ) {
+      return {
+        known: false,
+        reason: "the panel returned a malformed current-view graph identity",
+      };
+    }
     return {
       known: true,
       scope: identity.scope,
       ownerNodeId,
       ...(rawWorkflowUuid !== undefined ? { workflowUuid: rawWorkflowUuid } : {}),
+      ...(rawGraphIdentity !== undefined ? { graphIdentity: rawGraphIdentity } : {}),
     };
   }
 
