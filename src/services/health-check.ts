@@ -196,7 +196,24 @@ export async function runHealthCheck(
         // timestamp. #2329 matched `^Traceback` against the raw line, which therefore
         // could never fire: measured on a live 105-line log, 0 lines start with
         // "Traceback".
-        const bodyOf = (line: string): string => line.replace(/^\S+ - /, "");
+        //
+        // #2355 — ColoredFormatter prepends ANSI-wrapped `[LEVEL]` tags before the
+        // message, even when given ColoredFormatter("%(message)s"). After stripping
+        // the timestamp, the body still begins with `\x1b[1m\x1b[31m[ERROR]\x1b[0m `,
+        // so anchored patterns like `^!!!` or `^Traceback` need the ANSI escapes
+        // stripped first. The ColoredFormatter output has ANSI codes immediately after
+        // the timestamp prefix: `\x1b[...m[LEVEL]\x1b[0m message`.
+        //
+        // Stripping ANSI leaves the [LEVEL] marker intact so existing patterns like
+        // `/[ERROR]/` continue to work. The anchored patterns need to account for
+        // the optional [LEVEL] tag that may precede them.
+        const stripAnsi = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
+        const bodyOf = (line: string): string => {
+          // Strip timestamp prefix and ANSI escape sequences
+          let body = line.replace(/^\S+ - /, "");
+          body = stripAnsi(body);
+          return body;
+        };
 
         // What stock ComfyUI actually emits. #2329 keyed on `[ERROR]`/`[EXCEPTION]`,
         // which its in-memory handler never writes — app/logger.py formats the memory
@@ -209,14 +226,18 @@ export async function runHealthCheck(
         // "Got an OOM, unloading all loaded models." were all invisible, so a crashed
         // render reported byte-identically to a healthy server in the diagnostic users
         // paste into bug reports.
+        //
+        // #2355 — after stripping ANSI codes (which ColoredFormatter wraps around
+        // [LEVEL] tags), the body may be `[ERROR] !!! Exception...` instead of
+        // `!!! Exception...`. Patterns must account for this optional [LEVEL] prefix.
         const ERROR_HEADERS: readonly RegExp[] = [
-          /^!!!\s*Exception during processing/i,   // execution.py render failure
-          /^Traceback\s*\(/i,                       // a Python traceback header
+          /^(?:\[(?:ERROR|WARNING|INFO|DEBUG|CRITICAL|EXCEPTION)\]\s*)?!!!\s*Exception during processing/i,   // execution.py render failure, possibly with [LEVEL]
+          /^(?:\[(?:ERROR|WARNING|INFO|DEBUG|CRITICAL|EXCEPTION)\]\s*)?Traceback\s*\(/i,                       // traceback header, possibly with [LEVEL]
           /\[ERROR\]|\[EXCEPTION\]/i,               // ComfyUI-Manager / file handler
         ];
         const ERROR_SIGNALS: readonly RegExp[] = [
           ...ERROR_HEADERS,
-          /^[A-Za-z0-9_.]*(Error|Exception)\s*:/,          // a bare exception tail
+          /^(?:\[(?:ERROR|WARNING|INFO|DEBUG|CRITICAL|EXCEPTION)\]\s*)?[A-Za-z0-9_.]*(Error|Exception)\s*:/,          // exception tail, possibly with [LEVEL]
           /\bGot an OOM\b/i,                        // model_management OOM notice
           /\bAllocation on device\b/i,              // torch allocator OOM
           /\bCUDA out of memory\b/i,
@@ -257,7 +278,8 @@ export async function runHealthCheck(
             if (isHeader(b)) break;
             if (/^[ \t]/.test(b) || b.trim() === "") { group.push(allLines[j]); processed.add(j); continue; }
             // A bare exception tail closes the traceback it belongs to; take it and stop.
-            if (/^[A-Za-z0-9_.]*(Error|Exception)\s*:/.test(b)) {
+            // The tail may be prefixed with a [LEVEL] tag from ColoredFormatter.
+            if (/^(?:\[(?:ERROR|WARNING|INFO|DEBUG|CRITICAL|EXCEPTION)\]\s*)?[A-Za-z0-9_.]*(Error|Exception)\s*:/.test(b)) {
               group.push(allLines[j]); processed.add(j);
             }
             break;
@@ -267,7 +289,10 @@ export async function runHealthCheck(
         // Take the last N error groups, then flatten them into lines for scrubbing
         const recentErrorGroups = errorGroups.slice(-recentErrors);
         const errorLines = recentErrorGroups.flat();
-        const errLines = scrubLogLines(errorLines);
+        // Strip ANSI escape sequences before scrubbing secrets, so the patterns used
+        // by scrubSecretShapedText don't get confused by control bytes.
+        const ansiStripped = errorLines.map((line) => stripAnsi(line));
+        const errLines = scrubLogLines(ansiStripped);
         if (errLines.length > 0) {
           lines.push(`\n**Recent errors** (last ${errLines.length}):`);
           for (const e of errLines) lines.push(`  ${e.trim()}`);
