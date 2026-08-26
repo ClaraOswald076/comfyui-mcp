@@ -114,6 +114,15 @@ function bridge(opts: {
   /** Receiver navigation to another graph with the SAME owner/workflow and
    * colliding inner ids. Only graph_identity may distinguish this target. */
   receiverGraphIdentityCollisionAfterMcpFence?: boolean;
+  /** A parent/subgraph scope cached before graph_enter_subgraph. The child
+   * graph token must not be compared against this pre-entry graph. */
+  preEntryScopeRead?: {
+    known: true;
+    scope: "root" | "subgraph";
+    ownerNodeId: string | null;
+    workflowUuid?: string;
+    graphIdentity?: string;
+  };
   omitWorkflowUuid?: boolean;
   workflowUuid?: string;
 }) {
@@ -366,7 +375,10 @@ function bridge(opts: {
     resolveActiveTabId: () => TAB,
     tabCanMutateGraph: () => true,
     tabConnectionIdentity: () => connectionIdentity,
-    promotedScopeFor: () => observedPromotedScope,
+    promotedScopeFor: () =>
+      !inSubgraph && opts.preEntryScopeRead
+        ? opts.preEntryScopeRead
+        : observedPromotedScope,
     ...(opts.authoritativeScopeRead
       ? {
           readPromotedScope: async () => {
@@ -667,6 +679,22 @@ const SAFE_ANIMA_SUBGRAPH = {
 const SAFE_ANIMA_IDENTITY_BY_ID = {
   "78": ANIMA_IDENTITY_BY_ID["78"],
   "76": { nodes: [{ id: 76, type: "PrimitiveStringMultiline" }] },
+};
+
+const CURRENT_SAFE_PROMOTED_SUBGRAPH = {
+  ...SAFE_ANIMA_SUBGRAPH,
+  promoted_terminals: [
+    {
+      widget: "quality_prompt",
+      immediate_node_id: 76,
+      immediate_widget: "quality_prompt",
+      terminal_node_id: 76,
+      terminal_node_type: "PrimitiveStringMultiline",
+      terminal_widget: "quality_prompt",
+      terminal_inputs: [],
+      chain_depth: 0,
+    },
+  ],
 };
 
 /** The outer read lists only B. The receiver's terminal witness proves that
@@ -1003,6 +1031,169 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
       "graph_get_subgraph",
       "graph_set_widget",
     ]);
+  });
+
+  it("fails closed before the outer write when a current panel omits its witness array", async () => {
+    const missingWitness: Record<string, unknown> = { ...CURRENT_SAFE_PROMOTED_SUBGRAPH };
+    delete missingWitness.promoted_terminals;
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "renamed_alias", value: "new" },
+      {
+        firstWrite: "ok",
+        promotedTerminalWitnesses: true,
+        subgraph: {
+          ...missingWitness,
+          nodes: [{ id: 76, type: "PrimitiveStringMultiline", widgets: { quality_prompt: "old" } }],
+        },
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/omitted the witness array/);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
+  });
+
+  it("fails closed before any write for an ambiguous current terminal alias", async () => {
+    const entry = CURRENT_SAFE_PROMOTED_SUBGRAPH.promoted_terminals[0];
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "new" },
+      {
+        firstWrite: "ok",
+        promotedTerminalWitnesses: true,
+        subgraph: { ...CURRENT_SAFE_PROMOTED_SUBGRAPH, promoted_terminals: [entry, { ...entry }] },
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/missing, ambiguous, stale, or unresolved/);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
+  });
+
+  it("fails closed before any write for a malformed current terminal witness", async () => {
+    const entry = CURRENT_SAFE_PROMOTED_SUBGRAPH.promoted_terminals[0];
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "new" },
+      {
+        firstWrite: "ok",
+        promotedTerminalWitnesses: true,
+        subgraph: { ...CURRENT_SAFE_PROMOTED_SUBGRAPH, promoted_terminals: [{ ...entry, terminal_inputs: "bad" }] },
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/malformed, stale, or incomplete ownership envelope/);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
+  });
+
+  it("fails closed before any write when the current alias loses its _subgraphSlot proof", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "new" },
+      {
+        firstWrite: "ok",
+        promotedTerminalWitnesses: true,
+        subgraph: {
+          ...CURRENT_SAFE_PROMOTED_SUBGRAPH,
+          promoted_terminals: [
+            {
+              widget: "quality_prompt",
+              error: "_subgraphSlot missing or unresolved",
+            },
+          ],
+        },
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/missing, ambiguous, stale, or unresolved/);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
+  });
+
+  it("keeps a current-panel ordinary subgraph widget on the original outer path", async () => {
+    const { isError, calls } = await setWidget(
+      { node_id: 78, widget: "ordinary", value: "new" },
+      {
+        firstWrite: "ok",
+        promotedTerminalWitnesses: true,
+        subgraph: {
+          subgraph_of: { node_id: 78, title: "Ordinary container" },
+          node_count: 1,
+          nodes: [{ id: 76, type: "PrimitiveStringMultiline", widgets: { ordinary: "old" } }],
+          promoted_terminals: [],
+        },
+      },
+    );
+
+    expect(isError).toBe(false);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toEqual([
+      expect.objectContaining({ node_id: 78, widget: "ordinary" }),
+    ]);
+  });
+
+  it("preserves the legacy panel path for an alias the old panel cannot witness", async () => {
+    const { isError, calls } = await setWidget(
+      { node_id: 78, widget: "renamed_alias", value: "new" },
+      {
+        firstWrite: "ok",
+        subgraph: {
+          ...SAFE_ANIMA_SUBGRAPH,
+          nodes: [{ id: 76, type: "PrimitiveStringMultiline", widgets: { quality_prompt: "old" } }],
+        },
+      },
+    );
+
+    expect(isError).toBe(false);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toEqual([
+      expect.objectContaining({ node_id: 78, widget: "renamed_alias" }),
+    ]);
+  });
+
+  it("does not compare the child graph token with a parent view before entering it", async () => {
+    const { isError, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "new" },
+      {
+        firstWrite: "ok",
+        promotedTerminalWitnesses: true,
+        subgraph: CURRENT_SAFE_PROMOTED_SUBGRAPH,
+        detailById: SAFE_ANIMA_IDENTITY_BY_ID,
+        preEntryScopeRead: {
+          known: true,
+          scope: "subgraph",
+          ownerNodeId: "500",
+          workflowUuid: "workflow-a",
+          graphIdentity: "graph:workflow-a-parent",
+        },
+      },
+    );
+
+    expect(isError).toBe(false);
+    expect(calls.map((call) => call.cmd)).toContain("graph_enter_subgraph");
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toEqual([
+      expect.objectContaining({ node_id: 76, widget: "quality_prompt" }),
+    ]);
+  });
+
+  it("fails closed when the current terminal witness relinks before dispatch", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "new" },
+      {
+        firstWrite: "ok",
+        promotedTerminalWitnesses: true,
+        preflightSubgraph: CURRENT_SAFE_PROMOTED_SUBGRAPH,
+        subgraph: {
+          ...CURRENT_SAFE_PROMOTED_SUBGRAPH,
+          promoted_terminals: [
+            {
+              ...CURRENT_SAFE_PROMOTED_SUBGRAPH.promoted_terminals[0],
+              terminal_node_id: 99,
+            },
+          ],
+        },
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/mapping changed or became unverifiable/);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
   });
 
   it("refuses a promoted mapping for an old receiver without the graph-identity fence", async () => {

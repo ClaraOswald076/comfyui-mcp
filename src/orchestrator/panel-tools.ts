@@ -6357,6 +6357,26 @@ function promotedMatchCount(payload: Record<string, unknown>, widget: string): n
   return matches;
 }
 
+/** Count the current panel's authoritative alias entries. A complete witness
+ * array is also the distinction between a promoted alias and an ordinary
+ * widget on the same subgraph container; do not infer that distinction from
+ * the inner node's concrete widget names because aliases may be renamed. */
+function promotedTerminalAliasCount(
+  payload: Record<string, unknown>,
+  widget: string,
+): number | null {
+  const entries = payload.promoted_terminals;
+  if (!Array.isArray(entries)) return null;
+  return entries.filter(
+    (entry) =>
+      !!entry &&
+      typeof entry === "object" &&
+      !Array.isArray(entry) &&
+      typeof (entry as Record<string, unknown>).widget === "string" &&
+      ((entry as Record<string, unknown>).widget as string).toLowerCase() === widget.toLowerCase(),
+  ).length;
+}
+
 function currentPromotedBindingError(
   ctx: PanelToolCtx,
   binding: PromotedWriteBinding,
@@ -6413,13 +6433,10 @@ function currentPromotedScopeError(
     ) {
       return "the receiving panel current graph/subgraph identity changed or became unverifiable";
     }
-    // Before graph_enter_subgraph the live query is correctly scoped to the
-    // parent/root graph, while expected.graphIdentity names the target graph
-    // carried in subgraph_of. Compare the graph token only once the receiver
-    // is actually in a subgraph (the authoritative/final fence requires that).
-    if (scopeRead.scope === "subgraph" && scopeRead.graphIdentity !== expected.graphIdentity) {
-      return "the receiving panel current graph identity changed or became unverifiable";
-    }
+    // Before graph_enter_subgraph the live query is scoped to the parent/root
+    // graph, while expected.graphIdentity names the child graph carried in
+    // subgraph_of. Never compare those different graph objects. The child
+    // identity is checked only by the post-entry/current-dispatch fences above.
     if (expected.workflowUuid !== undefined && scopeRead.workflowUuid !== expected.workflowUuid) {
       return "the receiving panel workflow scope changed or became unverifiable";
     }
@@ -6511,10 +6528,9 @@ async function preparePromotedWidgetWrite(
   // advertises that it publishes that witness. Older panels retain their
   // established known-bad recovery path rather than being mistaken for a
   // bundle that can classify renamed promotion aliases.
-  if (
-    ctx.tabPromotedTerminalWitnessCapability?.() !== true &&
-    !mayHaveKnownBadPromotedWidget(widget)
-  ) {
+  const publishesCompleteTerminalWitness =
+    ctx.tabPromotedTerminalWitnessCapability?.() === true;
+  if (!publishesCompleteTerminalWitness && !mayHaveKnownBadPromotedWidget(widget)) {
     return null;
   }
 
@@ -6542,6 +6558,15 @@ async function preparePromotedWidgetWrite(
     return promotedWriteRefusal(
       widget,
       "graph_get_subgraph returned no definitive non-promoted or ownership result",
+    );
+  }
+  if (
+    publishesCompleteTerminalWitness &&
+    !Object.prototype.hasOwnProperty.call(payload, "promoted_terminals")
+  ) {
+    return promotedWriteRefusal(
+      widget,
+      "the current receiver advertised complete promoted-terminal witnesses but omitted the witness array",
     );
   }
   // The recursive alias mapping is the current receiver's proof that this
@@ -6591,6 +6616,22 @@ async function preparePromotedWidgetWrite(
   }
   const inner = resolveInnerPromotedTarget(payload, widget, nodeId as number | string);
   if (!inner) {
+    const terminalAliases = publishesCompleteTerminalWitness
+      ? promotedTerminalAliasCount(payload, widget)
+      : 0;
+    if (terminalAliases === null || terminalAliases > 0) {
+      return promotedWriteRefusal(
+        widget,
+        terminalAliases === null
+          ? "the current receiver's promoted-terminal witness was unavailable"
+          : "the promoted-terminal witness was missing, ambiguous, stale, or unresolved",
+      );
+    }
+    // A current panel's complete witness array is authoritative: an alias
+    // absent from it is an ordinary own-widget, even if an inner concrete node
+    // happens to use the same spelling. Preserve the original outer write for
+    // that deliberate non-promoted case.
+    if (publishesCompleteTerminalWitness && terminalAliases === 0) return null;
     const matches = promotedMatchCount(payload, widget);
     if (matches === 0) return null;
     return promotedWriteRefusal(
@@ -6675,6 +6716,15 @@ async function recheckPromotedOuterMapping(
     );
   }
   const payload = parseToolResultJson(confirmation);
+  if (
+    ctx.tabPromotedTerminalWitnessCapability?.() === true &&
+    (!payload || !Object.prototype.hasOwnProperty.call(payload, "promoted_terminals"))
+  ) {
+    return promotedWriteRefusal(
+      widget,
+      "the current receiver advertised complete promoted-terminal witnesses but omitted the witness array",
+    );
+  }
   const envelope = validatePromotedSubgraphEnvelope(payload, outerNodeId);
   const observedScope = envelope ? promotedScopeWitnessFromEnvelope(envelope) : null;
   const inner = envelope
