@@ -92,6 +92,9 @@ export interface CompletionPayload {
   error?: string;
   note?: string;
   prompt_id?: string;
+  /** Stable panel delivery identity. Replays with this key are the same
+   * completion even when the first WebSocket write was not acknowledged. */
+  completion_key?: string;
   [k: string]: unknown;
 }
 
@@ -126,6 +129,8 @@ export interface RunTicket {
    * this to reject an unknown completion observed before this run existed. */
   dispatchedAt?: number;
   toNodeId?: number;
+  /** Panel-issued completion identity bound to this ticket generation. */
+  completionKey?: string;
   /**
    * Generation of THIS ticket. Bumped whenever the id is opened again (a fresh
    * ticket after the old one was evicted, or a reopen), so a completion can only
@@ -138,6 +143,8 @@ export interface RunTicket {
   seq: number;
   /** True once a completion for this exact prompt id was acked as delivered. */
   settled: boolean;
+  /** The settled completion came from the history watchdog before Panel's key arrived. */
+  watchdogSettled?: boolean;
   /**
    * This prompt id was queued MORE THAN ONCE, so it no longer identifies a
    * single run.
@@ -265,6 +272,9 @@ const MAX_ENTRIES_TOTAL = 96;
  *  it outlives the tickets that feed it; a resend later than THIS is delivered
  *  again, but as `foreign` — flagged UNDETERMINED, never as the awaited run. */
 const MAX_DELIVERED_MEMO = 512;
+/** Stable panel completion keys remembered after acknowledgement so a lost ack
+ * can be retried without creating a second agent turn. */
+const MAX_COMPLETION_KEY_MEMO = 512;
 /** Tabs whose evicted-completion counter is retained. */
 const MAX_DROPPED_KEYS = 64;
 /** Prompt ids whose ticket THIS party opened and which have since been evicted
@@ -337,6 +347,20 @@ function idlessFingerprint(key: string, payload: CompletionPayload): string {
   return `${key}|~idless~|${payload.kind ?? ""}|${payload.note ?? ""}|${payload.error ?? ""}|${files}`;
 }
 
+const MAX_COMPLETION_KEY_LENGTH = 512;
+
+type CompletionReceiptIdentity = {
+  promptId: string;
+  owner: string;
+  ticketSeq: number;
+};
+
+function validCompletionKey(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 && value.length <= MAX_COMPLETION_KEY_LENGTH
+    ? value
+    : undefined;
+}
+
 export class RunCompletionJournalImpl {
   /** prompt id → ticket. Keyed globally: ComfyUI prompt ids are UUIDs, so an
    *  exact match is proof of identity on its own and survives a session's tab
@@ -351,6 +375,9 @@ export class RunCompletionJournalImpl {
    *  panel that re-sends the frame after the entry was removed can't produce a
    *  second delivery. */
   private delivered = new Set<string>();
+  /** Route/session-scoped completion keys already acknowledged. The route/session
+   * identity is part of the opaque key supplied by the panel. */
+  private completionReceipts = new Map<string, CompletionReceiptIdentity>();
   /** Content fingerprint → delivery time, for ID-LESS completions (which have no
    *  run identity to memoize). Bounded FIFO + a time window, so an identical
    *  re-send is suppressed but a later genuinely-different render is not. */
@@ -491,7 +518,7 @@ export class RunCompletionJournalImpl {
    */
   private claimRaced(
     promptId: string,
-    meta: { tabId: string; conversation?: string; dispatchedAt?: number },
+    meta: { tabId: string; conversation?: string; dispatchedAt?: number; completionKey?: string },
   ): { claimed: Set<JournalEntry>; reissue: Set<string> } {
     const claimed = new Set<JournalEntry>();
     /** Keys whose queued copy was pulled back and must now be re-delivered. */
@@ -503,6 +530,7 @@ export class RunCompletionJournalImpl {
       // belongs here — it stays unidentified rather than being claimed on timing alone.
       if (entry.correlation.status === "unidentified") continue;
       if (entry.correlation.promptId !== promptId) continue;
+      if (meta.completionKey && entry.payload.completion_key !== meta.completionKey) continue;
       if (entry.arrivedAt < meta.dispatchedAt) continue;
       // Only for the party this dispatch belongs to; another tab's completion for
       // the same id is not ours to claim.
@@ -671,7 +699,13 @@ export class RunCompletionJournalImpl {
    *  attribute. */
   openRun(
     promptId: string | null | undefined,
-    meta: { tabId: string; conversation?: string; toNodeId?: number; dispatchedAt?: number },
+    meta: {
+      tabId: string;
+      conversation?: string;
+      toNodeId?: number;
+      dispatchedAt?: number;
+      completionKey?: string;
+    },
   ): boolean {
     if (typeof promptId !== "string" || !promptId) return false;
     // #1327 — CLAIM THE COMPLETION THAT BEAT ITS OWN TICKET.
@@ -713,6 +747,9 @@ export class RunCompletionJournalImpl {
       existing.queuedAt = Date.now();
       if (typeof meta.dispatchedAt === "number") existing.dispatchedAt = meta.dispatchedAt;
       else delete existing.dispatchedAt;
+      const completionKey = validCompletionKey(meta.completionKey);
+      if (completionKey) existing.completionKey = completionKey;
+      else delete existing.completionKey;
       existing.seq = ++this.ticketSeq; // a NEW generation of this id
       // The id no longer identifies ONE run. Every completion for it from here
       // on is unattributable (see RunTicket.reused) — reported UNDETERMINED, and
@@ -745,6 +782,7 @@ export class RunCompletionJournalImpl {
       queuedAt: Date.now(),
       ...(typeof meta.dispatchedAt === "number" ? { dispatchedAt: meta.dispatchedAt } : {}),
       ...(typeof meta.toNodeId === "number" ? { toNodeId: meta.toNodeId } : {}),
+      ...(validCompletionKey(meta.completionKey) ? { completionKey: validCompletionKey(meta.completionKey) } : {}),
       settled: false,
       ...(hasHistory ? { reused: true } : {}),
     });
@@ -783,7 +821,13 @@ export class RunCompletionJournalImpl {
     // A REUSED id proves nothing: the panel sends only the id, so a completion
     // for it could belong to either generation. Report it as foreign — real, but
     // UNDETERMINED — rather than claiming it is the run now outstanding.
-    if (ticket && ownsRun(ticket, key, conversation) && !ticket.reused) {
+    const completionKey = validCompletionKey(payload.completion_key);
+    if (
+      ticket &&
+      ownsRun(ticket, key, conversation) &&
+      !ticket.reused &&
+      (!ticket.completionKey || !completionKey || ticket.completionKey === completionKey)
+    ) {
       return { status: "matched", promptId: pid };
     }
     // #925 — SAY WHICH KIND OF UNDETERMINED THIS IS. The refusal is unchanged;
@@ -832,7 +876,33 @@ export class RunCompletionJournalImpl {
     payload: CompletionPayload,
     opts: { conversation?: string } = {},
   ): JournalEntry {
+    const completionKey = validCompletionKey(payload.completion_key);
     const conversation = opts.conversation;
+    const promptId = typeof payload.prompt_id === "string" ? payload.prompt_id.trim() : "";
+    const ticket = promptId ? this.tickets.get(promptId) : undefined;
+    if (completionKey) {
+      const sameReceipt = [...this.entries.values()].find((entry) => {
+        if (entry.payload.completion_key !== completionKey || entry.key !== key) return false;
+        if (entry.correlation.status === "unidentified" || entry.correlation.promptId !== promptId || entry.superseded) return false;
+        // With no ticket yet, the exact opaque receipt is still safe to
+        // coalesce; it is not an ACK proof. With a ticket, require its exact
+        // generation so prompt-id reuse cannot collapse into the old entry.
+        return !ticket || (entry.ticketSeq ?? 0) === ticket.seq;
+      });
+      if (sameReceipt) return sameReceipt;
+    }
+    // A keyed frame can be the first proof that the panel received its prompt
+    // ticket. Bind it only to the current, non-reused generation; a reused id
+    // must never let an old key become the new run's ACK proof.
+    if (
+      completionKey &&
+      ticket &&
+      !ticket.reused &&
+      ownsRun(ticket, key, conversation) &&
+      !ticket.completionKey
+    ) {
+      ticket.completionKey = completionKey;
+    }
     const correlation = this.correlate(key, payload, conversation);
     let idlessRepeat = false;
     /** This id already stands for more than one run (see RunTicket.reused). */
@@ -864,6 +934,40 @@ export class RunCompletionJournalImpl {
       // ticket after the old one was evicted): different generation, different
       // key, no match.
       gen = this.generationOf(key, correlation.promptId, conversation);
+      if (completionKey) {
+        // Watchdog handoff fence: if the history fallback won the small race
+        // between its final awaiting check and this panel frame, the panel's
+        // keyed event is the same current ticket generation. Reuse the already
+        // journaled fallback and bind the key to it instead of creating a second
+        // agent turn. A reused/foreign generation fails these exact checks and
+        // remains a separately disclosed completion.
+        const watchdogEntry = [...this.entries.values()].find((entry) => {
+          if (entry.payload.completion_source !== "orchestrator-history-watchdog") return false;
+          if (entry.superseded || entry.correlation.status !== "matched") return false;
+          return (
+            entry.key === key &&
+            entry.conversation === conversation &&
+            entry.correlation.promptId === correlation.promptId &&
+            (entry.ticketSeq ?? 0) === gen &&
+            gen > 0
+          );
+        });
+        if (watchdogEntry) {
+          watchdogEntry.payload = { ...watchdogEntry.payload, completion_key: completionKey };
+          return watchdogEntry;
+        }
+        const existing = [...this.entries.values()].find((entry) => {
+          if (entry.payload.completion_key !== completionKey) return false;
+          if (entry.superseded || entry.correlation.status === "unidentified") return false;
+          return (
+            entry.key === key &&
+            entry.correlation.promptId === correlation.promptId &&
+            (entry.ticketSeq ?? 0) === gen &&
+            gen > 0
+          );
+        });
+        if (existing) return existing;
+      }
       // UNPROVABLE identity — no dedupe of any kind is safe:
       //  • `reused`: the id stands for more than one run (see RunTicket.reused).
       //  • gen 0: this tab never ticketed the id, so there is NO generation to
@@ -1216,6 +1320,38 @@ export class RunCompletionJournalImpl {
     // and must not memoize the id as delivered, which would then suppress the new
     // run's real completion.
     if (entry.superseded) return;
+    const ticketForEntry =
+      entry.correlation.status === "unidentified"
+        ? undefined
+        : this.tickets.get(entry.correlation.promptId);
+    if (
+      entry.payload.completion_source === "orchestrator-history-watchdog" &&
+      entry.correlation.status === "matched" &&
+      ticketForEntry &&
+      ticketForEntry.seq === entry.ticketSeq &&
+      ticketForEntry.reused !== true
+    ) {
+      ticketForEntry.watchdogSettled = true;
+    }
+    const completionKey =
+      validCompletionKey(entry.payload.completion_key) ??
+      (entry.correlation.status === "matched" &&
+      ticketForEntry &&
+      ticketForEntry.seq === entry.ticketSeq &&
+      ticketForEntry.reused !== true
+        ? validCompletionKey(ticketForEntry.completionKey)
+        : null);
+    if (
+      completionKey &&
+      entry.correlation.status === "matched" &&
+      (entry.ticketSeq ?? 0) > 0
+    ) {
+      this.memoCompletionReceipt(completionKey, {
+        promptId: entry.correlation.promptId,
+        owner: ownerOf(entry.key, entry.conversation),
+        ticketSeq: entry.ticketSeq ?? 0,
+      });
+    }
     if (entry.correlation.status !== "unidentified") {
       // …and do not memoize a REUSED id either. DEFENSE IN DEPTH, not a live
       // defect: `openRun` already clears the memo on every path, so no reachable
@@ -1443,7 +1579,94 @@ export class RunCompletionJournalImpl {
     }
   }
 
+  /**
+   * Is this route-scoped completion already outstanding or acknowledged?
+   * The panel uses the answer to resend after a lost receipt without creating
+   * a second journal entry/agent turn.
+   */
+  hasCompletionReceipt(
+    completionKey: string,
+    opts: { promptId: string; key?: string; conversation?: string },
+  ): boolean {
+    const value = validCompletionKey(completionKey);
+    if (!value) return false;
+    const matchesCurrent = (promptId: string, key?: string, conversation?: string): boolean => {
+      const ticket = this.tickets.get(promptId);
+      if (!ticket || ticket.reused) return false;
+      if (key !== undefined && !ownsRun(ticket, key, conversation)) return false;
+      if (ticket.completionKey !== value) return false;
+      const identity = this.completionReceipts.get(value);
+      if (
+        identity &&
+        identity.promptId === promptId &&
+        identity.ticketSeq === ticket.seq &&
+        identity.owner === ownerOf(key ?? ticket.tabId, conversation ?? ticket.conversation)
+      ) {
+        return true;
+      }
+      return [...this.entries.values()].some(
+        (entry) =>
+          entry.payload.completion_key === value &&
+          !entry.superseded &&
+          entry.correlation.status === "matched" &&
+          entry.correlation.promptId === promptId &&
+          (entry.ticketSeq ?? 0) === ticket.seq &&
+          (entry.key === ticket.tabId ||
+            (ticket.conversation !== undefined && entry.conversation === ticket.conversation)),
+      );
+    };
+    return matchesCurrent(opts.promptId, opts.key, opts.conversation);
+  }
+
+  private memoCompletionReceipt(completionKey: string, identity: CompletionReceiptIdentity): void {
+    this.completionReceipts.delete(completionKey);
+    this.completionReceipts.set(completionKey, identity);
+    while (this.completionReceipts.size > MAX_COMPLETION_KEY_MEMO) {
+      const oldest = this.completionReceipts.keys().next().value;
+      if (oldest === undefined) break;
+      this.completionReceipts.delete(oldest);
+    }
+  }
+
+  /** True only when a keyed panel frame is valid for the current ticket generation. */
+  acceptsCompletionReceipt(
+    completionKey: string,
+    promptId: string,
+    key: string,
+    conversation?: string,
+  ): boolean {
+    const value = validCompletionKey(completionKey);
+    const pid = typeof promptId === "string" ? promptId.trim() : "";
+    if (!value || !pid) return false;
+    const ticket = this.tickets.get(pid);
+    if (!ticket || ticket.reused || !ownsRun(ticket, key, conversation)) return false;
+    if (ticket.completionKey !== value) return false;
+    return this.hasCompletionReceipt(value, { promptId: pid, key, conversation });
+  }
+
   /** Test/diagnostic helpers. */
+  /** Bind a late Panel run receipt to the ticket's current generation. */
+  bindCompletionKey(promptId: string, completionKey: string): boolean {
+    const pid = typeof promptId === "string" ? promptId.trim() : "";
+    const value = validCompletionKey(completionKey);
+    const ticket = pid ? this.tickets.get(pid) : undefined;
+    if (!pid || !value || !ticket || ticket.reused) return false;
+    if (ticket.completionKey && ticket.completionKey !== value) return false;
+    if (ticket.settled && !ticket.completionKey && ticket.watchdogSettled !== true) return false;
+    for (const [otherPromptId, other] of this.tickets) {
+      if (otherPromptId !== pid && other.completionKey === value && other.seq !== ticket.seq) return false;
+    }
+    ticket.completionKey = value;
+    if (ticket.settled && ticket.watchdogSettled === true) {
+      this.memoCompletionReceipt(value, {
+        promptId: pid,
+        owner: ownerOf(ticket.tabId, ticket.conversation),
+        ticketSeq: ticket.seq,
+      });
+    }
+    return true;
+  }
+
   /** Whether this prompt identity still has an open or terminal ticket. */
   hasTicket(promptId: string): boolean {
     return this.tickets.has(promptId);
@@ -1456,6 +1679,7 @@ export class RunCompletionJournalImpl {
     this.entries.clear();
     this.dropped.clear();
     this.delivered.clear();
+    this.completionReceipts.clear();
     this.idlessSeen.clear();
     this.forgottenOwnRuns.clear();
     this.seq = 0;

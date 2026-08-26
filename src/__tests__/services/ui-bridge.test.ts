@@ -5547,12 +5547,14 @@ describe("#1728: late panel run receipts", () => {
     const events: unknown[] = [];
     const sock = await connectPanel("tab-1728-receipt");
     bridge.onPanelMessage = (event) => events.push(event);
+    const completionKey = JSON.stringify(["tab-1728-receipt", "session-1728", "prompt-1728", "generation-a"]);
 
     sock.send(
       JSON.stringify({
         type: "run_receipt",
         run_rid: "run-rid-1728",
         prompt_id: "prompt-1728",
+        completion_key: completionKey,
       }),
     );
 
@@ -5561,6 +5563,7 @@ describe("#1728: late panel run receipts", () => {
         runRid: "run-rid-1728",
         tabId: "tab-1728-receipt",
         promptIds: ["prompt-1728"],
+        completionKeys: [{ promptId: "prompt-1728", completionKey }],
       }),
     );
     expect(events.some((event) => (event as { type?: string }).type === "run_receipt")).toBe(false);
@@ -5568,6 +5571,7 @@ describe("#1728: late panel run receipts", () => {
     expect(bridge.takeLateRunReceipt("run-rid-1728")).toMatchObject({
       runRid: "run-rid-1728",
       promptIds: ["prompt-1728"],
+      completionKeys: [{ promptId: "prompt-1728", completionKey }],
     });
     expect(bridge.peekLateRunReceipt("run-rid-1728")).toBeUndefined();
     sock.close();

@@ -1739,6 +1739,7 @@ export type LateRunReceipt = {
   runRid: string;
   tabId: string;
   promptIds: string[];
+  completionKeys: Array<{ promptId: string; completionKey: string }>;
   lateByMs: number;
 };
 
@@ -2166,7 +2167,10 @@ export class UiBridge {
     { ok: true; cmd: string; tabId: string; ts: number; lateByMs: number; result?: unknown }
   >();
   /** Exact prompt receipts sent by the Panel after its graph_run command returned. */
-  private lateRunReceipts = new Map<string, { tabId: string; promptIds: string[]; ts: number }>();
+  private lateRunReceipts = new Map<
+    string,
+    { tabId: string; promptIds: string[]; completionKeys: Map<string, string>; ts: number }
+  >();
   /** Bounded post-reconcile owners for exact receipts that arrive after panel_run returned. */
   private lateRunReceiptHandoffs = new Map<
     string,
@@ -4265,12 +4269,17 @@ export class UiBridge {
   private recordLateRunReceipt(msg: Record<string, unknown>, tabId: string | null): void {
     const runRid = typeof msg.run_rid === "string" ? msg.run_rid.trim() : "";
     const promptId = typeof msg.prompt_id === "string" ? msg.prompt_id.trim() : "";
+    const completionKey =
+      typeof msg.completion_key === "string" && msg.completion_key.length > 0 && msg.completion_key.length <= 512
+        ? msg.completion_key
+        : "";
     if (!runRid || !promptId || !tabId) return;
     this.pruneLateMutations();
     const prior = this.lateRunReceipts.get(runRid);
     if (prior && prior.tabId !== tabId) return;
     const handoff = this.lateRunReceiptHandoffs.get(runRid);
     const promptIds = prior?.promptIds ?? [];
+    const completionKeys = prior?.completionKeys ?? new Map<string, string>();
     const isNewPromptId = !promptIds.includes(promptId);
     if (
       handoff &&
@@ -4288,7 +4297,8 @@ export class UiBridge {
       if (promptIds.length >= UiBridge.MAX_LATE_MUTATIONS) return;
       promptIds.push(promptId);
     }
-    this.lateRunReceipts.set(runRid, { tabId, promptIds, ts: prior?.ts ?? Date.now() });
+    if (completionKey) completionKeys.set(promptId, completionKey);
+    this.lateRunReceipts.set(runRid, { tabId, promptIds, completionKeys, ts: prior?.ts ?? Date.now() });
     if (
       handoff &&
       handoff.expiresAt > Date.now() &&
@@ -4362,6 +4372,7 @@ export class UiBridge {
       runRid,
       tabId: hit.tabId,
       promptIds: [...hit.promptIds],
+      completionKeys: [...hit.completionKeys.entries()].map(([promptId, completionKey]) => ({ promptId, completionKey })),
       lateByMs: Math.max(0, Date.now() - hit.ts),
     };
   }
@@ -4375,6 +4386,7 @@ export class UiBridge {
       runRid,
       tabId: hit.tabId,
       promptIds: [...hit.promptIds],
+      completionKeys: [...hit.completionKeys.entries()].map(([promptId, completionKey]) => ({ promptId, completionKey })),
       lateByMs: Math.max(0, Date.now() - hit.ts),
     };
   }

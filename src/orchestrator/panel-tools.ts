@@ -14256,7 +14256,12 @@ async function reconcileLateRunAck(
   allowPanelQueueUnknown = false,
   expectedTabId?: string,
   expectedPromptCount = 1,
-): Promise<{ result: unknown; lateByMs: number; via: "ack" | "queue" | "queue-uncertain" | "receipt" } | null> {
+): Promise<{
+  result: unknown;
+  lateByMs: number;
+  via: "ack" | "queue" | "queue-uncertain" | "receipt";
+  completionKeys?: Array<{ promptId: string; completionKey: string }>;
+} | null> {
   const parsed = parseToolResultJson(res);
   // An exact Panel receipt is safe even when a queued_unknown reply already
   // carried some ids: the bridge event is the producer's own prompt capture,
@@ -14318,7 +14323,12 @@ async function reconcileLateRunAck(
           const takenReceipt = bridge.takeLateRunReceipt(rid!);
           const result = takenReceipt ? latePanelReceiptResult(parsed, takenReceipt.promptIds) : null;
           if (takenReceipt && result) {
-            return { result, lateByMs: takenReceipt.lateByMs, via: "receipt" };
+            return {
+              result,
+              lateByMs: takenReceipt.lateByMs,
+              via: "receipt",
+              completionKeys: takenReceipt.completionKeys,
+            };
           }
         }
       }
@@ -14355,6 +14365,7 @@ async function reconcileLateRunAck(
             result,
             lateByMs: takenReceipt?.lateByMs ?? Date.now() - startedAt,
             via: "receipt",
+            completionKeys: takenReceipt?.completionKeys,
           };
         }
       }
@@ -17295,15 +17306,27 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               for (const rawId of promptIds) {
                 const id = typeof rawId === "string" ? rawId.trim() : "";
                 if (!id) continue;
+                const completionKey =
+                  receipt.completionKeys?.find((entry) => entry.promptId === id)?.completionKey ??
+                  taken?.completionKeys?.find((entry) => entry.promptId === id)?.completionKey;
                 // The normal reply/queue fallback owns the same stable prompt
                 // identity when it wins the race. A late receipt is only a
                 // transport retry of that identity; reopening the journal
                 // ticket would mark it reused and disable exact correlation.
                 // A settled ticket is equally authoritative: late
                 // at-least-once receipt frames must be a no-op.
-                if (RunCompletions.hasTicket(id)) continue;
+                if (RunCompletions.hasTicket(id)) {
+                  if (completionKey) RunCompletions.bindCompletionKey(id, completionKey);
+                  continue;
+                }
                 QueueMonitor.markSelfQueued(id);
-                if (RunCompletions.openRun(id, ticketOpts)) opened.push(id);
+                if (
+                  RunCompletions.openRun(id, {
+                    ...ticketOpts,
+                    ...(completionKey ? { completionKey } : {}),
+                  })
+                )
+                  opened.push(id);
               }
               if (opened.length) ctx.onRunTicketOpened?.(opened);
             });
@@ -17314,6 +17337,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           }
         };
         let lateAckNote = "";
+        let lateReceiptCompletionKeys = new Map<string, string>();
         let res: ToolResult;
         try {
           res = await ctx.call(runCmd, 20000, observeRunRid);
@@ -17347,6 +17371,15 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               : 1,
           );
           if (!recovered) return;
+          for (const entry of recovered.completionKeys ?? []) {
+            if (
+              typeof entry?.promptId === "string" &&
+              typeof entry?.completionKey === "string" &&
+              entry.completionKey.length > 0
+            ) {
+              lateReceiptCompletionKeys.set(entry.promptId, entry.completionKey);
+            }
+          }
           res = ok(recovered.result);
           const promptId =
             typeof (recovered.result as { prompt_id?: unknown }).prompt_id === "string"
@@ -17529,6 +17562,15 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             if (pendingReceipt && pendingReceipt.tabId === runTicketTab) {
               const takenReceipt = ctx.bridge.takeLateRunReceipt(runRid);
               lateReceiptPromptIds = takenReceipt?.promptIds ?? [];
+              for (const entry of takenReceipt?.completionKeys ?? []) {
+                if (
+                  typeof entry?.promptId === "string" &&
+                  typeof entry?.completionKey === "string" &&
+                  entry.completionKey.length > 0
+                ) {
+                  lateReceiptCompletionKeys.set(entry.promptId, entry.completionKey);
+                }
+              }
             }
           } catch {}
         }
@@ -17581,7 +17623,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             : queuedIds.length === 0
             ? RunCompletions.openRun(undefined, ticketOpts)
             : queuedIds.map((id) => {
-                const opened = RunCompletions.openRun(id, ticketOpts);
+                const completionKey = lateReceiptCompletionKeys.get(id);
+                const opened = RunCompletions.openRun(id, {
+                  ...ticketOpts,
+                  ...(completionKey ? { completionKey } : {}),
+                });
                 if (opened) ticketedPromptIds.push(id);
                 return opened;
               }).some(Boolean);
