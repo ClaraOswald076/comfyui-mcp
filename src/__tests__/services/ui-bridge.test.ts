@@ -635,6 +635,41 @@ describe("UiBridge (typed dispatch outcome — panel #442 defect 4)", () => {
     expect(result).toMatchObject({ from: "A" });
     a.close();
   });
+
+  it("records the latest structured current-view owner for promoted-write fences (#2314)", async () => {
+    const a = await connectPanel("tab-scope-2314");
+    a.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd === "graph_query") {
+        a.send(
+          JSON.stringify({
+            rid: msg.rid,
+            ok: true,
+            result: {
+              viewing: {
+                scope: "subgraph",
+                owner_node_id: 78,
+                workflow_uuid: "11111111-1111-4111-8111-111111111111",
+              },
+              nodes: [{ id: 76, type: "PrimitiveStringMultiline" }],
+            },
+          }),
+        );
+      }
+    });
+    await waitFor(() => expect(bridge.connected()).toBe(true));
+    await bridge.send(
+      { cmd: "graph_query", ids: [76], fields: "compact", limit: 1 },
+      { tabId: "tab-scope-2314" },
+    );
+    expect(bridge.promotedScopeFor("tab-scope-2314")).toEqual({
+      known: true,
+      scope: "subgraph",
+      ownerNodeId: "78",
+      workflowUuid: "11111111-1111-4111-8111-111111111111",
+    });
+    a.close();
+  });
 });
 
 describe("UiBridge (multi-tab)", () => {

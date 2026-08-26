@@ -1080,6 +1080,18 @@ export type TabWorkflowUuidRead =
   | { known: true; uuid?: string }
   | { known: false; reason: string };
 
+/** #2314 — the latest structured current-view identity observed from a panel
+ * reply. This is deliberately separate from the workflow stamp: two subgraphs
+ * in one workflow may reuse the same inner node ids and types. */
+export type TabPromotedScopeRead =
+  | {
+      known: true;
+      scope: "root" | "subgraph";
+      ownerNodeId: string | null;
+      workflowUuid?: string;
+    }
+  | { known: false; reason: string };
+
 /**
  * What the orchestrator's fence-adoption validator answers (#1077).
  *
@@ -1930,6 +1942,9 @@ export class UiBridge {
    *  to (the generation-bound-command leak: the server can't retract a frame already
    *  delivered to the browser, but the browser can decline to APPLY a stale one). */
   private resolveTabWorkflowUuid: ((tabId: string) => string | undefined) | null = null;
+  /** #2314 — latest structured current-view witness per routing tab. Cleared on
+   * hello/rebind boundaries; populated only from successful panel replies. */
+  private readonly promotedScopes = new Map<string, TabPromotedScopeRead>();
   /** #1656 — orchestrator-injected: is this tab's CURRENT stamp one that was CARRIED
    *  from a tab id the same socket retired (carryWorkflowCommandStamp), rather than one
    *  the tab itself has proven under this id?
@@ -2948,6 +2963,10 @@ export class UiBridge {
           }
         }
         this.cancelTabGone(tabId, incarnationId);
+        // A hello can keep the route id while replacing the viewed workflow or
+        // subgraph. Do not let a scope witness from the prior canvas authorize
+        // a later promoted write.
+        this.promotedScopes.delete(tabId);
         this.conns.set(tabId, {
           sock,
           tabId,
@@ -3211,6 +3230,7 @@ export class UiBridge {
           // an unrelated tab reusing the id can never be granted the veto.
           const served = this.liveConnForTab(p.ctx.tabId, sock);
           served?.provenSupportedCmds.add(p.cmd);
+          this.notePromotedScope(p.ctx.tabId, msg.result);
           this.noteSiblingSuccess(p.ctx, rid);
           p.resolve(msg.result);
         } else {
@@ -3827,6 +3847,19 @@ export class UiBridge {
     } catch {
       return undefined;
     }
+  }
+
+  /** Return the latest structured current-view owner observed for this tab.
+   * Reads which carry no `viewing` field do not overwrite it; a malformed
+   * structured identity is retained as unknown so a promoted write cannot use
+   * an earlier owner proof after the current-view witness became unreadable. */
+  promotedScopeFor(tabId: string): TabPromotedScopeRead {
+    return (
+      this.promotedScopes.get(tabId) ?? {
+        known: false,
+        reason: "no current panel graph-scope witness has been observed",
+      }
+    );
   }
 
   /** #884 P0 — inject the orchestrator's turn-target pin (see the field doc and
@@ -4962,6 +4995,7 @@ export class UiBridge {
    *  the switch retire branch (with the retired id), and the bridge defers its on-hello
    *  replay/flush/resume until AFTER onPanelMessage so this purge lands first. */
   dropQueuedDeliveries(tabId: string): void {
+    this.promotedScopes.delete(tabId);
     this.missedFrames.delete(tabId);
     this.mailbox.delete(tabId);
     // MIRROR teardown (see above): a viewer must not auto-follow an unproven workflow switch.
@@ -5640,6 +5674,62 @@ export class UiBridge {
       if (p.ctx.tabId !== ctx.tabId) continue;
       p.ctx.siblingReply ??= ctx.command.cmd;
     }
+  }
+
+  /** Record only the panel's structured current-view witness. This is a cache
+   * of an authenticated panel reply, not caller-supplied command metadata. */
+  private notePromotedScope(tabId: string, result: unknown): void {
+    if (!result || typeof result !== "object" || Array.isArray(result)) return;
+    const payload = result as Record<string, unknown>;
+    if (!Object.prototype.hasOwnProperty.call(payload, "viewing")) return;
+    const viewing = payload.viewing;
+    if (!viewing || typeof viewing !== "object" || Array.isArray(viewing)) {
+      this.promotedScopes.set(tabId, {
+        known: false,
+        reason: "the panel returned malformed current-view metadata",
+      });
+      return;
+    }
+    const identity = viewing as Record<string, unknown>;
+    if (identity.scope !== "root" && identity.scope !== "subgraph") {
+      this.promotedScopes.set(tabId, {
+        known: false,
+        reason: "the panel returned an unknown current-view scope",
+      });
+      return;
+    }
+    const rawOwner = identity.owner_node_id;
+    let ownerNodeId: string | null = null;
+    if (rawOwner !== undefined && rawOwner !== null) {
+      if (
+        (typeof rawOwner !== "number" || !Number.isSafeInteger(rawOwner)) &&
+        (typeof rawOwner !== "string" || rawOwner.length === 0)
+      ) {
+        this.promotedScopes.set(tabId, {
+          known: false,
+          reason: "the panel returned a malformed current-view owner",
+        });
+        return;
+      }
+      ownerNodeId = String(rawOwner);
+    }
+    const rawWorkflowUuid = identity.workflow_uuid;
+    if (
+      rawWorkflowUuid !== undefined &&
+      (typeof rawWorkflowUuid !== "string" || rawWorkflowUuid.length === 0)
+    ) {
+      this.promotedScopes.set(tabId, {
+        known: false,
+        reason: "the panel returned a malformed current-view workflow identity",
+      });
+      return;
+    }
+    this.promotedScopes.set(tabId, {
+      known: true,
+      scope: identity.scope,
+      ownerNodeId,
+      ...(rawWorkflowUuid !== undefined ? { workflowUuid: rawWorkflowUuid } : {}),
+    });
   }
 
   /** Write one attempt of a command to a live socket and arm its reply timer.

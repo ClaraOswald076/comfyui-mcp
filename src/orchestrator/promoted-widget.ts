@@ -33,12 +33,13 @@ export type InnerPromotedTarget = {
 export type PromotedViewingIdentity = {
   scope: "root" | "subgraph";
   ownerNodeId: string | null;
-  workflowUuid: string;
+  /** Older/current panels may omit this while the active workflow identity is unreadable. */
+  workflowUuid?: string;
 };
 
 /** The stable scope witness carried from the promotion read to the inner write. */
 export type PromotedScopeWitness = {
-  workflowUuid: string;
+  workflowUuid?: string;
   ownerNodeId: string;
 };
 
@@ -193,13 +194,16 @@ function canonicalPromotedNodeId(value: unknown): string | null {
 
 /** Parse the panel's structured current-graph identity without accepting a
  * prose/detail fallback. The panel deliberately omits workflow_uuid when the
- * live workflow identity cannot be read, so that omission is not a usable fence. */
+ * live workflow identity cannot be read; owner_node_id remains the required
+ * subgraph witness for this promoted mapping. */
 export function parsePromotedViewingIdentity(value: unknown): PromotedViewingIdentity | null {
   if (!isRecord(value)) return null;
   const scope = value.scope;
   if (scope !== "root" && scope !== "subgraph") return null;
   const workflowUuid = value.workflow_uuid;
-  if (typeof workflowUuid !== "string" || workflowUuid.length === 0) return null;
+  if (workflowUuid !== undefined && (typeof workflowUuid !== "string" || workflowUuid.length === 0)) {
+    return null;
+  }
 
   const rawOwner = value.owner_node_id;
   let ownerNodeId: string | null = null;
@@ -207,7 +211,11 @@ export function parsePromotedViewingIdentity(value: unknown): PromotedViewingIde
     ownerNodeId = canonicalPromotedNodeId(rawOwner);
     if (!ownerNodeId) return null;
   }
-  return { scope, ownerNodeId, workflowUuid };
+  return {
+    scope,
+    ownerNodeId,
+    ...(workflowUuid !== undefined ? { workflowUuid } : {}),
+  };
 }
 
 /**
@@ -274,7 +282,9 @@ export function promotedScopeWitnessFromEnvelope(
   const ownerNodeId = canonicalPromotedNodeId(envelope.nodeId);
   if (!ownerNodeId) return null;
   return {
-    workflowUuid: envelope.viewing.workflowUuid,
+    ...(envelope.viewing.workflowUuid !== undefined
+      ? { workflowUuid: envelope.viewing.workflowUuid }
+      : {}),
     ownerNodeId,
   };
 }
@@ -288,8 +298,8 @@ export function promotedViewingMatchesScope(
   const viewing = parsePromotedViewingIdentity(payload?.viewing);
   return (
     viewing?.scope === "subgraph" &&
-    viewing.workflowUuid === expected.workflowUuid &&
-    viewing.ownerNodeId === expected.ownerNodeId
+    viewing.ownerNodeId === expected.ownerNodeId &&
+    (expected.workflowUuid === undefined || viewing.workflowUuid === expected.workflowUuid)
   );
 }
 

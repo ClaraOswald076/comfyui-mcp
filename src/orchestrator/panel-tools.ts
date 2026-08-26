@@ -74,7 +74,13 @@ import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { parse as parseYaml } from "yaml";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { UiBridge, PanelVersionReading, UnsupportedShowMediaItem, TabWorkflowUuidRead } from "../services/ui-bridge.js";
+import type {
+  UiBridge,
+  PanelVersionReading,
+  UnsupportedShowMediaItem,
+  TabPromotedScopeRead,
+  TabWorkflowUuidRead,
+} from "../services/ui-bridge.js";
 import {
   requiredPanelVersion,
   SEMVER_RE,
@@ -6319,7 +6325,35 @@ function currentPromotedBindingError(
 function currentPromotedScopeError(
   ctx: PanelToolCtx,
   expected: PromotedScopeWitness,
+  requireCurrentSubgraph = false,
 ): string | null {
+  const readScope = (ctx.bridge as unknown as BridgeProbe).promotedScopeFor;
+  if (typeof readScope === "function") {
+    let observed: TabPromotedScopeRead;
+    try {
+      observed = readScope.call(ctx.bridge, ctx.tabId);
+    } catch {
+      return "the receiving panel current-view scope became unreadable";
+    }
+    if (observed.known !== true) {
+      return "the receiving panel current-view scope became unverifiable";
+    }
+    if (
+      requireCurrentSubgraph &&
+      (observed.scope !== "subgraph" || observed.ownerNodeId !== expected.ownerNodeId)
+    ) {
+      return "the receiving panel current subgraph owner changed or became unverifiable";
+    }
+    if (expected.workflowUuid !== undefined && observed.workflowUuid !== expected.workflowUuid) {
+      return "the receiving panel workflow scope changed or became unverifiable";
+    }
+  }
+
+  // The workflow stamp remains an independent receiver fence. Its UUID is
+  // optional for panels whose structured viewing reply legitimately omits it;
+  // the owner witness above is still required whenever the real bridge provides
+  // one.
+  if (expected.workflowUuid === undefined) return null;
   const read = ctx.bridge.workflowUuidFor;
   if (typeof read !== "function") {
     return "the receiving panel workflow scope was unavailable";
@@ -12312,6 +12346,7 @@ interface BridgeProbe {
   corroborateTabStamp?: (tabId: string, workflowUuid: string) => boolean;
   refreshWorkflowUuid?: (tabId: string, workflowUuid: string) => boolean;
   workflowUuidFor?: (tabId: string) => TabWorkflowUuidRead;
+  promotedScopeFor?: (tabId: string) => TabPromotedScopeRead;
   lastFenceRefusal?: (tabId: string) => string | undefined;
   isHeadless?: (tabId: string) => boolean;
   canReach?: (tabId: string) => boolean;
@@ -17028,7 +17063,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                     `Refusing promoted inner graph_set_widget: ${error}. No graph_set_widget was dispatched.`,
                   );
                 }
-                const scopeError = currentPromotedScopeError(ctx, plan.scope);
+                const scopeError = currentPromotedScopeError(ctx, plan.scope, true);
                 if (scopeError) {
                   throw new Error(
                     `Refusing promoted inner graph_set_widget: ${scopeError}. No graph_set_widget was dispatched.`,
@@ -17594,7 +17629,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                   );
                 }
                 const scopeError = recoveryScope
-                  ? currentPromotedScopeError(ctx, recoveryScope)
+                  ? currentPromotedScopeError(ctx, recoveryScope, true)
                   : "the promoted recovery scope was unavailable";
                 if (scopeError) {
                   throw new Error(

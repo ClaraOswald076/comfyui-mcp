@@ -95,6 +95,8 @@ function bridge(opts: {
   remappedWriteError?: string;
   reconnectBeforeWrite?: boolean;
   tabRebindBeforeWrite?: boolean;
+  ownerRebindBeforeWrite?: boolean;
+  omitWorkflowUuid?: boolean;
   workflowUuid?: string;
 }) {
   const calls: Array<Record<string, unknown>> = [];
@@ -102,12 +104,13 @@ function bridge(opts: {
   let subgraphReads = 0;
   let inSubgraph = false;
   const workflowUuid = opts.workflowUuid ?? "workflow-a";
+  let currentOwnerNodeId = 78;
   let connectionIdentity = { generation: 1, tabSessionId: "browser-tab-a" };
   const beforeWrite = { mutate: undefined as (() => void) | undefined };
   const currentViewing = () => ({
     scope: inSubgraph ? "subgraph" : "root",
-    ...(inSubgraph ? { owner_node_id: 78 } : {}),
-    workflow_uuid: workflowUuid,
+    ...(inSubgraph ? { owner_node_id: currentOwnerNodeId } : {}),
+    ...(opts.omitWorkflowUuid ? {} : { workflow_uuid: workflowUuid }),
   });
   const withCurrentViewing = (value: Record<string, unknown>): Record<string, unknown> =>
     Object.prototype.hasOwnProperty.call(value, "viewing")
@@ -233,6 +236,12 @@ function bridge(opts: {
     resolveActiveTabId: () => TAB,
     tabCanMutateGraph: () => true,
     tabConnectionIdentity: () => connectionIdentity,
+    promotedScopeFor: () => ({
+      known: true,
+      scope: inSubgraph ? "subgraph" : "root",
+      ownerNodeId: inSubgraph ? String(currentOwnerNodeId) : null,
+      ...(opts.omitWorkflowUuid ? {} : { workflowUuid }),
+    }),
     tabExpectedNodeTypeFenceCapability: () => true,
     tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
     workflowUuidFor: () => ({ known: true, uuid: workflowUuid }),
@@ -248,6 +257,13 @@ function bridge(opts: {
       // A second browser tab for the same workflow keeps the workflow route
       // but has a different receiver session.
       connectionIdentity = { generation: 1, tabSessionId: "browser-tab-b" };
+    };
+  } else if (opts.ownerRebindBeforeWrite) {
+    beforeWrite.mutate = () => {
+      // Same workflow, same browser-tab session, different open subgraph. The
+      // inner id/type deliberately remain colliding; only the owner witness
+      // distinguishes the receiver at the final dispatch fence.
+      currentOwnerNodeId = 79;
     };
   }
   return { b, calls, beforeWrite };
@@ -665,6 +681,10 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
     ["stale owner", { ...SAFE_ANIMA_SUBGRAPH, subgraph_of: { node_id: 79 } }],
     ["wrong node count", { ...SAFE_ANIMA_SUBGRAPH, node_count: 2 }],
     ["malformed viewing identity", { ...SAFE_ANIMA_SUBGRAPH, viewing: null }],
+    [
+      "malformed viewing workflow identity",
+      { ...SAFE_ANIMA_SUBGRAPH, viewing: { scope: "subgraph", owner_node_id: 78, workflow_uuid: 42 } },
+    ],
   ])("refuses a %s envelope before writing the container", async (_name, subgraph) => {
     const { text, isError, calls } = await setWidget(
       { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
@@ -717,6 +737,41 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
     expect(isError).toBe(true);
     expect(text).toMatch(/current graph scope changed|inner receiver changed|unverifiable/);
     expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(0);
+  });
+
+  it("refuses an owner A to owner B navigation at the final dispatch fence", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
+      {
+        firstWrite: "ok",
+        subgraph: SAFE_ANIMA_SUBGRAPH,
+        detailById: SAFE_ANIMA_IDENTITY_BY_ID,
+        ownerRebindBeforeWrite: true,
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/current subgraph owner changed|unverifiable/);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(0);
+  });
+
+  it("keeps a valid same-owner write when workflow_uuid is unavailable", async () => {
+    const { isError, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
+      {
+        firstWrite: "ok",
+        subgraph: SAFE_ANIMA_SUBGRAPH,
+        detailById: SAFE_ANIMA_IDENTITY_BY_ID,
+        omitWorkflowUuid: true,
+      },
+    );
+
+    expect(isError).toBe(false);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(1);
+    expect(calls.find((c) => c.cmd === "graph_set_widget")).toMatchObject({
+      node_id: 76,
+      widget: "quality_prompt",
+    });
   });
 
   it("refuses when the bound panel reconnects before the inner dispatch", async () => {
