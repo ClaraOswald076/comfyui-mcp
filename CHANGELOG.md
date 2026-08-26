@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.120] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- refuse only proven dynamic-combo STRING sub-widget writes that can revert after verification (#2299)
+
 ## [0.52.119] - 2026-08-25
 
 ### MCP
