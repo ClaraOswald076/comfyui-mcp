@@ -916,6 +916,9 @@ describe("the shipped launcher rescues a real cold start (#1447)", () => {
         result: { serverInfo: { version: string } };
       };
       expect(handshake.result.serverInfo.version).toBe(launcher.INSTALLING_VERSION);
+      // A real client completes its own handshake here, and the launcher will
+      // not announce a re-list before it does.
+      client.send({ jsonrpc: "2.0", method: "notifications/initialized" });
       await waitFor(
         () => parseAll(client.stdout).find((f) => f.method === "notifications/tools/list_changed"),
         15000,
