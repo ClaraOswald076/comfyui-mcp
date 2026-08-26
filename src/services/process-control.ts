@@ -6393,3 +6393,8 @@ export const __processControlTestHooks = {
     remoteRebootTimingOverride = timing;
   },
 };
+
+// Issue #2320 test hooks — expose rebootViaManager for testing probe behavior
+export const __rebootViaManagerTestHooks = {
+  rebootViaManager,
+};
