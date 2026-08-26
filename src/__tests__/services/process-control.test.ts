@@ -1513,4 +1513,60 @@ describe("restart truthfulness + Pinokio-shaped refusal (#742)", () => {
     // Unknown token → no-op, never throws.
     expect(() => clearRestartDispatch("tok-nope")).not.toThrow();
   });
+
+  it("reboots Manager v4.2.2 via GET /v2/manager/reboot (#2320)", async () => {
+    // Manager v4.2.2 only accepts GET on the /v2/manager/reboot endpoint.
+    // POST returns 405 Method Not Allowed. The probe list must try GET /v2,
+    // and the reboot must fire. The fix adds GET /v2/manager/reboot to REBOOT_ROUTES
+    // so the probe succeeds where it previously failed. When POST /v2 returns
+    // 405 (wrong verb), the fix skips it and continues to the next probe, which
+    // is GET /v2 (added by the fix), and that succeeds.
+    mockLivePortNoKill();
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: [
+          "C:\\Users\\x\\AppData\\Local\\Programs\\Comfy Desktop\\resources\\ComfyUI\\main.py",
+          "--port",
+          "8188",
+        ],
+      },
+    });
+    installLiveDesktopSupervisor();
+    __processControlTestHooks.setRemoteRebootTimingForTests({
+      settleMs: 0,
+      budgetMs: 500,
+      intervalMs: 5,
+    });
+    const fetchMock = vi.fn(async (url: unknown, opts?: unknown) => {
+      const urlStr = String(url);
+      const method = (opts as any)?.method || "GET";
+      // Manager v4.2.2: POST /v2/manager/reboot → 405 (wrong verb)
+      if (urlStr.includes("/v2/manager/reboot") && method === "POST") {
+        return { status: 405, ok: false } as Response;
+      }
+      // Manager v4.2.2: GET /v2/manager/reboot → connection drop (fires)
+      if (urlStr.includes("/v2/manager/reboot") && method === "GET") {
+        throw new Error("socket hang up"); // connection drop = reboot fired
+      }
+      // /system_stats after reboot comes back
+      if (urlStr.includes("system_stats")) {
+        return { ok: true } as Response;
+      }
+      return { status: 404, ok: false } as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(true);
+    expect(result.ready).toBe(true);
+    // Desktop reboot: no spawn, so `started` has no evidence. `ready` confirms.
+    // Verify GET /v2/manager/reboot was actually called (the fix being tested)
+    const v2GetCall = fetchMock.mock.calls.find(
+      ([url, opts]) =>
+        String(url).includes("/v2/manager/reboot") &&
+        ((opts as any)?.method || "GET") === "GET"
+    );
+    expect(v2GetCall).toBeDefined();
+  });
 });

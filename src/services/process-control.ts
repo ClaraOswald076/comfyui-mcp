@@ -4720,6 +4720,7 @@ interface RebootResult {
 //     surfaces as 404/405 and we fall through to the next candidate.
 const REBOOT_ROUTES: ReadonlyArray<{ path: string; method: "POST" | "GET" }> = [
   { path: "/v2/manager/reboot", method: "POST" },
+  { path: "/v2/manager/reboot", method: "GET" },
   { path: "/manager/reboot", method: "GET" },
   { path: "/manager/reboot", method: "POST" },
 ];
@@ -4827,8 +4828,13 @@ async function rebootViaManager(base: string): Promise<RebootResult> {
           note: `the request returned HTTP ${res.status}`,
         };
       }
-      // 404 / other non-OK: wrong route for this Manager build — try the next.
-      failures.push(`${method} ${path} → HTTP ${res.status}`);
+      // 405 Method Not Allowed: the route EXISTS but does not accept this verb —
+      // try a different verb on the same path, not a different path. Do not
+      // report it as route-absent (issue #2320). 404 / other non-OK: wrong route
+      // for this Manager build — try the next.
+      if (res.status !== 405) {
+        failures.push(`${method} ${path} → HTTP ${res.status}`);
+      }
     } catch (err) {
       if (isConnectionDrop(err)) {
         return {
