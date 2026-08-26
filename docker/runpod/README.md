@@ -175,16 +175,22 @@ So SSH + Jupyter + nginx come from the base; **our hook adds everything else**.
   volume.
 * **`--input-directory` / `--output-directory`** — inputs and generated images on
   the volume.
+* **`--models-directory /workspace/models`** — makes ComfyUI's
+  `folder_paths.models_dir` the persistent volume root. This is required for
+  ComfyUI-Manager's explicit relative `save_path` values; `is_default` only
+  changes the ordering of category search paths.
 * **`--extra-model-paths-config`** — points every model category at
   `/workspace/models` (see below). MODELS persist on the volume.
 * **We deliberately do NOT use `--base-directory`.** It would relocate
   `custom_nodes` (and temp) onto the volume too — but we want `custom_nodes` to
-  stay **in the image**. The per-dir flags + `extra_model_paths.yaml` give us
-  exactly the split we want (data on the volume, software in the image).
+  stay **in the image**. The per-dir flags, explicit `--models-directory`, and
+  `extra_model_paths.yaml` give us exactly the split we want (data on the
+  volume, software in the image).
 
 > **Flag verification.** These flag names were verified against ComfyUI `master`
-> (`comfy/cli_args.py`): `--user-directory`, `--input-directory`,
-> `--output-directory`, `--base-directory`, and `--extra-model-paths-config` all
+> (`comfy/cli_args.py`): `--user-directory`, `--models-directory`,
+> `--input-directory`, `--output-directory`, `--base-directory`, and
+> `--extra-model-paths-config` all
 > exist with these exact spellings, and `--base-directory`'s own help text states
 > it sets the base for "models, custom_nodes, input, output, temp, and user
 > directories" — confirming why we avoid it. **Assumption to confirm at build:**
@@ -249,11 +255,12 @@ comfyui_mcp_volume:
 
 Notes:
 
-* **`is_default: true`** is the load-bearing line. ComfyUI's
+* **`is_default: true`** keeps the volume category paths first for lookup. ComfyUI's
   `add_model_folder_path(..., is_default=True)` **inserts** the path at the front
-  of each category's list, so `/workspace/models/<cat>` becomes the default
-  download target. Without it, the image's `/opt/ComfyUI/models/<cat>` (ephemeral)
-  would stay first and Manager downloads would **not** persist.
+  of each category's list, so `/workspace/models/<cat>` is preferred for lookup.
+  The launch's explicit `--models-directory /workspace/models` is the separate
+  guarantee that Manager's explicit relative `save_path` writes also land on the
+  volume; `is_default` alone cannot change `folder_paths.models_dir`.
 * **No `custom_nodes:` key** — on purpose. Mapping `custom_nodes` to the volume
   would break the fast-restart contract.
 * `base_path: /workspace` with `models/...` relative subpaths mirrors ComfyUI's

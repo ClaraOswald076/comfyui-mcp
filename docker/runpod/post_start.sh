@@ -581,10 +581,12 @@ fi
 # -----------------------------------------------------------------------------
 # 5. Launch ComfyUI from the BAKED venv (image), pointed at the volume dirs.
 #    Invoke the venv python by ABSOLUTE PATH (no `activate` needed).
-#    Per-directory flags keep user/input/output on /workspace; models come from
-#    extra_model_paths.yaml (is_default → volume is primary). custom_nodes are
-#    symlinked onto the volume in §4.5 above (so runtime installs persist); we do
-#    NOT use --base-directory (it would relocate the whole tree, incl. the venv).
+#    Per-directory flags keep user/input/output on /workspace. --models-directory
+#    makes ComfyUI's folder_paths.models_dir the persistent volume root, which is
+#    required for Manager's explicit relative save_path values; the extra path map
+#    still puts every category's volume subfolder first. custom_nodes are symlinked
+#    onto the volume in §4.5 above (so runtime installs persist); we do NOT use
+#    --base-directory (it would relocate the whole tree, incl. the venv).
 # -----------------------------------------------------------------------------
 VPY="${COMFY_HOME}/venv/bin/python"
 if [ ! -x "${VPY}" ]; then
@@ -624,6 +626,7 @@ ARGS=(--listen 0.0.0.0 --port "${COMFY_PORT}"
       --enable-manager --enable-cors-header
       "${ATTN_ARGS[@]}"
       --user-directory  "${USER_DIR}"
+      --models-directory "${MODELS_DIR}"
       --input-directory "${INPUT_DIR}"
       --output-directory "${OUTPUT_DIR}")
 # Load the volume model map only if the file exists (it's baked, but be defensive).

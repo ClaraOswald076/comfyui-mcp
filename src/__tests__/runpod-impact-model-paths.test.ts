@@ -122,6 +122,28 @@ describe("the RunPod image maps Impact Pack's model categories onto the volume (
     expect(exported).toBeLessThan(launch);
   });
 
+  it("makes ComfyUI Manager's explicit save_path writes use the volume root", () => {
+    // managerModelDestination() deliberately sends a relative `save_path` for nested
+    // destinations and categories without a Manager type-map entry. Manager resolves
+    // those relative paths under folder_paths.models_dir, which is NOT changed by
+    // extra_model_paths.yaml's is_default flag. The launch flag is therefore the
+    // production proof that e.g. `diffusers/foo` cannot fall back to /opt/ComfyUI/models.
+    const modelsFlag = postStartSrc.search(
+      /^\s+--models-directory "\$\{MODELS_DIR\}"\r?$/m,
+    );
+    expect(modelsFlag, "ComfyUI must launch with the persistent models root").toBeGreaterThan(-1);
+
+    const argsStart = postStartSrc.search(/^ARGS=\(/m);
+    const extraFlag = postStartSrc.indexOf("--extra-model-paths-config");
+    const launch = postStartSrc.search(/^nohup .*main\.py/m);
+    expect(argsStart).toBeGreaterThan(-1);
+    expect(extraFlag).toBeGreaterThan(-1);
+    expect(launch).toBeGreaterThan(-1);
+    expect(argsStart).toBeLessThan(modelsFlag);
+    expect(modelsFlag).toBeLessThan(launch);
+    expect(extraFlag).toBeLessThan(launch);
+  });
+
   it("documents the same category set it ships", () => {
     // README.md embeds a full copy of the yaml under "Model paths". That copy is what a
     // maintainer reads when adding the NEXT category, so a stale one does not just mislead —
