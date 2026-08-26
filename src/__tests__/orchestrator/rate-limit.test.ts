@@ -125,6 +125,22 @@ describe("sanitizeDetail", () => {
     expect(out).not.toContain("abcdefghijklmnop");
   });
 
+  it("redacts segmented opaque ids as one atom", () => {
+    const cases = [
+      "org_1234567890_abcdefghi",
+      "tenant_account_1234567890_abcdefghi",
+      "wrapper_qavexidopulnertiskym_extra_more",
+    ];
+    for (const value of cases) {
+      const out = sanitizeDetail(`rate limit reached for ${value}`);
+      expect(out).not.toContain(value);
+      for (const segment of value.split(/[-_]/).filter((segment) => segment.length >= 9)) {
+        expect(out).not.toContain(segment);
+      }
+      expect(out).toContain("rate limit reached for");
+    }
+  });
+
   it("redacts an identifier that has no digit in it at all", () => {
     // The reported case. 22 alphabetic characters, no separator, no digit.
     const alpha = sanitizeDetail("account abcdefghijklmnopqrstuv is limited");
@@ -174,6 +190,29 @@ describe("sanitizeDetail", () => {
     // it at or below 22 characters (a 22-character id must vanish); this pins it
     // above 18, so nobody "hardens" the rule down into ordinary long words.
     expect(sanitizeDetail("this request was disproportionately large")).toContain("disproportionately");
+  });
+
+  it("keeps long prose while retaining opaque and explicitly labelled masking", () => {
+    const prose = [
+      "account counterrevolutionary policy",
+      "the user uncharacteristically exceeded the limit",
+      "account compartmentalization policy",
+      "internationalization is enabled",
+    ];
+    for (const sentence of prose) {
+      expect(sanitizeDetail(sentence)).toBe(sentence);
+    }
+
+    const labelled = [
+      "account_id=abcdefghijklmnopqrstuv",
+      "user_id: qavexidopulnertiskym",
+      '{"account_id":"counterrevolutionary"}',
+    ];
+    for (const sentence of labelled) {
+      expect(sanitizeDetail(sentence)).not.toMatch(
+        /(?:abcdefghijklmnopqrstuv|qavexidopulnertiskym|counterrevolutionary)/,
+      );
+    }
   });
 
   it("redacts an email address", () => {

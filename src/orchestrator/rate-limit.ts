@@ -173,49 +173,118 @@ function parseWaitFromProse(text: string): number | null {
  * `redactTokens` covers credentials in the shapes OAuth uses, and it is applied
  * first — but it knows nothing about `org-7df23a26037240f88f967fb1c64d8e3f` or
  * `cak-fc91zq3o4h0b111bug391`, which is exactly what leaked. The rule here is
- * SHAPE, not a list of known prefixes: a prefixed opaque run, or a long bare
- * run, is an identifier whatever the vendor calls it, and no rate-limit
- * explanation needs one to be useful. A vendor inventing a new prefix tomorrow is
- * covered without a code change, and so is one that mints ids with no digit in
- * them (#2313) — shape here means LENGTH and the absence of a space, never a
- * character class, and never a guess at whether a run reads like English.
+ * shape plus the smallest amount of context needed for the one ambiguous case:
+ * an all-alpha long run can be either a minted id or an English word. A
+ * prefixed/segmented opaque run, UUID, e-mail, or explicitly labelled value is
+ * an id regardless of its contents. Bare all-alpha runs need either a
+ * rate-limit label/status context or a shape that is not one of the ordinary
+ * prose words covered by the table below.
  *
- * Deliberately aggressive. Over-redaction costs a few characters of an error
- * message; under-redaction publishes an account id into a chat log that gets
- * screenshotted.
+ * This is deliberately fail-closed for structured labels and fail-readable for
+ * prose. There is no morphology heuristic that can reliably distinguish a
+ * vendor-minted all-alpha id from an English word, so the small prose table is
+ * explicit and testable rather than pretending that vowel counts solve it.
  */
+const EXPLICIT_ALPHA_IDENTIFIER_LABEL =
+  /(?:^|[\s"'([{])(?:account|acct|user|workspace|token|key)(?:[_-](?:id|identifier)|\s+(?:id|identifier))\b\s*["']?\s*(?:[:=]\s*)?["'([{]?\s*$/i;
+const DIRECT_ALPHA_IDENTIFIER_LABEL =
+  /(?:^|[.!?;]\s*|(?:your|the)[\s-]+)(?:account|acct|user|tenant|plan)\s*(?:[,;.!?:=]\s*[\[({]?|[-_]+\s*[\[({]?|\s+)$/i;
+const GENERIC_ALPHA_IDENTIFIER_CONTEXT = /(?:\b(?:for|from|of|tenant|plan)\s*|[\[({]\s*)$/i;
+const IDENTIFIER_STATUS = /^\s+(?:is|was|has|had|reached|exceeded|exhausted|limited|invalid|expired|blocked|disabled)\b/i;
+const NATURAL_LANGUAGE_ALPHA_RUNS = new Set([
+  "compartmentalization",
+  "counterrevolutionary",
+  "internationalization",
+  "nondeterministically",
+  "uncharacteristically",
+]);
+
+function isNaturalLanguageAlphaRun(run: string): boolean {
+  return NATURAL_LANGUAGE_ALPHA_RUNS.has(run.split(/[-_]+/, 1)[0].toLowerCase());
+}
+
+function isExplicitIdentifierValue(run: string): boolean {
+  return /^(?:account|acct|user|workspace|token|key)(?:[_-](?:id|identifier))[-_]/i.test(run);
+}
+
+function hasAlphaIdentifierContext(input: string, offset: number, run: string): boolean {
+  const before = input.slice(Math.max(0, offset - 96), offset);
+  if (EXPLICIT_ALPHA_IDENTIFIER_LABEL.test(before)) return true;
+
+  const after = input.slice(offset + run.length);
+  const afterClosingPunctuation = after.replace(/^\s*[\])}]+/, "");
+  const terminal =
+    !afterClosingPunctuation.trim() ||
+    /^[\s]*[.,;!?]/.test(after) ||
+    IDENTIFIER_STATUS.test(afterClosingPunctuation);
+  if (!terminal) return false;
+
+  return DIRECT_ALPHA_IDENTIFIER_LABEL.test(before) || GENERIC_ALPHA_IDENTIFIER_CONTEXT.test(before);
+}
+
+function firstIdentifierPrefix(run: string): string {
+  const prefix = run.match(/^[A-Za-z][A-Za-z0-9]{0,12}[-_]/)?.[0] ?? "";
+  // A UUID glued directly to a vendor word (org550e8400-...) has no safe
+  // prefix boundary. Preserving that whole digit-bearing fragment would defeat
+  // the atomic UUID replacement, so only retain alphabetic prefix segments.
+  return /\d/.test(prefix.slice(0, -1)) ? "" : prefix;
+}
+
+function preserveNaturalLanguagePrefixedRun(run: string): boolean {
+  if (isExplicitIdentifierValue(run)) return false;
+  return isNaturalLanguageAlphaRun(run);
+}
+
 export function sanitizeDetail(raw: string, max = 200): string {
   const masked = redactTokens(raw)
-    // UUID-shaped ids FIRST, with any prefix attached. Their hyphens defeat both
-    // rules below: the longest unbroken run inside a UUID is 12 characters, so the
-    // bare-run rule never fires, and the prefixed rule matches only the TAIL —
-    // which is worse than missing it outright, because
-    // `550e8400-e29b-41d4-a716-<redacted>` reads as sanitized while 24 of its 36
-    // characters shipped. A partial redaction nobody re-checks is the dangerous
-    // shape here, so this runs before anything can produce one.
+    // E-mail addresses FIRST: the local part may itself look like a bare id, but
+    // #2294's contract is to mask the whole address atomically.
+    .replace(/\b[\w.+-]+@[\w-]+\.[\w.]+\b/g, "<redacted>")
+    // UUID-shaped ids next, before the other identifier rules. The boundary is
+    // deliberately non-alphanumeric instead of `\b`: `_` is a word character,
+    // and `tenant_account_<uuid>` must be consumed as one value rather than
+    // leaving a partial UUID for the next rule to redact.
     .replace(
-      /\b(?:([A-Za-z][A-Za-z0-9]{1,12})[-_])?[A-Za-z0-9]{0,32}[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}[A-Za-z0-9]{0,32}\b/g,
-      (_m, prefix: string | undefined) => (prefix ? `${prefix}-<redacted>` : "<redacted>"),
+      /(^|[^A-Za-z0-9])((?:(?:[A-Za-z][A-Za-z0-9]{0,12}[-_])+)?[A-Za-z0-9]{0,32}[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}[A-Za-z0-9]{0,32})(?=$|[^A-Za-z0-9])/g,
+      (_m, boundary: string, value: string) => {
+        const prefix = firstIdentifierPrefix(value);
+        return `${boundary}${prefix ? `${prefix}<redacted>` : "<redacted>"}`;
+      },
     )
-    // prefixed opaque identifiers: org-…, cak-…, key_…, acct-…
-    .replace(/\b([A-Za-z][A-Za-z0-9]{1,12}[-_])[A-Za-z0-9]{10,}\b/g, "$1<redacted>")
-    // bare long runs (an id that came without a prefix). LENGTH is the whole
-    // test: there is deliberately no `(?=[A-Za-z0-9]*\d)` lookahead requiring
-    // a digit. That lookahead was here until #2313, and it meant an all-alphabetic
-    // id — `account abcdefghijklmnopqrstuv is limited` — passed through untouched
-    // while the same string ending in a digit was redacted. Neither other rule
-    // caught it: the prefixed rule needs a `-`/`_`, and the UUID rule needs the
-    // UUID shape.
-    //
-    // Do NOT put it back to protect prose — it does not buy what it looks like it
-    // buys. Measured over 1.19M word tokens of this repo's comments, docs and
-    // user-facing strings, exactly ONE all-lowercase run of 20+ characters is an
-    // English word (`nondeterministically`, once), and it has never appeared in a
-    // 429. An unbroken 20-character alphanumeric run is an identifier; an
-    // explanatory sentence has spaces in it, and every space ends a run.
-    .replace(/\b[A-Za-z0-9]{20,}\b/g, "<redacted>")
-    // e-mail addresses occasionally appear in quota messages
-    .replace(/\b[\w.+-]+@[\w-]+\.[\w.]+\b/g, "<redacted>");
+    // Prefixed and segmented opaque identifiers: org-…, org_…_…, cak-…, key_…,
+    // and long wrapper/value forms. The entire atom is matched before replacing
+    // it, so no later rule can turn a segmented value into a misleading partial.
+    .replace(
+      /(^|[^A-Za-z0-9])(((?:[A-Za-z][A-Za-z0-9]{0,12}[-_])+)[A-Za-z0-9]{10,}(?:[-_]+[A-Za-z0-9]+)*)(?=$|[^A-Za-z0-9])/g,
+      (_m, boundary: string, run: string) =>
+        preserveNaturalLanguagePrefixedRun(run)
+          ? `${boundary}${run}`
+          : `${boundary}${firstIdentifierPrefix(run)}<redacted>`,
+    )
+    // Machine-labelled values are identifiers even when their alphabetic
+    // payload happens to be an English word. This also handles JSON-like
+    // `account_id: "..."` forms that are shorter than the bare-run threshold.
+    .replace(
+      /((?:account|acct|user|workspace|token|key)(?:[_-](?:id|identifier)|\s+(?:id|identifier))\b\s*["']?\s*[:=]\s*["'([{]?\s*)([A-Za-z0-9]{10,}(?:[-_]+[A-Za-z0-9]+)*)(?=$|[^A-Za-z0-9])/gi,
+      (_m, label: string) => `${label}<redacted>`,
+    )
+    // Long segmented values whose first segment is itself longer than a normal
+    // prefix (for example qavexidopulnertiskym_extra) are still one atom.
+    .replace(
+      /(^|[^A-Za-z0-9])([A-Za-z0-9]{10,}(?:[-_]+[A-Za-z0-9]+)+)(?=$|[^A-Za-z0-9])/g,
+      (_m, boundary: string, run: string) =>
+        preserveNaturalLanguagePrefixedRun(run) ? `${boundary}${run}` : `${boundary}<redacted>`,
+    )
+    // Bare long runs: digits are an opaque shape by themselves. An all-alpha
+    // run is masked only in an identifier/status context, with ordinary prose
+    // words explicitly retained. Explicit machine labels (account_id, user_id,
+    // and their JSON-like forms) are always handled by that context check.
+    .replace(/\b[A-Za-z0-9]{20,}\b/g, (run, offset, input: string) => {
+      if (/\d/.test(run)) return "<redacted>";
+      return !isNaturalLanguageAlphaRun(run) && hasAlphaIdentifierContext(input, offset, run)
+        ? "<redacted>"
+        : run;
+    });
   return masked.replace(/\s+/g, " ").trim().slice(0, max);
 }
 
