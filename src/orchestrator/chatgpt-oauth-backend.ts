@@ -205,7 +205,13 @@ export class ChatGptOAuthBackend extends OllamaBackend {
     const sizeOf = (m: TurnMessage) => (m.images ?? []).reduce((n, b64) => n + b64.length, 0);
     let bytesBefore = 0;
     for (const m of this.turnHistory) bytesBefore += sizeOf(m);
-    if (bytesBefore <= budget) return { droppedImages: 0, undeliveredImages: 0, budget, bytesBefore };
+    logger.warn(
+      `[DEBUG-2224] trimCodexImagePayloadToBudget: turnHistory.length=${this.turnHistory.length}, bytesBefore=${bytesBefore}, budget=${budget}`,
+    );
+    if (bytesBefore <= budget) {
+      logger.warn(`[DEBUG-2224] trim not needed (${bytesBefore} <= ${budget})`);
+      return { droppedImages: 0, undeliveredImages: 0, budget, bytesBefore };
+    }
 
     let remaining = bytesBefore;
     let droppedImages = 0;
