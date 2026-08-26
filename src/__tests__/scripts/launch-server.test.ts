@@ -612,6 +612,51 @@ describe("cold-start proxy state machine (#1447)", () => {
     expect(parseAll(r.toClient).filter((f) => f.id === 7)).toHaveLength(1);
   });
 
+  it("holds the re-list announcement until the client says it is initialized", async () => {
+    // Round-4 gate: the announcement was sent the instant the server's
+    // handshake landed, which can be BEFORE the client has finished its own —
+    // and a notification sent ahead of `notifications/initialized` is one the
+    // client is entitled to ignore. Losing it costs the whole session: the tool
+    // list stays empty, silently, which is the failure this issue is about.
+    const r = rig(40);
+    r.fromClient(INIT);
+    await waitFor(() => parseAll(r.toClient)[0]);
+    expect(r.proxy.phase()).toBe("installing");
+
+    // Handover arrives first, with no `initialized` from the client yet.
+    r.fromChild({
+      jsonrpc: "2.0",
+      id: 7,
+      result: { protocolVersion: "2025-03-26", capabilities: { tools: { listChanged: true } } },
+    });
+    await waitFor(() => (r.proxy.phase() === "live" ? true : undefined));
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(parseAll(r.toClient).some((f) => f.method === "notifications/tools/list_changed")).toBe(false);
+
+    // …and it fires as soon as the client is ready, even though `live` is
+    // otherwise a pure wire that does not inspect frames.
+    r.fromClient({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await waitFor(() => parseAll(r.toClient).find((f) => f.method === "notifications/tools/list_changed"));
+  });
+
+  it("repeats the announcement — one lost notification must not cost the session", async () => {
+    const r = rig(40);
+    r.fromClient(INIT);
+    await waitFor(() => parseAll(r.toClient)[0]);
+    r.fromClient({ jsonrpc: "2.0", method: "notifications/initialized" });
+    r.fromChild({
+      jsonrpc: "2.0",
+      id: 7,
+      result: { protocolVersion: "2025-03-26", capabilities: { tools: { listChanged: true } } },
+    });
+    const announcements = () =>
+      parseAll(r.toClient).filter((f) => f.method === "notifications/tools/list_changed").length;
+    await waitFor(() => (announcements() >= 1 ? true : undefined));
+    // Re-listing is idempotent, so a second one costs a round-trip; a missed
+    // first one costs everything.
+    await waitFor(() => (announcements() >= 2 ? true : undefined), 5000);
+  }, 15000);
+
   it("answers a batched tools/list mid-install instead of forwarding it into the wait", async () => {
     const r = rig(40);
     r.fromClient(INIT);

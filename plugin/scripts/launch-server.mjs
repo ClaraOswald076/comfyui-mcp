@@ -431,10 +431,56 @@ export function attachColdStartProxy({
   let initializeId;
   let initializeParams;
   let timer = null;
+  let clientInitialized = false;
+  let announcePending = false;
+  const announceTimers = [];
 
   // No backpressure source: these are the wrapper's own short control frames,
   // and pausing an unrelated stream to emit one would be a bug, not a courtesy.
   const toClient = (message) => writeFrame(clientOut, null, JSON.stringify(message));
+
+  /**
+   * Tell the client to re-list — the one message that turns a rescued session
+   * into a working one. It is sent MORE THAN ONCE, on purpose (round-4 gate).
+   *
+   * A single notification is a single point of failure for the whole fix: if the
+   * client is not yet listening for it, the session sits on the empty tool list
+   * for good, which is the silent, total failure this issue is about. The client
+   * registers that listener around its own `initialize` bookkeeping, and the
+   * handover can land in the middle of it.
+   *
+   * Re-listing is idempotent — it costs one `tools/list` round-trip — so paying
+   * for two extra notifications to close a race that costs the user the whole
+   * session is the right trade.
+   */
+  const ANNOUNCE_REPEAT_MS = [1500, 6000];
+  const announceTools = () => {
+    toClient({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
+    for (const delay of ANNOUNCE_REPEAT_MS) {
+      const repeat = setTimeout(() => toClient({ jsonrpc: "2.0", method: "notifications/tools/list_changed" }), delay);
+      if (typeof repeat.unref === "function") repeat.unref();
+      announceTimers.push(repeat);
+    }
+  };
+
+  /**
+   * …and it is never sent before the client says it is initialized. The spec
+   * puts `notifications/initialized` at the end of the client's handshake, so a
+   * notification sent ahead of it is one the client is entitled to ignore.
+   */
+  const announceWhenReady = () => {
+    if (clientInitialized) announceTools();
+    else announcePending = true;
+  };
+
+  const markClientInitialized = () => {
+    if (clientInitialized) return;
+    clientInitialized = true;
+    if (announcePending) {
+      announcePending = false;
+      announceTools();
+    }
+  };
 
   const disarm = () => {
     if (timer) {
@@ -472,11 +518,18 @@ export function attachColdStartProxy({
           timer = setTimeout(rescue, deadlineMs);
           if (typeof timer.unref === "function") timer.unref();
         }
+      } else if (announcePending && carriesInitialized(parseFrame(line))) {
+        // The handover beat the client's own handshake. `live` is otherwise a
+        // pure wire, so without this the deferred announcement would never fire
+        // and the session would keep the empty tool list for good.
+        markClientInitialized();
       }
       writeFrame(childIn, clientIn, line);
       return;
     }
-    const decision = installingDecision(parseFrame(line));
+    const parsed = parseFrame(line);
+    if (carriesInitialized(parsed)) markClientInitialized();
+    const decision = installingDecision(parsed);
     if (decision.action === "forward") {
       writeFrame(childIn, clientIn, line);
     } else if (decision.action === "reply") {
@@ -529,11 +582,12 @@ export function attachColdStartProxy({
       // `tools/list_changed` and left the client believing it had connected.
       phase = "failed";
       disarm();
+      for (const repeat of announceTimers) clearTimeout(repeat);
       if (onHandoverFailed) onHandoverFailed(msg.error);
       return;
     }
     phase = "live";
-    toClient({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
+    announceWhenReady();
   });
 
   return {
@@ -541,6 +595,12 @@ export function attachColdStartProxy({
     // Test seam: fire the deadline without waiting for wall-clock time.
     forceRescue: rescue,
   };
+}
+
+/** Does this client frame — single or batched — say the client is initialized? */
+function carriesInitialized(msg) {
+  if (Array.isArray(msg)) return msg.some(carriesInitialized);
+  return Boolean(msg) && (msg.method === "notifications/initialized" || msg.method === "initialized");
 }
 
 function parseFrame(line) {
