@@ -6326,25 +6326,33 @@ function currentPromotedScopeError(
   ctx: PanelToolCtx,
   expected: PromotedScopeWitness,
   requireCurrentSubgraph = false,
+  observedOverride?: TabPromotedScopeRead,
 ): string | null {
-  const readScope = (ctx.bridge as unknown as BridgeProbe).promotedScopeFor;
-  if (typeof readScope === "function") {
-    let observed: TabPromotedScopeRead;
-    try {
-      observed = readScope.call(ctx.bridge, ctx.tabId);
-    } catch {
-      return "the receiving panel current-view scope became unreadable";
+  let scopeRead = observedOverride;
+  if (scopeRead === undefined) {
+    const readScope = (ctx.bridge as unknown as BridgeProbe).promotedScopeFor;
+    if (typeof readScope === "function") {
+      try {
+        scopeRead = readScope.call(ctx.bridge, ctx.tabId);
+      } catch {
+        scopeRead = {
+          known: false,
+          reason: "the receiving panel current-view scope became unreadable",
+        };
+      }
     }
-    if (observed.known !== true) {
+  }
+  if (scopeRead !== undefined) {
+    if (scopeRead.known !== true) {
       return "the receiving panel current-view scope became unverifiable";
     }
     if (
       requireCurrentSubgraph &&
-      (observed.scope !== "subgraph" || observed.ownerNodeId !== expected.ownerNodeId)
+      (scopeRead.scope !== "subgraph" || scopeRead.ownerNodeId !== expected.ownerNodeId)
     ) {
       return "the receiving panel current subgraph owner changed or became unverifiable";
     }
-    if (expected.workflowUuid !== undefined && observed.workflowUuid !== expected.workflowUuid) {
+    if (expected.workflowUuid !== undefined && scopeRead.workflowUuid !== expected.workflowUuid) {
       return "the receiving panel workflow scope changed or became unverifiable";
     }
   }
@@ -6373,32 +6381,35 @@ function currentPromotedScopeError(
   return null;
 }
 
-/** Perform a fresh current-view read for the promoted receiver. The bridge
- * cache remains useful for the synchronous dispatch callback, but it is not
- * authoritative across the final graph_query -> graph_set_widget window. */
+type PromotedScopeFence = {
+  error: string | null;
+  /** The exact structured result of the live graph_query. Once present, the
+   * synchronous dispatch fence must use this witness rather than the bridge's
+   * cached reply state. */
+  observed?: TabPromotedScopeRead;
+};
+
+/** Perform a fresh current-view read for the promoted receiver. Return the
+ * validated result as part of the fence so the final synchronous callback does
+ * not silently fall back to a stale cached owner. */
 async function authoritativePromotedScopeError(
   ctx: PanelToolCtx,
   expected: PromotedScopeWitness,
   innerNodeId: number | string,
-): Promise<string | null> {
+): Promise<PromotedScopeFence> {
   const readScope = (ctx.bridge as unknown as BridgeProbe).readPromotedScope;
-  if (typeof readScope !== "function") return currentPromotedScopeError(ctx, expected, true);
+  if (typeof readScope !== "function") {
+    return { error: currentPromotedScopeError(ctx, expected, true) };
+  }
 
   let observed: TabPromotedScopeRead;
   try {
     observed = await readScope.call(ctx.bridge, ctx.tabId, innerNodeId);
   } catch {
-    return "the receiving panel current-view scope became unreadable";
+    return { error: "the receiving panel current-view scope became unreadable" };
   }
-  if (
-    observed.known !== true ||
-    observed.scope !== "subgraph" ||
-    observed.ownerNodeId !== expected.ownerNodeId ||
-    (expected.workflowUuid !== undefined && observed.workflowUuid !== expected.workflowUuid)
-  ) {
-    return "the receiving panel current subgraph owner changed or became unverifiable";
-  }
-  return null;
+  const error = currentPromotedScopeError(ctx, expected, true, observed);
+  return { error, observed };
 }
 
 function promotedWriteRefusal(widget: string, reason: string): ToolResult {
@@ -17086,15 +17097,15 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             // before this write is dispatched. Take a fresh authoritative view
             // read at the write boundary so the final synchronous callback is
             // never the first place we discover a stale owner witness.
-            const authoritativeScopeError = await authoritativePromotedScopeError(
+            const authoritativeScope = await authoritativePromotedScopeError(
               ctx,
               plan.scope,
               plan.inner.innerNodeId,
             );
-            if (authoritativeScopeError) {
+            if (authoritativeScope.error) {
               const exited = await leave();
               return appendToolResultText(
-                promotedWriteRefusal(args.widget as string, authoritativeScopeError),
+                promotedWriteRefusal(args.widget as string, authoritativeScope.error),
                 exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : "",
               );
             }
@@ -17110,7 +17121,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                     `Refusing promoted inner graph_set_widget: ${error}. No graph_set_widget was dispatched.`,
                   );
                 }
-                const scopeError = currentPromotedScopeError(ctx, plan.scope, true);
+                const scopeError = currentPromotedScopeError(
+                  ctx,
+                  plan.scope,
+                  true,
+                  authoritativeScope.observed,
+                );
                 if (scopeError) {
                   throw new Error(
                     `Refusing promoted inner graph_set_widget: ${scopeError}. No graph_set_widget was dispatched.`,
@@ -17663,15 +17679,15 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           );
         }
 
-        const authoritativeRecoveryScopeError = recoveryScope
+        const authoritativeRecoveryScope = recoveryScope
           ? await authoritativePromotedScopeError(ctx, recoveryScope, inner.innerNodeId)
-          : "the promoted recovery scope was unavailable";
-        if (authoritativeRecoveryScopeError) {
+          : { error: "the promoted recovery scope was unavailable" };
+        if (authoritativeRecoveryScope.error) {
           const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
           return appendToolResultText(
             first,
             `\n\n${textOfToolResult(
-              promotedWriteRefusal(refusal.widget, authoritativeRecoveryScopeError),
+              promotedWriteRefusal(refusal.widget, authoritativeRecoveryScope.error),
             )}` + (exited.isError ? ` panel_exit_subgraph also FAILED: ${textOfToolResult(exited)}` : ""),
           );
         }
@@ -17689,7 +17705,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                   );
                 }
                 const scopeError = recoveryScope
-                  ? currentPromotedScopeError(ctx, recoveryScope, true)
+                  ? currentPromotedScopeError(
+                      ctx,
+                      recoveryScope,
+                      true,
+                      authoritativeRecoveryScope.observed,
+                    )
                   : "the promoted recovery scope was unavailable";
                 if (scopeError) {
                   throw new Error(
