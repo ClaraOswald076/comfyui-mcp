@@ -3,7 +3,12 @@ import { existsSync, type Stats } from "node:fs";
 import { platform } from "node:os";
 import { readdir, stat, mkdir, readFile, lstat, realpath } from "node:fs/promises";
 import { dirname, join, basename, normalize, resolve, relative, sep, isAbsolute, extname } from "node:path";
-import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
+import {
+  config,
+  getComfyUIBaseUrl,
+  getComfyuiTargetGeneration,
+  isRemoteMode,
+} from "../config.js";
 import { getClient, getLogs, getSystemStats, comfyApiFetch } from "../comfyui/client.js";
 import { getExtraModelRoots, getLiveExtraModelRoots } from "./extra-paths.js";
 import {
@@ -458,6 +463,12 @@ export type ModelListingCoverage = {
   /** Set when neither path could run: no HTTP answer AND no local install path
    *  to scan, which is the exact shape that produced the false "no models". */
   noSourceAvailable?: boolean;
+  /** Set when the ComfyUI target changed while this listing was in flight. Any
+   *  names/paths collected before that change have been discarded. */
+  targetChanged?: {
+    startedBaseUrl: string;
+    currentBaseUrl: string;
+  };
   /**
    * Other categories THIS server registers, collected only when a FILTERED call
    * came back empty (#962).
@@ -527,22 +538,87 @@ export function describeUnparsableBody(status: number, body: string): string {
   );
 }
 
+type ModelListingTargetWitness = Readonly<{
+  generation: number;
+  baseUrl: string;
+  remote: boolean;
+  localPath: string | undefined;
+}>;
+
+function captureModelListingTarget(): ModelListingTargetWitness {
+  return {
+    generation: getComfyuiTargetGeneration(),
+    baseUrl: getComfyUIBaseUrl(),
+    remote: isRemoteMode(),
+    localPath: config.comfyuiPath,
+  };
+}
+
+function targetMatchesWitness(witness: ModelListingTargetWitness): boolean {
+  return (
+    getComfyuiTargetGeneration() === witness.generation &&
+    getComfyUIBaseUrl() === witness.baseUrl &&
+    isRemoteMode() === witness.remote &&
+    config.comfyuiPath === witness.localPath
+  );
+}
+
+/**
+ * A model listing is one answer about one ComfyUI target. If that target is
+ * retargeted while an HTTP/filesystem await is in flight, none of the names or
+ * paths collected so far can be attributed to the target the caller asked
+ * about. Clear every source-derived field and make the caller retry instead of
+ * returning a mixed or stale inventory. The generation check is intentional:
+ * an A -> B -> A round trip has the same final URL and mode but is still stale.
+ */
+function refuseStaleModelListing(
+  witness: ModelListingTargetWitness,
+  coverage: ModelListingCoverage,
+): boolean {
+  if (targetMatchesWitness(witness)) return false;
+
+  if (!coverage.targetChanged) {
+    coverage.targetChanged = {
+      startedBaseUrl: witness.baseUrl,
+      currentBaseUrl: getComfyUIBaseUrl(),
+    };
+  }
+  coverage.answered.length = 0;
+  coverage.unanswered.length = 0;
+  coverage.absent = [];
+  coverage.httpUnavailable = undefined;
+  coverage.otherRegisteredCategories = undefined;
+  coverage.usedFilesystem = false;
+  coverage.noSourceAvailable = true;
+  return true;
+}
+
 /** Model listing plus the provenance needed to describe it honestly. */
 export async function listLocalModelsWithCoverage(
   modelType?: string,
 ): Promise<{ models: LocalModel[]; coverage: ModelListingCoverage }> {
+  const target = captureModelListingTarget();
   const coverage: ModelListingCoverage = {
     answered: [],
     unanswered: [],
     absent: [],
     usedFilesystem: false,
   };
-  const models = await collectLocalModels(modelType, coverage);
+  const models = await collectLocalModels(modelType, coverage, target);
+  if (refuseStaleModelListing(target, coverage)) {
+    return { models: [], coverage };
+  }
   // #962 — a filtered call that found nothing is about to say "none". Before it
   // does, ask the server what it actually registers. Bounded to this one case,
   // so the common paths pay nothing.
   if (models.length === 0 && modelType !== undefined && coverage.answered.includes(modelType)) {
     coverage.otherRegisteredCategories = await otherRegisteredCategories(modelType);
+    if (refuseStaleModelListing(target, coverage)) {
+      return { models: [], coverage };
+    }
+  }
+  if (refuseStaleModelListing(target, coverage)) {
+    return { models: [], coverage };
   }
   return { models, coverage };
 }
@@ -583,6 +659,7 @@ export async function listLocalModels(
 async function collectLocalModels(
   modelType: string | undefined,
   coverage: ModelListingCoverage,
+  target: ModelListingTargetWitness,
 ): Promise<LocalModel[]> {
   const dirsToScan: string[] = modelType ? [modelType] : [...MODEL_SUBDIRS];
   const results: LocalModel[] = [];
@@ -607,7 +684,9 @@ async function collectLocalModels(
     //
     // A FILTERED call already names its exact category, so it needs no discovery.
     if (!modelType) {
-      for (const cat of await discoverExtraCategories(client)) dirsToScan.push(cat);
+      const extraCategories = await discoverExtraCategories(client);
+      if (refuseStaleModelListing(target, coverage)) return [];
+      for (const cat of extraCategories) dirsToScan.push(cat);
     }
     // A `*_gguf` view aliases real folders, so the same file can be reported both
     // via the view and via a core category (e.g. a custom node that re-registers
@@ -617,6 +696,7 @@ async function collectLocalModels(
     for (const dir of dirsToScan) {
       try {
         const res = await comfyApiFetch(`/models/${dir}`);
+        if (refuseStaleModelListing(target, coverage)) return [];
         // A non-OK status or a non-array body means we did NOT learn what this
         // category holds. Recording the reason is the whole point: continuing
         // silently is what let a warming-up server look like an empty install.
@@ -654,6 +734,7 @@ async function collectLocalModels(
         // nothing about what actually happened. #918 called that out on the sibling
         // tool; classify it here instead of leaking it.
         const body = await res.text();
+        if (refuseStaleModelListing(target, coverage)) return [];
         let files: unknown;
         try {
           files = JSON.parse(body);
@@ -705,9 +786,11 @@ async function collectLocalModels(
     }
     if (httpReturnedAny) {
       await enrichWithCivitaiMetadata(results);
+      if (refuseStaleModelListing(target, coverage)) return [];
       return results;
     }
   } catch (err) {
+    if (refuseStaleModelListing(target, coverage)) return [];
     logger.debug("HTTP model listing unavailable, trying filesystem", { err });
     coverage.httpUnavailable = err instanceof Error ? err.message : String(err);
     // The outer throw (no client / cloud mode / GGUF discovery) aborts before any
@@ -726,9 +809,21 @@ async function collectLocalModels(
   }
 
   // Path 2 — filesystem fallback. Only useful in pure local mode without
-  // extra_model_paths.yaml. Returning empty here is only the RIGHT answer when
-  // HTTP actually answered; when it didn't, this is the false-empty path from
-  // #918 and the caller has to be told the difference (coverage.noSourceAvailable).
+  // extra_model_paths.yaml. A configured COMFYUI_PATH may deliberately coexist
+  // with a remote URL, so the path itself is not permission to scan it: doing so
+  // would answer a remote inventory question with this MCP host's models (#2319).
+  // Remote callers already have the connected server's HTTP result above; when
+  // that result is unavailable, return an explicitly source-less answer instead
+  // of consulting a local tree that belongs to another target.
+  if (refuseStaleModelListing(target, coverage)) return [];
+  if (isRemoteMode()) {
+    coverage.noSourceAvailable = coverage.unanswered.length > 0;
+    return results;
+  }
+
+  // Returning empty here is only the RIGHT answer when HTTP actually answered;
+  // when it didn't, this is the false-empty path from #918 and the caller has to
+  // be told the difference (coverage.noSourceAvailable).
   if (!config.comfyuiPath) {
     coverage.noSourceAvailable = coverage.unanswered.length > 0;
     return results;
@@ -742,8 +837,10 @@ async function collectLocalModels(
     try {
       entries = await readdir(dirPath, { recursive: true });
     } catch {
+      if (refuseStaleModelListing(target, coverage)) return [];
       continue;
     }
+    if (refuseStaleModelListing(target, coverage)) return [];
     for (const entry of entries) {
       // Same `.gguf`-only guard as the HTTP path for `*_gguf` categories (e.g. an
       // explicit `listLocalModels("unet_gguf")`): never list non-gguf files here.
@@ -751,6 +848,7 @@ async function collectLocalModels(
       const filePath = join(dirPath, entry);
       try {
         const info = await stat(filePath);
+        if (refuseStaleModelListing(target, coverage)) return [];
         if (!info.isFile()) continue;
         if (!dedup.add(dir, entry)) continue; // same file already surfaced elsewhere
         results.push({
@@ -761,12 +859,14 @@ async function collectLocalModels(
           type: dir,
         });
       } catch {
+        if (refuseStaleModelListing(target, coverage)) return [];
         // Skip files we can't stat
       }
     }
   }
 
   await enrichWithCivitaiMetadata(results);
+  if (refuseStaleModelListing(target, coverage)) return [];
   return results;
 }
 
