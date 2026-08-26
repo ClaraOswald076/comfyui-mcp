@@ -3905,6 +3905,16 @@ export class UiBridge {
     }
   }
 
+  /** Whether THIS connected panel also enforces the stable graph identity in
+   * an expected promoted scope at the actual mutation boundary (#2314 P1). */
+  tabExpectedScopeGraphIdentityFenceCapability(tabId: string): boolean {
+    try {
+      return this.resolveTarget(tabId).enforcesExpectedScopeGraphIdentityAtWrite === true;
+    } catch {
+      return false;
+    }
+  }
+
   /** Return the latest structured current-view owner observed for this tab.
    * Reads which carry no `viewing` field do not overwrite it; a malformed
    * structured identity is retained as unknown so a promoted write cannot use

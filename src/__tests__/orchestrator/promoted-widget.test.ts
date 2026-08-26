@@ -61,6 +61,10 @@ const SUBGRAPH = {
   ],
 };
 
+const DEFINITIVE_NON_PROMOTED_SUBGRAPH = new Error(
+  "Node 78 (OrdinaryNode) is not a subgraph",
+);
+
 type Outcome = "contradict" | "ok" | "fail";
 
 function bridge(opts: {
@@ -100,6 +104,9 @@ function bridge(opts: {
   /** Navigation after MCP's final synchronous callback but before the panel
    * receiver evaluates the expected_scope envelope. */
   receiverNavigationAfterMcpFence?: boolean;
+  /** #2314 P1: emulate an old receiver that does not atomically enforce the
+   * stable graph identity carried by expected_scope. */
+  scopeGraphIdentityFence?: boolean;
   /** Receiver navigation to another graph with the SAME owner/workflow and
    * colliding inner ids. Only graph_identity may distinguish this target. */
   receiverGraphIdentityCollisionAfterMcpFence?: boolean;
@@ -372,6 +379,7 @@ function bridge(opts: {
         }
       : {}),
     tabExpectedNodeTypeFenceCapability: () => true,
+    tabExpectedScopeGraphIdentityFenceCapability: () => opts.scopeGraphIdentityFence !== false,
     tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
     workflowUuidFor: () => ({ known: true, uuid: workflowUuid }),
   } as unknown as PanelToolCtx["bridge"];
@@ -484,7 +492,7 @@ describe("panel_set_widget promoted inner dynamic-combo child (#2299)", () => {
         firstWriteError: DYNAMIC_CHILD_CONTRADICTORY,
         subgraph: DYNAMIC_SUBGRAPH,
         detailById: DYNAMIC_DETAIL_BY_ID,
-        preflightSubgraph: new Error("preflight unavailable"),
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
       },
     );
     expect(isError).toBe(true);
@@ -505,7 +513,7 @@ describe("panel_set_widget promoted inner dynamic-combo child (#2299)", () => {
         firstWrite: "contradict",
         firstWriteError: DYNAMIC_CHILD_CONTRADICTORY,
         innerWrite: "ok",
-        preflightSubgraph: new Error("preflight unavailable"),
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
         subgraph: {
           ...DYNAMIC_SUBGRAPH,
           nodes: [
@@ -582,7 +590,7 @@ describe("panel_set_widget promoted inner LC123 regional prompt (#2305)", () => 
         firstWriteError: ANIMA_CONTRADICTORY,
         subgraph: ANIMA_SUBGRAPH,
         detailById: ANIMA_IDENTITY_BY_ID,
-        preflightSubgraph: new Error("preflight unavailable"),
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
       },
     );
     expect(isError).toBe(true);
@@ -615,7 +623,7 @@ describe("panel_set_widget promoted inner LC123 regional prompt (#2305)", () => 
         firstWrite: "contradict",
         firstWriteError: ANIMA_CONTRADICTORY,
         innerWrite: "ok",
-        preflightSubgraph: new Error("preflight unavailable"),
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
         subgraph: {
           ...ANIMA_SUBGRAPH,
           nodes: [
@@ -786,12 +794,29 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
     expect(writes[0]).toMatchObject({ node_id: 76, widget });
   });
 
-  it("keeps a successful container write when promotion preflight is unavailable", async () => {
-    const { isError, calls } = await setWidget(
+  it("refuses an indeterminate graph_get_subgraph error before any container write", async () => {
+    const { text, isError, calls } = await setWidget(
       { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
       {
         firstWrite: "ok",
         subgraph: new Error("graph_get_subgraph unavailable"),
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/could not determine whether the addressed node is a promoted container/);
+    expect(calls.map((c) => c.cmd)).toEqual([
+      "graph_query",
+      "graph_get_subgraph",
+    ]);
+  });
+
+  it("keeps a definitive non-promoted write valid", async () => {
+    const { isError, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
+      {
+        firstWrite: "ok",
+        subgraph: new Error("Node 78 (OrdinaryNode) is not a subgraph"),
       },
     );
 
@@ -801,6 +826,23 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
       "graph_get_subgraph",
       "graph_set_widget",
     ]);
+  });
+
+  it("refuses a promoted mapping for an old receiver without the graph-identity fence", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
+      {
+        firstWrite: "ok",
+        subgraph: SAFE_ANIMA_SUBGRAPH,
+        detailById: SAFE_ANIMA_IDENTITY_BY_ID,
+        scopeGraphIdentityFence: false,
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/lacks the atomic promoted graph-identity write fence/);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(0);
+    expect(calls.map((c) => c.cmd)).not.toContain("graph_enter_subgraph");
   });
 
   it("refuses when the promotion relinks after classification", async () => {
@@ -1031,7 +1073,7 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
         remappedWriteError: ANIMA_CONTRADICTORY,
         subgraph: ANIMA_SUBGRAPH,
         detailById: ANIMA_IDENTITY_BY_ID,
-        preflightSubgraph: new Error("preflight unavailable"),
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
       },
     );
 
@@ -1048,7 +1090,7 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
       {
         firstWrite: "contradict",
         firstWriteError: ANIMA_CONTRADICTORY,
-        preflightSubgraph: new Error("preflight unavailable"),
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
         subgraph: SAFE_ANIMA_SUBGRAPH,
         detailById: SAFE_ANIMA_IDENTITY_BY_ID,
       },
@@ -1063,12 +1105,12 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
     expect(calls.filter((c) => c.cmd === "graph_set_widget" && c.node_id === 78)).toHaveLength(1);
   });
 
-  it("routes a successful scope retry through the promoted inner guards", async () => {
-    const { isError, calls } = await setWidget(
+  it("fails closed when a scope retry cannot classify the current target", async () => {
+    const { text, isError, calls } = await setWidget(
       { node_id: 188, widget: "quality_prompt", value: "masterpiece" },
       {
         scopeLost: true,
-        preflightSubgraph: new Error("preflight unavailable"),
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
         subgraph: new Error("outer wrapper is unavailable after navigation"),
         detailById: {
           "188": SAFE_ANIMA_IDENTITY_BY_ID["76"],
@@ -1076,11 +1118,11 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
       },
     );
 
-    expect(isError).toBe(false);
+    expect(isError).toBe(true);
+    expect(text).toMatch(/could not determine whether the addressed node is a promoted container/);
     const writes = calls.filter((c) => c.cmd === "graph_set_widget");
-    expect(writes).toHaveLength(2);
-    expect(writes[0]).toMatchObject({ node_id: 188, widget: "quality_prompt" });
-    expect(writes[1]).toMatchObject({ node_id: 188, widget: "quality_prompt" });
+    expect(writes).toHaveLength(1);
+    expect(calls.map((c) => c.cmd)).toContain("graph_enter_subgraph");
   });
 
   it("refuses legacy recovery navigation after the live read before inner dispatch", async () => {
@@ -1089,7 +1131,7 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
       {
         firstWrite: "contradict",
         firstWriteError: ANIMA_CONTRADICTORY,
-        preflightSubgraph: new Error("preflight unavailable"),
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
         subgraph: SAFE_ANIMA_SUBGRAPH,
         detailById: SAFE_ANIMA_IDENTITY_BY_ID,
         authoritativeScopeRead: true,
@@ -1118,7 +1160,7 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
       {
         firstWrite: "contradict",
         firstWriteError: ANIMA_CONTRADICTORY,
-        preflightSubgraph: new Error("preflight unavailable"),
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
         subgraph: SAFE_ANIMA_SUBGRAPH,
         detailById: SAFE_ANIMA_IDENTITY_BY_ID,
         authoritativeScopeRead: true,
@@ -1150,7 +1192,7 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
       { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
       {
         firstWriteError: "no usable /object_info was available for this widget write",
-        preflightSubgraph: new Error("preflight unavailable"),
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
         subgraph: SAFE_ANIMA_SUBGRAPH,
         detailById: SAFE_ANIMA_IDENTITY_BY_ID,
         refreshNodes: { refreshed: true },
@@ -1169,7 +1211,7 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
       { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
       {
         firstWriteError: "no usable /object_info was available for this widget write",
-        preflightSubgraph: new Error("preflight unavailable"),
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
         subgraph: ANIMA_SUBGRAPH,
         detailById: ANIMA_IDENTITY_BY_ID,
         refreshNodes: { refreshed: true },
@@ -1186,7 +1228,7 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
       { node_id: 188, widget: "model.prompt", value: "a long prompt" },
       {
         scopeLost: true,
-        preflightSubgraph: new Error("preflight unavailable"),
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
         subgraph: new Error("outer wrapper is unavailable after navigation"),
         detailById: {
           "188": {
@@ -1221,7 +1263,7 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
     );
 
     expect(isError).toBe(true);
-    expect(text).toMatch(/dynamic-combo/);
+    expect(text).toMatch(/dynamic-combo|could not determine whether the addressed node is a promoted container/);
     expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(1);
   });
 
@@ -1230,7 +1272,7 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
       { node_id: 78, widget: "Stack_Data", value: "NEW" },
       {
         firstWriteError: STACK_DATA_CONTRADICTORY,
-        preflightSubgraph: new Error("preflight unavailable"),
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
         subgraph: {
           subgraph_of: { node_id: 78, title: "Container" },
           node_count: 1,
@@ -1251,7 +1293,7 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
       { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
       {
         firstWriteError: ANIMA_CONTRADICTORY,
-        preflightSubgraph: new Error("preflight unavailable"),
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
         subgraph: SAFE_ANIMA_SUBGRAPH,
         postEnterGraphQueryById: { "76": ANIMA_IDENTITY_BY_ID["76"] },
         detailById: SAFE_ANIMA_IDENTITY_BY_ID,
@@ -1268,8 +1310,8 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
       { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
       {
         firstWriteError: ANIMA_CONTRADICTORY,
-        preflightSubgraph: new Error("preflight unavailable"),
-        recoveryPreflightSubgraph: new Error("recovery preflight unavailable"),
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
+        recoveryPreflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
         subgraph: SAFE_ANIMA_SUBGRAPH,
         postEnterGraphQueryById: { "76": ANIMA_IDENTITY_BY_ID["76"] },
         detailById: SAFE_ANIMA_IDENTITY_BY_ID,
@@ -1424,7 +1466,7 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
           node_count: 1,
           nodes: [{ id: 76, type: "OtherLoraLoader", widgets: { stack_data: "old" } }],
         },
-        preflightSubgraph: new Error("preflight unavailable"),
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
       },
     );
 
@@ -1459,7 +1501,7 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
           node_count: 1,
           nodes: [{ id: 76, type: "OtherLoraLoader", widgets: { stack_data: "old" } }],
         },
-        preflightSubgraph: new Error("preflight unavailable"),
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
       },
     );
 
@@ -1490,7 +1532,7 @@ describe("panel_set_widget promoted-subgraph recovery (#1655)", () => {
           node_count: 1,
           nodes: [{ id: 76, type: "DaSiWa_LTX2LoraLoader", widgets: { stack_data: "old" } }],
         },
-        preflightSubgraph: new Error("preflight unavailable"),
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
       },
     );
 

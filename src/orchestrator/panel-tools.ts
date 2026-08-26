@@ -6279,6 +6279,17 @@ function promotedEnvelopeCarriesEvidence(payload: Record<string, unknown> | null
   );
 }
 
+/** The shipped panel's only definitive non-promoted result is its own
+ * `Node <id> (<type>) is not a subgraph` refusal. Every other graph_get_subgraph
+ * error is an indeterminate read: a disconnect, stale route, old panel, or
+ * transport failure can all leave a promoted container unresolved. */
+function isDefinitiveNonPromotedSubgraphRead(res: ToolResult): boolean {
+  if (!res.isError) return false;
+  return /^Error:\s*Node\s+\S+(?:\s+\([^)]*\))?\s+is not a subgraph\b/i.test(
+    textOfToolResult(res),
+  );
+}
+
 function promotedMatchCount(payload: Record<string, unknown>, widget: string): number {
   const nodes = payload.nodes;
   if (!Array.isArray(nodes)) return 0;
@@ -6438,9 +6449,10 @@ function promotedWriteRefusal(widget: string, reason: string): ToolResult {
  * checks the receiver again. A later promotion relink therefore cannot redirect
  * an apparently safe container write onto a known-bad inner.
  *
- * An unavailable graph_get_subgraph remains the pre-existing fail-open case: it
- * supplies no promotion classification. A successful response with promotion
- * fields that are malformed, stale, truncated, or ambiguous fails closed.
+ * Only the panel's definitive "is not a subgraph" result supplies a safe
+ * non-promoted classification. An unavailable, malformed, or otherwise
+ * indeterminate read fails closed because the panel can resolve a promoted
+ * container to its unsafe inner node.
  */
 async function preparePromotedWidgetWrite(
   ctx: PanelToolCtx,
@@ -6461,14 +6473,20 @@ async function preparePromotedWidgetWrite(
   }
 
   const sub = await ctx.call({ cmd: "graph_get_subgraph", node_id: nodeId });
-  // Preserve #2299's unavailable-preflight fail-open behavior exactly: an
-  // unavailable read does not classify the write as promoted.
-  if (sub.isError) return null;
+  if (sub.isError) {
+    if (isDefinitiveNonPromotedSubgraphRead(sub)) return null;
+    return promotedWriteRefusal(
+      widget,
+      "graph_get_subgraph could not determine whether the addressed node is a promoted container",
+    );
+  }
   const payload = parseToolResultJson(sub);
-  // Some lightweight test seams return the ordinary write envelope for every
-  // command. It carries no subgraph claim, so it is not promotion evidence.
-  if (!promotedEnvelopeCarriesEvidence(payload)) return null;
-  if (!payload) return null;
+  if (!payload || !promotedEnvelopeCarriesEvidence(payload)) {
+    return promotedWriteRefusal(
+      widget,
+      "graph_get_subgraph returned no definitive non-promoted or ownership result",
+    );
+  }
   if (!hasIdentityApi) {
     return promotedWriteRefusal(widget, "the receiver identity was unavailable while the mapping was read");
   }
@@ -6527,6 +6545,12 @@ async function preparePromotedWidgetWrite(
   }
   if (ctx.tabExpectedNodeTypeFenceCapability?.() !== true) {
     return promotedWriteRefusal(widget, "the receiving panel lacks the atomic inner-node write fence");
+  }
+  if (ctx.tabExpectedScopeGraphIdentityFenceCapability?.() !== true) {
+    return promotedWriteRefusal(
+      widget,
+      "the receiving panel lacks the atomic promoted graph-identity write fence",
+    );
   }
 
   return {
@@ -12527,6 +12551,10 @@ export interface PanelToolCtx {
    * expected_node_type at the synchronous mutation boundary. Real contexts
    * provide this; omitted/false is a fail-closed answer for #2107. */
   tabExpectedNodeTypeFenceCapability?: () => boolean;
+  /** Whether the currently bound panel enforces the stable graph identity in
+   * expected_scope at the synchronous mutation boundary. Real contexts provide
+   * this; omitted/false is a fail-closed answer for promoted writes (#2314 P1). */
+  tabExpectedScopeGraphIdentityFenceCapability?: () => boolean;
   /**
    * The same question TRI-STATE, for code that must REPORT the answer rather than
    * gate on it. `tabCanMutateGraph` fails closed (an unreadable probe becomes
@@ -13947,6 +13975,8 @@ export function makePanelToolCtx(
   ctx.tabCanMutateGraph = () => bridge.tabCanMutateGraph(ctx.tabId);
   ctx.tabExpectedNodeTypeFenceCapability = () =>
     bridge.tabExpectedNodeTypeFenceCapability(ctx.tabId);
+  ctx.tabExpectedScopeGraphIdentityFenceCapability = () =>
+    bridge.tabExpectedScopeGraphIdentityFenceCapability(ctx.tabId);
   ctx.tabGraphMutationCapability = () => bridge.tabGraphMutationCapability(ctx.tabId);
   return ctx;
 }
@@ -17458,6 +17488,17 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             return appendToolResultText(
               first,
               `\n\n${textOfToolResult(promotedWriteRefusal(refusal.widget, recoveryScopeError))}`,
+            );
+          }
+          if (ctx.tabExpectedScopeGraphIdentityFenceCapability?.() !== true) {
+            return appendToolResultText(
+              first,
+              `\n\n${textOfToolResult(
+                promotedWriteRefusal(
+                  refusal.widget,
+                  "the receiving panel lacks the atomic promoted graph-identity write fence",
+                ),
+              )}`,
             );
           }
         }

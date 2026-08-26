@@ -3298,6 +3298,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     await waitFor(() =>
       expect(bridge.tabs().some((t) => t.tab_id === "tmp:old-promoted-graph-identity")).toBe(true),
     );
+    expect(bridge.tabExpectedScopeGraphIdentityFenceCapability("tmp:old-promoted-graph-identity")).toBe(false);
     const caught = await bridge
       .send(
         {
@@ -3393,6 +3394,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     autoReply(modern, "modern");
     await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:modern")).toBe(true));
     expect(bridge.tabExpectedNodeTypeFenceCapability("tmp:modern")).toBe(true);
+    expect(bridge.tabExpectedScopeGraphIdentityFenceCapability("tmp:modern")).toBe(true);
     // A graph mutator AND each workflow mutator all dispatch (enforcement + trusted stamp present).
     for (const cmd of [
       { cmd: "graph_add_node", node: "x" },
