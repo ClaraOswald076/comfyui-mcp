@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.127] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- prevent recovered completion replays from duplicating agent turns (#2341)
+
 ## [0.52.126] - 2026-08-25
 
 ### MCP
