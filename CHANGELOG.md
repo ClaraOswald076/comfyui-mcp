@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.123] - 2026-08-25
+
+### MCP
+
+#### Fixed
+- persist ComfyUI-Manager model downloads on RunPod volumes (#2302)
+
 ## [0.52.122] - 2026-08-25
 
 ### MCP
