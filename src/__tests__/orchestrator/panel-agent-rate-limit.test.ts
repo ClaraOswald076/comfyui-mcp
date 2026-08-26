@@ -121,7 +121,10 @@ describe("a rate-limit WAIT is narrated, not mourned", () => {
 
 describe("a rate limit that could NOT be waited out", () => {
   const FINISHED =
-    "⚠️ kimi-k3 hit its rate limit — max RPM: 3. Nothing was lost — try again in a moment, or switch models from the composer picker.";
+    "⚠️ kimi-k3 hit its rate limit — max RPM: 3. " + 
+    "Try again in a moment or switch models from the composer picker — but if the turn had " +
+    "already started changing the graph, check the canvas before re-sending, because " +
+    "re-sending runs those steps again.";
 
   it("renders the finished sentence without the generic turn-failure wrapper", async () => {
     const said = await saidDuring(() => [

@@ -151,6 +151,14 @@ describe("sanitizeDetail", () => {
       expect(bare).not.toContain(part);
     }
     expect(bare).toContain("account");
+
+    // Gate round 2: a prefix GLUED to the uuid with no separator slipped past the
+    // optional-prefix group and left the same misleading partial one layer down.
+    const glued = sanitizeDetail("org550e8400-e29b-41d4-a716-446655440000 hit its cap");
+    for (const part of ["org550e8400", "550e8400", "e29b", "41d4", "a716", "446655440000"]) {
+      expect(glued).not.toContain(part);
+    }
+    expect(glued).toContain("hit its cap");
     expect(bare).toContain("limit");
   });
 

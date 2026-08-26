@@ -192,7 +192,7 @@ export function sanitizeDetail(raw: string, max = 200): string {
     // characters shipped. A partial redaction nobody re-checks is the dangerous
     // shape here, so this runs before anything can produce one.
     .replace(
-      /\b(?:([A-Za-z][A-Za-z0-9]{1,12})[-_])?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g,
+      /\b(?:([A-Za-z][A-Za-z0-9]{1,12})[-_])?[A-Za-z0-9]{0,32}[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}[A-Za-z0-9]{0,32}\b/g,
       (_m, prefix: string | undefined) => (prefix ? `${prefix}-<redacted>` : "<redacted>"),
     )
     // prefixed opaque identifiers: org-…, cak-…, key_…, acct-…
@@ -318,7 +318,7 @@ export function gaveUpNotice(
   if (attempts > 0) {
     return (
       `⚠️ ${model} is rate limited and did not recover after ${attempts} ${attempts === 1 ? "attempt" : "attempts"}${because}. ` +
-      `Nothing was lost — try again in a moment, or switch models from the composer picker.`
+      `Try again in a moment or switch models from the composer picker — but if the turn had already started changing the graph, check the canvas before re-sending, because re-sending runs those steps again.`
     );
   }
   const why =
@@ -329,7 +329,7 @@ export function gaveUpNotice(
         : "Its response could not be read, so there was no wait to honour and the request was not retried automatically. ";
   return (
     `⚠️ ${model} hit its rate limit${because}. ${why}` +
-    `Nothing was lost — try again in a moment, or switch models from the composer picker.`
+    `Try again in a moment or switch models from the composer picker — but if the turn had already started changing the graph, check the canvas before re-sending, because re-sending runs those steps again.`
   );
 }
 
