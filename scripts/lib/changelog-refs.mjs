@@ -10,9 +10,20 @@
  * Ported from comfyui-mcp-panel's scripts/lib/changelog-refs.mjs (panel #1894).
  */
 
-/** Trailing-parenthesised references — the shape the generator writes. */
+/**
+ * Parenthesised references — the shape the generator writes, plus the comma list
+ * a human writes when one entry closes two PRs: `… (#2382, #2387)` (0.52.136).
+ *
+ * The single-reference regex this started as (the panel's) returns NOTHING for
+ * that spelling, and nothing is not a failure — it makes the reachability half
+ * skip the entry in silence, so an entry written that way is exempt from the
+ * check built to catch a wrong credit. A guard that quietly checks nothing is the
+ * same failure this file exists to close, one level up.
+ */
 export function referenceNumbers(text) {
-  return [...String(text ?? "").matchAll(/\(#(\d+)\)/g)].map((m) => m[1]);
+  return [...String(text ?? "").matchAll(/\((#\d+(?:\s*,\s*#\d+)*)\)/g)].flatMap((group) =>
+    [...group[1].matchAll(/#(\d+)/g)].map((m) => m[1]),
+  );
 }
 
 /**

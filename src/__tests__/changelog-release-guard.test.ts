@@ -164,6 +164,28 @@ describe("#2407 half A: everything CITED must be REACHABLE", () => {
     expect(violations[0]).toContain("is an ancestor of v1.1.0");
   });
 
+  it("checks an entry that closes TWO PRs in one comma list", () => {
+    // 0.52.136 writes `… (#2382, #2387)`. The panel's single-reference regex
+    // returns nothing for that, which does not fail — it makes this whole half
+    // skip the entry in silence, exempting it from the check meant to catch a
+    // wrong credit. Coverage still passed it (that half reads bare #N), so the
+    // release looked fully audited while half of the audit saw nothing.
+    const violations = auditReleaseSection({
+      markdown: section("### Fixed", "- one entry, two PRs (#2382, #2387)"),
+      version: "1.1.0",
+      commits: [
+        commitOf("aaa", "fix: the first half (#2382)"),
+        commitOf("bbb", "fix: the second half (#2387)"),
+      ],
+      rangeCommits: [],
+      targetRef: "v1.1.0",
+      previousRef: "v1.0.0",
+      isAncestor: (sha: string) => sha !== "bbb",
+    });
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain("#2387");
+  });
+
   it("reports an entry naming a number no commit carries", () => {
     // This is the 0.52.134 shape: the section cited #2378, no commit anywhere
     // carried it, and reading that gap as "not shipped yet" produced a whole
