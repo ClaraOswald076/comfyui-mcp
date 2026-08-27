@@ -22187,7 +22187,7 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
     ),
     def(
       "panel_list_nodes",
-      "List the custom-node packs currently installed in the user's ComfyUI (via the built-in Manager). Read-only.",
+      "List the custom-node PACKS currently installed in the user's ComfyUI (via the built-in Manager). Takes no arguments — it returns the whole installed set. Read-only. This lists packs, NOT node classes: to find out whether a specific node type is available (e.g. LTXVContextWindowsGuideAware), use comfy_cli action:\"search_nodes\", which fuzzy-searches real node classes and falls back to the connected server's live /object_info. panel_search_nodes is a third thing again — it searches INSTALLABLE packs in the registry, not what is already here.",
       {},
       async (_args, ctx) => ctx.call({ cmd: "nodes_list" }, 20000),
     ),
