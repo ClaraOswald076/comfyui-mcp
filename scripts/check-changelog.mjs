@@ -38,7 +38,7 @@
  * CHANGELOG — a guard whose only test subject is the file it guards can only be
  * exercised by breaking a release.
  */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
@@ -412,16 +412,26 @@ export function main(argv) {
   // letting that exit 0 turns run-checks' green tick into a gate that passed
   // because it could not look, which is the whole failure this guard exists to
   // stop, aimed at itself.
-  let insideRepository = true;
-  try {
-    insideRepository = git("rev-parse", "--is-inside-work-tree") === "true";
-  } catch {
-    insideRepository = false;
-  }
+  // Asked of the FILESYSTEM, not of git. Asking git is circular: if git cannot be
+  // executed at all (`spawnSync git EPERM` — the case that prompted this), then
+  // `rev-parse --is-inside-work-tree` fails too and the broken state reads as "no
+  // repository here", which is the exact pass this is meant to prevent. Deleting
+  // .git/objects reproduces the same trap: git then reports "not a git repository"
+  // even though the checkout plainly is one. `.git` is a directory in a normal
+  // clone and a FILE in a git worktree; existsSync answers both.
+  const repositoryPresent =
+    existsSync(join(ROOT, ".git")) ||
+    (() => {
+      try {
+        return git("rev-parse", "--is-inside-work-tree") === "true";
+      } catch {
+        return false;
+      }
+    })();
   try {
     commits = readCommits(targetRef);
   } catch (error) {
-    if (insideRepository) {
+    if (repositoryPresent) {
       console.error(
         `changelog: git failed inside a repository at ${targetRef} ` +
           `(${String(error.message).split("\n")[0]}). Refusing to report a pass on a ` +

@@ -21,7 +21,7 @@
 // shape reverted; the named test fails in both cases. See the PR body.
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -219,16 +219,19 @@ describe("#2407 half B: everything REACHABLE must be CITED", () => {
     // commits in 0.52.125 carry #2313 as their sole reference, shipped under merge
     // #2340, so citing #2313 is the only way they are documentable at all. That
     // release is correctly written and must stay green.
-    const ambiguousIssue = [
-      commitOf("aaa", "fix(rate-limit): one part (#2313)"),
-      commitOf("bbb", "fix(rate-limit): another part (#2313)"),
-      commitOf("ccc", "fix(2313): the PR that closed it (#2331)"),
+    const soleIdentity = commitOf("aaa", "fix(rate-limit): one part (#2313)");
+    // Two PRs under #2313 make it genuinely ambiguous, so the vouching rule is
+    // actually under test rather than trivially satisfied.
+    const commits = [
+      soleIdentity,
+      commitOf("bbb", "fix(2313): the first PR (#2331)"),
+      commitOf("ccc", "fix(2313): the second PR (#2340)"),
     ];
     const violations = auditReleaseSection({
-      markdown: section("### Fixed", "- sanitize identifiers (#2313)", "- the closing PR (#2331)"),
+      markdown: section("### Fixed", "- sanitize identifiers (#2313)"),
       version: "1.1.0",
-      commits: ambiguousIssue,
-      rangeCommits: ambiguousIssue.slice(0, 2),
+      commits,
+      rangeCommits: [soleIdentity],
       targetRef: "v1.1.0",
       previousRef: "v1.0.0",
     });
@@ -602,10 +605,15 @@ describe("#2407 end to end: the guard blocks the cut that shipped 0.52.138", () 
   it("FAILS when git breaks inside a repository, rather than reporting a pass", () => {
     // Review round 2: a git failure and "there is no repository here" shared exit 0,
     // so an EPERM or a corrupt object store turned run-checks' green tick into a
-    // gate that passed because it could not look. Simulated by corrupting the object
-    // store of a real repo — the repository is unmistakably present, and git cannot
-    // read its history.
+    // gate that passed because it could not look.
+    //
+    // Removing .git/objects makes git itself answer "not a git repository", which is
+    // why the presence check asks the FILESYSTEM instead — the first attempt asked
+    // git, and this very case walked straight past it into the skip path. The same
+    // trap swallows the `spawnSync git EPERM` that prompted the finding: if git
+    // cannot run, it cannot tell you that you are in a repository either.
     rmSync(join(dir, ".git", "objects"), { recursive: true, force: true });
+    expect(existsSync(join(dir, ".git"))).toBe(true);
     const result = runGuard();
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("git failed inside a repository");
