@@ -245,6 +245,92 @@ describe("graph MUTATIONS still fail fast while a prompt is running (#1639)", ()
     expect(textOf(res)).toMatch(/QUEUE BUSY/);
   });
 
+  // #1716 reopened — the fence above is CORRECT; the message was the defect. A caller
+  // that asked to defer and omitted expected_value got the byte-identical refusal an
+  // ordinary edit gets, naming neither parameter, so the documented opt-in looked
+  // broken. The test above passes either way (it only asserts QUEUE BUSY), which is
+  // why it held green through the whole life of the reported defect.
+  it("#1716 reopened: the refusal NAMES the missing expected_value", async () => {
+    startRender();
+
+    const { bridge, sent } = makeBridge();
+    const ctx = makePanelToolCtx(bridge, TAB, new WorkflowTargetStore());
+    const res = await defByName("panel_set_widget").handler(
+      { node_id: 3, widget: "text", value: "a cat", defer_until_idle: true } as never,
+      ctx,
+    );
+    const text = textOf(res);
+
+    expect(sent).toEqual([]);
+    expect(res.isError).toBe(true);
+    expect(text).toMatch(/defer_until_idle/);
+    expect(text).toMatch(/expected_value/);
+    expect(text).toMatch(/does not qualify/);
+    // The remedy has to be performable: naming the read that supplies the value.
+    expect(text).toMatch(/panel_query_graph/);
+  });
+
+  it("#1716 reopened: a deferral refusal is DISTINGUISHABLE from an ordinary one", async () => {
+    // This is the whole report: identical bytes whether or not deferral was requested.
+    startRender();
+    const { bridge } = makeBridge();
+    const ctx = makePanelToolCtx(bridge, TAB, new WorkflowTargetStore());
+
+    const deferred = textOf(
+      await defByName("panel_set_widget").handler(
+        { node_id: 3, widget: "text", value: "a cat", defer_until_idle: true } as never,
+        ctx,
+      ),
+    );
+    const ordinary = textOf(
+      await defByName("panel_set_widget").handler(
+        { node_id: 3, widget: "text", value: "a cat" } as never,
+        ctx,
+      ),
+    );
+
+    expect(deferred).not.toBe(ordinary);
+    expect(ordinary).not.toMatch(/defer_until_idle/);
+  });
+
+  it("#1716 reopened: an ordinary edit's refusal is unchanged", async () => {
+    // The new branch is reached ONLY when defer_until_idle === true, so the message a
+    // normal caller sees must still be the #1933 one, word for word.
+    startRender();
+    const { bridge } = makeBridge();
+    const ctx = makePanelToolCtx(bridge, TAB, new WorkflowTargetStore());
+    const text = textOf(
+      await defByName("panel_set_widget").handler(
+        { node_id: 3, widget: "text", value: "a cat" } as never,
+        ctx,
+      ),
+    );
+
+    expect(text).toMatch(/panel_set_widget was NOT sent/);
+    expect(text).toMatch(/panel_set_widget MUTATES the workflow/);
+    expect(text).toMatch(/NOT fenced/);
+    expect(text).not.toMatch(/does not qualify/);
+  });
+
+  it("#1716 reopened: a NON-SCALAR deferred value is named as the reason", async () => {
+    startRender();
+    const { bridge, sent } = makeBridge();
+    const ctx = makePanelToolCtx(bridge, TAB, new WorkflowTargetStore());
+    const res = await defByName("panel_set_widget").handler(
+      {
+        node_id: 3,
+        widget: "text",
+        value: { not: "scalar" },
+        defer_until_idle: true,
+        expected_value: "old",
+      } as never,
+      ctx,
+    );
+
+    expect(sent).toEqual([]);
+    expect(textOf(res)).toMatch(/scalar/);
+  });
+
   it("the refusal names the reads that ARE available instead of sending the agent to poll", async () => {
     startRender("p-in-flight", "42");
 

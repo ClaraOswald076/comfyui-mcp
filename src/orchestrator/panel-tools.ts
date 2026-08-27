@@ -1429,14 +1429,47 @@ function isDeferredWidgetScalar(value: unknown): boolean {
  * request to reach that production classifier instead of refusing it unsent.
  */
 function graphCmdRequestsDeferredWidget(cmd: Record<string, unknown>): boolean {
-  return (
-    cmd.cmd === "graph_set_widget" &&
-    cmd.defer_until_idle === true &&
-    typeof cmd.widget === "string" &&
-    isDeferredWidgetScalar(cmd.value) &&
-    Object.prototype.hasOwnProperty.call(cmd, "expected_value") &&
-    isDeferredWidgetScalar(cmd.expected_value)
-  );
+  return deferredWidgetRequestGap(cmd) === null;
+}
+
+/**
+ * #1716 (reopened) — WHY a deferral request did not qualify, or null when it did.
+ *
+ * `defer_until_idle` and `expected_value` are BOTH optional in the tool schema, so
+ * `defer_until_idle:true` with no `expected_value` is a well-formed call that zod
+ * accepts and this gate then silently declines to exempt. The caller then received the
+ * BYTE-IDENTICAL queue-busy refusal an ordinary edit gets — a message naming neither
+ * parameter — which is what the reopened report describes: the documented opt-in
+ * appearing not to work, with nothing saying why.
+ *
+ * Stated here rather than as a zod refinement: a refinement rejects the call before it
+ * reaches the tool, and this is the only place that knows a deferral was ATTEMPTED.
+ */
+function deferredWidgetRequestGap(cmd: Record<string, unknown>): string | null {
+  if (cmd.cmd !== "graph_set_widget") return "it is not a widget write";
+  if (cmd.defer_until_idle !== true) return "defer_until_idle was not true";
+  if (typeof cmd.widget !== "string") return "no widget name was given";
+  if (!isDeferredWidgetScalar(cmd.value)) {
+    return "`value` is not a string, finite number or boolean — only scalar edits can be parked";
+  }
+  // Key PRESENCE is not enough: the tool handler always materialises the key when
+  // defer_until_idle is true (`expected_value: args.expected_value`), so an omitted
+  // argument arrives as an OWN key holding undefined. Testing hasOwnProperty alone made
+  // this branch unreachable from the only path that reaches it, and the reported case —
+  // simply not passing one — fell through to the type complaint below, which is true but
+  // tells the caller their value is the wrong TYPE rather than absent.
+  if (!Object.prototype.hasOwnProperty.call(cmd, "expected_value") || cmd.expected_value === undefined) {
+    return (
+      "`expected_value` was not supplied. Deferral is optimistic-concurrency guarded: " +
+      "the Panel re-reads the widget just before replaying the edit and refuses if it " +
+      "moved, so it needs the value you observed. Read it with panel_query_graph and " +
+      "pass it back"
+    );
+  }
+  if (!isDeferredWidgetScalar(cmd.expected_value)) {
+    return "`expected_value` is not a string, finite number or boolean";
+  }
+  return null;
 }
 
 function graphCmdBlockedByRunningPrompt(cmd: Record<string, unknown>): string | null {
@@ -1451,6 +1484,25 @@ function graphCmdBlockedByRunningPrompt(cmd: Record<string, unknown>): string | 
   if (graphCmdRequestsDeferredWidget(cmd)) return null;
   const snap = QueueMonitor.snapshot();
   if (!snap.running) return null;
+  // #1716 (reopened) — the caller ASKED to defer and the request did not qualify.
+  // Falling through to the generic refusal is what made the opt-in look broken:
+  // identical bytes whether deferral was requested or not. Name the requirement that
+  // was not met. Only reached while a prompt is actually running, so an ordinary
+  // edit's reply is byte-identical to before.
+  if (cmd.defer_until_idle === true) {
+    const gap = deferredWidgetRequestGap(cmd);
+    if (gap) {
+      const deferSubject = panelToolForGraphCmd(name) ?? "This edit";
+      return (
+        `${deferSubject} was NOT sent — nothing was applied. You asked to park this ` +
+        `edit until the queue is idle (defer_until_idle:true), but the request does ` +
+        `not qualify: ${gap}. QUEUE BUSY: a ComfyUI prompt is running` +
+        `${queueBusySnapshotNote()}, so the edit was fenced as an ordinary mutation. ` +
+        `Fix the request above and retry — or drop defer_until_idle and retry after ` +
+        `queue (action:"list") shows running: 0.`
+      );
+    }
+  }
   // #1933 — name what the CALLER called. `cmd.cmd` is the BRIDGE command
   // (observed: a `panel_set_widget` call arrives here as `graph_set_widget`),
   // and PanelToolCtx.call carries no tool identity, so the tool name is
