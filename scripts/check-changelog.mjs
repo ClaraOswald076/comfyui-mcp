@@ -1,0 +1,430 @@
+#!/usr/bin/env node
+/**
+ * Verify the release section that is about to ship — or that just did.
+ *
+ *   node scripts/check-changelog.mjs [version] [--ref <git-ref>]
+ *
+ * WHY THIS EXISTS (#2407). gen-changelog.mjs is a generator; nothing verified its
+ * output. On one evening three cuts went wrong the same way, and every one of them
+ * was invisible:
+ *
+ *   0.52.133  shipped #2378 and did not list it        (hand-corrected by #2384)
+ *   0.52.134  cut to carry a fix that had ALREADY shipped — no code changes at all
+ *   0.52.138  shipped #2400 and did not list it        (hand-corrected by #2406)
+ *
+ * All three are one race: a PR merges between the release branch being cut and the
+ * release PR merging. Ancestry then resolves itself — the branch merges into main,
+ * so the tag gets the code — which is exactly why nobody notices. The CHANGELOG is
+ * the only thing that gaps, and it gaps silently. 0.52.134 is the instructive one:
+ * reading a notes gap as "the fix has not shipped yet" produced a whole no-op
+ * version, the opposite error from the same root cause.
+ *
+ * TWO DIRECTIONS, and the second is the one that catches the above:
+ *
+ *   A. Everything CITED must be REACHABLE. A `## [X]` entry naming PR #N must have
+ *      a commit carrying #N that is an ancestor of vX. Ported from the panel
+ *      (comfyui-mcp-panel#1894); catches an entry credited to a release that does
+ *      not contain it.
+ *   B. Everything REACHABLE must be CITED. Every commit in `v<prev>..vX` that names
+ *      a PR must be mentioned in [X]. The panel does not implement this half. A
+ *      MISSING entry is a different failure from a wrong one, and it is the one
+ *      that shipped three times.
+ *
+ * Plus the structural checks a hand-edited section needs: no version with two
+ * sections, no heading repeated inside one, no PR credited twice.
+ *
+ * The audit is a pure function with `isAncestor` and both commit lists injected, so
+ * it is tested against synthetic histories rather than against this repo's own
+ * CHANGELOG — a guard whose only test subject is the file it guards can only be
+ * exercised by breaking a release.
+ */
+import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { dirname, join, resolve } from "node:path";
+
+import { isReleaseSubject } from "./lib/release-subject.mjs";
+import {
+  canonicalReference,
+  commitReferences,
+  mentionedNumbers,
+  referenceAliases,
+  referenceNumbers,
+} from "./lib/changelog-refs.mjs";
+
+const SCRIPT_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+// COMFYUI_MCP_CHANGELOG_ROOT is the override gen-changelog.mjs already takes, for
+// the same reason it takes one: without it the only way to exercise this is to cut
+// a release and read the result.
+const ROOT = resolve(
+  process.env.COMFYUI_MCP_CHANGELOG_ROOT || process.env.CHANGELOG_ROOT || SCRIPT_ROOT,
+);
+const CHANGELOG = join(ROOT, "CHANGELOG.md");
+
+const git = (...gitArgs) =>
+  execFileSync("git", ["-C", ROOT, ...gitArgs], {
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+
+// ── parsing ──────────────────────────────────────────────────────────────────
+
+/** `## [X] - date` sections, with the body lines that follow each. */
+export function parseReleaseSections(markdown) {
+  // mcp's CHANGELOG.md is CRLF and the panel's is LF. Normalise, or a heading
+  // regex anchored with $ silently matches nothing in one of the two repos.
+  const lines = String(markdown ?? "").replace(/\r\n/g, "\n").split("\n");
+  const releases = [];
+  let current = null;
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = /^##\s+\[([^\]]+)\](?:\s*-\s*(\S+))?/.exec(lines[index]);
+    if (!match) continue;
+    if (current) current.lines = lines.slice(current.start + 1, index);
+    current = { version: match[1].trim(), date: match[2] ?? null, start: index, lines: [] };
+    releases.push(current);
+  }
+  if (current) current.lines = lines.slice(current.start + 1);
+  return releases;
+}
+
+/** Headings and bullet entries inside one release body. */
+export function parseReleaseBody(lines) {
+  const headings = [];
+  const entries = [];
+  let section = null;
+  let entry = null;
+
+  const flush = () => {
+    if (!entry) return;
+    entries.push({ ...entry, text: entry.lines.join("\n").trim() });
+    entry = null;
+  };
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const heading = /^(#{3,6})\s+(.+?)\s*$/.exec(line);
+    if (heading) {
+      flush();
+      section = { level: heading[1].length, text: heading[2], line: index + 1 };
+      headings.push(section);
+      continue;
+    }
+    if (/^[-*]\s+/.test(line)) {
+      flush();
+      entry = { section, line: index + 1, lines: [line.replace(/^[-*]\s+/, "")] };
+      continue;
+    }
+    // A continuation line is blank or indented; anything else ends the entry.
+    if (entry && (line.trim() === "" || /^\s+\S/.test(line))) entry.lines.push(line.trim());
+    else if (entry) flush();
+  }
+  flush();
+  return { headings, entries };
+}
+
+/** `<sha>\x1f<subject>\x1e…` from git log, which cannot be split on newlines. */
+export function parseCommitSubjects(output) {
+  return String(output ?? "")
+    .split("\x1e")
+    .map((record) => record.trim())
+    .filter(Boolean)
+    .map((record) => {
+      const separator = record.indexOf("\x1f");
+      const sha = separator >= 0 ? record.slice(0, separator) : "";
+      const subject = separator >= 0 ? record.slice(separator + 1) : record;
+      return { sha, subject, refs: commitReferences(subject) };
+    });
+}
+
+const semverIdentifier = "(?:0|[1-9]\\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)";
+const strictSemver = new RegExp(
+  `^(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)(?:-${semverIdentifier}(?:\\.${semverIdentifier})*)?$`,
+);
+
+export const releaseVersion = (version) => String(version ?? "").replace(/^v/, "");
+export const isStrictSemver = (version) => strictSemver.test(releaseVersion(version));
+
+// ── the audit ────────────────────────────────────────────────────────────────
+
+/**
+ * @param markdown      CHANGELOG.md contents to audit
+ * @param version       which release section to audit
+ * @param commits       every commit reachable from targetRef (alias + ancestry pool)
+ * @param rangeCommits  commits in previousRef..targetRef with no merges (coverage
+ *                      pool), or null when the range could not be resolved
+ * @param targetRef     the ref this section claims to describe
+ * @param previousRef   the ref the release is measured from, for the message
+ * @param isAncestor    (sha, ref) => boolean
+ */
+export function auditReleaseSection({
+  markdown,
+  version,
+  commits = [],
+  rangeCommits = null,
+  targetRef,
+  previousRef,
+  isAncestor = () => true,
+}) {
+  const normalizedVersion = releaseVersion(version);
+  const sections = parseReleaseSections(markdown);
+  const violations = [];
+
+  // One version, one section. A hand-edited reconcile has produced two before.
+  const seenReleaseSections = new Map();
+  for (const item of sections) {
+    const itemVersion = releaseVersion(item.version);
+    if (!isStrictSemver(itemVersion)) continue;
+    const line = item.start + 1;
+    if (seenReleaseSections.has(itemVersion)) {
+      violations.push(
+        `CHANGELOG.md repeats the [${itemVersion}] release section at lines ` +
+          `${seenReleaseSections.get(itemVersion)} and ${line}. Keep one top-level section.`,
+      );
+    } else {
+      seenReleaseSections.set(itemVersion, line);
+    }
+  }
+
+  const section = sections.find((item) => releaseVersion(item.version) === normalizedVersion);
+  if (!section) {
+    return [...violations, `CHANGELOG.md has no [${normalizedVersion}] release section.`];
+  }
+  if (!section.lines.some((line) => line.trim())) {
+    return [...violations, `CHANGELOG.md [${normalizedVersion}] release section is empty.`];
+  }
+
+  const { headings, entries } = parseReleaseBody(section.lines);
+  const aliases = referenceAliases(commits);
+  const canonical = (ref) => canonicalReference(ref, aliases);
+
+  const seenHeadings = new Map();
+  for (const heading of headings) {
+    const key = `${heading.level}:${heading.text.toLowerCase()}`;
+    const line = section.start + heading.line;
+    if (seenHeadings.has(key)) {
+      violations.push(
+        `[${normalizedVersion}] repeats the heading "${heading.text}" at lines ` +
+          `${seenHeadings.get(key)} and ${line}. Merge the two blocks.`,
+      );
+    } else {
+      seenHeadings.set(key, line);
+    }
+  }
+
+  const seenReferences = new Map();
+  for (const item of entries) {
+    const keys = [...new Set(referenceNumbers(item.text).map(canonical))];
+    const line = section.start + item.line;
+    for (const key of keys) {
+      if (seenReferences.has(key)) {
+        violations.push(
+          `[${normalizedVersion}] credits issue/PR identity #${key} twice, at lines ` +
+            `${seenReferences.get(key)} and ${line}.`,
+        );
+      } else {
+        seenReferences.set(key, line);
+      }
+    }
+  }
+
+  // A. Everything CITED must be REACHABLE from the ref this section describes.
+  const byRef = new Map();
+  for (const commit of commits) {
+    for (const ref of commit.refs) {
+      if (!byRef.has(ref)) byRef.set(ref, []);
+      byRef.get(ref).push(commit);
+    }
+  }
+  for (const item of entries) {
+    const refs = referenceNumbers(item.text);
+    if (!refs.length) continue; // Legacy prose with no PR cannot be ancestry-checked.
+    const pr = refs.at(-1);
+    const line = section.start + item.line;
+    const candidates = byRef.get(pr) ?? [];
+    if (!candidates.length) {
+      violations.push(
+        `[${normalizedVersion}] entry at line ${line} names PR #${pr}, but no commit reachable ` +
+          `from ${targetRef} carries that reference.`,
+      );
+      continue;
+    }
+    if (!candidates.some((candidate) => isAncestor(candidate.sha, targetRef))) {
+      violations.push(
+        `[${normalizedVersion}] entry at line ${line} names PR #${pr}, but no commit carrying it ` +
+          `is an ancestor of ${targetRef} — it did not ship in this release.`,
+      );
+    }
+  }
+
+  // B. Everything REACHABLE must be CITED. The half that catches a silent gap.
+  if (rangeCommits) {
+    const mentioned = new Set(mentionedNumbers(section.lines.join("\n")).map(canonical));
+    for (const commit of rangeCommits) {
+      // A release commit describes the release, not something in it. `v<prev>..<target>`
+      // includes the target, so X's own release commit is always in this range.
+      if (isReleaseSubject(commit.subject)) continue;
+      // No PR number means a local commit a squash superseded. gen-changelog drops
+      // those too, and the two must agree or the guard fights the generator.
+      const prs = referenceNumbers(commit.subject);
+      if (!prs.length) continue;
+      if (commit.refs.some((ref) => mentioned.has(canonical(ref)))) continue;
+      violations.push(
+        `[${normalizedVersion}] does not mention PR #${prs.at(-1)}, which shipped in this ` +
+          `release (reachable from ${targetRef}, not from ${previousRef}): "${commit.subject}". ` +
+          `Add the entry, or add #${prs.at(-1)} to the entry that already covers it.`,
+      );
+    }
+  }
+
+  return violations;
+}
+
+/** Name parity with the panel's guard, which the port started from. */
+export const checkChangelog = auditReleaseSection;
+
+// ── CLI ──────────────────────────────────────────────────────────────────────
+
+function readCommits(ref) {
+  const commit = git("rev-parse", "--verify", `${ref}^{commit}`);
+  return parseCommitSubjects(git("log", "--format=%H%x1f%s%x1e", commit));
+}
+
+export function main(argv) {
+  const args = argv.slice(2);
+  const refIndex = args.indexOf("--ref");
+  const refValueIndex = refIndex >= 0 ? refIndex + 1 : -1;
+  const explicitRef = refIndex >= 0 ? args[refValueIndex] : null;
+  // Option-shaped leftovers stay in the version candidates so `--bad-version` is
+  // REJECTED rather than ignored — ignoring it would silently audit a different
+  // section than the caller named.
+  const versionArgs = args.filter((_, index) => index !== refIndex && index !== refValueIndex);
+
+  if (refIndex >= 0 && !explicitRef) {
+    console.error("changelog: --ref requires a Git commit ref");
+    return 2;
+  }
+  if (versionArgs.length > 1) {
+    console.error("changelog: expected at most one release version argument");
+    return 2;
+  }
+
+  let markdown;
+  if (explicitRef) {
+    try {
+      git("rev-parse", "--verify", `${explicitRef}^{commit}`);
+      markdown = git("show", `${explicitRef}:CHANGELOG.md`);
+    } catch (error) {
+      console.error(
+        `changelog: could not read CHANGELOG.md at ${explicitRef}: ${String(error.message).split("\n")[0]}`,
+      );
+      return 1;
+    }
+  } else {
+    markdown = readFileSync(CHANGELOG, "utf8");
+  }
+
+  let version;
+  if (versionArgs.length === 1) {
+    version = releaseVersion(versionArgs[0]);
+    if (!isStrictSemver(version)) {
+      console.error(`changelog: invalid release version "${versionArgs[0]}"; expected strict SemVer`);
+      return 2;
+    }
+  } else {
+    // The newest released section — the one a cut just wrote, or is about to.
+    version = releaseVersion(
+      parseReleaseSections(markdown).find((item) => isStrictSemver(item.version))?.version,
+    );
+  }
+  if (!version) {
+    console.error("usage: node scripts/check-changelog.mjs [version] [--ref <git-ref>]");
+    return 2;
+  }
+
+  // The tag when it exists; HEAD while the cut is still in flight, since both
+  // `npm version` and the release PR run before the tag is pushed.
+  let targetRef = explicitRef;
+  if (!targetRef) {
+    const tag = `v${version}`;
+    try {
+      git("rev-parse", "--verify", `${tag}^{commit}`);
+      targetRef = tag;
+    } catch {
+      targetRef = "HEAD";
+    }
+  }
+
+  let commits = [];
+  let rangeCommits = null;
+  let previousRef = null;
+  try {
+    commits = readCommits(targetRef);
+  } catch (error) {
+    // Loud, and never confusable with a pass: name the halves that did not run.
+    console.error(
+      `changelog: could not read history at ${targetRef} ` +
+        `(${String(error.message).split("\n")[0]}) — structure was checked, ` +
+        `reachability and coverage were NOT.`,
+    );
+  }
+
+  // A shallow clone cannot answer "what shipped since the last release". It can
+  // only answer it WRONG, by reporting every PR as missing. Skip, and say so.
+  let shallow = false;
+  try {
+    shallow = git("rev-parse", "--is-shallow-repository") === "true";
+  } catch {
+    shallow = false;
+  }
+  if (shallow) {
+    console.error(
+      "changelog: shallow clone — coverage (every shipped PR is listed) was NOT checked.",
+    );
+  } else if (commits.length) {
+    try {
+      previousRef = git("describe", "--tags", "--abbrev=0", `${targetRef}^`);
+      rangeCommits = parseCommitSubjects(
+        git("log", `${previousRef}..${targetRef}`, "--no-merges", "--format=%H%x1f%s%x1e"),
+      );
+    } catch {
+      console.error(
+        `changelog: no release tag before ${targetRef} — coverage ` +
+          `(every shipped PR is listed) was NOT checked.`,
+      );
+      rangeCommits = null;
+    }
+  }
+
+  const violations = auditReleaseSection({
+    markdown,
+    version,
+    commits,
+    rangeCommits,
+    targetRef,
+    previousRef,
+    isAncestor: (sha, ref) => {
+      try {
+        git("merge-base", "--is-ancestor", sha, ref);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  });
+
+  if (violations.length) {
+    for (const violation of violations) console.error(`changelog: ERROR — ${violation}`);
+    return 1;
+  }
+  console.log(
+    rangeCommits
+      ? `changelog: [${version}] lists every PR since ${previousRef}, and every entry it names is reachable from ${targetRef}`
+      : `changelog: [${version}] is structurally sound and reachable from ${targetRef}`,
+  );
+  return 0;
+}
+
+const invokedDirectly =
+  process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+if (invokedDirectly) process.exit(main(process.argv));
