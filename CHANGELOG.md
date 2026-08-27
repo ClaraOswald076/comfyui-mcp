@@ -12,8 +12,8 @@ All notable changes to this project are documented here. This project adheres to
 
 #### Fixed
 - fence the definitive-non-subgraph exit, via one shared check (#2410)
-- verify bare workflow aliases before reporting a successful open (#1639, #2408)
-- preserve and consume a proven legacy rebind exactly once (#971, #2408)
+- verify bare workflow aliases before reporting a successful open (#1639)
+- preserve and consume a proven legacy rebind exactly once (#971)
 - fence promoted ordinary fast path after scope probe (#2405)
 - definitive non-subgraph read must tolerate a parenthesised node type (#2402)
 
