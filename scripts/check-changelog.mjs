@@ -542,9 +542,6 @@ export function main(argv) {
       // previous release narrows the range, and everything before it then passes
       // uncited — a silent gap, which is the failure this whole guard exists for.
       previousRef = git("describe", "--tags", "--abbrev=0", "--match", "v[0-9]*", `${targetRef}^`);
-      rangeCommits = parseCommitSubjects(
-        git("log", `${previousRef}..${targetRef}`, "--format=%H%x1f%s%x1e"),
-      );
     } catch {
       // `describe` fails for two very different reasons, and the round-2 fix to the
       // history read left this sibling exit behind: no tag is REACHABLE (the first
@@ -566,6 +563,25 @@ export function main(argv) {
           `(every shipped PR is listed) was NOT checked.`,
       );
       rangeCommits = null;
+    }
+    // The range read is its OWN failure, not a missing tag. Sharing a catch with
+    // `describe` meant a `git log` error landed in the no-previous-tag handler and
+    // skipped coverage at exit 0 — the third sibling of this family, after the
+    // history read and `describe` itself. Here the tag has already resolved, so
+    // git demonstrably works and any failure is real.
+    if (previousRef) {
+      try {
+        rangeCommits = parseCommitSubjects(
+          git("log", `${previousRef}..${targetRef}`, "--format=%H%x1f%s%x1e"),
+        );
+      } catch (error) {
+        console.error(
+          `changelog: could not read ${previousRef}..${targetRef} ` +
+            `(${String(error.message).split("\n")[0]}). Refusing to report a pass on a ` +
+            `coverage check that could not run.`,
+        );
+        return 1;
+      }
     }
   }
 
