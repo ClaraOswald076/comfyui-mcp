@@ -4851,7 +4851,7 @@ describe("#716 workflow UUID refresh after reconnect/open/re-pin", () => {
     const ctx: PanelToolCtx = {
       call: async (cmd) =>
         cmd.cmd === "workflow_list"
-          ? { content: [{ type: "text", text: JSON.stringify({ active: { path: resolved, routing_key: "wf:workflows/a/foo.json", workflow_uuid: LIVE_UUID } }) }] }
+          ? { content: [{ type: "text", text: JSON.stringify({ active_confirmed: true, active: { path: resolved, routing_key: "wf:workflows/a/foo.json", workflow_uuid: LIVE_UUID } }) }] }
           : { content: [{ type: "text", text: JSON.stringify({ opened: { path: resolved }, routing_key: "wf:workflows/a/foo.json", workflow_uuid: LIVE_UUID }) }] },
       confirm: async () => "yes" as const,
       bridge: { refreshWorkflowUuid: refresh } as unknown as PanelToolCtx["bridge"],

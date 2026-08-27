@@ -8831,7 +8831,7 @@ function activeMatchesOpenRefreshTarget(active: unknown, path: string): boolean 
 export type OpenActiveReading = "same" | "different" | "indeterminate";
 
 /** #887 — what the post-open corroborating read OBSERVED, when it contradicts the open. */
-export type OpenDriftNotice = { drifted: true; activeLabel: string };
+export type OpenDriftNotice = { drifted: true; activeLabel: string; unverified?: boolean };
 
 /**
  * Would this active record plausibly BE the requested workflow? Used only to
@@ -11234,11 +11234,107 @@ async function refreshOpenWorkflowUuid(
   // alias/basename to a path, but that reply must never retroactively turn the
   // alias into a UUID-refresh authorization. Require the reply to corroborate
   // the original exact saved identity before consulting the live active record.
+  const requestedSavedPath = canonicalSavedWorkflowPath(requestedPath);
+  const requestedIsBareAlias =
+    !!requestedSavedPath && !requestedSavedPath.includes("/");
   const requestedIdentity = canonicalRequestedSavedIdentity(requestedPath);
   const openedIdentity = openedPath
     ? canonicalSavedRecordIdentity({ path: openedPath, routing_key: parsedOpen?.routing_key })
     : null;
+  if (requestedIsBareAlias) {
+    // A bare filename is only a selector. It is not safe to let a native
+    // success through unless the panel both resolved it to a saved path and
+    // gave us a fresh, explicitly confirmed active observation. In particular,
+    // an omitted `opened.path` is not a resolution, and an omitted
+    // `active_confirmed` is not confirmation (#1639).
+    if (!openedPath || !canonicalRequestedSavedIdentity(openedPath)) {
+      return {
+        drifted: true,
+        unverified: true,
+        activeLabel: "the panel did not return a resolved path for this filename",
+      };
+    }
+    let list: Record<string, unknown> | null = null;
+    try {
+      const res = await ctx.call({ cmd: "workflow_list" }, 6000);
+      if (!res?.isError) list = parseToolResultJson(res);
+    } catch {
+      list = null;
+    }
+    if (!list || list.active_confirmed !== true) {
+      return {
+        drifted: true,
+        unverified: true,
+        activeLabel: "the panel did not return a freshly confirmed active workflow after resolving this filename",
+      };
+    }
+    const resolvedIdentity = canonicalSavedRecordIdentity({
+      path: openedPath,
+      routing_key: parsedOpen?.routing_key,
+    });
+    const activeIdentity = canonicalSavedRecordIdentity(list.active);
+    if (resolvedIdentity && activeIdentity === resolvedIdentity) {
+      // The re-read proves which resolved path is active, but the caller only
+      // supplied an alias. Preserve #716's no-adoption rule.
+      return null;
+    }
+    if (activeIdentity) {
+      return { drifted: true, activeLabel: describeActiveRecord(list.active) };
+    }
+    return {
+      drifted: true,
+      unverified: true,
+      activeLabel: "the panel returned an unconfirmed active workflow after resolving this filename",
+    };
+  }
   if (!requestedIdentity || requestedIdentity !== openedIdentity) {
+    // A bare filename is an alias, not a saved identity. The panel's `opened.path`
+    // is the resolution of that alias; once it is available, corroborate THAT exact
+    // path against a fresh active-list read before allowing the caller to treat the
+    // success as an active-canvas success. Without this branch, the alias exits here
+    // before any live observation and a stale previous tab can be reported as active
+    // and bound (#1639).
+    const resolvedIdentity = openedPath ? canonicalRequestedSavedIdentity(openedPath) : null;
+    if (!requestedIdentity && resolvedIdentity) {
+      let list: Record<string, unknown> | null = null;
+      try {
+        const res = await ctx.call({ cmd: "workflow_list" }, 6000);
+        if (!res?.isError) list = parseToolResultJson(res);
+      } catch {
+        list = null;
+      }
+      if (!list) {
+        return {
+          drifted: true,
+          unverified: true,
+          activeLabel: "the panel did not return a confirmed active workflow after resolving this filename",
+        };
+      }
+      if (list.active_confirmed !== true) {
+        return {
+          drifted: true,
+          unverified: true,
+          activeLabel: "the panel returned an unconfirmed active workflow after resolving this filename",
+        };
+      }
+      const activeIdentity = canonicalSavedRecordIdentity(list.active);
+      if (activeIdentity === resolvedIdentity) {
+        // The re-read proves which resolved path is active, but the caller only
+        // supplied an alias. Preserve #716's no-adoption rule: an alias may be
+        // observed for the #1639 wrong-canvas guard, never promoted into a new
+        // command-fence UUID by the reply-resolved path.
+        return null;
+      }
+      if (activeIdentity) {
+        return { drifted: true, activeLabel: describeActiveRecord(list.active) };
+      }
+      return {
+        drifted: true,
+        unverified: true,
+        activeLabel: "the panel returned an unconfirmed active workflow after resolving this filename",
+      };
+    }
+
     // #812 — the SAVED corroboration above can never succeed for an unsaved
     // target (there is no path), so try the parallel UNSAVED identity: the
     // caller's literal token against the panel's own proven routing_key for
@@ -11573,6 +11669,14 @@ async function openWorkflowWithVerify(path: string, ctx: PanelToolCtx): Promise<
       // act is typically a write. The session's fence is untouched (nothing was
       // adopted), so the tab that IS active keeps its own protection.
       if (drift) {
+        if (drift.unverified) {
+          return fail(
+            `workflow_open: ${path} was reported applied, but the panel could not prove that ` +
+              `${drift.activeLabel}. The active canvas is UNKNOWN, so this open is not a ` +
+              `success and this session's workflow identity was NOT re-pointed. Inspect ` +
+              `panel_list_workflows before reading or writing the graph.`,
+          );
+        }
         return fail(
           `workflow_open: ${path} was opened, but ${drift.activeLabel} is the ACTIVE workflow now — ` +
             `the panel confirmed this on a re-read after the open completed. This session's ` +
