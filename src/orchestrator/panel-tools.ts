@@ -1265,6 +1265,10 @@ export const __panelToolsTestHooks = {
   setSaveTimeoutSettleGraceMs(ms: number | null): void {
     saveTimeoutSettleGraceMsOverride = ms;
   },
+  /** Shrink the #1908 route-boundary budget for frozen-tab tests. */
+  setPanelSearchRouteTiming(timing: { budgetMs: number } | null): void {
+    panelSearchRouteTimingOverride = timing;
+  },
   isRetrySafeCmd,
   isTransientReconnectError,
   isWorkerTransportSendError,
@@ -1288,6 +1292,20 @@ export const __panelToolsTestHooks = {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// #1908 — `nodes_search` is a canvas-independent Manager read, but the old
+// handler still sent it through the session's bound canvas tab. A frozen tab
+// never starts the Panel-side deadline because its listener never runs, so the
+// route itself needs a finite budget. There is no safe alternate-tab instance
+// proof in the bridge contract, so this route remains bound to the session tab.
+export const PANEL_SEARCH_ROUTE_BUDGET_MS = 18_000;
+let panelSearchRouteTimingOverride: { budgetMs: number } | null = null;
+
+function panelSearchRouteTiming(): { budgetMs: number } {
+  return panelSearchRouteTimingOverride ?? {
+    budgetMs: PANEL_SEARCH_ROUTE_BUDGET_MS,
+  };
 }
 
 // ── Post-reconnect retry-once for idempotent panel commands ──────────────────
@@ -13356,6 +13374,8 @@ interface BridgeProbe {
   isHeadless?: (tabId: string) => boolean;
   canReach?: (tabId: string) => boolean;
   tabs?: () => Array<{ tab_id: string }>;
+  liveTabIdFor?: (tabId: string) => string | undefined;
+  tabServerOrigin?: (tabId: string) => string | undefined;
   resolveActiveTabId?: () => string;
   resolveSharedTabId?: (scopeId?: string) => string | undefined;
   takeLateAskReply?: (askId: string) => unknown;
@@ -15582,6 +15602,87 @@ async function dispatchToTab(
     }
     return fail(err);
   }
+}
+
+function panelSearchTimeoutResult(
+  query: string,
+  budgetMs: number,
+): Record<string, unknown> {
+  return {
+    count: 0,
+    results: [],
+    query,
+    timed_out: true,
+    panel_unresponsive: true,
+    panel_route: "bound_tab_timeout",
+    timeout_ms: budgetMs,
+    reason: "No panel reply was observed before the MCP route budget expired.",
+    message:
+      "Node-registry search could not complete because the bound ComfyUI panel tab did not " +
+      "answer. This is not evidence that the requested pack is missing. The MCP route " +
+      "does not retarget this request to another tab without a stronger instance proof; retry " +
+      "after the bound panel tab responds.",
+  };
+}
+
+/**
+ * Route the Manager read with an MCP-owned deadline. Lightweight test bridges
+ * and older compatibility contexts keep the existing `ctx.call` path when they
+ * cannot expose the live-tab inventory. No alternate tab is eligible here: the
+ * available bridge origin fields do not prove a path-aware ComfyUI instance.
+ *
+ * The bounded call deliberately stays inside `makePanelToolCtx`. That preserves
+ * its `liveTabIdFor`/`ensureReachable` resolution and the existing retry-safe
+ * reconnect/rebind envelope for `nodes_search`. The synchronous guard is passed
+ * through to UiBridge's final dispatch boundary, so a retry that wakes after the
+ * MCP deadline is refused before it can write a second frame. The call promise is
+ * observed on both outcomes after the route returns, consuming a late settlement.
+ */
+async function panelSearchAtRouteBoundary(
+  ctx: PanelToolCtx,
+  cmd: Record<string, unknown>,
+  query: string,
+): Promise<ToolResult> {
+  const b: BridgeProbe = ctx.bridge;
+  // Lightweight compatibility contexts do not expose the live-tab inventory
+  // used by the route-owned send. Keep their existing ctx.call path; this is
+  // still the session's bound route, never an alternate-tab fallback.
+  const supportsRouteBoundary =
+    typeof b?.tabs === "function" &&
+    typeof b.isHeadless === "function" &&
+    typeof b.canReach === "function";
+  if (!supportsRouteBoundary) return ctx.call(cmd, 20000);
+
+  const timing = panelSearchRouteTiming();
+  const budgetMs = Math.max(1, Math.floor(timing.budgetMs));
+  const deadline = Date.now() + budgetMs;
+
+  return new Promise<ToolResult>((resolve) => {
+    let settled = false;
+    const finish = (result: ToolResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(
+      () => finish(ok(panelSearchTimeoutResult(query, budgetMs))),
+      budgetMs,
+    );
+
+    // Start the ctx.call promise before yielding to the event loop. Its internal
+    // retry/rebind path remains active even if this route promise times out, but
+    // the guard below prevents any post-deadline retry from reaching the socket.
+    const call = ctx.call(cmd, budgetMs, undefined, () => {
+      if (Date.now() >= deadline) {
+        throw new Error("panel_search_nodes route deadline expired before dispatch");
+      }
+    });
+    void call.then(
+      (result) => finish(result),
+      (error) => finish(fail(error)),
+    );
+  });
 }
 
 /** Re-resolve the desktop redirect target after a transient drop — returns the fresh
@@ -22261,7 +22362,12 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         const query = String(args.query ?? "");
         const limit = typeof args.limit === "number" ? args.limit : undefined;
         const out = await searchPanelNodes({
-          panelSearch: () => ctx.call({ cmd: "nodes_search", query, limit }, 20000),
+          // #1908 — this read is independent of the canvas, so a frozen bound
+          // tab must not own the whole bridge window. The route helper keeps
+          // the session binding unchanged and applies an MCP-owned deadline;
+          // it never guesses another ComfyUI instance.
+          panelSearch: () =>
+            panelSearchAtRouteBoundary(ctx, { cmd: "nodes_search", query, limit }, query),
           query,
           limit,
         });
