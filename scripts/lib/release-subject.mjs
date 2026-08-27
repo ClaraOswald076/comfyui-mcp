@@ -50,4 +50,4 @@ export const isReleaseSubject = (s) =>
   /^release:/i.test(s) ||
   /^v?\d+\.\d+\.\d+\s*(\(#\d+\))?$/.test(s) ||
   /^\w+\(release\)!?:\s*v?\d+\.\d+\.\d+\s*(\(#\d+\))?$/i.test(s) ||
-  /^\w+(?:\([^)]*\))?!?:\s*release\s+v?\d+\.\d+\.\d+\s*(\(#\d+\))?$/i.test(s);
+  /^chore(?:\([^)]*\))?!?:\s*release\s+v?\d+\.\d+\.\d+\s*(\(#\d+\))?$/i.test(s);

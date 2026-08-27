@@ -50,6 +50,7 @@ import {
   commitReferences,
   isReleaseMerge,
   mentionedNumbers,
+  mergeReferences,
   referenceAliases,
   referenceNumbers,
 } from "./lib/changelog-refs.mjs";
@@ -299,8 +300,14 @@ export function auditReleaseSection({
       // Anything with no reference at all is a local commit a squash superseded —
       // gen-changelog drops those too, and the two must agree or the guard fights
       // its own generator.
+      // The fallback is for MERGE subjects specifically, not for anything whose
+      // refs happen to be non-empty. Reading commit.refs here also swallowed a
+      // numeric conventional SCOPE: `fix(2333): a UUID redacts its whole token`
+      // carries no PR at all — 2333 is the issue — and the guard demanded the
+      // changelog cite #2333 as though it were one. That commit is a local step
+      // inside merge #2294, and 0.52.124 was flagged for it.
       const cited = referenceNumbers(commit.subject);
-      const shipped = cited.length ? cited : commit.refs.slice(-1);
+      const shipped = cited.length ? cited : mergeReferences(commit.subject);
       if (!shipped.length) continue;
       // What this commit IS, as opposed to what it merely references.
       const identity = shipped.at(-1);
@@ -487,6 +494,21 @@ export function main(argv) {
         git("log", `${previousRef}..${targetRef}`, "--format=%H%x1f%s%x1e"),
       );
     } catch {
+      // `describe` fails for two very different reasons, and the round-2 fix to the
+      // history read left this sibling exit behind: no tag is REACHABLE (the first
+      // release — legitimate, skip), or the tag refs cannot be read at all (broken —
+      // and silently skipping coverage there is a gate passing because it could not
+      // look). Listing tags separates them: it succeeds in the first case and throws
+      // in the second.
+      try {
+        git("tag", "--list");
+      } catch (error) {
+        console.error(
+          `changelog: git could not read tags (${String(error.message).split("\n")[0]}). ` +
+            `Refusing to report a pass on a coverage check that could not run.`,
+        );
+        return 1;
+      }
       console.error(
         `changelog: no release tag before ${targetRef} — coverage ` +
           `(every shipped PR is listed) was NOT checked.`,

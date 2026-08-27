@@ -132,6 +132,43 @@ describe("#2407 half B: everything REACHABLE must be CITED", () => {
     ).toEqual([]);
   });
 
+  it("does NOT treat a numeric conventional scope as a shipped PR identity", () => {
+    // Review round 3, and a false positive I introduced in round 2: the merge
+    // fallback read commit.refs, which also holds a numeric SCOPE. `fix(2333): a
+    // UUID redacts its whole token` carries no PR at all — 2333 is the issue, and
+    // the commit is a local step inside merge #2294 — yet the guard demanded the
+    // changelog cite #2333 as a PR, and flagged the real 0.52.124 for it.
+    const scopeOnly = commitOf("aaa", "fix(2333): a UUID redacts its whole token");
+    expect(
+      auditReleaseSection({
+        markdown: section("### Fixed", "- something else (#801)"),
+        version: "1.1.0",
+        commits: [scopeOnly, commitOf("bbb", "fix: something else (#801)")],
+        rangeCommits: [scopeOnly],
+        targetRef: "v1.1.0",
+        previousRef: "v1.0.0",
+      }),
+    ).toEqual([]);
+  });
+
+  it("does not let a fix ABOUT a release be skipped as one", () => {
+    // Review round 3. The release shape accepted any commit type, so
+    // `fix: release v1.2.3 (#778)` — a real change — was dropped by the guard AND
+    // by the generator, which is the silent omission this whole file exists to
+    // stop. Only `chore:` writes a release here.
+    const aboutARelease = commitOf("aaa", "fix: release v1.2.3 (#778)");
+    const violations = auditReleaseSection({
+      markdown: section("### Fixed", "- something else (#801)"),
+      version: "1.1.0",
+      commits: [aboutARelease, commitOf("bbb", "fix: something else (#801)")],
+      rangeCommits: [aboutARelease],
+      targetRef: "v1.1.0",
+      previousRef: "v1.0.0",
+    });
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain("#778");
+  });
+
   it("sees a REAL merge commit, whose PR number is a bare #N on the merge subject", () => {
     // Review round 2, verified against history: this repo mostly squash-merges but
     // not always, and `--no-merges` plus the parenthesised-only regex made every
