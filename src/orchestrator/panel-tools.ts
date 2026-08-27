@@ -8831,7 +8831,7 @@ function activeMatchesOpenRefreshTarget(active: unknown, path: string): boolean 
 export type OpenActiveReading = "same" | "different" | "indeterminate";
 
 /** #887 — what the post-open corroborating read OBSERVED, when it contradicts the open. */
-export type OpenDriftNotice = { drifted: true; activeLabel: string };
+export type OpenDriftNotice = { drifted: true; activeLabel: string; unverified?: boolean };
 
 /**
  * Would this active record plausibly BE the requested workflow? Used only to
@@ -9857,6 +9857,8 @@ export type WorkflowFenceRebind =
       before: FenceRead;
       kind: "no_uuid" | "uncorroborated";
       why: string;
+      /** The corroborated active record, when it was readable but carried no UUID. */
+      active?: Record<string, unknown>;
       /** #1292 — how hard we already tried, so the remedy can stop telling a
        *  caller to do the thing this function just did. Present only on the
        *  `uncorroborated` path, which is the one that rechecks. `settles` is
@@ -10548,6 +10550,7 @@ async function rebindWorkflowFence(
       before,
       kind: "no_uuid",
       why: "the active workflow record carries no usable workflow_uuid",
+      active,
     };
   }
   // "already current" requires a KNOWN prior fence equal to the live uuid. An
@@ -11223,8 +11226,21 @@ async function refreshOpenWorkflowUuid(
   ctx: PanelToolCtx,
   requestedPath: string,
   openResult: ToolResult,
+  legacyRebind?: ExplicitCurrentRebindProof,
 ): Promise<OpenDriftNotice | null> {
   const parsedOpen = parseToolResultJson(openResult);
+  // #971 compatibility: older/lightweight bridges may return only an explicit
+  // transport route for a successful open. The proof is supplied by the one
+  // immediately following open only after the caller consumed it before any
+  // await; it is never a substitute for the modern bare-alias `opened.path` +
+  // confirmed active workflow contract.
+  const legacyReboundRoute =
+    legacyRebind?.tabId === ctx.tabId &&
+    legacyRebind.savedIdentity === canonicalBareSavedIdentity(requestedPath) &&
+    !openResult.isError &&
+    parsedOpen?.ok === true &&
+    parsedOpen.routedTo === ctx.tabId &&
+    (typeof ctx.bridge.canReach !== "function" || ctx.bridge.canReach(ctx.tabId));
   const opened = parsedOpen?.opened;
   const openedPath =
     opened && typeof opened === "object" && typeof (opened as { path?: unknown }).path === "string"
@@ -11234,11 +11250,115 @@ async function refreshOpenWorkflowUuid(
   // alias/basename to a path, but that reply must never retroactively turn the
   // alias into a UUID-refresh authorization. Require the reply to corroborate
   // the original exact saved identity before consulting the live active record.
+  const requestedSavedPath = canonicalSavedWorkflowPath(requestedPath);
+  const requestedIsBareAlias =
+    !!requestedSavedPath && !requestedSavedPath.includes("/");
   const requestedIdentity = canonicalRequestedSavedIdentity(requestedPath);
   const openedIdentity = openedPath
     ? canonicalSavedRecordIdentity({ path: openedPath, routing_key: parsedOpen?.routing_key })
     : null;
+  if (requestedIsBareAlias) {
+    // A bare filename is only a selector. It is not safe to let a native
+    // success through unless the panel both resolved it to a saved path and
+    // gave us a fresh, explicitly confirmed active observation. In particular,
+    // an omitted `opened.path` is not a resolution, and an omitted
+    // `active_confirmed` is not confirmation (#1639).
+    if (!openedPath) {
+      if (legacyReboundRoute) return null;
+      return {
+        drifted: true,
+        unverified: true,
+        activeLabel: "the panel did not return a resolved path for this filename",
+      };
+    }
+    if (!canonicalRequestedSavedIdentity(openedPath)) {
+      return {
+        drifted: true,
+        unverified: true,
+        activeLabel: "the panel did not return a resolved path for this filename",
+      };
+    }
+    let list: Record<string, unknown> | null = null;
+    try {
+      const res = await ctx.call({ cmd: "workflow_list" }, 6000);
+      if (!res?.isError) list = parseToolResultJson(res);
+    } catch {
+      list = null;
+    }
+    if (!list || list.active_confirmed !== true) {
+      return {
+        drifted: true,
+        unverified: true,
+        activeLabel: "the panel did not return a freshly confirmed active workflow after resolving this filename",
+      };
+    }
+    const resolvedIdentity = canonicalSavedRecordIdentity({
+      path: openedPath,
+      routing_key: parsedOpen?.routing_key,
+    });
+    const activeIdentity = canonicalSavedRecordIdentity(list.active);
+    if (resolvedIdentity && activeIdentity === resolvedIdentity) {
+      // The re-read proves which resolved path is active, but the caller only
+      // supplied an alias. Preserve #716's no-adoption rule.
+      return null;
+    }
+    if (activeIdentity) {
+      return { drifted: true, activeLabel: describeActiveRecord(list.active) };
+    }
+    return {
+      drifted: true,
+      unverified: true,
+      activeLabel: "the panel returned an unconfirmed active workflow after resolving this filename",
+    };
+  }
   if (!requestedIdentity || requestedIdentity !== openedIdentity) {
+    // A bare filename is an alias, not a saved identity. The panel's `opened.path`
+    // is the resolution of that alias; once it is available, corroborate THAT exact
+    // path against a fresh active-list read before allowing the caller to treat the
+    // success as an active-canvas success. Without this branch, the alias exits here
+    // before any live observation and a stale previous tab can be reported as active
+    // and bound (#1639).
+    const resolvedIdentity = openedPath ? canonicalRequestedSavedIdentity(openedPath) : null;
+    if (!requestedIdentity && resolvedIdentity) {
+      let list: Record<string, unknown> | null = null;
+      try {
+        const res = await ctx.call({ cmd: "workflow_list" }, 6000);
+        if (!res?.isError) list = parseToolResultJson(res);
+      } catch {
+        list = null;
+      }
+      if (!list) {
+        return {
+          drifted: true,
+          unverified: true,
+          activeLabel: "the panel did not return a confirmed active workflow after resolving this filename",
+        };
+      }
+      if (list.active_confirmed !== true) {
+        return {
+          drifted: true,
+          unverified: true,
+          activeLabel: "the panel returned an unconfirmed active workflow after resolving this filename",
+        };
+      }
+      const activeIdentity = canonicalSavedRecordIdentity(list.active);
+      if (activeIdentity === resolvedIdentity) {
+        // The re-read proves which resolved path is active, but the caller only
+        // supplied an alias. Preserve #716's no-adoption rule: an alias may be
+        // observed for the #1639 wrong-canvas guard, never promoted into a new
+        // command-fence UUID by the reply-resolved path.
+        return null;
+      }
+      if (activeIdentity) {
+        return { drifted: true, activeLabel: describeActiveRecord(list.active) };
+      }
+      return {
+        drifted: true,
+        unverified: true,
+        activeLabel: "the panel returned an unconfirmed active workflow after resolving this filename",
+      };
+    }
+
     // #812 — the SAVED corroboration above can never succeed for an unsaved
     // target (there is no path), so try the parallel UNSAVED identity: the
     // caller's literal token against the panel's own proven routing_key for
@@ -11492,6 +11612,11 @@ function noReachableTabFail(cmd: string, ctx?: PanelToolCtx): ToolResult {
 }
 
 async function openWorkflowWithVerify(path: string, ctx: PanelToolCtx): Promise<ToolResult> {
+  // #971 — consume the explicit-current proof BEFORE the first await. This
+  // makes it one-shot even when this open fails, and prevents a concurrent or
+  // later open from inheriting a proof belonging to an earlier operation.
+  const legacyRebind = ctx.lastExplicitCurrentRebind;
+  ctx.lastExplicitCurrentRebind = undefined;
   // #402: after a full ComfyUI restart the browser tab re-registers a few seconds
   // later. Awaiting a stable binding BEFORE dispatching a mutating workflow_open
   // (nothing is sent yet — no double-apply risk) means the command reaches a live
@@ -11560,7 +11685,7 @@ async function openWorkflowWithVerify(path: string, ctx: PanelToolCtx): Promise<
       );
     }
     {
-      const drift = await refreshOpenWorkflowUuid(ctx, path, res);
+      const drift = await refreshOpenWorkflowUuid(ctx, path, res, legacyRebind);
       // #887 — the read above is the ONLY observation in this whole path taken
       // after a real round trip, so it is the only thing that can catch the active
       // pointer having settled elsewhere. It already declined to adopt the uuid;
@@ -11573,6 +11698,14 @@ async function openWorkflowWithVerify(path: string, ctx: PanelToolCtx): Promise<
       // act is typically a write. The session's fence is untouched (nothing was
       // adopted), so the tab that IS active keeps its own protection.
       if (drift) {
+        if (drift.unverified) {
+          return fail(
+            `workflow_open: ${path} was reported applied, but the panel could not prove that ` +
+              `${drift.activeLabel}. The active canvas is UNKNOWN, so this open is not a ` +
+              `success and this session's workflow identity was NOT re-pointed. Inspect ` +
+              `panel_list_workflows before reading or writing the graph.`,
+          );
+        }
         return fail(
           `workflow_open: ${path} was opened, but ${drift.activeLabel} is the ACTIVE workflow now — ` +
             `the panel confirmed this on a re-read after the open completed. This session's ` +
@@ -11979,6 +12112,12 @@ function canonicalRequestedSavedIdentity(path: unknown): string | null {
   // command fence must bind. It may still resolve a legacy pin, but must never
   // authorize replacing its existing UUID stamp.
   return canonicalPath && canonicalPath.includes("/") ? `wf:${canonicalPath}` : null;
+}
+
+/** Canonical identity for a bare saved-workflow selector, for one-shot #971 proof matching. */
+function canonicalBareSavedIdentity(path: unknown): string | null {
+  const canonicalPath = canonicalSavedWorkflowPath(path);
+  return canonicalPath && !canonicalPath.includes("/") ? `wf:${canonicalPath}` : null;
 }
 
 /**
@@ -13143,6 +13282,12 @@ interface BridgeProbe {
   takeLateAskReply?: (askId: string) => unknown;
 }
 
+/** The only compatibility proof accepted for a legacy bare workflow open. */
+export interface ExplicitCurrentRebindProof {
+  tabId: string;
+  savedIdentity: string;
+}
+
 export interface PanelToolCtx {
   /** Forward a command to the panel and wrap the reply as a tool result. An
    *  optional observer receives the bridge request id after the frame is written,
@@ -13235,6 +13380,14 @@ export interface PanelToolCtx {
    * Optional so lightweight test contexts can omit it.
    */
   awaitReachable?: (budgetMs?: number) => Promise<boolean>;
+  /**
+   * One-shot proof for the legacy #971 recovery path. A current-mode recovery
+   * that actually moved an orphaned session records the exact tab and the
+   * corroborated saved identity it selected; only the immediately following
+   * matching legacy workflow_open may use its transport route echo as
+   * compatibility evidence, never as a workflow-identity/UUID source.
+   */
+  lastExplicitCurrentRebind?: ExplicitCurrentRebindProof;
   /** Snapshot of the current panel registration. The browser-tab session id is
    * separate from the workflow-derived routing tab id, which another browser
    * tab may reuse for the same saved workflow. */
@@ -20916,6 +21069,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         if (mode === "pinned" && !(path ?? "").trim()) {
           return fail("Provide path when pinning — use panel_list_workflows to list open workflows.");
         }
+        // A prior explicit recovery proof must not survive another targeting
+        // call. It is valid only for the open immediately following the rebind
+        // that produced it.
+        ctx.lastExplicitCurrentRebind = undefined;
         // mode:'current' is the explicit, user/agent-initiated "rebind me to the
         // tab that's live now" consent signal. Self-heal a session whose captured
         // tab id was orphaned (reconnect/reload/workflow-switch) BEFORE writing the
@@ -20928,8 +21085,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // on a successful turn-pin recovery. Track that separately from the
         // real-tab rebind note below.
         let currentModeTurnRepinned = false;
+        let explicitCurrentRebindBefore: string | undefined;
         if (mode === "current" && ctx.rebindToActiveTab) {
           const before = ctx.tabId;
+          explicitCurrentRebindBefore = before;
           const recoveringScope = isScopeAddress(before);
           // Hold the send() wait BEFORE the first await so a same-batch sibling
           // that already hit the null pin waits instead of minting #884.
@@ -21179,6 +21338,23 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             const moved = ctx.workflowTarget.set(ctx.tabId, { mode: "current" });
             ctx.bridge.push({ type: "workflow_target", target: moved }, ctx.tabId);
             rebindNote += ` The panel dropped mid-call: this session moved from tab ${tabBeforeProbe} onto tab ${ctx.tabId}, and mode:"current" was applied there too.`;
+          }
+        }
+        // #971 — preserve the old-panel recovery only when the current-mode
+        // operation itself corroborated the saved identity now selected. The
+        // proof is consumed by the next open before its first await, so a failed
+        // open, a different alias, or a later open cannot inherit it.
+        if (
+          mode === "current" &&
+          !deferredBind &&
+          explicitCurrentRebindBefore !== undefined &&
+          ctx.tabId !== explicitCurrentRebindBefore &&
+          fenceRebind &&
+          "active" in fenceRebind
+        ) {
+          const savedIdentity = canonicalSavedRecordIdentity(fenceRebind.active);
+          if (savedIdentity) {
+            ctx.lastExplicitCurrentRebind = { tabId: ctx.tabId, savedIdentity };
           }
         }
         // panel#1529 — "Graph tools will target that workflow" is a CLAIM ABOUT
