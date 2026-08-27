@@ -521,6 +521,46 @@ describe("#2407 end to end: the guard blocks the cut that shipped 0.52.138", () 
     expect(result.stdout).toContain("lists every PR since v1.0.0");
   });
 
+  it("reports a PR that landed as a REAL merge commit, through the actual git range", () => {
+    // WIRING, not the helper. The pure audit understands a merge subject, but the
+    // range that feeds it is a `git log` invocation, and restoring `--no-merges`
+    // there left every merge test green while making the CLI blind again — the
+    // fix present, the path to it severed. This drives the real query.
+    git("checkout", "-q", "-b", "fix/900-thing");
+    commit("wip: work with no PR number of its own");
+    git("checkout", "-q", "main");
+    git(
+      "merge",
+      "--no-ff",
+      "-m",
+      "Merge pull request #901 from artokun/fix/900-thing",
+      "fix/900-thing",
+    );
+    writeChangelog(
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "## [1.1.0] - 2026-08-27",
+      "",
+      "### Fixed",
+      "- an unrelated tidy-up (#902)",
+      "",
+      "## [1.0.0] - 2026-08-26",
+      "",
+      "### Fixed",
+      "- the first thing (#801)",
+      "",
+    );
+    commit("fix: an unrelated tidy-up (#902)");
+    commit("chore: release v1.1.0 (#903)");
+    git("tag", "v1.1.0");
+
+    const result = runGuard();
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("does not mention PR #901");
+  });
+
   it("audits the cut BEFORE the tag exists, which is when a release can still be fixed", () => {
     // `npm version` and the release PR both run before the tag is pushed. If the
     // guard only worked against a tag it would report the mistake after publish.
