@@ -478,6 +478,63 @@ describe("#2407 structure: a hand-edited section stays well formed", () => {
     expect(violations.some((v) => v.includes("credits issue/PR identity #801 twice"))).toBe(true);
   });
 
+  it("allows the SAME bucket under two components — that is valid generated output", () => {
+    // Review round 5, reproduced on real history. gen-changelog nests
+    // `### <component>` > `#### <bucket>`, so a release touching both components
+    // emits `#### Fixed` twice. [0.50.37] shipped exactly that, and keying
+    // heading uniqueness on level+text alone REJECTED it — a false positive that
+    // blocks a correct release, the worst direction for this guard.
+    const twoComponents = [
+      "# Changelog",
+      "",
+      "## [1.1.0] - 2026-08-26",
+      "",
+      "### RunPod image",
+      "",
+      "#### Fixed",
+      "- a hash that could not be computed (#1123)",
+      "",
+      "### MCP",
+      "",
+      "#### Fixed",
+      "- a different fix entirely (#1134)",
+      "",
+    ].join("\n");
+    expect(
+      auditReleaseSection({
+        markdown: twoComponents,
+        version: "1.1.0",
+        targetRef: "v1.1.0",
+        historyComplete: false,
+      }).filter((v: string) => v.includes("repeats the heading")),
+    ).toEqual([]);
+  });
+
+  it("...but still catches the same bucket twice under ONE component", () => {
+    const realDuplicate = [
+      "# Changelog",
+      "",
+      "## [1.1.0] - 2026-08-26",
+      "",
+      "### MCP",
+      "",
+      "#### Fixed",
+      "- a (#1)",
+      "",
+      "#### Fixed",
+      "- b (#2)",
+      "",
+    ].join("\n");
+    expect(
+      auditReleaseSection({
+        markdown: realDuplicate,
+        version: "1.1.0",
+        targetRef: "v1.1.0",
+        historyComplete: false,
+      }).some((v: string) => v.includes('repeats the heading "Fixed"')),
+    ).toBe(true);
+  });
+
   it("reports a missing or empty section rather than passing it", () => {
     expect(
       auditReleaseSection({ markdown: "# Changelog\n", version: "1.1.0", targetRef: "v1.1.0" }).join(),
@@ -770,6 +827,40 @@ describe("#2407 end to end: the guard blocks the cut that shipped 0.52.138", () 
     } finally {
       rmSync(bare, { recursive: true, force: true });
     }
+  });
+
+  it("measures from the previous RELEASE tag, not from a stray non-version tag", () => {
+    // Review round 5. `describe --tags` matches ANY tag, and this repo carries a
+    // non-release one (`backup/570-prerebase`). A stray tag sitting after the last
+    // release narrows the range past the unlisted PR, and the gap then passes —
+    // silently, which is the exact failure the coverage half exists to catch.
+    commit("fix(900): the one that got away (#901)");
+    git("tag", "backup/scratch-work");
+    writeChangelog(
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "## [1.1.0] - 2026-08-27",
+      "",
+      "### Fixed",
+      "- an unrelated tidy-up (#902)",
+      "",
+      "## [1.0.0] - 2026-08-26",
+      "",
+      "### Fixed",
+      "- the first thing (#801)",
+      "",
+    );
+    commit("fix: an unrelated tidy-up (#902)");
+    commit("chore: release v1.1.0 (#903)");
+    git("tag", "v1.1.0");
+
+    const result = runGuard();
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("does not mention PR #901");
+    // ...and it must say it measured from the release, not the scratch tag.
+    expect(result.stderr).toContain("not from v1.0.0");
   });
 
   it("refuses a malformed version argument instead of auditing a different section", () => {

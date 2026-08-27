@@ -97,6 +97,14 @@ export function parseReleaseBody(lines) {
   const entries = [];
   let section = null;
   let entry = null;
+  // A heading's identity is its PATH, not its text. gen-changelog nests
+  // `### <component>` > `#### <bucket>` for this repo's two components, so a
+  // release touching both emits `#### Fixed` twice — once under `### MCP`, once
+  // under `### RunPod image`. That is correct generated output, and keying
+  // uniqueness on level+text alone rejected it: [0.50.37] is a real shipped
+  // section that fails that way. Refusing a valid release is the direction that
+  // blocks a good publish, so siblings are told apart by their parents.
+  const openHeadings = [];
 
   const flush = () => {
     if (!entry) return;
@@ -109,7 +117,13 @@ export function parseReleaseBody(lines) {
     const heading = /^(#{3,6})\s+(.+?)\s*$/.exec(line);
     if (heading) {
       flush();
-      section = { level: heading[1].length, text: heading[2], line: index + 1 };
+      const level = heading[1].length;
+      while (openHeadings.length && openHeadings.at(-1).level >= level) openHeadings.pop();
+      const path = [...openHeadings, { level, text: heading[2] }]
+        .map((item) => `${item.level}:${item.text.toLowerCase()}`)
+        .join(" > ");
+      section = { level, text: heading[2], line: index + 1, path };
+      openHeadings.push(section);
       headings.push(section);
       continue;
     }
@@ -206,7 +220,7 @@ export function auditReleaseSection({
 
   const seenHeadings = new Map();
   for (const heading of headings) {
-    const key = `${heading.level}:${heading.text.toLowerCase()}`;
+    const key = heading.path;
     const line = section.start + heading.line;
     if (seenHeadings.has(key)) {
       violations.push(
@@ -523,7 +537,11 @@ export function main(argv) {
       // reads off the failure instead of having to be inferred. Guessing a newer
       // base would trade a loud, wrong-looking failure for a silent gap, which is
       // the exact direction this guard exists to close.
-      previousRef = git("describe", "--tags", "--abbrev=0", `${targetRef}^`);
+      // --match v[0-9]*: `--tags` alone matches ANY tag, and this repo carries a
+      // non-release one (`backup/570-prerebase`). Selecting a stray tag as the
+      // previous release narrows the range, and everything before it then passes
+      // uncited — a silent gap, which is the failure this whole guard exists for.
+      previousRef = git("describe", "--tags", "--abbrev=0", "--match", "v[0-9]*", `${targetRef}^`);
       rangeCommits = parseCommitSubjects(
         git("log", `${previousRef}..${targetRef}`, "--format=%H%x1f%s%x1e"),
       );
