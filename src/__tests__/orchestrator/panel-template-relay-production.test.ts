@@ -108,7 +108,7 @@ describe("orchestrator panel template relay wiring (#2196)", () => {
     expect(wiring.resolveAllowedPanelOrigin("tab-1", target)).toBeUndefined();
     expect(wiring.resolvePanelUrl("tab-1", target)).toBeUndefined();
 
-    for (const origin of ["http://127.0.0.1:8188", "http://[::1]:8188"]) {
+    for (const origin of ["http://127.0.0.1:8188", "http://[::1]:8188", "http://localhost:8188"]) {
       target = `${origin}/comfyapi`;
       observedOrigin = origin;
       expect(wiring.resolveAllowedPanelOrigin("tab-1", target)).toBe(origin);
@@ -127,17 +127,23 @@ describe("orchestrator panel template relay wiring (#2196)", () => {
     await expect(requestPanelTemplateIndex()).rejects.toMatchObject({ code: "NO_PANEL_ORIGIN" });
   });
 
-  it("refuses an exact localhost match before fetch can resolve another loopback listener", async () => {
+  // #2382/#2385. Dropping "localhost" from LOOPBACK_HOSTS made this request
+  // fail NO_PANEL_ORIGIN, which shipped in 0.52.135 and is still live: #2387
+  // documented the fail-closed rule but changed no behaviour here. Authorizing
+  // the origin — rather than declining it — is also what keeps the fetch under
+  // the relay's own generation fence, instead of handing it to a child that may
+  // still hold the pre-retarget target (#1429).
+  it("serves a localhost-served panel and still refuses a mixed localhost/127.0.0.1 pair", async () => {
     let panelRequests = 0;
     const panel = createServer((_req, res) => {
       panelRequests += 1;
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ "unexpected-pack": [{ name: "wrong-listener" }] }));
+      res.end(JSON.stringify({ "panel-pack": [{ name: "localhost-template" }] }));
     });
     const panelOrigin = await listen(panel);
     servers.push({ close: () => closeServer(panel) });
     const port = new URL(panelOrigin).port;
-    const target = `http://localhost:${port}/comfyapi`;
+    let target = `http://localhost:${port}/comfyapi`;
     const observedOrigin = `http://localhost:${port}`;
     const bridge = {
       canReach: () => true,
@@ -151,14 +157,25 @@ describe("orchestrator panel template relay wiring (#2196)", () => {
       currentTargetGeneration: () => 0,
       secrets: new Map([[SECRET, "orchestrator::codex"]]),
     });
-    expect(wiring.resolveAllowedPanelOrigin("tab-1", target)).toBeUndefined();
-    expect(wiring.resolvePanelUrl("tab-1", target)).toBeUndefined();
+    expect(wiring.resolveAllowedPanelOrigin("tab-1", target)).toBe(observedOrigin);
+    expect(wiring.resolvePanelUrl("tab-1", target)).toBe(`${observedOrigin}/comfyapi/api/workflow_templates`);
+
     const relay = await startPanelTemplateRelayServer({ bridge, ...wiring });
     servers.push(relay);
     process.env.COMFYUI_MCP_RELAY_SECRET = SECRET;
     process.env.COMFYUI_MCP_TEMPLATE_RELAY_URL = relay.endpointUrl;
+    await expect(requestPanelTemplateIndex()).resolves.toMatchObject({
+      "panel-pack": [{ name: "localhost-template" }],
+    });
+    expect(panelRequests).toBe(1);
+
+    // A MIXED pair is a genuine mismatch, not a name ambiguity, and must stay a
+    // hard refusal that never reaches the panel.
+    target = `http://127.0.0.1:${port}/comfyapi`;
+    expect(wiring.resolveAllowedPanelOrigin("tab-1", target)).toBeUndefined();
+    expect(wiring.resolvePanelUrl("tab-1", target)).toBeUndefined();
     await expect(requestPanelTemplateIndex()).rejects.toMatchObject({ code: "NO_PANEL_ORIGIN" });
-    expect(panelRequests).toBe(0);
+    expect(panelRequests).toBe(1);
   });
 
   it("rejects a stale in-flight response after retargeting and still serves the current target", async () => {
@@ -234,5 +251,123 @@ describe("orchestrator panel template relay wiring (#2196)", () => {
       "current-panel-pack": [{ name: "current-template" }],
     });
     expect(panelRequests).toBe(2);
+  });
+  // #2382 — the ambiguity is REMOVED, not refused. `localhost` authorizes the
+  // origin, but the fetch is pinned to literal addresses, and when more than one
+  // loopback address answers they must agree.
+  it("pins a localhost fetch to a literal address and refuses two disagreeing listeners", async () => {
+    const hits: string[] = [];
+    const makeServer = (payload: string) =>
+      createServer((req, res) => {
+        hits.push(`${req.headers.host ?? "?"}`);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(payload);
+      });
+    // Bind the SAME port on both loopback families. Two distinct processes on a
+    // dual-stack machine look exactly like this.
+    const v4 = makeServer(JSON.stringify({ "v4-pack": [{ name: "from-127" }] }));
+    await new Promise<void>((resolve, reject) => {
+      v4.once("error", reject);
+      v4.listen({ host: "127.0.0.1", port: 0 }, () => resolve());
+    });
+    const addr = v4.address();
+    if (!addr || typeof addr === "string") throw new Error("no bind");
+    const port = addr.port;
+    servers.push({ close: () => closeServer(v4) });
+
+    const v6 = makeServer(JSON.stringify({ "v6-pack": [{ name: "from-::1" }] }));
+    let v6Bound = true;
+    await new Promise<void>((resolve) => {
+      v6.once("error", () => { v6Bound = false; resolve(); });
+      v6.listen({ host: "::1", port, ipv6Only: true }, () => resolve());
+    });
+    if (v6Bound) servers.push({ close: () => closeServer(v6) });
+
+    const target = `http://localhost:${port}/comfyapi`;
+    const observedOrigin = `http://localhost:${port}`;
+    const bridge = {
+      canReach: () => true,
+      resolveFailure: () => undefined,
+      resolveSharedTabId: () => "tab-1",
+      tabServerOrigin: () => observedOrigin,
+    };
+    const wiring = createPanelTemplateRelayWiring({
+      bridge,
+      currentTarget: () => target,
+      currentTargetGeneration: () => 0,
+      secrets: new Map([[SECRET, "orchestrator::codex"]]),
+    });
+    // The origin is authorized — that is the half #2385 removed.
+    expect(wiring.resolveAllowedPanelOrigin("tab-1", target)).toBe(observedOrigin);
+
+    const relay = await startPanelTemplateRelayServer({ bridge, ...wiring });
+    servers.push(relay);
+    process.env.COMFYUI_MCP_RELAY_SECRET = SECRET;
+    process.env.COMFYUI_MCP_TEMPLATE_RELAY_URL = relay.endpointUrl;
+
+    if (v6Bound) {
+      // Two listeners, two different indexes: refuse rather than guess.
+      await expect(requestPanelTemplateIndex()).rejects.toMatchObject({ code: "AMBIGUOUS_PANEL_LISTENER" });
+    } else {
+      await expect(requestPanelTemplateIndex()).resolves.toMatchObject({ "v4-pack": [{ name: "from-127" }] });
+    }
+    // Whatever happened, the NAME was never the destination: every request
+    // arrived with a literal-address Host header.
+    expect(hits.length).toBeGreaterThan(0);
+    for (const host of hits) expect(host).not.toContain("localhost");
+  });
+  // #2382 — a listener that answers BADLY is still a listener. The pinned fetch
+  // must not quietly prefer whichever address happened to return valid JSON:
+  // the erroring one could be the real panel, and then we would be serving the
+  // other process's index — the exact bug pinning exists to prevent.
+  it("refuses when one loopback listener 503s and another returns a valid index", async () => {
+    const v4 = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ "v4-pack": [{ name: "from-127" }] }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      v4.once("error", reject);
+      v4.listen({ host: "127.0.0.1", port: 0 }, () => resolve());
+    });
+    const addr = v4.address();
+    if (!addr || typeof addr === "string") throw new Error("no bind");
+    const port = addr.port;
+    servers.push({ close: () => closeServer(v4) });
+
+    const v6 = createServer((_req, res) => {
+      res.writeHead(503);
+      res.end("unavailable");
+    });
+    let v6Bound = true;
+    await new Promise<void>((resolve) => {
+      v6.once("error", () => { v6Bound = false; resolve(); });
+      v6.listen({ host: "::1", port, ipv6Only: true }, () => resolve());
+    });
+    if (!v6Bound) return; // No IPv6 loopback here; nothing to disagree with.
+    servers.push({ close: () => closeServer(v6) });
+
+    const target = `http://localhost:${port}/comfyapi`;
+    const observedOrigin = `http://localhost:${port}`;
+    const bridge = {
+      canReach: () => true,
+      resolveFailure: () => undefined,
+      resolveSharedTabId: () => "tab-1",
+      tabServerOrigin: () => observedOrigin,
+    };
+    const relay = await startPanelTemplateRelayServer({
+      bridge,
+      ...createPanelTemplateRelayWiring({
+        bridge,
+        currentTarget: () => target,
+        currentTargetGeneration: () => 0,
+        secrets: new Map([[SECRET, "orchestrator::codex"]]),
+      }),
+    });
+    servers.push(relay);
+    process.env.COMFYUI_MCP_RELAY_SECRET = SECRET;
+    process.env.COMFYUI_MCP_TEMPLATE_RELAY_URL = relay.endpointUrl;
+
+    // NOT the v4 index, even though v4 answered perfectly well.
+    await expect(requestPanelTemplateIndex()).rejects.toMatchObject({ code: "AMBIGUOUS_PANEL_LISTENER" });
   });
 });

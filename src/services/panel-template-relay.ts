@@ -1,4 +1,6 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { lookup as dnsLookupCb } from "node:dns";
+import { promisify } from "node:util";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
 /**
@@ -21,10 +23,47 @@ export const PANEL_TEMPLATE_RELAY_HTTP_PATH = "/__comfyui_mcp_panel_template_rel
 
 const ID_RE = /^[A-Za-z0-9_-]{16,80}$/;
 const HEX_RE = /^[a-f0-9]{64}$/;
-// A hostname does not identify which loopback listener a browser reached. Keep
-// relay destinations pinned to literal addresses so fetch cannot independently
-// resolve `localhost` to a different process or address family.
-const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1"]);
+// Hosts that may AUTHORIZE a relay origin. `localhost` is included, but it is
+// never fetched as a name — see LOOPBACK_LITERALS and pinnedLoopbackUrls.
+//
+// #2382 is the reason this needs saying. `localhost` names an address family,
+// not a listener, so an exact origin match does not prove that a later
+// `fetch(url)` reaches the socket the browser is on: Node >=20 connects with
+// Happy Eyeballs, so the name can land on either loopback family. #2385
+// answered that by dropping `localhost` from this set, which took `list_packs
+// action:"list_templates"` from working to erroring for every user whose
+// ComfyUI is served at `http://localhost:<port>` — an ordinary setup, since the
+// panel Origin is the browser's — and the caller is fail-closed once a panel
+// route exists, so nothing caught it.
+//
+// The refusal was not the only option, and it was not the right one. The
+// ambiguity lives in the SECOND name resolution, not in the origin check, so it
+// is removed rather than refused: the destination is resolved once, here, and
+// every request goes to a literal address. Where a name resolves to more than
+// one loopback address the candidates must AGREE, which is the property that
+// actually matters and is checkable, unlike listener identity, which is not.
+//
+// Not falling through to the headless COMFYUI_URL path on a refusal is
+// deliberate and stays that way (#2387): a mid-turn child keeps the PREVIOUS
+// target across a retarget (#1429, retargetAllForMcpEnv), so it can list a
+// stale server's index. Fetching here, under the relay's own generation fence,
+// is what prevents that.
+//
+// A mixed pair (`localhost` observed vs `127.0.0.1` configured, or the reverse)
+// is still refused by the exact-origin equality below.
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
+
+// Relay fetches only ever go to a LITERAL loopback address. `localhost` may
+// authorize an origin (above), but it is never a fetch destination: see
+// pinnedLoopbackUrls, which resolves it to these before any request is made.
+const LOOPBACK_LITERALS = new Set(["127.0.0.1", "::1"]);
+
+// Promisified so the single resolution happens in ONE place we control.
+const dnsLookup = promisify(dnsLookupCb) as (
+  hostname: string,
+  options: { all: true; verbatim: boolean },
+) => Promise<Array<{ address: string; family: number }>>;
+const AMBIGUOUS_LOOPBACK_NAMES = new Set(["localhost"]);
 
 export interface PanelTemplateRelayRequest {
   version: typeof PANEL_TEMPLATE_RELAY_VERSION;
@@ -221,6 +260,7 @@ function validateResponse(value: unknown, requestId: string, secret: string): Re
 
 function errorMessage(error: string): string {
   const known = new Set([
+    "AMBIGUOUS_PANEL_LISTENER",
     "AMBIGUOUS_REQUESTER",
     "BACKLOG_FULL",
     "HTTP_ERROR",
@@ -432,6 +472,13 @@ export function currentPanelTemplateOrigin(
     observed.protocol === target.protocol &&
     observed.port === target.port &&
     observed.origin === target.origin;
+  // An ambiguous NAME is authorized over cleartext only. Over TLS the address
+  // cannot be pinned without breaking verification of a certificate issued to
+  // the name, which leaves the fetch re-resolving it -- so `https://localhost`
+  // stays refused, exactly as it is on main today. Nothing regresses by
+  // declining to restore it, and the http case is the reported one (#2382).
+  const ambiguousName = AMBIGUOUS_LOOPBACK_NAMES.has(observed.host) || AMBIGUOUS_LOOPBACK_NAMES.has(target.host);
+  if (ambiguousName && observed.protocol !== "http:") return undefined;
   return exactLoopbackOrigin ? observed.origin : undefined;
 }
 
@@ -461,6 +508,135 @@ function safePanelTemplateUrl(raw: string | undefined, allowedOrigin: string | u
   }
 }
 
+/**
+ * Expands a relay URL into the literal-address URLs that will actually be
+ * fetched, so `fetch` never performs a second, independent name resolution
+ * (#2382).
+ *
+ * A literal host is returned unchanged. An ambiguous NAME is resolved once,
+ * here, and every resolved address must be loopback — which also closes a hole
+ * that existed before this function: a hosts-file entry pointing `localhost`
+ * off-box would previously have been fetched, because only the ORIGIN STRING
+ * was ever checked against the loopback set, never the address it resolves to.
+ */
+async function pinnedLoopbackUrls(url: URL): Promise<URL[]> {
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (LOOPBACK_LITERALS.has(host)) return [url];
+  // Only a cleartext ambiguous name gets here: currentPanelTemplateOrigin
+  // refuses the TLS case, because pinning and certificate verification cannot
+  // both hold. Re-checked rather than assumed -- this function is what decides
+  // where a request is actually sent.
+  if (!AMBIGUOUS_LOOPBACK_NAMES.has(host) || url.protocol !== "http:") {
+    throw new PanelTemplateRelayError("The panel template relay refused a non-loopback destination.", "NO_PANEL_ORIGIN");
+  }
+  let resolved: Array<{ address: string }>;
+  try {
+    resolved = await dnsLookup(host, { all: true, verbatim: true });
+  } catch {
+    throw new PanelTemplateRelayError("The connected panel could not fetch the workflow-template index.", "PANEL_FETCH_FAILED");
+  }
+  const literals: string[] = [];
+  for (const { address } of resolved) {
+    const literal = address.toLowerCase();
+    // A name that resolves ANYWHERE off loopback is refused whole rather than
+    // partially honoured. Before pinning, only the ORIGIN STRING was ever
+    // checked, so a `localhost` pointed off-box by a hosts entry was fetched.
+    if (!LOOPBACK_LITERALS.has(literal)) {
+      throw new PanelTemplateRelayError("The panel template relay refused a non-loopback destination.", "NO_PANEL_ORIGIN");
+    }
+    if (!literals.includes(literal)) literals.push(literal);
+  }
+  if (literals.length === 0) {
+    throw new PanelTemplateRelayError("The connected panel could not fetch the workflow-template index.", "PANEL_FETCH_FAILED");
+  }
+  return literals.map((literal) => {
+    const pinned = new URL(url.href);
+    pinned.hostname = literal.includes(":") ? `[${literal}]` : literal;
+    return pinned;
+  });
+}
+
+/**
+ * Fetches the template index over pinned literal addresses.
+ *
+ * When a name resolves to more than one loopback address we cannot know which
+ * socket the browser reached — the Origin header does not carry the family, and
+ * probing cannot tell a dual-stack listener bound to `::` apart from two
+ * separate processes. So identity is not what we establish. We fetch every
+ * candidate and require them to AGREE: if each reachable address returns the
+ * same index, the answer is the same whichever one the panel is on, which is
+ * the property that actually matters. Disagreement is the real ambiguity, and
+ * is refused rather than resolved by guessing.
+ */
+async function fetchPinnedPanelIndex(url: URL, deadlineAt: number): Promise<string> {
+  const candidates = await pinnedLoopbackUrls(url);
+  if (candidates.length === 1) return fetchPanelIndex(candidates[0], deadlineAt);
+  const settled = await Promise.all(
+    candidates.map(async (candidate) => {
+      try {
+        return { state: "ok" as const, body: await fetchPanelIndex(candidate, deadlineAt) };
+      } catch (error) {
+        // A REFUSED CONNECTION IS THE ONLY SAFE THING TO IGNORE. It proves
+        // nothing is listening on that address, so it cannot be the panel. Any
+        // other failure means something IS there and merely answered badly --
+        // possibly the real panel returning 503 -- and preferring whichever
+        // address happened to succeed would then serve the OTHER listener's
+        // index, which is the defect this function exists to prevent.
+        return isConnectionRefused(error)
+          ? { state: "absent" as const }
+          : { state: "failed" as const, error };
+      }
+    }),
+  );
+  const present = settled.filter((r) => r.state !== "absent");
+  if (present.length === 0) {
+    throw new PanelTemplateRelayError("The connected panel could not fetch the workflow-template index.", "PANEL_FETCH_FAILED");
+  }
+  // Exactly one listener exists, so there is nothing for it to disagree with:
+  // report its outcome verbatim, success or failure.
+  if (present.length === 1) {
+    const only = present[0];
+    if (only.state === "ok") return only.body;
+    throw only.error;
+  }
+  // More than one listener answered the panel's address. Every one of them must
+  // have produced the SAME index, or we cannot say what the panel would see.
+  const bodies: string[] = [];
+  for (const result of present) {
+    if (result.state !== "ok") {
+      throw new PanelTemplateRelayError(
+        "Another loopback listener answered the panel's address and could not be read.",
+        "AMBIGUOUS_PANEL_LISTENER",
+      );
+    }
+    bodies.push(result.body);
+  }
+  if (bodies.some((body) => body !== bodies[0])) {
+    throw new PanelTemplateRelayError(
+      "Two different loopback listeners answered the panel's address with different template indexes.",
+      "AMBIGUOUS_PANEL_LISTENER",
+    );
+  }
+  return bodies[0];
+}
+
+/** True only for a refused CONNECTION, i.e. nothing is listening on that address. */
+function isConnectionRefused(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const code = (current as { code?: unknown }).code;
+    // ECONNREFUSED is the loopback case. The rest cover a resolvable address
+    // with no route -- equally "nothing is listening here".
+    if (code === "ECONNREFUSED" || code === "EHOSTUNREACH" || code === "ENETUNREACH" || code === "EADDRNOTAVAIL") return true;
+    const aggregate = (current as { errors?: unknown }).errors;
+    if (Array.isArray(aggregate) && aggregate.some((inner) => isConnectionRefused(inner))) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 async function fetchPanelIndex(url: URL, deadlineAt: number): Promise<string> {
   const remaining = deadlineAt - Date.now();
   if (remaining <= 0) throw new PanelTemplateRelayError("The panel template relay timed out.", "TIMEOUT");
@@ -471,8 +647,12 @@ async function fetchPanelIndex(url: URL, deadlineAt: number): Promise<string> {
       redirect: "manual",
       signal: AbortSignal.timeout(remaining),
     });
-  } catch {
-    throw new PanelTemplateRelayError("The connected panel could not fetch the workflow-template index.", "PANEL_FETCH_FAILED");
+  } catch (error) {
+    const failure = new PanelTemplateRelayError("The connected panel could not fetch the workflow-template index.", "PANEL_FETCH_FAILED");
+    // Preserve the connect-level cause so a multi-address fetch can tell "no
+    // listener" from "a listener that failed" -- see fetchPinnedPanelIndex.
+    (failure as { cause?: unknown }).cause = error;
+    throw failure;
   }
   if (response.url) {
     const finalUrl = safePanelTemplateUrl(response.url, url.origin);
@@ -567,7 +747,7 @@ export async function startPanelTemplateRelayServer(
             response = failureResponse(request.requestId, "NO_PANEL_ORIGIN");
           } else {
             try {
-              const body = await withinDeadline(fetchPanelIndex(panelUrl, requestDeadline(request)), requestDeadline(request));
+              const body = await withinDeadline(fetchPinnedPanelIndex(panelUrl, requestDeadline(request)), requestDeadline(request));
               const targetNow = options.resolveCurrentTarget();
               if (targetNow.url !== targetAtStart.url || targetNow.generation !== targetAtStart.generation) {
                 throw new PanelTemplateRelayError(
