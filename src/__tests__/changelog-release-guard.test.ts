@@ -53,7 +53,7 @@ describe("#2407 half B: everything REACHABLE must be CITED", () => {
       markdown: section("### Fixed", "- something else (#801)"),
       version: "1.1.0",
       commits: [shipped, commitOf("bbb", "fix: something else (#801)")],
-      rangeCommits: [shipped],
+      rangeCommits: [shipped, commitOf("bbb", "fix: something else (#801)")],
       targetRef: "v1.1.0",
       previousRef: "v1.0.0",
       isAncestor: () => true,
@@ -144,7 +144,7 @@ describe("#2407 half B: everything REACHABLE must be CITED", () => {
         markdown: section("### Fixed", "- something else (#801)"),
         version: "1.1.0",
         commits: [scopeOnly, commitOf("bbb", "fix: something else (#801)")],
-        rangeCommits: [scopeOnly],
+        rangeCommits: [scopeOnly, commitOf("bbb", "fix: something else (#801)")],
         targetRef: "v1.1.0",
         previousRef: "v1.0.0",
       }),
@@ -161,7 +161,7 @@ describe("#2407 half B: everything REACHABLE must be CITED", () => {
       markdown: section("### Fixed", "- something else (#801)"),
       version: "1.1.0",
       commits: [aboutARelease, commitOf("bbb", "fix: something else (#801)")],
-      rangeCommits: [aboutARelease],
+      rangeCommits: [aboutARelease, commitOf("bbb", "fix: something else (#801)")],
       targetRef: "v1.1.0",
       previousRef: "v1.0.0",
     });
@@ -180,7 +180,7 @@ describe("#2407 half B: everything REACHABLE must be CITED", () => {
       markdown: section("### Fixed", "- something else (#801)"),
       version: "1.1.0",
       commits: [merge, commitOf("bbb", "fix: something else (#801)")],
-      rangeCommits: [merge],
+      rangeCommits: [merge, commitOf("bbb", "fix: something else (#801)")],
       targetRef: "v1.1.0",
       previousRef: "v1.0.0",
     });
@@ -315,7 +315,9 @@ describe("#2407 half A: everything CITED must be REACHABLE", () => {
       markdown: section("### Fixed", "- one entry, a bogus first citation (#999, #901)"),
       version: "1.1.0",
       commits: [commitOf("aaa", "fix: the real change (#901)")],
-      rangeCommits: [],
+      // null, not []: this exercises reachability only. An EMPTY range is a
+      // different claim — a release that shipped nothing may cite nothing.
+      rangeCommits: null,
       targetRef: "v1.1.0",
       previousRef: "v1.0.0",
     });
@@ -336,7 +338,7 @@ describe("#2407 half A: everything CITED must be REACHABLE", () => {
         commitOf("aaa", "fix: the first half (#2382)"),
         commitOf("bbb", "fix: the second half (#2387)"),
       ],
-      rangeCommits: [],
+      rangeCommits: null,
       targetRef: "v1.1.0",
       previousRef: "v1.0.0",
       isAncestor: (sha: string) => sha !== "bbb",
@@ -387,6 +389,43 @@ describe("#2407 half A: everything CITED must be REACHABLE", () => {
     });
     expect(violations.some((v) => v.includes('repeats the heading "Fixed"'))).toBe(true);
     expect(violations.some((v) => v.includes("names PR"))).toBe(false);
+  });
+
+  it("REACHABLE is not SHIPPED HERE — an older PR cannot be re-credited", () => {
+    // Review round 4, and a real one: every earlier release is reachable from this
+    // tag, so ancestry alone accepts a section crediting itself with work that
+    // landed two releases ago. That is the 0.52.134 mistake. [0.52.133] credits
+    // itself with #2196, whose commit is not in v0.52.132..v0.52.133 at all — its
+    // actual work was #2376, which the coverage half separately reports as missing.
+    const older = commitOf("old", "fix: shipped two releases ago (#2196)");
+    const current = commitOf("new", "fix: this release's real work (#2376)");
+    const violations = auditReleaseSection({
+      markdown: section("### Fixed", "- authorize panel template relays (#2196)"),
+      version: "1.1.0",
+      commits: [older, current],
+      rangeCommits: [current],
+      targetRef: "v1.1.0",
+      previousRef: "v1.0.0",
+      isAncestor: () => true,
+    });
+    expect(violations.some((v) => v.includes("not in v1.0.0..v1.1.0"))).toBe(true);
+  });
+
+  it("but makes no such claim when the range is unknown", () => {
+    // Without a range there is nothing to be outside of, and guessing would fail
+    // correct releases — the direction that blocks a good publish.
+    const older = commitOf("old", "fix: shipped two releases ago (#2196)");
+    expect(
+      auditReleaseSection({
+        markdown: section("### Fixed", "- authorize panel template relays (#2196)"),
+        version: "1.1.0",
+        commits: [older],
+        rangeCommits: null,
+        targetRef: "v1.1.0",
+        previousRef: null,
+        isAncestor: () => true,
+      }),
+    ).toEqual([]);
   });
 
   it("reports an entry naming a number no commit carries", () => {
@@ -677,6 +716,23 @@ describe("#2407 end to end: the guard blocks the cut that shipped 0.52.138", () 
     } finally {
       rmSync(shallow, { recursive: true, force: true });
     }
+  });
+
+  it("FAILS a release with no section at all, instead of auditing its predecessor", () => {
+    // Review round 4. Defaulting to the newest SECTION meant a cut that wrote no
+    // notes was audited as the previous version — and passed, because the previous
+    // version is fine. The one release with no notes whatsoever is precisely the
+    // one that must fail. package.json is what is being released.
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "x", version: "1.1.0" }));
+    commit("fix(900): a change with nowhere to be listed (#901)");
+    commit("chore: release v1.1.0 (#903)");
+    git("tag", "v1.1.0");
+
+    const result = runGuard();
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("has no [1.1.0] release section");
+    // The predecessor must NOT be what got audited and waved through.
+    expect(result.stdout).not.toContain("[1.0.0]");
   });
 
   it("FAILS when git breaks inside a repository, rather than reporting a pass", () => {

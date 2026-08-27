@@ -250,6 +250,7 @@ export function auditReleaseSection({
       byRef.get(ref).push(commit);
     }
   }
+  const shippedHere = rangeCommits && new Set(rangeCommits.map((commit) => commit.sha));
   for (const item of historyComplete ? entries : []) {
     // EVERY parenthesised citation, not only the trailing one. `(#2382, #2387)`
     // names two shipped changes, and checking just the last let an unreachable
@@ -274,6 +275,18 @@ export function auditReleaseSection({
         violations.push(
           `[${normalizedVersion}] entry at line ${line} names PR #${pr}, but no commit carrying it ` +
             `is an ancestor of ${targetRef} — it did not ship in this release.`,
+        );
+        continue;
+      }
+      // Reachable is not the same as SHIPPED HERE. Every earlier release is
+      // reachable from this tag, so an entry crediting this version with a change
+      // that landed two releases ago passes the ancestry test — which is the
+      // 0.52.134 mistake exactly. [0.52.133] credits itself with #2196, whose
+      // commit is not in v0.52.132..v0.52.133 at all; its real work was #2376.
+      if (shippedHere && !candidates.some((candidate) => shippedHere.has(candidate.sha))) {
+        violations.push(
+          `[${normalizedVersion}] entry at line ${line} names PR #${pr}, but the commit carrying ` +
+            `it is not in ${previousRef}..${targetRef} — it shipped in an earlier release.`,
         );
       }
     }
@@ -386,9 +399,30 @@ export function main(argv) {
       return 2;
     }
   } else {
-    // The newest released section — the one a cut just wrote, or is about to.
+    // What is BEING RELEASED, not whichever section happens to be newest.
+    //
+    // Taking the newest section meant a cut that wrote no section at all was
+    // audited as its PREDECESSOR — and passed, because the predecessor is fine.
+    // The one release with no notes whatsoever is exactly the one that must fail.
+    // package.json is the authority: `npm version` bumps it and gen-changelog
+    // stamps the matching section, so the two agree on every healthy release, and
+    // a missing section becomes "has no [X] release section" instead of silence.
+    //
+    // With --ref the working tree's package.json describes a different commit, so
+    // the tag name is the authority there instead.
+    const fromRef = explicitRef && /^v?\d+\.\d+\.\d+/.test(explicitRef) ? explicitRef : null;
+    let fromPackage = null;
+    if (!fromRef) {
+      try {
+        fromPackage = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).version;
+      } catch {
+        fromPackage = null;
+      }
+    }
     version = releaseVersion(
-      parseReleaseSections(markdown).find((item) => isStrictSemver(item.version))?.version,
+      fromRef ??
+        fromPackage ??
+        parseReleaseSections(markdown).find((item) => isStrictSemver(item.version))?.version,
     );
   }
   if (!version) {
