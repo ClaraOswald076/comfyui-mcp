@@ -6,6 +6,22 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.139] - 2026-08-26
+
+### MCP
+
+#### Fixed
+- fence the definitive-non-subgraph exit, via one shared check (#2410)
+- verify bare workflow aliases before reporting a successful open (#1639), via PR #2408
+- preserve and consume a proven legacy rebind exactly once (#971)
+- fence promoted ordinary fast path after scope probe (#2405)
+- definitive non-subgraph read must tolerate a parenthesised node type (#2402)
+
+#### Changed
+- 0.52.138 ships #2400 but does not list it (#2406)
+- panel_show_media says staging needs a LOCAL ComfyUI (#2404)
+
+
 ## [0.52.138] - 2026-08-26
 
 ### MCP
