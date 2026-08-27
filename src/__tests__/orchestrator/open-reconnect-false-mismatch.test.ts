@@ -101,10 +101,19 @@ function emptyGraph() {
   return { nodes: [] as unknown[], links: [] as unknown[] };
 }
 
-function listReply(opts: { confirmed: boolean; uuid: string; path?: string }) {
+function listReply(opts: {
+  confirmed: boolean;
+  uuid: string;
+  path?: string;
+  omitActiveConfirmed?: boolean;
+}) {
   const path = opts.path ?? PATH;
   const active = { path, routing_key: `wf:${path}`, workflow_uuid: opts.uuid };
-  return { active, workflows: [{ ...active, active: true }], active_confirmed: opts.confirmed };
+  return {
+    active,
+    workflows: [{ ...active, active: true }],
+    ...(opts.omitActiveConfirmed ? {} : { active_confirmed: opts.confirmed }),
+  };
 }
 
 type GraphQuery = "answers" | "mismatch";
@@ -112,12 +121,15 @@ type GraphQuery = "answers" | "mismatch";
 function bridge(opts: {
   stamp: string;
   graphQuery: GraphQuery;
+  openResult?: "error" | "success";
   /** First N workflow_list replies are unconfirmed; then confirmed. */
   unconfirmedLists?: number;
   /** First N graph_serialize replies are the empty settling snapshot. */
   emptySerializes?: number;
   listPath?: string;
   listUuid?: string;
+  omitOpenedPath?: boolean;
+  omitActiveConfirmed?: boolean;
 }) {
   const calls: string[] = [];
   let stamp: string | undefined = opts.stamp;
@@ -136,9 +148,21 @@ function bridge(opts: {
           confirmed: listCalls > unconfirmedLists,
           uuid: listUuid,
           path: listPath,
+          omitActiveConfirmed: opts.omitActiveConfirmed,
         });
       }
-      if (cmd.cmd === "workflow_open") throw new Error(IDENTITY_PROVEN);
+      if (cmd.cmd === "workflow_open") {
+        if (opts.openResult === "success") {
+          return {
+            opened: opts.omitOpenedPath
+              ? { filename: "v3.json" }
+              : { path: PATH, filename: "v3.json" },
+            routing_key: TAB,
+            workflow_uuid: LIVE,
+          };
+        }
+        throw new Error(IDENTITY_PROVEN);
+      }
       if (cmd.cmd === "graph_query") {
         if (opts.graphQuery === "mismatch") {
           throw new Error(
@@ -186,12 +210,12 @@ afterEach(() => {
   qm.state.runningPromptId = null;
 });
 
-async function openWorkflow(opts: Parameters<typeof bridge>[0]) {
+async function openWorkflow(opts: Parameters<typeof bridge>[0], requestedPath = PATH) {
   const { b, calls, stampOf } = bridge(opts);
   const ctx = makePanelToolCtx(b, TAB, new WorkflowTargetStore());
   const def = buildPanelToolDefs().find((d) => d.name === "panel_open_workflow");
   if (!def) throw new Error("panel_open_workflow is not registered");
-  const res: ToolResult = await def.handler({ path: PATH } as never, ctx);
+  const res: ToolResult = await def.handler({ path: requestedPath } as never, ctx);
   return {
     text: res.content.map((c) => (c as { text?: string }).text ?? "").join(" "),
     isError: res.isError === true,
@@ -268,5 +292,102 @@ describe("panel_open_workflow does not false-mismatch the already-active canvas 
     expect(text).toMatch(/PREVIOUS workflow/);
     expect(text).toMatch(/expected routing wf:workflows\/v3\.json/);
     expect(text).toMatch(/observed routing wf:workflows\/v3\.json/);
+  });
+
+  it("a bare filename never reports active/bound success without a live active re-read (#1639)", async () => {
+    const { text, isError, calls, stamp } = await openWorkflow(
+      {
+        stamp: PRIOR,
+        graphQuery: "answers",
+        openResult: "success",
+        listPath: "workflows/previous.json",
+        listUuid: PRIOR,
+      },
+      "v3.json",
+    );
+
+    expect(isError).toBe(true);
+    expect(calls).toContain("workflow_list");
+    expect(stamp).toBe(PRIOR);
+    expect(text).toMatch(/ACTIVE workflow now/i);
+    expect(text).toMatch(/previous\.json/);
+    expect(text).not.toMatch(/Opened/);
+  });
+
+  it("a bare filename succeeds only after the resolved path is confirmed active (#1639)", async () => {
+    const { text, isError, calls, stamp } = await openWorkflow(
+      {
+        stamp: PRIOR,
+        graphQuery: "answers",
+        openResult: "success",
+        listPath: PATH,
+        listUuid: LIVE,
+      },
+      "v3.json",
+    );
+
+    expect(isError).toBe(false);
+    expect(calls).toContain("workflow_list");
+    expect(stamp).toBe(PRIOR);
+    expect(text).toMatch(/workflows\/v3\.json/);
+  });
+
+  it("a bare filename fails closed when the resolved active identity is unconfirmed (#1639)", async () => {
+    const { text, isError, calls, stamp } = await openWorkflow(
+      {
+        stamp: PRIOR,
+        graphQuery: "answers",
+        openResult: "success",
+        unconfirmedLists: 1,
+        listPath: PATH,
+        listUuid: LIVE,
+      },
+      "v3.json",
+    );
+
+    expect(isError).toBe(true);
+    expect(calls).toContain("workflow_list");
+    expect(stamp).toBe(PRIOR);
+    expect(text).toMatch(/active canvas is UNKNOWN/i);
+    expect(text).not.toMatch(/Opened/);
+  });
+
+  it("a bare filename fails closed when the open reply omits its resolved path (#1639)", async () => {
+    const { text, isError, calls, stamp } = await openWorkflow(
+      {
+        stamp: PRIOR,
+        graphQuery: "answers",
+        openResult: "success",
+        omitOpenedPath: true,
+      },
+      "v3.json",
+    );
+
+    expect(isError).toBe(true);
+    expect(calls).not.toContain("workflow_list");
+    expect(stamp).toBe(PRIOR);
+    expect(text).toMatch(/active canvas is UNKNOWN/i);
+    expect(text).toMatch(/resolved path/i);
+    expect(text).not.toMatch(/Opened/);
+  });
+
+  it("a bare filename fails closed when active_confirmed is omitted (#1639)", async () => {
+    const { text, isError, calls, stamp } = await openWorkflow(
+      {
+        stamp: PRIOR,
+        graphQuery: "answers",
+        openResult: "success",
+        omitActiveConfirmed: true,
+        listPath: PATH,
+        listUuid: LIVE,
+      },
+      "v3.json",
+    );
+
+    expect(isError).toBe(true);
+    expect(calls).toContain("workflow_list");
+    expect(stamp).toBe(PRIOR);
+    expect(text).toMatch(/active canvas is UNKNOWN/i);
+    expect(text).not.toMatch(/Opened/);
   });
 });

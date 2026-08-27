@@ -32,7 +32,11 @@ import type { PanelToolCtx, ToolResult } from "../../orchestrator/panel-tools.js
 const textOf = (res: ToolResult): string =>
   res.content.map((c) => (c as { text?: string }).text ?? "").join(" ");
 
-function reconnectingBridge(initial: string[] = []) {
+function reconnectingBridge(
+  initial: string[] = [],
+  activePath = "demo.json",
+  resolveActiveTabId?: () => string,
+) {
   const live = new Set(initial);
   const headless = new Set<string>();
   const sent: Array<{ cmd: Record<string, unknown>; tabId?: string }> = [];
@@ -45,7 +49,15 @@ function reconnectingBridge(initial: string[] = []) {
       }
       sent.push({ cmd, tabId: id });
       if (cmd.cmd === "workflow_list") {
-        return { workflows: [...live].map((t) => ({ key: t, active: true })), active: { key: id } };
+        const active = { path: activePath, routing_key: `wf:${activePath}` };
+        return {
+          workflows: [...live].map((t) =>
+            t === id
+              ? { ...active, active: true }
+              : { path: `${t}.json`, routing_key: `wf:${t}.json`, active: false },
+          ),
+          active,
+        };
       }
       return { ok: true, routedTo: id };
     },
@@ -53,11 +65,12 @@ function reconnectingBridge(initial: string[] = []) {
     canReach: (id: string) => live.has(id),
     isHeadless: (id: string) => headless.has(id),
     tabs: () => [...live].map((t) => ({ tab_id: t, title: t, connected_at: 0 })),
-    resolveActiveTabId: () => {
-      if (live.size === 1) return [...live][0];
-      if (live.size === 0) throw new Error("Panel not reachable: no panel connected");
-      throw new Error("Multiple panel tabs are connected and none is last active — pass tab_id.");
-    },
+    resolveActiveTabId:
+      resolveActiveTabId ?? (() => {
+        if (live.size === 1) return [...live][0];
+        if (live.size === 0) throw new Error("Panel not reachable: no panel connected");
+        throw new Error("Multiple panel tabs are connected and none is last active — pass tab_id.");
+      }),
   } as unknown as PanelToolCtx["bridge"];
   return { bridge, live, headless, sent };
 }
@@ -71,8 +84,7 @@ afterEach(() => {
 });
 
 it("#971 the last-active case works — this is the path the design documents", async () => {
-  const { bridge } = reconnectingBridge(["tab-a", "tab-b"]);
-  (bridge as unknown as { resolveActiveTabId: () => string }).resolveActiveTabId = () => "tab-b";
+  const { bridge } = reconnectingBridge(["tab-a", "tab-b"], "demo.json", () => "tab-b");
   const ctx = makePanelToolCtx(bridge, "stale-tab", new WorkflowTargetStore());
   expect(await ctx.awaitReachable!()).toBe(false);
 
@@ -84,6 +96,43 @@ it("#971 the last-active case works — this is the path the design documents", 
 
   const open = buildPanelToolDefs().find((d) => d.name === "panel_open_workflow")!;
   expect(((await open.handler({ path: "demo.json" }, ctx)) as ToolResult).isError).toBeFalsy();
+});
+
+it("#971 consumes the proof when an unrelated bare alias is attempted", async () => {
+  const { bridge } = reconnectingBridge(["tab-a", "tab-b"], "demo.json", () => "tab-b");
+  const ctx = makePanelToolCtx(bridge, "stale-tab", new WorkflowTargetStore());
+
+  const target = buildPanelToolDefs().find((d) => d.name === "panel_set_workflow_target")!;
+  expect(((await target.handler({ mode: "current" }, ctx)) as ToolResult).isError).toBeFalsy();
+
+  const open = buildPanelToolDefs().find((d) => d.name === "panel_open_workflow")!;
+  const unrelated = (await open.handler({ path: "other.json" }, ctx)) as ToolResult;
+  expect(unrelated.isError).toBe(true);
+  expect(textOf(unrelated)).toMatch(/resolved path|UNKNOWN/i);
+
+  // The mismatched open consumed the one-shot proof before dispatching. A later
+  // alias cannot inherit it, even though the bridge still returns the legacy
+  // {ok:true,routedTo} shape.
+  const second = (await open.handler({ path: "demo.json" }, ctx)) as ToolResult;
+  expect(second.isError).toBe(true);
+  expect(textOf(second)).toMatch(/resolved path|UNKNOWN/i);
+});
+
+it("#971 consumes the proof after one successful legacy bare open", async () => {
+  const { bridge } = reconnectingBridge(["tab-a", "tab-b"]);
+  (bridge as unknown as { resolveActiveTabId: () => string }).resolveActiveTabId = () => "tab-b";
+  const ctx = makePanelToolCtx(bridge, "stale-tab", new WorkflowTargetStore());
+
+  const target = buildPanelToolDefs().find((d) => d.name === "panel_set_workflow_target")!;
+  expect(((await target.handler({ mode: "current" }, ctx)) as ToolResult).isError).toBeFalsy();
+
+  const open = buildPanelToolDefs().find((d) => d.name === "panel_open_workflow")!;
+  const first = (await open.handler({ path: "demo.json" }, ctx)) as ToolResult;
+  expect(first.isError).toBeFalsy();
+
+  const second = (await open.handler({ path: "other.json" }, ctx)) as ToolResult;
+  expect(second.isError).toBe(true);
+  expect(textOf(second)).toMatch(/resolved path|UNKNOWN/i);
 });
 
 it("#971 with NO last-active tab, the prescribed recovery is a dead end", async () => {
