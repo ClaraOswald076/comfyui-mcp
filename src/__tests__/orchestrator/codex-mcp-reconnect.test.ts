@@ -57,6 +57,7 @@ const MCP_SERVERS_WITH_UNRELATED_HTTP_UP = [
 const WORKER_TRANSPORT_FAILURE =
   "Transport send error: WorkerTransport<StreamableHttpClientWorker<...>> error: " +
   "HTTP request failed sending request to http://127.0.0.1:9198/orchestrator%3A%3Acodex";
+const MUTATION_WORKER_TRANSPORT_FAILURE = `${WORKER_TRANSPORT_FAILURE} (mutation item)`;
 // The exact wrapper reported by panel_save_workflow -> immediate panel_run on
 // the affected EventNotificationTransport path. It is an outer HTTP-MCP client
 // failure, not a panel tool result; handling it must not retry panel_run.
@@ -111,7 +112,21 @@ interface Drive {
       | "worker-transport-retry"
       | "scrubbed-transport"
       | "event-notification-transport"
-      | "unrelated-transport",
+      | "unrelated-transport"
+      | "panel-read-retry-outline-success"
+      | "panel-read-retry-query-success"
+      | "panel-read-retry-failure"
+      | "panel-read-retry-amplified"
+      | "panel-read-retry-inactive"
+      | "panel-read-retry-interleaved"
+      | "panel-read-retry-exit"
+      | "panel-read-retry-timeout"
+      | "panel-read-retry-cancelled"
+      | "panel-mutation-no-retry"
+      | "panel-mutation-before-read-no-retry"
+      | "panel-read-retry-mutation-error"
+      | "panel-unrelated-read-no-retry"
+      | "panel-read-no-enter-no-retry",
   ): Promise<void>;
   releaseInterrupt(): void;
   waitForIdle(): Promise<void>;
@@ -134,11 +149,15 @@ function startDrive(opts: {
   const turnWaiters: Array<() => void> = [];
   let waitingForTurn = false;
   let releaseInterrupt: (() => void) | null = null;
+  let resolveExit: (() => void) | null = null;
+  const exitPromise = new Promise<void>((resolve) => {
+    resolveExit = resolve;
+  });
 
   const client = {
     notificationHandler: null as ((msg: unknown) => void) | null,
     exitError: null as Error | null,
-    exitPromise: new Promise<void>(() => {}),
+    exitPromise,
     request: vi.fn(async (method: string, params?: unknown) => {
       if (method === "thread/start" || method === "thread/resume") {
         return { thread: { id: "thread-1" }, model: "gpt-5.6-sol" };
@@ -228,6 +247,121 @@ function startDrive(opts: {
       waitingForTurn = false;
       const turnId = `turn-${starts}`;
       if (
+        kind.startsWith("panel-read-retry-") ||
+        kind === "panel-mutation-no-retry" ||
+        kind === "panel-mutation-before-read-no-retry" ||
+        kind === "panel-read-retry-mutation-error" ||
+        kind === "panel-unrelated-read-no-retry" ||
+        kind === "panel-read-no-enter-no-retry"
+      ) {
+        const notify = (method: string, params: Record<string, unknown>) =>
+          client.notificationHandler?.({ method, params: { threadId: "thread-1", turnId, ...params } });
+        const enter = { type: "mcpToolCall", id: "enter-1", server: "panel", tool: "panel_enter_subgraph" };
+        if (kind !== "panel-read-no-enter-no-retry") {
+          notify("item/started", { item: enter });
+          notify("item/completed", { item: { ...enter, status: "completed" } });
+        }
+        if (kind === "panel-mutation-no-retry") {
+          const mutation = { type: "mcpToolCall", id: "mutation-1", server: "panel", tool: "panel_set_property" };
+          notify("item/started", { item: mutation });
+          notify("error", {
+            itemId: mutation.id,
+            error: { message: WORKER_TRANSPORT_FAILURE },
+            willRetry: true,
+          });
+        } else if (kind === "panel-mutation-before-read-no-retry") {
+          const mutation = { type: "mcpToolCall", id: "mutation-1", server: "panel", tool: "panel_set_property" };
+          const read = { type: "mcpToolCall", id: "read-1", server: "panel", tool: "panel_graph_outline" };
+          notify("item/started", { item: mutation });
+          notify("item/started", { item: read });
+          notify("error", {
+            itemId: read.id,
+            error: { message: WORKER_TRANSPORT_FAILURE },
+            willRetry: true,
+          });
+        } else if (kind === "panel-read-retry-mutation-error") {
+          const read = { type: "mcpToolCall", id: "read-1", server: "panel", tool: "panel_graph_outline" };
+          const mutation = { type: "mcpToolCall", id: "mutation-1", server: "panel", tool: "panel_set_property" };
+          notify("item/started", { item: read });
+          notify("item/started", { item: mutation });
+          notify("error", {
+            itemId: read.id,
+            error: { message: WORKER_TRANSPORT_FAILURE },
+            willRetry: true,
+          });
+          notify("error", {
+            itemId: mutation.id,
+            error: { message: MUTATION_WORKER_TRANSPORT_FAILURE },
+            willRetry: true,
+          });
+        } else if (kind === "panel-unrelated-read-no-retry") {
+          const unrelated = { type: "mcpToolCall", id: "unrelated-1", server: "panel", tool: "panel_view_selected" };
+          notify("item/started", { item: unrelated });
+          notify("error", {
+            itemId: unrelated.id,
+            error: { message: WORKER_TRANSPORT_FAILURE },
+            willRetry: true,
+          });
+        } else {
+          const readTool = kind === "panel-read-retry-query-success" ? "panel_query_graph" : "panel_graph_outline";
+          const read = { type: "mcpToolCall", id: "read-1", server: "panel", tool: readTool };
+          notify("item/started", { item: read });
+          if (kind === "panel-read-retry-interleaved") {
+            const mutation = { type: "mcpToolCall", id: "mutation-1", server: "panel", tool: "panel_set_property" };
+            notify("item/started", { item: mutation });
+            notify("error", {
+              itemId: read.id,
+              error: { message: WORKER_TRANSPORT_FAILURE },
+              willRetry: true,
+            });
+            // The mutation's late completion must not satisfy the read retry.
+            notify("item/completed", { item: { ...mutation, status: "completed" } });
+            notify("item/completed", { item: { ...read, status: "completed" } });
+            notify("turn/completed", { turn: { id: turnId, status: "completed" } });
+          } else {
+            if (kind === "panel-read-retry-inactive") client.exitError = new Error("app-server connection closed");
+            notify("error", {
+              itemId: read.id,
+              error: { message: WORKER_TRANSPORT_FAILURE },
+              willRetry: true,
+            });
+            if (
+              kind === "panel-read-retry-outline-success" ||
+              kind === "panel-read-retry-query-success"
+            ) {
+              notify("item/completed", { item: { ...read, status: "completed" } });
+              notify("turn/completed", { turn: { id: turnId, status: "completed" } });
+            } else if (kind === "panel-read-retry-failure") {
+              notify("error", {
+                itemId: read.id,
+                error: { message: WORKER_TRANSPORT_FAILURE + " (retry failed)" },
+                willRetry: false,
+              });
+            } else if (kind === "panel-read-retry-amplified") {
+              // A second willRetry signal must not arm a third attempt. The
+              // backend fences the still-live turn and interrupts it once.
+              notify("error", {
+                itemId: read.id,
+                error: { message: WORKER_TRANSPORT_FAILURE + " (retry failed)" },
+                willRetry: true,
+              });
+            } else if (kind === "panel-read-retry-exit") {
+              client.exitError = new Error("app-server connection closed during read retry");
+              resolveExit?.();
+            } else if (kind === "panel-read-retry-timeout") {
+              await backend.interrupt();
+            } else if (kind === "panel-read-retry-cancelled") {
+              await backend.interrupt();
+              notify("turn/completed", { turn: { id: turnId, status: "interrupted" } });
+            }
+          }
+        }
+        if (kind === "panel-read-retry-timeout") {
+          await waitFor(() => expect(events.some((event) => event.type === "result")).toBe(true));
+        } else {
+          await waitFor(() => expect(idle).toBe(true));
+        }
+      } else if (
         kind === "worker-transport" ||
         kind === "worker-transport-retry" ||
         kind === "scrubbed-transport" ||
@@ -270,7 +404,7 @@ function startDrive(opts: {
       }
       // The MCP watch runs AFTER the turn result, before the run loop waits
       // for the next channel item. Idle is the barrier that it finished.
-      await waitFor(() => expect(idle).toBe(true));
+      if (kind !== "panel-read-retry-timeout") await waitFor(() => expect(idle).toBe(true));
     },
     releaseInterrupt() {
       releaseInterrupt?.();
@@ -289,6 +423,215 @@ function startDrive(opts: {
 }
 
 describe("Codex mid-session MCP drop reconnects panel tools (#1524)", () => {
+  it("retries a live panel_graph_outline once after panel_enter_subgraph (#2395)", async () => {
+    const drive = startDrive({ listings: [PANEL_UP] });
+    await drive.endTurn("panel-read-retry-outline-success");
+
+    expect(drive.reloadCalls).toBe(0);
+    expect(drive.interruptCalls).toBe(0);
+    expect(
+      drive.events.filter(
+        (e) => e.type === "error" && !(e as { sessionNotice?: boolean }).sessionNotice,
+      ),
+    ).toHaveLength(0);
+    expect(drive.events.filter((e) => e.type === "result")).toHaveLength(1);
+
+    await drive.finish();
+  });
+
+  it("retries a live panel_query_graph once after panel_enter_subgraph (#2395)", async () => {
+    const drive = startDrive({ listings: [PANEL_UP] });
+    await drive.endTurn("panel-read-retry-query-success");
+
+    expect(drive.reloadCalls).toBe(0);
+    expect(drive.interruptCalls).toBe(0);
+    expect(drive.events.filter((e) => e.type === "result")).toHaveLength(1);
+    expect(
+      drive.events.filter(
+        (e) => e.type === "error" && !(e as { sessionNotice?: boolean }).sessionNotice,
+      ),
+    ).toHaveLength(0);
+
+    await drive.finish();
+  });
+
+  it("preserves the first read transport error when the one retry fails (#2395)", async () => {
+    const drive = startDrive({ listings: [PANEL_UP] });
+    await drive.endTurn("panel-read-retry-failure");
+
+    const failures = drive.events.filter(
+      (e): e is Extract<AgentEvent, { type: "error" }> =>
+        e.type === "error" && !(e as { sessionNotice?: boolean }).sessionNotice,
+    );
+    expect(failures).toHaveLength(1);
+    expect(failures[0].message).toContain(WORKER_TRANSPORT_FAILURE);
+    expect(failures[0].message).toMatch(/retried this read once/i);
+    expect(drive.reloadCalls).toBe(1);
+    expect(drive.interruptCalls).toBe(0);
+
+    await drive.finish();
+  });
+
+  it("does not amplify a repeated retry signal or retry when the app-server is inactive (#2395)", async () => {
+    const amplified = startDrive({ listings: [PANEL_UP] });
+    await amplified.endTurn("panel-read-retry-amplified");
+    expect(amplified.interruptCalls).toBe(1);
+    expect(amplified.reloadCalls).toBe(1);
+    expect(amplified.events.filter((e) => e.type === "result")).toHaveLength(1);
+    expect(
+      amplified.events.filter(
+        (e) => e.type === "error" && !(e as { sessionNotice?: boolean }).sessionNotice,
+      ),
+    ).toHaveLength(1);
+    await amplified.finish();
+
+    const inactive = startDrive({ listings: [PANEL_UP] });
+    await inactive.endTurn("panel-read-retry-inactive");
+    expect(inactive.interruptCalls).toBe(1);
+    expect(inactive.reloadCalls).toBe(1);
+    expect(inactive.events.filter((e) => e.type === "result")).toHaveLength(1);
+    await inactive.finish();
+  });
+
+  it("correlates a read retry across parallel and late panel items (#2395)", async () => {
+    const drive = startDrive({ listings: [PANEL_UP] });
+    await drive.endTurn("panel-read-retry-interleaved");
+
+    expect(drive.reloadCalls).toBe(0);
+    expect(drive.interruptCalls).toBe(0);
+    expect(drive.events.filter((e) => e.type === "result")).toHaveLength(1);
+    expect(
+      drive.events.filter(
+        (e) => e.type === "error" && !(e as { sessionNotice?: boolean }).sessionNotice,
+      ),
+    ).toHaveLength(0);
+
+    await drive.finish();
+  });
+
+  it("preserves the original read transport error when the app-server exits during retry (#2395)", async () => {
+    const drive = startDrive({ listings: [PANEL_UP] });
+    await drive.endTurn("panel-read-retry-exit");
+
+    const failures = drive.events.filter(
+      (e): e is Extract<AgentEvent, { type: "error" }> =>
+        e.type === "error" && !(e as { sessionNotice?: boolean }).sessionNotice,
+    );
+    expect(failures).toHaveLength(1);
+    expect(failures[0].message).toContain(WORKER_TRANSPORT_FAILURE);
+    expect(failures[0].message).toMatch(/retried this read once/i);
+    expect(failures[0].message).not.toMatch(/app-server connection closed during read retry/i);
+    expect(drive.reloadCalls).toBe(1);
+    expect(drive.interruptCalls).toBe(0);
+
+    await drive.finish();
+  });
+
+  it("keeps cancellation semantics while a panel read retry is pending (#2395)", async () => {
+    const drive = startDrive({ listings: [PANEL_UP] });
+    await drive.endTurn("panel-read-retry-cancelled");
+
+    expect(drive.interruptCalls).toBe(1);
+    expect(drive.events.filter((e) => e.type === "result")).toContainEqual(
+      expect.objectContaining({ type: "result", ok: false, subtype: "interrupted" }),
+    );
+    expect(
+      drive.events.filter(
+        (e) => e.type === "error" && !(e as { sessionNotice?: boolean }).sessionNotice,
+      ),
+    ).toHaveLength(0);
+
+    await drive.finish();
+  });
+
+  it("keeps timeout cancellation semantics while a panel read retry is pending (#2395)", async () => {
+    const drive = startDrive({ listings: [PANEL_UP], holdInterrupt: true });
+    await drive.endTurn("panel-read-retry-timeout");
+
+    expect(drive.interruptCalls).toBe(1);
+    expect(drive.events.filter((e) => e.type === "result")).toContainEqual(
+      expect.objectContaining({ type: "result", ok: true, subtype: "interrupted" }),
+    );
+    expect(
+      drive.events.filter(
+        (e) => e.type === "error" && !(e as { sessionNotice?: boolean }).sessionNotice,
+      ),
+    ).toHaveLength(0);
+
+    await drive.finish();
+  });
+
+  it("does not retry a mutating panel tool after a transport failure (#2395)", async () => {
+    const drive = startDrive({ listings: [PANEL_UP] });
+    await drive.endTurn("panel-mutation-no-retry");
+
+    expect(drive.interruptCalls).toBe(1);
+    expect(drive.reloadCalls).toBe(1);
+    expect(drive.events.filter((e) => e.type === "result")).toHaveLength(1);
+    expect(
+      drive.events.filter(
+        (e) => e.type === "error" && !(e as { sessionNotice?: boolean }).sessionNotice,
+      ),
+    ).toHaveLength(1);
+
+    await drive.finish();
+  });
+
+  it("invalidates the enter lifecycle when a mutation starts before the read (#2395)", async () => {
+    const drive = startDrive({ listings: [PANEL_UP] });
+    await drive.endTurn("panel-mutation-before-read-no-retry");
+
+    const failures = drive.events.filter(
+      (e): e is Extract<AgentEvent, { type: "error" }> =>
+        e.type === "error" && !(e as { sessionNotice?: boolean }).sessionNotice,
+    );
+    expect(failures).toHaveLength(1);
+    expect(failures[0].message).toMatch(/did not retry the request/i);
+    expect(failures[0].message).not.toMatch(/retried this read once/i);
+    expect(drive.interruptCalls).toBe(1);
+    expect(drive.reloadCalls).toBe(1);
+    expect(drive.events.filter((e) => e.type === "result")).toHaveLength(1);
+    await drive.finish();
+  });
+
+  it("isolates a distinct mutation transport error from an armed read retry (#2395)", async () => {
+    const drive = startDrive({ listings: [PANEL_UP] });
+    await drive.endTurn("panel-read-retry-mutation-error");
+
+    const failures = drive.events.filter(
+      (e): e is Extract<AgentEvent, { type: "error" }> =>
+        e.type === "error" && !(e as { sessionNotice?: boolean }).sessionNotice,
+    );
+    expect(failures).toHaveLength(1);
+    expect(failures[0].message).toContain(WORKER_TRANSPORT_FAILURE);
+    expect(failures[0].message).toContain(MUTATION_WORKER_TRANSPORT_FAILURE);
+    expect(failures[0].message).toMatch(/did not retry the request/i);
+    expect(failures[0].message).not.toMatch(/retried this read once/i);
+    expect(drive.interruptCalls).toBe(1);
+    expect(drive.reloadCalls).toBe(1);
+    await drive.finish();
+  });
+
+  it("does not retry an unrelated panel read after panel_enter_subgraph (#2395)", async () => {
+    const drive = startDrive({ listings: [PANEL_UP] });
+    await drive.endTurn("panel-unrelated-read-no-retry");
+
+    expect(drive.interruptCalls).toBe(1);
+    expect(drive.reloadCalls).toBe(1);
+    expect(drive.events.filter((e) => e.type === "result")).toHaveLength(1);
+    await drive.finish();
+  });
+
+  it("does not retry an allowlisted read outside the panel_enter_subgraph lifecycle (#2395)", async () => {
+    const drive = startDrive({ listings: [PANEL_UP] });
+    await drive.endTurn("panel-read-no-enter-no-retry");
+
+    expect(drive.interruptCalls).toBe(1);
+    expect(drive.reloadCalls).toBe(1);
+    expect(drive.events.filter((e) => e.type === "result")).toHaveLength(1);
+    await drive.finish();
+  });
+
   it("a WorkerTransport send failure forces one panel reload without retrying the turn (#1777)", async () => {
     // Codex can report the HTTP send failure while its status inventory still
     // says `panel` is connected. The observed error is the recovery trigger;

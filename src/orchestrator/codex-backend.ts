@@ -114,10 +114,13 @@ export function isCodexPanelMcpTransportFailure(message: string, panelUrl: strin
 /** Keep a WorkerTransport failure self-contained: PanelAgent's generic turn
  * failure text says "Nothing was lost — try again", which is unsafe when a
  * mutation's dispatch/outcome was not established at this boundary. */
-function panelMcpTransportFailureNotice(message: string): string {
+function panelMcpTransportFailureNotice(message: string, retriedRead: boolean): string {
+  const retryNote = retriedRead
+    ? `The orchestrator retried this read once, but that retry also failed; the original transport error is preserved.`
+    : `The orchestrator did not retry the request.`;
   return (
     `The local panel MCP connection failed before a tool result was returned. ` +
-    `The orchestrator did not retry the request. For a render or other mutation, ` +
+    `${retryNote} For a render or other mutation, ` +
     `treat the first attempt's outcome as UNKNOWN until you inspect queue ` +
     `(action:"list") or get_history; do not re-run panel_run blindly. The panel MCP ` +
     `connection is being reloaded for the next turn. If it remains unavailable, ` +
@@ -617,6 +620,80 @@ export function toolNameOf(item: Record<string, unknown> | undefined): string | 
   // No explicit name field — use the item type as the label (commandExecution,
   // fileChange, webSearch, …) so the panel at least shows that a tool ran.
   return type ?? null;
+}
+
+// A failed HTTP MCP send is observed outside panel-mcp-http.ts, so the backend
+// has to classify the in-flight app-server item before deciding whether the
+// transport may issue its one retry. Keep this allowlist intentionally narrower
+// than the panel tool catalog: scope navigation and every mutation must never
+// be replayed from an opaque outer transport error.
+const PANEL_OUTER_TRANSPORT_RETRY_SAFE_TOOLS = new Set([
+  "panel_graph_outline",
+  "panel_query_graph",
+]);
+
+type PanelMcpToolItem = {
+  name: string;
+  itemId: string;
+  requestKeys: readonly string[];
+  retryOf?: string;
+};
+
+function stringFieldOf(value: Record<string, unknown> | undefined, ...keys: string[]): string | undefined {
+  if (!value) return undefined;
+  for (const key of keys) {
+    if (typeof value[key] === "string" && value[key]) return value[key] as string;
+  }
+  return undefined;
+}
+
+function isMcpToolCallItem(item: Record<string, unknown> | undefined): boolean {
+  return stringFieldOf(item, "type") === "mcpToolCall";
+}
+
+function panelMcpToolItemOf(item: Record<string, unknown> | undefined): PanelMcpToolItem | null {
+  const qualified = toolNameOf(item);
+  if (!qualified) return null;
+  const type = stringFieldOf(item, "type");
+  if (type && type !== "mcpToolCall") return null;
+  const separator = qualified.lastIndexOf(".");
+  const server = separator >= 0 ? qualified.slice(0, separator) : undefined;
+  const name = separator >= 0 ? qualified.slice(separator + 1) : qualified;
+  // If app-server identifies the MCP server, require the configured panel
+  // server. An item id is required for transport correlation; the display path
+  // above still supports older items that only have a tool name.
+  if (server && server !== "panel") return null;
+  const itemId = stringFieldOf(item, "id");
+  if (!itemId) return null;
+  const requestKeys = new Set<string>([itemId]);
+  for (const key of ["requestId", "request_id", "callId", "call_id"]) {
+    const value = stringFieldOf(item, key);
+    if (value) requestKeys.add(value);
+  }
+  const retryOf = stringFieldOf(item, "retryOf", "retry_of", "parentItemId", "parent_item_id");
+  if (retryOf) requestKeys.add(retryOf);
+  return {
+    name,
+    itemId,
+    requestKeys: [...requestKeys],
+    ...(retryOf ? { retryOf } : {}),
+  };
+}
+
+function panelMcpTransportErrorKeys(params: Record<string, unknown>): string[] {
+  const error = params.error as Record<string, unknown> | undefined;
+  const details = error?.additionalDetails as Record<string, unknown> | undefined;
+  const item = params.item as Record<string, unknown> | undefined;
+  const keys = new Set<string>();
+  for (const value of [
+    stringFieldOf(params, "itemId", "item_id", "requestId", "request_id", "callId", "call_id"),
+    stringFieldOf(item, "id", "requestId", "request_id", "callId", "call_id"),
+    stringFieldOf(error, "itemId", "item_id", "requestId", "request_id", "callId", "call_id"),
+    stringFieldOf(details, "itemId", "item_id", "requestId", "request_id", "callId", "call_id"),
+  ]) {
+    if (value) keys.add(value);
+  }
+  return [...keys];
 }
 
 /** A declared MCP server for the Codex app-server. Either a stdio command (the
@@ -1647,6 +1724,30 @@ export class CodexBackend implements AgentBackend {
     // the original panel mutation is still being retried.
     let mcpTransportFencePending = false;
     let turnFenced = false;
+    type PanelMcpRequest = PanelMcpToolItem & {
+      afterEnterItemId: string | null;
+      completed: boolean;
+    };
+    type PanelReadRetry = {
+      originalMessage: string;
+      tool: string;
+      itemIds: Set<string>;
+      requestKeys: Set<string>;
+    };
+    const panelMcpRequests = new Map<string, PanelMcpRequest>();
+    const panelRequestKeyToItem = new Map<string, string>();
+    const panelReadRetries = new Map<string, PanelReadRetry>();
+    const inFlightMcpItemIds = new Set<string>();
+    let unkeyedMcpItems = 0;
+    let panelEnterCandidate: { itemId: string; laterPanelRequestStarted: boolean } | null = null;
+    let immediatePanelReadAfterEnter: string | null = null;
+
+    // Retry contract: only the next panel request after a successful
+    // panel_enter_subgraph completion can be an eligible graph read. The
+    // one-shot sequence is consumed at request start; a mutation or unrelated
+    // panel request therefore invalidates it before a later read can qualify.
+    // Correlation must resolve the transport error to that request; ambiguity
+    // is fail-closed. Mutations and unrelated reads use normal fencing.
 
     // LIVENESS (watchdog re-arm): re-arm PanelAgent's idle watchdog ONLY for
     // notifications that represent work or an outcome for THIS active turn. A
@@ -1711,6 +1812,85 @@ export class CodexBackend implements AgentBackend {
       }
     };
 
+    // `willRetry:true` is the app-server's positive signal that it still owns
+    // the active connection and can retry the failed MCP send. Keep the local
+    // state checks as well: cancellation, timeout teardown, client replacement,
+    // and disposal must not wake a retry after the turn has stopped being live.
+    const appServerConnectionIsActive = (): boolean =>
+      !interrupted &&
+      !finishedResult &&
+      !turnFenced &&
+      !this.disposed &&
+      this.client === liveClient &&
+      liveClient.exitError == null;
+
+    const trackPanelMcpItem = (
+      item: PanelMcpToolItem,
+      afterEnterItemId: string | null,
+    ): PanelMcpRequest => {
+      const existing = panelMcpRequests.get(item.itemId);
+      if (existing) {
+        for (const key of item.requestKeys) {
+          existing.requestKeys = [...new Set([...existing.requestKeys, key])];
+          panelRequestKeyToItem.set(key, item.itemId);
+        }
+        return existing;
+      }
+      const request: PanelMcpRequest = {
+        ...item,
+        afterEnterItemId,
+        completed: false,
+      };
+      panelMcpRequests.set(item.itemId, request);
+      for (const key of item.requestKeys) panelRequestKeyToItem.set(key, item.itemId);
+      return request;
+    };
+
+    const panelMcpRequestForTransportError = (
+      params: Record<string, unknown>,
+    ): PanelMcpRequest | null => {
+      const keys = panelMcpTransportErrorKeys(params);
+      if (keys.length > 0) {
+        const itemIds = new Set<string>();
+        let unknownKey = false;
+        for (const key of keys) {
+          const itemId = panelRequestKeyToItem.get(key) ?? (panelMcpRequests.has(key) ? key : undefined);
+          if (itemId) itemIds.add(itemId);
+          else unknownKey = true;
+        }
+        // An unknown explicit key must never fall back to a different request.
+        if (unknownKey || itemIds.size !== 1) return null;
+        const request = panelMcpRequests.get([...itemIds][0]);
+        return request && !request.completed ? request : null;
+      }
+
+      // Older app-server errors omit itemId. A sole in-flight MCP request is
+      // still unambiguous; any parallel or unkeyed MCP item makes it ineligible.
+      if (unkeyedMcpItems > 0 || inFlightMcpItemIds.size !== 1) return null;
+      const inFlight = [...panelMcpRequests.values()].filter((request) => !request.completed);
+      if (inFlight.length !== 1) return null;
+      const [itemId] = inFlightMcpItemIds;
+      return inFlight[0].itemId === itemId ? inFlight[0] : null;
+    };
+
+    const panelReadRetryForRequest = (
+      request: PanelMcpRequest | null,
+    ): { originItemId: string; retry: PanelReadRetry } | null => {
+      if (!request) return null;
+      for (const [originItemId, retry] of panelReadRetries) {
+        if (
+          retry.itemIds.has(request.itemId) ||
+          request.requestKeys.some((key) => retry.requestKeys.has(key))
+        ) {
+          return { originItemId, retry };
+        }
+      }
+      return null;
+    };
+
+    const firstPanelReadRetry = (): PanelReadRetry | undefined =>
+      panelReadRetries.values().next().value as PanelReadRetry | undefined;
+
     const abortActiveTurn = () => {
       interrupted = true;
       if (finishedResult) return;
@@ -1734,6 +1914,14 @@ export class CodexBackend implements AgentBackend {
         if (watched !== liveClient) return;
         // Closing the old app-server is the point of a stale-host recycle;
         // its exit must not finish the replacement turn (#2045).
+        const retry = firstPanelReadRetry();
+        if (retry) {
+          panelReadRetries.clear();
+          emitTerminalError(panelMcpTransportFailureNotice(retry.originalMessage, true), {
+            outcomeUnknown: true,
+          });
+          return;
+        }
         if (hostRecycleInFlight) return;
         emitTerminalError(
           watched.exitError ? msgOf(watched.exitError) : "codex app-server connection closed.",
@@ -1750,14 +1938,18 @@ export class CodexBackend implements AgentBackend {
       await this.beginClientClose(fencedClient, "panel MCP transport recovery fence teardown failed");
     };
 
-    const finishMcpTransportFailure = (message: string, willRetry: boolean): void => {
+    const finishMcpTransportFailure = (
+      message: string,
+      willRetry: boolean,
+      retriedRead = false,
+    ): void => {
       if (mcpTransportFencePending || finishedResult) return;
       mcpTransportFencePending = true;
 
       // willRetry:false is already terminal at the app-server boundary. Keep
       // the existing bounded recovery path and its single local error/result.
       if (!willRetry) {
-        emitTerminalError(panelMcpTransportFailureNotice(message), { outcomeUnknown: true });
+        emitTerminalError(panelMcpTransportFailureNotice(message, retriedRead), { outcomeUnknown: true });
         return;
       }
 
@@ -1800,7 +1992,9 @@ export class CodexBackend implements AgentBackend {
         const fenceNote = interruptError
           ? " The active app-server turn could not be interrupted; its connection was closed before recovery."
           : " The active app-server turn was interrupted before recovery.";
-        emitTerminalError(panelMcpTransportFailureNotice(message) + fenceNote, { outcomeUnknown: true });
+        emitTerminalError(panelMcpTransportFailureNotice(message, retriedRead) + fenceNote, {
+          outcomeUnknown: true,
+        });
       })();
     };
 
@@ -1942,6 +2136,40 @@ export class CodexBackend implements AgentBackend {
           // reasoning items aren't "tools" — they're handled by the delta/commit
           // paths above — so skip them here.
           const item = params.item as Record<string, unknown> | undefined;
+          if (isMcpToolCallItem(item)) {
+            const itemId = stringFieldOf(item, "id");
+            if (itemId) inFlightMcpItemIds.add(itemId);
+            else unkeyedMcpItems += 1;
+          }
+          const panelTool = panelMcpToolItemOf(item);
+          if (panelTool) {
+            const isNewPanelRequest = !panelMcpRequests.has(panelTool.itemId);
+            let afterEnterItemId: string | null = null;
+            if (isNewPanelRequest) {
+              if (panelTool.name === "panel_enter_subgraph") {
+                immediatePanelReadAfterEnter = null;
+                panelEnterCandidate = { itemId: panelTool.itemId, laterPanelRequestStarted: false };
+              } else {
+                if (panelEnterCandidate) panelEnterCandidate.laterPanelRequestStarted = true;
+                if (immediatePanelReadAfterEnter && PANEL_OUTER_TRANSPORT_RETRY_SAFE_TOOLS.has(panelTool.name)) {
+                  afterEnterItemId = immediatePanelReadAfterEnter;
+                }
+                immediatePanelReadAfterEnter = null;
+              }
+            }
+            const request = trackPanelMcpItem(panelTool, afterEnterItemId);
+            for (const [originItemId, retry] of panelReadRetries) {
+              if (
+                request.name === retry.tool &&
+                (request.requestKeys.some((key) => retry.requestKeys.has(key)) ||
+                  request.retryOf === originItemId)
+              ) {
+                retry.itemIds.add(request.itemId);
+                for (const key of request.requestKeys) retry.requestKeys.add(key);
+                break;
+              }
+            }
+          }
           const name = toolNameOf(item);
           if (name) push({ type: "tool_call", name, phase: "start", detail: item });
           break;
@@ -1951,7 +2179,45 @@ export class CodexBackend implements AgentBackend {
           // (reasoning OR reply) then emit the canonical event: `assistant` for an
           // agentMessage, or tool_call(end) for a finished tool/command/MCP item.
           const item = params.item as Record<string, unknown> | undefined;
+          if (isMcpToolCallItem(item)) {
+            const itemId = stringFieldOf(item, "id");
+            if (itemId) inFlightMcpItemIds.delete(itemId);
+            else if (unkeyedMcpItems > 0) unkeyedMcpItems -= 1;
+          }
           const itemType = item?.type as string | undefined;
+          const panelTool = panelMcpToolItemOf(item);
+          const request = panelTool ? panelMcpRequests.get(panelTool.itemId) : undefined;
+          if (request) {
+            request.completed = true;
+            const completedSuccessfully =
+              item?.status !== "failed" &&
+              item?.status !== "error" &&
+              item?.status !== "declined" &&
+              item?.error == null;
+            if (request.name === "panel_enter_subgraph") {
+              immediatePanelReadAfterEnter =
+                completedSuccessfully &&
+                panelEnterCandidate?.itemId === request.itemId &&
+                !panelEnterCandidate.laterPanelRequestStarted
+                  ? request.itemId
+                  : null;
+              panelEnterCandidate = null;
+            }
+
+            const retryMatch = panelReadRetryForRequest(request);
+            if (retryMatch && request.name === retryMatch.retry.tool) {
+              const retryMessage = retryMatch.retry.originalMessage;
+              panelReadRetries.delete(retryMatch.originItemId);
+              if (!completedSuccessfully) {
+                finishMcpTransportFailure(retryMessage, false, true);
+                break;
+              }
+              // A successful completion proves that this request's one retry
+              // produced a tool result; do not queue the control-plane reload
+              // for the transient error recovered in-band.
+              if (panelReadRetries.size === 0) this.mcpTransportRecovery.delete("panel");
+            }
+          }
           closeStream();
           if (itemType === "agentMessage") {
             // `item.text` is normally a string, but newer app-server builds can
@@ -1994,7 +2260,51 @@ export class CodexBackend implements AgentBackend {
           // panel transport failure for the turn-boundary reload, and make the
           // outcome/reconnect boundary explicit to the caller.
           if (this.noteMcpTransportFailure(message)) {
-            finishMcpTransportFailure(message, params.willRetry === true);
+            const request = panelMcpRequestForTransportError(params);
+            const matchedRetry = panelReadRetryForRequest(request);
+            // Only a correlated terminal error for the armed request is its
+            // retry outcome. A distinct mutation or unrelated request never
+            // borrows, clears, or consumes that read's retry.
+            const retryAttempted = matchedRetry?.retry;
+            if (
+              !retryAttempted &&
+              params.willRetry === true &&
+              request != null &&
+              request.afterEnterItemId != null &&
+              PANEL_OUTER_TRANSPORT_RETRY_SAFE_TOOLS.has(request.name) &&
+              appServerConnectionIsActive()
+            ) {
+              // The Codex app-server owns the actual HTTP client. Let its live
+              // connection perform this one retry, but remember the first error
+              // so a second failure cannot amplify or replace the diagnosis.
+              panelReadRetries.set(request.itemId, {
+                originalMessage: message,
+                tool: request.name,
+                itemIds: new Set([request.itemId]),
+                requestKeys: new Set(request.requestKeys),
+              });
+              break;
+            }
+            // A transport error for a different request must not consume or
+            // rewrite a read retry that is already armed. The mutation still
+            // fences this turn, because its dispatch/outcome is unknown, but
+            // retain the saved read error in the terminal diagnosis and leave
+            // its per-item retry state untouched.
+            const pendingRead = firstPanelReadRetry();
+            const failureMessage = pendingRead
+              ? `${pendingRead.originalMessage}\nA distinct panel MCP request also failed: ${message}`
+              : message;
+            finishMcpTransportFailure(
+              retryAttempted?.originalMessage ?? failureMessage,
+              params.willRetry === true,
+              retryAttempted !== undefined,
+            );
+            break;
+          }
+          if (panelReadRetries.size > 0 && params.willRetry !== true) {
+            const retry = firstPanelReadRetry();
+            panelReadRetries.clear();
+            finishMcpTransportFailure(retry?.originalMessage ?? message, false, retry !== undefined);
             break;
           }
           if (params.willRetry === true) break;
@@ -2008,8 +2318,23 @@ export class CodexBackend implements AgentBackend {
           break;
         }
         case "turn/completed": {
-          closeStream();
           const t = params.turn as { status?: string } | undefined;
+          if (panelReadRetries.size > 0 && (t?.status === "interrupted" || interrupted)) {
+            // User cancellation (including a watchdog timeout that successfully
+            // interrupts the turn) is not a failed retry. Preserve the normal
+            // interrupted result and let the existing turn-end recovery observe
+            // the transport episode on its usual path.
+            panelReadRetries.clear();
+          } else if (panelReadRetries.size > 0) {
+            const retry = firstPanelReadRetry();
+            panelReadRetries.clear();
+            // A turn completion without a successful retry item is the retry's
+            // terminal outcome. Preserve the original transport error rather
+            // than reporting a later wrapper or a false success.
+            finishMcpTransportFailure(retry?.originalMessage ?? "panel MCP read retry failed", false, true);
+            break;
+          }
+          closeStream();
           // Mark a result emitted so a racing terminal-error path stays a no-op.
           finishedResult = true;
           push({ type: "result", ok: t?.status === "completed", ...(t?.status ? { subtype: t.status } : {}) });
