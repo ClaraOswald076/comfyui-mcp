@@ -251,6 +251,29 @@ describe("#2407 half B: everything REACHABLE must be CITED", () => {
     expect(violations.some((v) => v.includes("#2409"))).toBe(true);
   });
 
+  it("does NOT chain issue\u2192PR links transitively", () => {
+    // Review round 7. The panel's union-find makes the issue->PR relation
+    // transitive, and transitivity is false here: this project routinely reuses a
+    // previous PR number as the next commit's scope -- 62 numeric scopes in recent
+    // history are also PR numbers -- so `fix(100): (#200)` and `fix(200): (#300)`
+    // collapse into one class and a section citing only #100 silently vouches for
+    // #300. That hides a missing entry, the precise failure this guard exists for.
+    const chained = [
+      commitOf("aaa", "fix(100): first (#200)"),
+      commitOf("bbb", "fix(200): second (#300)"),
+    ];
+    const violations = auditReleaseSection({
+      markdown: section("### Fixed", "- only the first (#100)"),
+      version: "1.1.0",
+      commits: chained,
+      rangeCommits: chained,
+      targetRef: "v1.1.0",
+      previousRef: "v1.0.0",
+    });
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain("does not mention PR #300");
+  });
+
   it("but an umbrella still covers commits whose ONLY identity is that issue", () => {
     // The first attempt excluded ambiguous references outright and over-fired: six
     // commits in 0.52.125 carry #2313 as their sole reference, shipped under merge

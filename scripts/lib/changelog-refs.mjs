@@ -97,37 +97,24 @@ export function referenceAliases(commits) {
     }
   }
 
-  const parent = new Map();
-  const ensure = (ref) => {
-    if (!parent.has(ref)) parent.set(ref, ref);
-  };
-  const find = (ref) => {
-    ensure(ref);
-    let root = ref;
-    while (parent.get(root) !== root) root = parent.get(root);
-    while (parent.get(ref) !== ref) {
-      const next = parent.get(ref);
-      parent.set(ref, root);
-      ref = next;
-    }
-    return root;
-  };
-  const union = (a, b) => {
-    const left = find(a);
-    const right = find(b);
-    if (left !== right) parent.set(right, left);
-  };
-
+  // A DIRECT issue -> PR map, deliberately not the panel's union-find.
+  //
+  // Union-find makes the relation transitive, and transitivity is not true here.
+  // `fix(100): first (#200)` and `fix(200): second (#300)` are two separate
+  // changes that happen to chain, because this project routinely reuses a previous
+  // PR number as the next commit's scope -- 62 numeric scopes in recent history
+  // are also PR numbers. Unioned, all three collapse into one class, and a section
+  // citing only #100 silently vouches for PR #300 as well. That hides a missing
+  // entry, which is the precise failure this guard exists to catch.
+  //
+  // One hop, never chased: an issue stands for its own pull request and for
+  // nothing further along the chain.
+  const aliases = new Map();
   for (const [issue, prs] of candidates) {
     if (prs.size !== 1) continue;
     const [pr] = prs;
-    ensure(issue);
-    ensure(pr);
-    union(issue, pr);
+    aliases.set(issue, pr);
   }
-
-  const aliases = new Map();
-  for (const ref of parent.keys()) aliases.set(ref, find(ref));
   return aliases;
 }
 
