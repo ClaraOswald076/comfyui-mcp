@@ -76,6 +76,14 @@ import {
 } from "../services/panel-workflow-readiness.js";
 import { isPreExecutorRefusal } from "../services/panel-refusal.js";
 import { unexposeHostLinkShiftNote } from "../services/unexpose-host-link-shift.js";
+import {
+  assertScreenshotPersistAllowed,
+  decodePngBase64,
+  persistScreenshotPng,
+  resolveScreenshotPersistPath,
+  screenshotOverwriteFromArgs,
+  screenshotPersistPathFromArgs,
+} from "./panel-screenshot-persist.js";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { parse as parseYaml } from "yaml";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
@@ -22408,11 +22416,34 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
     ),
     def(
       "panel_screenshot",
-      "SCREENSHOT the canvas to a PNG IMAGE — pixels, for when the question is VISUAL: overlaps, alignment, rails, colors, group bands. To READ what is on the canvas as text (ids, types, widget values, wiring) use panel_graph_outline instead; an image cannot be searched or quoted. Renders the workflow the user is currently viewing (root graph, or the open subgraph): frames the whole graph (nodes + groups), captures, then restores the user's view. Use it to verify a layout you just built instead of reasoning from coordinates alone.",
-      { padding: z.number().optional().describe("Margin around the graph in px (default 60).") },
+      "SCREENSHOT the canvas to a PNG IMAGE — pixels, for when the question is VISUAL: overlaps, alignment, rails, colors, group bands. To READ what is on the canvas as text (ids, types, widget values, wiring) use panel_graph_outline instead; an image cannot be searched or quoted. Renders the workflow the user is currently viewing (root graph, or the open subgraph): frames the whole graph (nodes + groups), captures, then restores the user's view. Use it to verify a layout you just built instead of reasoning from coordinates alone. Optional save_path/output_path writes the PNG atomically on the MCP host (absolute .png path; existing files refused unless overwrite:true) so a bulk capture does not have to round-trip the base64 through a filesystem command.",
+      {
+        padding: z.number().optional().describe("Margin around the graph in px (default 60)."),
+        save_path: z
+          .string()
+          .optional()
+          .describe(
+            "Absolute path on the MCP host to write the captured PNG. Existing files are refused unless overwrite is true. output_path is the same argument under another name.",
+          ),
+        output_path: z
+          .string()
+          .optional()
+          .describe("Alias for save_path — an absolute .png path on the MCP host."),
+        overwrite: z
+          .boolean()
+          .optional()
+          .describe("Replace an existing file at save_path. Default false: an existing file is refused."),
+      },
       async (args: A, ctx) => {
         try {
           ctx.ensureReachable?.();
+          let persistDest: string | undefined;
+          const requestedPath = screenshotPersistPathFromArgs(args);
+          const overwrite = screenshotOverwriteFromArgs(args);
+          if (requestedPath !== undefined) {
+            persistDest = resolveScreenshotPersistPath(requestedPath);
+            assertScreenshotPersistAllowed(persistDest, overwrite);
+          }
           // Route to the same authoritative target as ctx.call: a pinned session
           // screenshots the PINNED workflow (via injected workflow_path), not just
           // whatever tab is visible (codex — graph_* must carry the pin).
@@ -22435,6 +22466,11 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
             | { type: "image"; data: string; mimeType: string }
             | { type: "text"; text: string }
           > = [{ type: "image", data: res.image, mimeType: res.mimeType ?? "image/png" }];
+          if (persistDest !== undefined) {
+            const pngBytes = decodePngBase64(res.image);
+            persistScreenshotPng(persistDest, pngBytes, overwrite);
+            content.push({ type: "text", text: `Saved to: ${persistDest}` });
+          }
           // A canvas capture cannot show DOM-overlay widget content (MarkdownNote
           // text renders as an empty body) — flag any such node in view so the
           // agent doesn't read the blank body as missing content (#567). Best-effort:
