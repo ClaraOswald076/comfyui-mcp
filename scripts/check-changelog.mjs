@@ -155,6 +155,8 @@ export const isStrictSemver = (version) => strictSemver.test(releaseVersion(vers
  *                      pool), or null when the range could not be resolved
  * @param targetRef     the ref this section claims to describe
  * @param previousRef   the ref the release is measured from, for the message
+ * @param historyComplete  false when `commits` is truncated or unreadable, which
+ *                      makes reachability unanswerable rather than false
  * @param isAncestor    (sha, ref) => boolean
  */
 export function auditReleaseSection({
@@ -164,6 +166,7 @@ export function auditReleaseSection({
   rangeCommits = null,
   targetRef,
   previousRef,
+  historyComplete = true,
   isAncestor = () => true,
 }) {
   const normalizedVersion = releaseVersion(version);
@@ -229,6 +232,14 @@ export function auditReleaseSection({
   }
 
   // A. Everything CITED must be REACHABLE from the ref this section describes.
+  //
+  // Gated on a COMPLETE history, because a truncated one cannot distinguish "this
+  // entry is credited to the wrong release" from "that commit is simply not in my
+  // pool". A depth-1 clone holds one commit, so every entry in the section looks
+  // unreachable: the guard reported #2398, #2399 and #2400 as bogus on a shallow
+  // checkout of this very branch, which fails a CORRECT release. Skipping coverage
+  // alone was not enough — and worse, saying so implied reachability had been
+  // checked when it had been checked against nothing.
   const byRef = new Map();
   for (const commit of commits) {
     for (const ref of commit.refs) {
@@ -236,7 +247,7 @@ export function auditReleaseSection({
       byRef.get(ref).push(commit);
     }
   }
-  for (const item of entries) {
+  for (const item of historyComplete ? entries : []) {
     const refs = referenceNumbers(item.text);
     if (!refs.length) continue; // Legacy prose with no PR cannot be ancestry-checked.
     const pr = refs.at(-1);
@@ -377,9 +388,15 @@ export function main(argv) {
   } catch {
     shallow = false;
   }
+  // A truncated history cannot answer EITHER question — not just coverage. Both
+  // ci.yml and release.yml check out at fetch-depth: 0 precisely so this branch is
+  // never taken where it matters; a developer's shallow clone gets the honest
+  // "checked nothing" instead of three invented failures.
+  const historyComplete = commits.length > 0 && !shallow;
   if (shallow) {
     console.error(
-      "changelog: shallow clone — coverage (every shipped PR is listed) was NOT checked.",
+      "changelog: shallow clone — reachability AND coverage were NOT checked; only " +
+        "the section's structure was. Re-run in a full clone (CI uses fetch-depth: 0).",
     );
   } else if (commits.length) {
     try {
@@ -418,6 +435,7 @@ export function main(argv) {
     rangeCommits,
     targetRef,
     previousRef,
+    historyComplete,
     isAncestor: (sha, ref) => {
       try {
         git("merge-base", "--is-ancestor", sha, ref);
@@ -432,11 +450,15 @@ export function main(argv) {
     for (const violation of violations) console.error(`changelog: ERROR — ${violation}`);
     return 1;
   }
-  console.log(
-    rangeCommits
-      ? `changelog: [${version}] lists every PR since ${previousRef}, and every entry it names is reachable from ${targetRef}`
-      : `changelog: [${version}] is structurally sound and reachable from ${targetRef}`,
-  );
+  // Three outcomes, named apart. A run that verified nothing must never print the
+  // sentence a fully verified run prints.
+  if (!historyComplete) {
+    console.log(`changelog: [${version}] is structurally sound; history was unavailable, so NOTHING about what shipped was verified`);
+  } else if (rangeCommits) {
+    console.log(`changelog: [${version}] lists every PR since ${previousRef}, and every entry it names is reachable from ${targetRef}`);
+  } else {
+    console.log(`changelog: [${version}] names only entries reachable from ${targetRef}; coverage was not checked`);
+  }
   return 0;
 }
 

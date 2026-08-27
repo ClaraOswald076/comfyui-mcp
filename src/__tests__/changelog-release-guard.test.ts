@@ -186,6 +186,50 @@ describe("#2407 half A: everything CITED must be REACHABLE", () => {
     expect(violations[0]).toContain("#2387");
   });
 
+  it("asks NOTHING about reachability when the history is truncated", () => {
+    // Found by the review gate on this PR, and reproduced: on a depth-1 clone the
+    // commit pool holds one commit, so EVERY entry looks unreachable. Against a
+    // shallow checkout of this very branch the guard invented three failures
+    // (#2398, #2399, #2400) for a perfectly correct release. Skipping coverage
+    // alone was not enough — an incomplete pool cannot tell "credited to the wrong
+    // release" from "not in my pool", and answering anyway fails a good publish.
+    const violations = auditReleaseSection({
+      markdown: section("### Fixed", "- shipped, but out of the shallow pool (#801)"),
+      version: "1.1.0",
+      commits: [],
+      rangeCommits: null,
+      targetRef: "HEAD",
+      previousRef: null,
+      historyComplete: false,
+      isAncestor: () => false,
+    });
+    expect(violations).toEqual([]);
+  });
+
+  it("still reports STRUCTURE when the history is truncated — that needs no git", () => {
+    const violations = auditReleaseSection({
+      markdown: [
+        "# Changelog",
+        "",
+        "## [1.1.0] - 2026-08-26",
+        "",
+        "### Fixed",
+        "- one thing (#801)",
+        "",
+        "### Fixed",
+        "- again (#802)",
+        "",
+      ].join("\n"),
+      version: "1.1.0",
+      commits: [],
+      rangeCommits: null,
+      targetRef: "HEAD",
+      historyComplete: false,
+    });
+    expect(violations.some((v) => v.includes('repeats the heading "Fixed"'))).toBe(true);
+    expect(violations.some((v) => v.includes("names PR"))).toBe(false);
+  });
+
   it("reports an entry naming a number no commit carries", () => {
     // This is the 0.52.134 shape: the section cited #2378, no commit anywhere
     // carried it, and reading that gap as "not shipped yet" produced a whole
@@ -383,6 +427,59 @@ describe("#2407 end to end: the guard blocks the cut that shipped 0.52.138", () 
     expect(result.stderr).toContain("reachable from HEAD");
   });
 
+  it("invents NOTHING on a shallow clone, and does not call that a verified pass", () => {
+    // The end-to-end form of the gate's finding. A depth-1 clone of a healthy
+    // release must not produce a single violation, and must not print the sentence
+    // a fully verified run prints — a skip that reads like a pass is the failure
+    // this guard exists to stop, turned on itself.
+    commit("fix(900): a shipped change (#901)");
+    writeChangelog(
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "## [1.1.0] - 2026-08-27",
+      "",
+      "### Fixed",
+      "- a shipped change (#901)",
+      "",
+      "## [1.0.0] - 2026-08-26",
+      "",
+      "### Fixed",
+      "- the first thing (#801)",
+      "",
+    );
+    commit("chore: release v1.1.0 (#903)");
+    git("tag", "v1.1.0");
+
+    const shallow = mkdtempSync(join(tmpdir(), "clguard-shallow-"));
+    try {
+      execFileSync(
+        "git",
+        ["clone", "--depth", "1", "--branch", "main", `file://${dir.replace(/\\/g, "/")}`, shallow],
+        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] },
+      );
+      expect(
+        execFileSync("git", ["-C", shallow, "rev-parse", "--is-shallow-repository"], {
+          encoding: "utf-8",
+        }).trim(),
+      ).toBe("true");
+
+      const result = spawnSync(process.execPath, [GUARD], {
+        cwd: shallow,
+        encoding: "utf-8",
+        env: { ...process.env, COMFYUI_MCP_CHANGELOG_ROOT: shallow },
+      });
+      expect(result.status).toBe(0);
+      expect(result.stderr).not.toContain("names PR");
+      expect(result.stderr).toContain("reachability AND coverage were NOT checked");
+      expect(result.stdout).not.toContain("lists every PR since");
+      expect(result.stdout).toContain("NOTHING about what shipped was verified");
+    } finally {
+      rmSync(shallow, { recursive: true, force: true });
+    }
+  });
+
   it("refuses a malformed version argument instead of auditing a different section", () => {
     for (const malformed of ["1.1", "1.1.0; touch pwned", "--bad-version"]) {
       const result = runGuard(malformed);
@@ -424,6 +521,17 @@ describe("#2407 WIRING: the guard actually runs on the paths that matter", () =>
     // would have blocked. Wiring into `npm test` is what keeps the two in step.
     expect(read(".github", "workflows", "ci.yml")).toMatch(/^\s*-\s*run:\s*npm test\s*$/m);
     expect(read(".github", "workflows", "release.yml")).toMatch(/^\s*-\s*run:\s*npm test\s*$/m);
+  });
+
+  it("and both check out at fetch-depth: 0, or the guard silently checks nothing", () => {
+    // The guard cannot verify a truncated history and correctly declines to try.
+    // That makes `fetch-depth: 0` load-bearing: drop it and every run becomes a
+    // structural check that still exits 0 — a gate that passes because it looked
+    // at nothing. Both files already set it (for check:blog-stale); this pins it
+    // as a dependency of THIS guard too, so removing it fails here rather than
+    // quietly disarming the release gate.
+    expect(read(".github", "workflows", "ci.yml")).toMatch(/fetch-depth:\s*0/);
+    expect(read(".github", "workflows", "release.yml")).toMatch(/fetch-depth:\s*0/);
   });
 
   it("and the guard shares ONE release-commit predicate with the generator", () => {
