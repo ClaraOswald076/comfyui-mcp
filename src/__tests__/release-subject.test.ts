@@ -38,6 +38,27 @@ describe("a release commit is recognised as one (#1309)", () => {
     expect(isReleaseSubject("build(release): 0.1.0 (#3)")).toBe(true);
   });
 
+  it("recognises the release PR TITLE protected main writes (#2407)", () => {
+    // The fourth shape: the release goes through a pull request titled
+    // `chore: release v0.52.133`, with no `(release)` scope and the version in the
+    // BODY. None of the three original regexes saw it, and the changelog guard's
+    // `v<prev>..vX` range always contains X's own release commit — so every release
+    // would have been reported as missing an entry for itself.
+    expect(isReleaseSubject("chore: release v0.52.133 (#2381)")).toBe(true);
+    expect(isReleaseSubject("chore: release 0.52.133")).toBe(true);
+    expect(isReleaseSubject("chore!: release v1.2.3")).toBe(true);
+  });
+
+  it("...but only for `chore`, so a fix ABOUT a release still counts (#2407)", () => {
+    // Accepting any commit type here silently dropped real work: `fix: release
+    // v1.2.3 (#778)` is a change, not a release, and both the generator and the
+    // guard skipped it. Same trap the `(release)`-scope shape was already narrowed
+    // for — a release-shaped subject must be a release, not merely mention one.
+    expect(isReleaseSubject("fix: release v1.2.3 (#778)")).toBe(false);
+    expect(isReleaseSubject("docs: release v1.2.3")).toBe(false);
+    expect(isReleaseSubject("feat: release v2.0.0 (#900)")).toBe(false);
+  });
+
   it("still recognises the two shapes it always did", () => {
     expect(isReleaseSubject("release: v0.50.87 — a stale model copy (#1306)")).toBe(true);
     expect(isReleaseSubject("0.50.85 (#1302)")).toBe(true);

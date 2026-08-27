@@ -17,6 +17,16 @@ const checks = [
   { name: "check:vocabulary", cmd: "npm", args: ["run", "check:vocabulary"] },
   { name: "check:unknown-collapse", cmd: "npm", args: ["run", "check:unknown-collapse"] },
   { name: "vocab:export", cmd: "npm", args: ["run", "vocab:export", "--", "--check"] },
+  // #2407 — the release notes are the ONE artefact nothing verified. Three cuts in
+  // one evening shipped a fix they did not list (0.52.133/#2378, 0.52.138/#2400)
+  // or listed one that had already shipped (0.52.134, a whole no-op version).
+  // Ancestry resolves itself in every case — the release branch merges into main,
+  // so the tag gets the code — so the gap is silent and only the changelog is
+  // wrong. This runs HERE rather than in a workflow on purpose: `npm test` is
+  // invoked by both ci.yml and release.yml, so the same guard gates a pull request
+  // and the publish, and a release path that enforced less than CI is what made
+  // three other gates advisory before they were copied into release.yml by hand.
+  { name: "check:changelog", cmd: "node", args: ["scripts/check-changelog.mjs"] },
 ];
 
 const results = [];
