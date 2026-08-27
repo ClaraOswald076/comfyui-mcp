@@ -45,8 +45,10 @@ import { dirname, join, resolve } from "node:path";
 
 import { isReleaseSubject } from "./lib/release-subject.mjs";
 import {
+  ambiguousReferences,
   canonicalReference,
   commitReferences,
+  isReleaseMerge,
   mentionedNumbers,
   referenceAliases,
   referenceNumbers,
@@ -270,20 +272,46 @@ export function auditReleaseSection({
 
   // B. Everything REACHABLE must be CITED. The half that catches a silent gap.
   if (rangeCommits) {
+    // An umbrella issue vouches for NOTHING. It has several PRs in this history, so
+    // one entry citing it would satisfy coverage for every one of them and hide all
+    // but the first — the shape where a fix on one exit leaves its siblings behind.
+    // referenceAliases already refuses to ALIAS these; refusing to alias is not
+    // refusing to vouch, which is the hole this closes.
+    const ambiguous = ambiguousReferences(commits);
     const mentioned = new Set(mentionedNumbers(section.lines.join("\n")).map(canonical));
     for (const commit of rangeCommits) {
-      // A release commit describes the release, not something in it. `v<prev>..<target>`
-      // includes the target, so X's own release commit is always in this range.
-      if (isReleaseSubject(commit.subject)) continue;
-      // No PR number means a local commit a squash superseded. gen-changelog drops
-      // those too, and the two must agree or the guard fights the generator.
-      const prs = referenceNumbers(commit.subject);
-      if (!prs.length) continue;
-      if (commit.refs.some((ref) => mentioned.has(canonical(ref)))) continue;
+      // A release describes itself, not something it contains. `v<prev>..<target>`
+      // includes the target, so X's own release commit is always in this range — and
+      // in the merge-commit flow, so is the merge that landed the release branch.
+      if (isReleaseSubject(commit.subject) || isReleaseMerge(commit.subject)) continue;
+      // A squash carries its PR as `(#N)`; a REAL merge carries it as a bare `#N` on
+      // `Merge pull request #N from …`, which commitReferences resolves and the
+      // parenthesised form never sees. Four PRs shipped that way across sixteen
+      // releases (#2294, #2307, #2326, #2340) and none of them is in the changelog.
+      // Anything with no reference at all is a local commit a squash superseded —
+      // gen-changelog drops those too, and the two must agree or the guard fights
+      // its own generator.
+      const cited = referenceNumbers(commit.subject);
+      const shipped = cited.length ? cited : commit.refs.slice(-1);
+      if (!shipped.length) continue;
+      // What this commit IS, as opposed to what it merely references.
+      const identity = shipped.at(-1);
+      const covered = commit.refs.some((ref) => {
+        if (!mentioned.has(canonical(ref))) return false;
+        // An umbrella issue vouches only for ITSELF. Citing #2393 documents the
+        // commits whose sole identity is #2393, but it must not stand in for
+        // #2400 and #2409 — two separate fixes, one of them then invisible.
+        // Excluding ambiguous references outright was the first attempt and it
+        // over-fired: six commits in 0.52.125 carry #2313 as their ONLY reference,
+        // shipped under merge #2340, and citing #2313 is the only way they are
+        // documentable at all. That release is correctly written and must stay green.
+        return !ambiguous.has(ref) || ref === identity;
+      });
+      if (covered) continue;
       violations.push(
-        `[${normalizedVersion}] does not mention PR #${prs.at(-1)}, which shipped in this ` +
+        `[${normalizedVersion}] does not mention PR #${shipped.at(-1)}, which shipped in this ` +
           `release (reachable from ${targetRef}, not from ${previousRef}): "${commit.subject}". ` +
-          `Add the entry, or add #${prs.at(-1)} to the entry that already covers it.`,
+          `Add the entry, or add #${shipped.at(-1)} to the entry that already covers it.`,
       );
     }
   }
@@ -369,9 +397,30 @@ export function main(argv) {
   let commits = [];
   let rangeCommits = null;
   let previousRef = null;
+  // "There is no repository here" and "the repository is there and git FAILED" are
+  // different answers and must not share an exit code. A source tarball or a zip
+  // download legitimately has no .git and nothing to verify against, so it skips.
+  // An EPERM, a corrupt object store or a missing git binary is an ERROR — and
+  // letting that exit 0 turns run-checks' green tick into a gate that passed
+  // because it could not look, which is the whole failure this guard exists to
+  // stop, aimed at itself.
+  let insideRepository = true;
+  try {
+    insideRepository = git("rev-parse", "--is-inside-work-tree") === "true";
+  } catch {
+    insideRepository = false;
+  }
   try {
     commits = readCommits(targetRef);
   } catch (error) {
+    if (insideRepository) {
+      console.error(
+        `changelog: git failed inside a repository at ${targetRef} ` +
+          `(${String(error.message).split("\n")[0]}). Refusing to report a pass on a ` +
+          `check that could not run.`,
+      );
+      return 1;
+    }
     // Loud, and never confusable with a pass: name the halves that did not run.
     console.error(
       `changelog: could not read history at ${targetRef} ` +
@@ -417,7 +466,7 @@ export function main(argv) {
       // the exact direction this guard exists to close.
       previousRef = git("describe", "--tags", "--abbrev=0", `${targetRef}^`);
       rangeCommits = parseCommitSubjects(
-        git("log", `${previousRef}..${targetRef}`, "--no-merges", "--format=%H%x1f%s%x1e"),
+        git("log", `${previousRef}..${targetRef}`, "--format=%H%x1f%s%x1e"),
       );
     } catch {
       console.error(

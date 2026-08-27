@@ -39,9 +39,36 @@ export function mentionedNumbers(text) {
   return [...String(text ?? "").matchAll(/#(\d+)\b/g)].map((m) => m[1]);
 }
 
-/** References in a conventional-commit subject, including a numeric issue scope. */
+/**
+ * A real merge commit: `Merge pull request #2294 from artokun/fix/2319-slug`.
+ *
+ * This repo squash-merges most of the time, but not always — four PRs across
+ * sixteen releases landed as true merges, and the PR number lives ONLY on the
+ * merge subject, in a BARE `#N` that the parenthesised form above never matches.
+ * All four (#2294, #2307, #2326, #2340) are cited nowhere in the changelog.
+ *
+ * The issue is taken from the branch, but only in the repo's `<type>/<issue>-<slug>`
+ * shape. `fix/2319-remote-list-local-models` yields 2319; `fix/rate-limit-429`
+ * deliberately yields nothing, because a trailing number in a slug is not an issue
+ * and a bogus alias would let an unrelated entry vouch for a real change.
+ */
+export function mergeReferences(subject) {
+  const match = /^Merge pull request #(\d+) from (?:[^\s/]+\/)?(.+?)\s*$/.exec(String(subject ?? ""));
+  if (!match) return [];
+  const issue = /^[^/]+\/(\d+)-/.exec(match[2])?.[1];
+  return issue && issue !== match[1] ? [issue, match[1]] : [match[1]];
+}
+
+/** True for the merge that lands a release branch — a release, not a change in one. */
+export function isReleaseMerge(subject) {
+  return /^Merge pull request #\d+ from (?:[^\s/]+\/)?release\//i.test(String(subject ?? ""));
+}
+
+/** References in a commit subject: conventional scope, `(#N)` refs, or a merge. */
 export function commitReferences(subject) {
   const text = String(subject ?? "");
+  const merge = mergeReferences(text);
+  if (merge.length) return merge;
   const refs = referenceNumbers(text);
   const match = /^(?:\w+)(?:\(([^)]+)\))?(?:!)?:\s*/.exec(text);
   if (match && /^#?\d+$/.test(match[1] ?? "")) refs.unshift((match[1] ?? "").replace(/^#/, ""));
@@ -102,6 +129,32 @@ export function referenceAliases(commits) {
   const aliases = new Map();
   for (const ref of parent.keys()) aliases.set(ref, find(ref));
   return aliases;
+}
+
+/**
+ * Issues that have MORE THAN ONE pull request in the supplied history.
+ *
+ * `referenceAliases` already refuses to alias these, but refusing to alias is not
+ * the same as refusing to vouch: an entry citing umbrella issue #2393 would still
+ * satisfy coverage for #2400 *and* #2409 by raw reference match, hiding the second
+ * fix behind the first. That is a live shape here — #2393 took two PRs, and #2409
+ * fixed a sibling exit five lines from the one #2400 fixed.
+ *
+ * So an ambiguous issue vouches for NOTHING; only its PR number will do.
+ */
+export function ambiguousReferences(commits) {
+  const candidates = new Map();
+  for (const commit of commits ?? []) {
+    const refs = commit?.refs ?? commitReferences(commit?.subject);
+    if (refs.length < 2) continue;
+    const pr = refs.at(-1);
+    for (const issue of refs.slice(0, -1)) {
+      if (issue === pr) continue;
+      if (!candidates.has(issue)) candidates.set(issue, new Set());
+      candidates.get(issue).add(pr);
+    }
+  }
+  return new Set([...candidates].filter(([, prs]) => prs.size > 1).map(([issue]) => issue));
 }
 
 export function canonicalReference(ref, aliases = new Map()) {
