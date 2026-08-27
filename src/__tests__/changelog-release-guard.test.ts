@@ -132,6 +132,109 @@ describe("#2407 half B: everything REACHABLE must be CITED", () => {
     ).toEqual([]);
   });
 
+  it("sees a REAL merge commit, whose PR number is a bare #N on the merge subject", () => {
+    // Review round 2, verified against history: this repo mostly squash-merges but
+    // not always, and `--no-merges` plus the parenthesised-only regex made every
+    // true merge invisible. Four shipped that way across sixteen releases —
+    // #2294, #2307, #2326, #2340 — and not one of them appears anywhere in
+    // CHANGELOG.md. 0.52.124 shipped a single entry while carrying four PRs.
+    const merge = commitOf("aaa", "Merge pull request #2294 from artokun/fix/rate-limit-429");
+    const violations = auditReleaseSection({
+      markdown: section("### Fixed", "- something else (#801)"),
+      version: "1.1.0",
+      commits: [merge, commitOf("bbb", "fix: something else (#801)")],
+      rangeCommits: [merge],
+      targetRef: "v1.1.0",
+      previousRef: "v1.0.0",
+    });
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain("does not mention PR #2294");
+  });
+
+  it("takes the issue from a merge branch, but only in the <type>/<issue>-<slug> shape", () => {
+    // `fix/2319-remote-list` yields 2319, so an entry citing the issue covers the
+    // merge PR. `fix/rate-limit-429` must yield NOTHING — a trailing number in a
+    // slug is not an issue, and a bogus alias would let an unrelated entry vouch
+    // for a real change, which is the failure this guard exists to prevent.
+    const linked = commitOf("aaa", "Merge pull request #2326 from artokun/fix/2319-remote-list");
+    expect(
+      auditReleaseSection({
+        markdown: section("### Fixed", "- fence local model listings (#2319)"),
+        version: "1.1.0",
+        commits: [linked],
+        rangeCommits: [linked],
+        targetRef: "v1.1.0",
+        previousRef: "v1.0.0",
+      }),
+    ).toEqual([]);
+
+    const slugNumber = commitOf("bbb", "Merge pull request #2294 from artokun/fix/rate-limit-429");
+    expect(
+      auditReleaseSection({
+        markdown: section("### Fixed", "- an entry citing the slug number (#429)"),
+        version: "1.1.0",
+        commits: [slugNumber],
+        rangeCommits: [slugNumber],
+        targetRef: "v1.1.0",
+        previousRef: "v1.0.0",
+      }).some((v) => v.includes("#2294")),
+    ).toBe(true);
+  });
+
+  it("ignores the merge that lands a release branch", () => {
+    const releaseMerge = commitOf("ccc", "Merge pull request #2337 from artokun/release/0.52.124");
+    expect(
+      auditReleaseSection({
+        markdown: section("### Fixed", "- a real change (#801)"),
+        version: "1.1.0",
+        commits: [commitOf("bbb", "fix: a real change (#801)"), releaseMerge],
+        rangeCommits: [commitOf("bbb", "fix: a real change (#801)"), releaseMerge],
+        targetRef: "v1.1.0",
+        previousRef: "v1.0.0",
+      }),
+    ).toEqual([]);
+  });
+
+  it("an UMBRELLA issue vouches for itself and nothing else", () => {
+    // #2393 took two PRs, and #2409 fixed a sibling exit five lines from the one
+    // #2400 fixed. One entry citing the umbrella must not stand in for both, or the
+    // second fix is invisible — a fix on one exit leaving its siblings behind.
+    const first = commitOf("aaa", "fix(2393): the first exit (#2400)");
+    const second = commitOf("bbb", "fix(2393): the sibling exit (#2409)");
+    const violations = auditReleaseSection({
+      markdown: section("### Fixed", "- a promoted write is judged on its own witness entry (#2393)"),
+      version: "1.1.0",
+      commits: [first, second],
+      rangeCommits: [first, second],
+      targetRef: "v1.1.0",
+      previousRef: "v1.0.0",
+    });
+    expect(violations).toHaveLength(2);
+    expect(violations.some((v) => v.includes("#2400"))).toBe(true);
+    expect(violations.some((v) => v.includes("#2409"))).toBe(true);
+  });
+
+  it("but an umbrella still covers commits whose ONLY identity is that issue", () => {
+    // The first attempt excluded ambiguous references outright and over-fired: six
+    // commits in 0.52.125 carry #2313 as their sole reference, shipped under merge
+    // #2340, so citing #2313 is the only way they are documentable at all. That
+    // release is correctly written and must stay green.
+    const ambiguousIssue = [
+      commitOf("aaa", "fix(rate-limit): one part (#2313)"),
+      commitOf("bbb", "fix(rate-limit): another part (#2313)"),
+      commitOf("ccc", "fix(2313): the PR that closed it (#2331)"),
+    ];
+    const violations = auditReleaseSection({
+      markdown: section("### Fixed", "- sanitize identifiers (#2313)", "- the closing PR (#2331)"),
+      version: "1.1.0",
+      commits: ambiguousIssue,
+      rangeCommits: ambiguousIssue.slice(0, 2),
+      targetRef: "v1.1.0",
+      previousRef: "v1.0.0",
+    });
+    expect(violations).toEqual([]);
+  });
+
   it("says nothing about coverage when the range could not be resolved", () => {
     // A shallow clone or a repo with no previous tag cannot answer "what shipped
     // since the last release" — it can only answer it wrong, by reporting every
@@ -162,6 +265,22 @@ describe("#2407 half A: everything CITED must be REACHABLE", () => {
     });
     expect(violations).toHaveLength(1);
     expect(violations[0]).toContain("is an ancestor of v1.1.0");
+  });
+
+  it("checks EVERY cited PR, not just the trailing one", () => {
+    // Review round 2. Checking only `refs.at(-1)` let an unreachable first citation
+    // hide behind a reachable second — a wrong credit surviving the half built to
+    // catch wrong credits. #999 is carried by no commit at all.
+    const violations = auditReleaseSection({
+      markdown: section("### Fixed", "- one entry, a bogus first citation (#999, #901)"),
+      version: "1.1.0",
+      commits: [commitOf("aaa", "fix: the real change (#901)")],
+      rangeCommits: [],
+      targetRef: "v1.1.0",
+      previousRef: "v1.0.0",
+    });
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain("#999");
   });
 
   it("checks an entry that closes TWO PRs in one comma list", () => {
@@ -477,6 +596,38 @@ describe("#2407 end to end: the guard blocks the cut that shipped 0.52.138", () 
       expect(result.stdout).toContain("NOTHING about what shipped was verified");
     } finally {
       rmSync(shallow, { recursive: true, force: true });
+    }
+  });
+
+  it("FAILS when git breaks inside a repository, rather than reporting a pass", () => {
+    // Review round 2: a git failure and "there is no repository here" shared exit 0,
+    // so an EPERM or a corrupt object store turned run-checks' green tick into a
+    // gate that passed because it could not look. Simulated by corrupting the object
+    // store of a real repo — the repository is unmistakably present, and git cannot
+    // read its history.
+    rmSync(join(dir, ".git", "objects"), { recursive: true, force: true });
+    const result = runGuard();
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("git failed inside a repository");
+    expect(result.stdout).not.toContain("structurally sound");
+  });
+
+  it("but SKIPS when there is no repository at all — a tarball has nothing to verify", () => {
+    const bare = mkdtempSync(join(tmpdir(), "clguard-norepo-"));
+    try {
+      writeFileSync(
+        join(bare, "CHANGELOG.md"),
+        ["# Changelog", "", "## [1.0.0] - 2026-08-26", "", "### Fixed", "- a thing (#801)", ""].join("\r\n"),
+      );
+      const result = spawnSync(process.execPath, [GUARD], {
+        cwd: bare,
+        encoding: "utf-8",
+        env: { ...process.env, COMFYUI_MCP_CHANGELOG_ROOT: bare },
+      });
+      expect(result.status).toBe(0);
+      expect(result.stdout).not.toContain("lists every PR since");
+    } finally {
+      rmSync(bare, { recursive: true, force: true });
     }
   });
 

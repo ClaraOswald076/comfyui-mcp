@@ -250,23 +250,31 @@ export function auditReleaseSection({
     }
   }
   for (const item of historyComplete ? entries : []) {
-    const refs = referenceNumbers(item.text);
-    if (!refs.length) continue; // Legacy prose with no PR cannot be ancestry-checked.
-    const pr = refs.at(-1);
+    // EVERY parenthesised citation, not only the trailing one. `(#2382, #2387)`
+    // names two shipped changes, and checking just the last let an unreachable
+    // first citation hide behind a reachable second — a wrong credit surviving the
+    // half built to catch wrong credits. Measured across sixteen releases: this
+    // adds ZERO violations, so the extra strictness costs no noise. Bare `#N` in
+    // prose is deliberately NOT ancestry-checked; that is commentary rather than a
+    // citation, and 0.52.135's "credit #2378 to 0.52.133, where it shipped" is a
+    // correct note about a ref that is legitimately unreachable from that tag.
+    const refs = [...new Set(referenceNumbers(item.text))];
     const line = section.start + item.line;
-    const candidates = byRef.get(pr) ?? [];
-    if (!candidates.length) {
-      violations.push(
-        `[${normalizedVersion}] entry at line ${line} names PR #${pr}, but no commit reachable ` +
-          `from ${targetRef} carries that reference.`,
-      );
-      continue;
-    }
-    if (!candidates.some((candidate) => isAncestor(candidate.sha, targetRef))) {
-      violations.push(
-        `[${normalizedVersion}] entry at line ${line} names PR #${pr}, but no commit carrying it ` +
-          `is an ancestor of ${targetRef} — it did not ship in this release.`,
-      );
+    for (const pr of refs) {
+      const candidates = byRef.get(pr) ?? [];
+      if (!candidates.length) {
+        violations.push(
+          `[${normalizedVersion}] entry at line ${line} names PR #${pr}, but no commit reachable ` +
+            `from ${targetRef} carries that reference.`,
+        );
+        continue;
+      }
+      if (!candidates.some((candidate) => isAncestor(candidate.sha, targetRef))) {
+        violations.push(
+          `[${normalizedVersion}] entry at line ${line} names PR #${pr}, but no commit carrying it ` +
+            `is an ancestor of ${targetRef} — it did not ship in this release.`,
+        );
+      }
     }
   }
 
