@@ -383,6 +383,21 @@ export function main(argv) {
     );
   } else if (commits.length) {
     try {
+      // The base is "the previous release REACHABLE from this one". That is only
+      // the immediate predecessor while version tags stay on the branch — which is
+      // true of the current flow (every tag from v0.52.13 on is an ancestor of
+      // main) and was NOT true of the 0.50/0.51 flow, where the tag was pushed
+      // from a local commit and the bump squash-merged onto protected main as a
+      // different sha. 130 of 311 tags are still unreachable for that reason, and
+      // #988 is the same root cause hitting the generator.
+      //
+      // Left as-is deliberately rather than second-guessed from the changelog's
+      // own ordering: `describe` only considers REACHABLE tags, so a wrong answer
+      // is always too OLD, never too new. That over-reports — it cannot hide a
+      // missing entry — and every message names the base it used, so the mistake
+      // reads off the failure instead of having to be inferred. Guessing a newer
+      // base would trade a loud, wrong-looking failure for a silent gap, which is
+      // the exact direction this guard exists to close.
       previousRef = git("describe", "--tags", "--abbrev=0", `${targetRef}^`);
       rangeCommits = parseCommitSubjects(
         git("log", `${previousRef}..${targetRef}`, "--no-merges", "--format=%H%x1f%s%x1e"),
