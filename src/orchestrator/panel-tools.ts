@@ -5909,6 +5909,64 @@ function parseQueriedNodeIdentityRow(row: unknown): QueriedNodeIdentity | null {
   return resolvedType ? { id, type: resolvedType } : null;
 }
 
+type QueriedNodeScope = {
+  activeView: "root" | "subgraph";
+  node: "ordinary" | "container";
+};
+
+/** Read the active viewing scope and node's explicit container bit before
+ * attempting promoted-widget resolution. The pinpoint detail projection carries
+ * the node bit even when the widget list is empty (which is how a fresh rgthree
+ * Power Lora Loader appears). Anything short of one exact, non-truncated row
+ * with an explicit root/subgraph witness is deliberately indeterminate; callers
+ * retain the existing fail-closed promoted-container path in that case. */
+function parseVerifiedQueriedNodeScope(
+  payload: Record<string, unknown> | null,
+  nodeId: unknown,
+): QueriedNodeScope | null {
+  if (!payload) return null;
+  if (
+    Object.prototype.hasOwnProperty.call(payload, "truncated") &&
+    payload.truncated !== false
+  ) {
+    return null;
+  }
+  const viewing = payload.viewing;
+  if (!viewing || typeof viewing !== "object" || Array.isArray(viewing)) return null;
+  const activeView = (viewing as Record<string, unknown>).scope;
+  if (activeView !== "root" && activeView !== "subgraph") return null;
+
+  let row: unknown;
+  if (Object.prototype.hasOwnProperty.call(payload, "nodes")) {
+    if (!Array.isArray(payload.nodes) || payload.nodes.length !== 1) return null;
+    row = payload.nodes[0];
+  } else if (typeof payload.text === "string") {
+    // Current panel detail replies carry JSON rows in text. Accept a structured
+    // row as well, but never infer is_subgraph from compact prose.
+    for (const line of payload.text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || /^\d+ match\(es\) of \d+ in scope/.test(trimmed)) continue;
+      if (!trimmed.startsWith("{") || row !== undefined) return null;
+      try {
+        row = JSON.parse(trimmed) as unknown;
+      } catch {
+        return null;
+      }
+    }
+  }
+
+  if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+  const identity = parseQueriedNodeIdentityRow(row);
+  const requestedId = canonicalQueriedNodeId(nodeId);
+  if (!identity || !requestedId || identity.id !== requestedId) return null;
+  const isSubgraph = (row as Record<string, unknown>).is_subgraph;
+  if (typeof isSubgraph !== "boolean") return null;
+  return {
+    activeView,
+    node: isSubgraph ? "container" : "ordinary",
+  };
+}
+
 /** Strict identity parser for the DaSiWa refusal gate. Unlike the older type-only
  * parser above, this accepts exactly one non-truncated row and authenticates its id. */
 function parseVerifiedQueriedNodeIdentity(
@@ -6476,6 +6534,26 @@ function promotedTerminalEvidenceError(
   return null;
 }
 
+/** A just-loaded official template can publish the terminal list before its
+ * promoted rail has settled. That is the one incomplete witness state worth a
+ * single fresh read; malformed, duplicate, or missing evidence remains a hard
+ * refusal and never becomes authorization through retry. */
+function promotedTerminalWitnessNeedsRefresh(payload: Record<string, unknown>): boolean {
+  if (!Object.prototype.hasOwnProperty.call(payload, "promoted_terminals")) return false;
+  const entries = payload.promoted_terminals;
+  if (!Array.isArray(entries)) return false;
+  return entries.some((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+    const witness = entry as Record<string, unknown>;
+    return (
+      typeof witness.widget === "string" &&
+      witness.widget.length > 0 &&
+      typeof witness.error === "string" &&
+      witness.error.length > 0
+    );
+  });
+}
+
 /** Resolve a requested relation without ever treating an unadvertised
  * witness miss as ordinary. A valid entry is safe positive evidence for this
  * alias even during capability skew; the legacy same-name scan remains the
@@ -6495,6 +6573,20 @@ function resolvePromotedWriteTarget(
     if (witnessed) return witnessed;
   }
   return resolveLegacyInnerPromotedTarget(payload, widget, nodeId);
+}
+
+async function readPromotedTargetScope(
+  ctx: PanelToolCtx,
+  nodeId: unknown,
+): Promise<QueriedNodeScope | null> {
+  const probe = await ctx.call({
+    cmd: "graph_query",
+    ids: [nodeId],
+    fields: "detail",
+    limit: 1,
+  });
+  if (probe.isError) return null;
+  return parseVerifiedQueriedNodeScope(parseToolResultJson(probe), nodeId);
 }
 
 function currentPromotedBindingError(
@@ -6753,6 +6845,14 @@ async function preparePromotedWidgetWrite(
     }
   }
 
+  // #2394 — a root-level rgthree Power Lora Loader may have no lora_N widget
+  // yet. Prove the addressed node is an ordinary root node before asking the
+  // promoted-container classifier to resolve a target that is intentionally
+  // absent. An unreadable scope probe is not permission for an outer write;
+  // it falls through to the existing conservative graph_get_subgraph path.
+  const targetScope = await readPromotedTargetScope(ctx, nodeId);
+  if (targetScope?.activeView === "root" && targetScope.node === "ordinary") return null;
+
   const sub = await ctx.call({ cmd: "graph_get_subgraph", node_id: nodeId });
   if (sub.isError) {
     if (isDefinitiveNonPromotedSubgraphRead(sub)) return null;
@@ -6762,7 +6862,7 @@ async function preparePromotedWidgetWrite(
       "graph_get_subgraph could not determine whether the addressed node is a promoted container",
     );
   }
-  const payload = parseToolResultJson(sub);
+  let payload = parseToolResultJson(sub);
   if (!payload || !promotedEnvelopeCarriesEvidence(payload)) {
     return promotedWriteRefusal(
       widget,
@@ -6777,6 +6877,33 @@ async function preparePromotedWidgetWrite(
       widget,
       "the current receiver advertised complete promoted-terminal witnesses but omitted the witness array",
     );
+  }
+  if (publishesCompleteTerminalWitness && promotedTerminalWitnessNeedsRefresh(payload)) {
+    // #2393 — an official template can publish the terminal list before its
+    // promoted rail has settled. Re-read exactly once, then run the same
+    // envelope, scope, mapping, and dispatch fences against that fresh reply.
+    const refreshed = await ctx.call({ cmd: "graph_get_subgraph", node_id: nodeId });
+    if (refreshed.isError) {
+      return promotedSubgraphReadRefusal(
+        widget,
+        refreshed,
+        "the promoted-terminal witness remained incomplete or unresolved after one fresh mapping read",
+      );
+    }
+    const refreshedPayload = parseToolResultJson(refreshed);
+    if (!refreshedPayload || !promotedEnvelopeCarriesEvidence(refreshedPayload)) {
+      return promotedWriteRefusal(
+        widget,
+        "the promoted-terminal witness remained incomplete or unresolved after one fresh mapping read",
+      );
+    }
+    if (!Object.prototype.hasOwnProperty.call(refreshedPayload, "promoted_terminals")) {
+      return promotedWriteRefusal(
+        widget,
+        "the current receiver advertised complete promoted-terminal witnesses but omitted the witness array after one fresh mapping read",
+      );
+    }
+    payload = refreshedPayload;
   }
   // The recursive alias mapping is the current receiver's proof that this
   // graph_get_subgraph response can classify renamed promotions. A legacy
