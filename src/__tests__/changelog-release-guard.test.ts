@@ -530,8 +530,13 @@ describe("#2407 WIRING: the guard actually runs on the paths that matter", () =>
     // at nothing. Both files already set it (for check:blog-stale); this pins it
     // as a dependency of THIS guard too, so removing it fails here rather than
     // quietly disarming the release gate.
-    expect(read(".github", "workflows", "ci.yml")).toMatch(/fetch-depth:\s*0/);
-    expect(read(".github", "workflows", "release.yml")).toMatch(/fetch-depth:\s*0/);
+    // Anchored to a whole LINE, not a substring. Both files also EXPLAIN
+    // fetch-depth: 0 in a comment, so the loose form of this assertion matched the
+    // prose and survived setting the real key to 1 — a wiring test that passes on
+    // a comment is worth less than no test, because it reads as coverage.
+    const settingLine = /^\s*fetch-depth:\s*0\s*$/m;
+    expect(read(".github", "workflows", "ci.yml")).toMatch(settingLine);
+    expect(read(".github", "workflows", "release.yml")).toMatch(settingLine);
   });
 
   it("and the guard shares ONE release-commit predicate with the generator", () => {
