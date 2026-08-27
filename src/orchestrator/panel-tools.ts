@@ -11225,6 +11225,17 @@ async function refreshOpenWorkflowUuid(
   openResult: ToolResult,
 ): Promise<OpenDriftNotice | null> {
   const parsedOpen = parseToolResultJson(openResult);
+  // #971 compatibility: older/lightweight bridges may return only an explicit
+  // transport route for a successful open. This proof is deliberately one-shot
+  // and is consumed below; it is never a substitute for the modern bare-alias
+  // `opened.path` + confirmed active workflow contract.
+  const reboundTab = ctx.lastExplicitCurrentRebindTab;
+  ctx.lastExplicitCurrentRebindTab = undefined;
+  const legacyReboundRoute =
+    reboundTab === ctx.tabId &&
+    parsedOpen?.ok === true &&
+    parsedOpen.routedTo === ctx.tabId &&
+    (typeof ctx.bridge.canReach !== "function" || ctx.bridge.canReach(ctx.tabId));
   const opened = parsedOpen?.opened;
   const openedPath =
     opened && typeof opened === "object" && typeof (opened as { path?: unknown }).path === "string"
@@ -11247,7 +11258,15 @@ async function refreshOpenWorkflowUuid(
     // gave us a fresh, explicitly confirmed active observation. In particular,
     // an omitted `opened.path` is not a resolution, and an omitted
     // `active_confirmed` is not confirmation (#1639).
-    if (!openedPath || !canonicalRequestedSavedIdentity(openedPath)) {
+    if (!openedPath) {
+      if (legacyReboundRoute) return null;
+      return {
+        drifted: true,
+        unverified: true,
+        activeLabel: "the panel did not return a resolved path for this filename",
+      };
+    }
+    if (!canonicalRequestedSavedIdentity(openedPath)) {
       return {
         drifted: true,
         unverified: true,
@@ -13339,6 +13358,13 @@ export interface PanelToolCtx {
    * Optional so lightweight test contexts can omit it.
    */
   awaitReachable?: (budgetMs?: number) => Promise<boolean>;
+  /**
+   * One-shot proof for the legacy #971 recovery path. A current-mode recovery
+   * that actually moved an orphaned session records the exact tab it selected;
+   * the next legacy workflow_open may use a matching transport route echo as
+   * compatibility evidence, but never as a workflow-identity/UUID source.
+   */
+  lastExplicitCurrentRebindTab?: string;
   /** Snapshot of the current panel registration. The browser-tab session id is
    * separate from the workflow-derived routing tab id, which another browser
    * tab may reuse for the same saved workflow. */
@@ -21020,6 +21046,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         if (mode === "pinned" && !(path ?? "").trim()) {
           return fail("Provide path when pinning — use panel_list_workflows to list open workflows.");
         }
+        // A prior explicit recovery proof must not survive another current-mode
+        // targeting call. It is valid only for the open immediately following
+        // the rebind that produced it.
+        if (mode === "current") ctx.lastExplicitCurrentRebindTab = undefined;
         // mode:'current' is the explicit, user/agent-initiated "rebind me to the
         // tab that's live now" consent signal. Self-heal a session whose captured
         // tab id was orphaned (reconnect/reload/workflow-switch) BEFORE writing the
@@ -21121,6 +21151,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // Detect the rebind regardless of whether awaitReachable or rebindToActiveTab
           // performed it (either mutates ctx.tabId), so the note is never swallowed.
           if (!deferredBind && ctx.tabId !== before) {
+            ctx.lastExplicitCurrentRebindTab = ctx.tabId;
             // #934 — `.slice(0, 8)` renders EVERY `wf:workflows/…` tab as the
             // literal "wf:workf", so this note read "Rebound this session from
             // tab wf:workf onto the active tab wf:workf" for a rebind between two
