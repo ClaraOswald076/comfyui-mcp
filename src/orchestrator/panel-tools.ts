@@ -6491,7 +6491,7 @@ async function refuseKnownBadWriteBeforeDispatch(
  */
 type PromotedWriteBinding = {
   tabId: string;
-  identity: { generation: number; tabSessionId: string };
+  identity: { generation: number; tabSessionId: string } | undefined;
 };
 
 type PromotedWritePlan = {
@@ -6796,9 +6796,11 @@ function currentPromotedBindingError(
   } catch {
     return "the panel connection identity became unreadable";
   }
-  if (!isUsablePanelConnectionIdentity(current)) {
-    return "the panel connection identity became unavailable";
-  }
+  const beforeOk = isUsablePanelConnectionIdentity(binding.identity);
+  const afterOk = isUsablePanelConnectionIdentity(current);
+  if (!beforeOk && !afterOk) return null;
+  if (!afterOk) return "the panel connection identity became unavailable";
+  if (!beforeOk) return null;
   if (!samePanelConnectionIdentity(binding.identity, current)) {
     return "the panel session or connection changed";
   }
@@ -7025,18 +7027,24 @@ function panelBindingDriftReason(
   tabBefore: string,
 ): string | undefined {
   if (!hasIdentityApi) return `the receiver identity was unavailable ${where}`;
-  if (!isUsablePanelConnectionIdentity(identityBefore)) {
-    return `the panel connection identity was unavailable ${where}`;
-  }
   let identityAfter: { generation: number; tabSessionId: string } | undefined;
   try {
     identityAfter = ctx.panelConnectionIdentity?.();
   } catch {
     return `the panel connection identity became unreadable ${where}`;
   }
-  if (ctx.tabId !== tabBefore || !isUsablePanelConnectionIdentity(identityAfter)) {
+  if (ctx.tabId !== tabBefore) {
     return `the panel tab or connection changed ${where}`;
   }
+  const beforeOk = isUsablePanelConnectionIdentity(identityBefore);
+  const afterOk = isUsablePanelConnectionIdentity(identityAfter);
+  // panel#1925 recurrence: after restart/hello, graph reads succeed but the
+  // fingerprint is missing (`tab_session_id` not yet on the socket). That is
+  // "cannot compare", not "the connection left". A usable-then-gone tuple is
+  // still drift.
+  if (!beforeOk && !afterOk) return undefined;
+  if (!beforeOk) return `the panel connection identity was unavailable ${where}`;
+  if (!afterOk) return `the panel connection identity became unreadable ${where}`;
   if (!samePanelConnectionIdentity(identityBefore, identityAfter)) {
     return `the panel session or connection changed ${where}`;
   }
@@ -7159,24 +7167,20 @@ async function preparePromotedWidgetWrite(
   // In particular, do not turn a narrow known-bad-name list into authorization
   // for an unscoped outer write: renamed Anima, dynamic, DaSiWa, and dotted
   // aliases are all untrusted shape inputs here.
-  if (!hasIdentityApi) {
-    return promotedWriteRefusal(widget, "the receiver identity was unavailable while the mapping was read");
-  }
-  if (!isUsablePanelConnectionIdentity(identityBefore)) {
-    return promotedWriteRefusal(widget, "the panel connection identity was unavailable");
-  }
-
-  let identityAfter: { generation: number; tabSessionId: string } | undefined;
+  const mappingDrift = panelBindingDriftReason(
+    ctx,
+    "while the mapping was read",
+    hasIdentityApi,
+    identityBefore,
+    tabBefore,
+  );
+  if (mappingDrift) return promotedWriteRefusal(widget, mappingDrift);
+  let identityAfter = identityBefore;
   try {
-    identityAfter = ctx.panelConnectionIdentity?.();
+    const current = ctx.panelConnectionIdentity?.();
+    if (current !== undefined) identityAfter = current;
   } catch {
-    return promotedWriteRefusal(widget, "the panel connection identity became unreadable while the mapping was read");
-  }
-  if (ctx.tabId !== tabBefore || !isUsablePanelConnectionIdentity(identityAfter)) {
-    return promotedWriteRefusal(widget, "the panel tab or connection changed while the mapping was read");
-  }
-  if (!samePanelConnectionIdentity(identityBefore, identityAfter)) {
-    return promotedWriteRefusal(widget, "the panel session or connection changed while the mapping was read");
+    identityAfter = identityBefore;
   }
 
   const envelope = validatePromotedSubgraphEnvelope(payload, nodeId as number | string);

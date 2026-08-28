@@ -110,6 +110,9 @@ function bridge(opts: {
   remappedWriteError?: string;
   reconnectBeforeWrite?: boolean;
   tabRebindBeforeWrite?: boolean;
+  /** panel#1925 recurrence: hello/restart left tab_session_id unset so the
+   *  fingerprint is missing even though graph reads succeed. */
+  missingConnectionIdentity?: boolean;
   authoritativeScopeRead?: boolean;
   ownerNavigationAfterFinalQuery?: boolean;
   /** Navigation after MCP's final synchronous callback but before the panel
@@ -452,7 +455,7 @@ function bridge(opts: {
     tabs: () => [{ tab_id: TAB, title: "wf", connected_at: 0 }],
     resolveActiveTabId: () => TAB,
     tabCanMutateGraph: () => true,
-    tabConnectionIdentity: () => connectionIdentity,
+    tabConnectionIdentity: () => (opts.missingConnectionIdentity ? undefined : connectionIdentity),
     promotedScopeFor: () =>
       !inSubgraph && opts.preEntryScopeRead
         ? opts.preEntryScopeRead
@@ -1699,6 +1702,23 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
     expect(isError).toBe(true);
     expect(text).toMatch(/witness was ambiguous|No graph_set_widget was dispatched/);
     expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
+  });
+
+  it("#1925 writes a promoted widget when the connection fingerprint is missing after restart", async () => {
+    const { isError, text, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "new" },
+      {
+        firstWrite: "ok",
+        promotedTerminalWitnesses: true,
+        subgraph: CURRENT_SAFE_PROMOTED_SUBGRAPH,
+        missingConnectionIdentity: true,
+      },
+    );
+    expect(text, text).not.toMatch(/connection identity/);
+    expect(isError).toBe(false);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toEqual([
+      expect.objectContaining({ node_id: 76, widget: "quality_prompt" }),
+    ]);
   });
 
   it("does not compare the child graph token with a parent view before entering it", async () => {
