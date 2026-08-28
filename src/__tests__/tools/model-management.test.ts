@@ -55,6 +55,7 @@ import { setProgressDir } from "../../services/download-progress.js";
 import * as progressModule from "../../services/download-progress.js";
 import { listDownloadJobs, resetDownloadJobs, startDownloadJob } from "../../services/download-jobs.js";
 import { downloadCacheIdentity } from "../../services/download-cache.js";
+import { segmentScratchPath } from "../../services/download-segments.js";
 import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -536,6 +537,221 @@ describe('download_model action:"status"', () => {
       else process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S = savedStall;
       await rm(dir, { recursive: true, force: true });
       await rm(cache, { recursive: true, force: true });
+    }
+  });
+
+  it("reports live segmented .seg staging instead of withholding progress (#2356 recurrence)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "model-management-2356-seg-"));
+    const cache = await mkdtemp(join(tmpdir(), "model-management-2356-seg-cache-"));
+    const savedCache = process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+    const savedStall = process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S;
+    const url = "https://huggingface.co/Comfy-Org/test/resolve/main/segmented.safetensors";
+    const id = "status-2356-seg";
+    const progressId = "progress-2356-seg";
+    process.env.COMFYUI_DOWNLOAD_CACHE_DIR = cache;
+    process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S = "0";
+    setProgressDir(dir);
+    try {
+      const partial = downloadCacheIdentity(url).partialPath;
+      await mkdir(dirname(partial), { recursive: true });
+      await writeFile(segmentScratchPath(partial), Buffer.alloc(1024));
+      await writeFile(
+        join(dir, `control-job-${id}-session.json`),
+        JSON.stringify({
+          id,
+          trayId: "tray-2356-seg",
+          progressId,
+          partialPath: partial,
+          url,
+          target_subfolder: "diffusion_models",
+          status: "downloading",
+          via_manager: false,
+          partial_identity: { version: 1, cache_key: "seg-test", auth_mode: "none" },
+          started_at: Date.now() - 32 * 60_000,
+          updated: Date.now(),
+        }),
+      );
+      await writeFile(
+        join(dir, `${progressId}-snapshot.json`),
+        JSON.stringify({
+          id: progressId,
+          name: "segmented.safetensors",
+          downloaded: 4.23 * 1024 ** 3,
+          total: 19.53 * 1024 ** 3,
+          bytes_per_sec: 8_000_000,
+          status: "downloading",
+          updated: Date.now(),
+        }),
+      );
+
+      const { downloadStatus } = makeServer();
+      const text = (await downloadStatus({ id })).content[0].text;
+      expect(text).toContain("live segmented staging");
+      expect(text).toContain("does not start from the beginning");
+      expect(text).toMatch(/4\.23\/19\.53 GB \(21%\)/);
+      expect(text).not.toContain("PROGRESS UNAVAILABLE");
+      expect(text).not.toContain("no readable durable .partial is present yet");
+    } finally {
+      setProgressDir("");
+      if (savedCache === undefined) delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+      else process.env.COMFYUI_DOWNLOAD_CACHE_DIR = savedCache;
+      if (savedStall === undefined) delete process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S;
+      else process.env.COMFYUI_DOWNLOAD_STALL_TIMEOUT_S = savedStall;
+      await rm(dir, { recursive: true, force: true });
+      await rm(cache, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps durable .partial as the byte authority when a leftover .seg also exists (#2356)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "model-management-2356-partial-wins-"));
+    const cache = await mkdtemp(join(tmpdir(), "model-management-2356-partial-wins-cache-"));
+    const savedCache = process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+    const url = "https://example.com/partial-wins.safetensors";
+    const id = "status-2356-partial-wins";
+    const progressId = "progress-2356-partial-wins";
+    process.env.COMFYUI_DOWNLOAD_CACHE_DIR = cache;
+    setProgressDir(dir);
+    try {
+      const identity = downloadCacheIdentity(url);
+      await mkdir(dirname(identity.partialPath), { recursive: true });
+      await writeFile(identity.partialPath, Buffer.alloc(100));
+      await writeFile(segmentScratchPath(identity.partialPath), Buffer.alloc(900));
+      await writeFile(
+        join(dir, `control-job-${id}-session.json`),
+        JSON.stringify({
+          id,
+          trayId: "tray-2356-partial-wins",
+          progressId,
+          partialPath: identity.partialPath,
+          url,
+          target_subfolder: "checkpoints",
+          status: "downloading",
+          via_manager: false,
+          partial_identity: { version: 1, cache_key: identity.cacheKey, auth_mode: "none" },
+          started_at: Date.now() - 60_000,
+          updated: Date.now(),
+        }),
+      );
+      await writeFile(
+        join(dir, `${progressId}-snapshot.json`),
+        JSON.stringify({
+          id: progressId,
+          name: "partial-wins.safetensors",
+          downloaded: 900,
+          total: 1_000,
+          bytes_per_sec: 10,
+          status: "downloading",
+          updated: Date.now(),
+        }),
+      );
+
+      const { downloadStatus } = makeServer();
+      const text = (await downloadStatus({ id })).content[0].text;
+      expect(text).toContain("(10%)");
+      expect(text).not.toContain("(90%)");
+      expect(text).toContain("reconciled to the durable .partial");
+      expect(text).not.toContain("live segmented staging");
+    } finally {
+      setProgressDir("");
+      if (savedCache === undefined) delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+      else process.env.COMFYUI_DOWNLOAD_CACHE_DIR = savedCache;
+      await rm(dir, { recursive: true, force: true });
+      await rm(cache, { recursive: true, force: true });
+    }
+  });
+
+  it("cancel recovery with a live .seg does not claim the re-issue starts from zero (#2356 recurrence)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "model-management-2356-seg-cancel-"));
+    const cache = await mkdtemp(join(tmpdir(), "model-management-2356-seg-cancel-cache-"));
+    const savedCache = process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+    const url = "https://example.com/seg-cancel.safetensors";
+    const id = "status-2356-seg-cancel";
+    const progressId = "progress-2356-seg-cancel";
+    process.env.COMFYUI_DOWNLOAD_CACHE_DIR = cache;
+    setProgressDir(dir);
+    try {
+      const identity = downloadCacheIdentity(url);
+      const partial = identity.partialPath;
+      await mkdir(dirname(partial), { recursive: true });
+      await writeFile(partial, Buffer.alloc(0));
+      await writeFile(segmentScratchPath(partial), Buffer.alloc(2048));
+      await writeFile(
+        join(dir, `control-job-${id}-session.json`),
+        JSON.stringify({
+          id,
+          trayId: "tray-2356-seg-cancel",
+          progressId,
+          partialPath: partial,
+          url,
+          target_subfolder: "checkpoints",
+          status: "cancelled",
+          via_manager: false,
+          partial_identity: { version: 1, cache_key: identity.cacheKey, auth_mode: "none" },
+          started_at: Date.now() - 60_000,
+          updated: Date.now(),
+        }),
+      );
+
+      const { downloadStatus } = makeServer();
+      const text = (await downloadStatus({ id })).content[0].text;
+      expect(text).toContain("segmented staging is present");
+      expect(text).toContain("does not start from the beginning");
+      expect(text).not.toContain("starts from the beginning");
+    } finally {
+      setProgressDir("");
+      if (savedCache === undefined) delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+      else process.env.COMFYUI_DOWNLOAD_CACHE_DIR = savedCache;
+      await rm(dir, { recursive: true, force: true });
+      await rm(cache, { recursive: true, force: true });
+    }
+  });
+
+  it("action:cancel during segmented staging does not claim a restart from zero (#2356 recurrence)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "model-management-2356-seg-cancel-live-"));
+    const savedCache = process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+    process.env.COMFYUI_DOWNLOAD_CACHE_DIR = dir;
+    const url = "https://example.com/seg-cancel-live.safetensors";
+    const identity = downloadCacheIdentity(url);
+    const partial = identity.partialPath;
+    setProgressDir(dir);
+    resetDownloadJobs();
+    downloadModelMock.mockImplementationOnce(async (...args: unknown[]) => {
+      (args[10] as (path: string) => void)(partial);
+      const signal = args[6] as AbortSignal;
+      return await new Promise<string>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new DOMException("cancelled", "AbortError")), {
+          once: true,
+        });
+      });
+    });
+    try {
+      await mkdir(dirname(partial), { recursive: true });
+      await writeFile(partial, Buffer.alloc(0));
+      await writeFile(segmentScratchPath(partial), Buffer.alloc(2048));
+      const { downloadModel, cancelDownload } = makeServer();
+      const downloading = downloadModel({
+        url,
+        target_subfolder: "checkpoints",
+      });
+      await vi.waitFor(() => expect(downloadModelMock).toHaveBeenCalled());
+      const [job] = listDownloadJobs();
+      expect(job).toBeTruthy();
+
+      const cancelled = await cancelDownload({ id: job.id, tray_id: job.trayId });
+      expect(cancelled.content[0].text).toContain("being aborted");
+      expect(cancelled.content[0].text).toContain("segmented staging is present");
+      expect(cancelled.content[0].text).toContain("does not start from the beginning");
+      expect(cancelled.content[0].text).not.toContain("starts from the beginning");
+      const text = (await downloading).content[0].text;
+      expect(text).toContain("segmented staging is present");
+      expect(text).toContain("does not start from the beginning");
+      expect(text).not.toContain("starts from the beginning");
+    } finally {
+      resetDownloadJobs();
+      setProgressDir("");
+      if (savedCache === undefined) delete process.env.COMFYUI_DOWNLOAD_CACHE_DIR;
+      else process.env.COMFYUI_DOWNLOAD_CACHE_DIR = savedCache;
+      await rm(dir, { recursive: true, force: true });
     }
   });
 
