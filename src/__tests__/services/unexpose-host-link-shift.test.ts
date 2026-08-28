@@ -107,6 +107,14 @@ describe("unexposeHostLinkShiftNote (#2437)", () => {
     expect(unexposeHostLinkShiftNote(REPORTER_REMOVED, [])).toBeNull();
   });
 
+  it("#2473 is silent when the panel reports host_links_reindexed", () => {
+    expect(
+      unexposeHostLinkShiftNote({
+        removed: { ...REPORTER_REMOVED.removed, host_links_reindexed: true },
+      }, ["image", "image_1"]),
+    ).toBeNull();
+  });
+
   it("is silent on a refusal / missing removed (nothing landed)", () => {
     expect(isLandedUnexpose({ error: "unknown slot" })).toBe(false);
     expect(unexposeHostLinkShiftNote({ error: "unknown slot" })).toBeNull();
@@ -136,6 +144,15 @@ describe("panel_unexpose_subgraph_input attaches the #2437 note", () => {
     expect(res.content).toHaveLength(2);
     expect(res.content[1]?.text).toBe(unexposeHostLinkShiftNote(REPORTER_REMOVED));
     expect(allText(res)).toMatch(/Required input is missing/);
+  });
+
+  it("#2473 a panel that reindexed does not get the stale remaining-piece note", async () => {
+    const payload = { removed: { ...REPORTER_REMOVED.removed, host_links_reindexed: true } };
+    const { ctx } = makeCtx(jsonResult(payload));
+    const res = await defByName("panel_unexpose_subgraph_input").handler({ name: "text" }, ctx);
+    expect(res.isError).toBeUndefined();
+    expect(res.content).toHaveLength(1);
+    expect(allText(res)).not.toMatch(/#2437/);
   });
 
   it("a panel refusal is not decorated — nothing was removed", async () => {
