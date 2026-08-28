@@ -6796,11 +6796,13 @@ function currentPromotedBindingError(
   } catch {
     return "the panel connection identity became unreadable";
   }
-  const beforeOk = isUsablePanelConnectionIdentity(binding.identity);
-  const afterOk = isUsablePanelConnectionIdentity(current);
-  if (!beforeOk && !afterOk) return null;
-  if (!afterOk) return "the panel connection identity became unavailable";
-  if (!beforeOk) return null;
+  if (!isUsablePanelConnectionIdentity(binding.identity) && !isUsablePanelConnectionIdentity(current)) {
+    return null;
+  }
+  if (!isUsablePanelConnectionIdentity(current)) {
+    return "the panel connection identity became unavailable";
+  }
+  if (!isUsablePanelConnectionIdentity(binding.identity)) return null;
   if (!samePanelConnectionIdentity(binding.identity, current)) {
     return "the panel session or connection changed";
   }
@@ -7036,15 +7038,19 @@ function panelBindingDriftReason(
   if (ctx.tabId !== tabBefore) {
     return `the panel tab or connection changed ${where}`;
   }
-  const beforeOk = isUsablePanelConnectionIdentity(identityBefore);
-  const afterOk = isUsablePanelConnectionIdentity(identityAfter);
   // panel#1925 recurrence: after restart/hello, graph reads succeed but the
   // fingerprint is missing (`tab_session_id` not yet on the socket). That is
   // "cannot compare", not "the connection left". A usable-then-gone tuple is
   // still drift.
-  if (!beforeOk && !afterOk) return undefined;
-  if (!beforeOk) return `the panel connection identity was unavailable ${where}`;
-  if (!afterOk) return `the panel connection identity became unreadable ${where}`;
+  if (!isUsablePanelConnectionIdentity(identityBefore) && !isUsablePanelConnectionIdentity(identityAfter)) {
+    return undefined;
+  }
+  if (!isUsablePanelConnectionIdentity(identityBefore)) {
+    return `the panel connection identity was unavailable ${where}`;
+  }
+  if (!isUsablePanelConnectionIdentity(identityAfter)) {
+    return `the panel connection identity became unreadable ${where}`;
+  }
   if (!samePanelConnectionIdentity(identityBefore, identityAfter)) {
     return `the panel session or connection changed ${where}`;
   }
