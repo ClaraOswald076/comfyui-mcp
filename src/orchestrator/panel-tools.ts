@@ -6006,7 +6006,7 @@ function parseQueriedNodeType(payload: Record<string, unknown> | null): string |
   return null;
 }
 
-type QueriedNodeIdentity = { id: string; type: string };
+type QueriedNodeIdentity = { id: string; type: string; nodeIdentity?: string };
 
 function canonicalQueriedNodeId(value: unknown): string | null {
   if (typeof value === "number") {
@@ -6033,12 +6033,23 @@ function parseQueriedNodeIdentityRow(row: unknown): QueriedNodeIdentity | null {
     return null;
   }
   const resolvedType = typeof type === "string" ? type : classType;
-  return resolvedType ? { id, type: resolvedType } : null;
+  const nodeIdentity = record.node_identity;
+  if (
+    nodeIdentity !== undefined &&
+    (typeof nodeIdentity !== "string" || nodeIdentity.length === 0 || nodeIdentity.length > 256)
+  ) {
+    return null;
+  }
+  return resolvedType
+    ? { id, type: resolvedType, ...(nodeIdentity !== undefined ? { nodeIdentity } : {}) }
+    : null;
 }
 
 type QueriedNodeScope = {
   activeView: "root" | "subgraph";
   node: "ordinary" | "container";
+  nodeType: string;
+  nodeIdentity?: string;
 };
 
 /** Read the active viewing scope and node's explicit container bit before
@@ -6091,6 +6102,8 @@ function parseVerifiedQueriedNodeScope(
   return {
     activeView,
     node: isSubgraph ? "container" : "ordinary",
+    nodeType: identity.type,
+    ...(identity.nodeIdentity !== undefined ? { nodeIdentity: identity.nodeIdentity } : {}),
   };
 }
 
@@ -6519,6 +6532,7 @@ type PromotedWritePlan = {
 type OrdinaryWritePlan = {
   kind: "ordinary-write";
   expectedNodeType: string;
+  expectedNodeIdentity: string;
 };
 
 type PromotedExpectedScope = PromotedScopeWitness & {
@@ -6602,10 +6616,18 @@ function classifyPromotedSubgraphReadError(res: ToolResult): PromotedSubgraphRea
   if (!res.isError) return "permanent";
   if (isDefinitiveNonPromotedSubgraphRead(res)) return "definitive-ordinary";
   const text = textOfToolResult(res);
+  // Keep this list aligned with the bridge's established reconnect classifier.
+  // The promoted preflight opts out of the ordinary retry wrapper, so this is
+  // the one place that decides whether its explicit refresh is allowed. The
+  // panel's workflow-switch guard is a separate, known-safe pre-executor
+  // refusal: it explicitly says nothing was applied and asks for a retry.
   if (
-    /(?:websocket|socket).*(?:disconnected|closed|reset)|(?:disconnected|closed|reset).*(?:websocket|socket)|\b(?:no connected tab|genuinely gone|unavailable|panel not reachable|failed to fetch|ECONNRESET|ECONNABORTED|EPIPE|premature close|other side closed)\b/i.test(
+    isTransientReconnectError(new Error(text)) ||
+    /(?:websocket|socket).*(?:disconnected|closed|reset)|(?:disconnected|closed|reset).*(?:websocket|socket)/i.test(
       text,
-    )
+    ) ||
+    /\bunavailable\b/i.test(text) ||
+    isWorkflowSwitchGuardRefusal(new Error(text))
   ) {
     return "transient";
   }
@@ -7214,6 +7236,13 @@ async function preparePromotedWidgetWrite(
             "the definitive ordinary refresh did not publish a node type fence",
           );
         }
+        const expectedNodeIdentity = targetScope?.nodeIdentity;
+        if (!expectedNodeIdentity) {
+          return promotedWriteRefusal(
+            widget,
+            "the preflight ordinary-node read did not publish a trustworthy node identity fence",
+          );
+        }
         if (ctx.tabExpectedNodeTypeFenceCapability?.() !== true) {
           return promotedPanelBuildRefusal(
             ctx,
@@ -7223,7 +7252,16 @@ async function preparePromotedWidgetWrite(
             "enforces_expected_node_type_at_write",
           );
         }
-        return { kind: "ordinary-write", expectedNodeType };
+        if (ctx.tabExpectedNodeIdentityFenceCapability?.() !== true) {
+          return promotedPanelBuildRefusal(
+            ctx,
+            nodeId,
+            widget,
+            "does not advertise the atomic ordinary-node identity write fence",
+            "enforces_expected_node_identity_at_write",
+          );
+        }
+        return { kind: "ordinary-write", expectedNodeType, expectedNodeIdentity };
       }
       return promotedSubgraphReadRefusal(
         widget,
@@ -13691,6 +13729,7 @@ interface BridgeProbe {
   readPromotedScope?: (tabId: string, innerNodeId: number | string) => Promise<TabPromotedScopeRead>;
   tabPromotedTerminalWitnessCapability?: (tabId: string) => boolean;
   tabPromotedParentRailFenceCapability?: (tabId: string) => boolean;
+  tabExpectedNodeIdentityFenceCapability?: (tabId: string) => boolean;
   lastFenceRefusal?: (tabId: string) => string | undefined;
   isHeadless?: (tabId: string) => boolean;
   canReach?: (tabId: string) => boolean;
@@ -13847,6 +13886,11 @@ export interface PanelToolCtx {
    * expected_node_type at the synchronous mutation boundary. Real contexts
    * provide this; omitted/false is a fail-closed answer for #2107. */
   tabExpectedNodeTypeFenceCapability?: () => boolean;
+  /** Whether the currently bound panel enforces the opaque node-incarnation
+   * expected_node_identity at the synchronous mutation boundary. Real contexts
+   * provide this; omitted/false is a fail-closed answer for the transient
+   * ordinary-node recovery path. */
+  tabExpectedNodeIdentityFenceCapability?: () => boolean;
   /** Whether the currently bound panel enforces the stable graph identity in
    * expected_scope at the synchronous mutation boundary. Real contexts provide
    * this; omitted/false is a fail-closed answer for promoted writes (#2314 P1). */
@@ -15363,6 +15407,9 @@ export function makePanelToolCtx(
   ctx.tabCanMutateGraph = () => bridge.tabCanMutateGraph(ctx.tabId);
   ctx.tabExpectedNodeTypeFenceCapability = () =>
     bridge.tabExpectedNodeTypeFenceCapability(ctx.tabId);
+  ctx.tabExpectedNodeIdentityFenceCapability = () =>
+    typeof bridge.tabExpectedNodeIdentityFenceCapability === "function" &&
+    bridge.tabExpectedNodeIdentityFenceCapability(ctx.tabId);
   ctx.tabExpectedScopeGraphIdentityFenceCapability = () =>
     bridge.tabExpectedScopeGraphIdentityFenceCapability(ctx.tabId);
   ctx.tabPromotedTerminalWitnessCapability = () =>
@@ -18489,6 +18536,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           : null;
 
         let expectedNodeType: string | undefined = ordinaryPlan?.expectedNodeType;
+        let expectedNodeIdentity: string | undefined = ordinaryPlan?.expectedNodeIdentity;
         if (!promotedPlan && !ordinaryPlan && args.widget === DASIWA_STACK_WIDGET) {
           const daSiWaFence = await verifyDaSiWaStackWriteFence(ctx, args.node_id);
           if (daSiWaFence && "content" in daSiWaFence) return daSiWaFence;
@@ -18512,6 +18560,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           targetExpectedNodeType: string | undefined = expectedNodeType,
           beforeDispatch?: () => void,
           targetExpectedScope?: PromotedExpectedScope,
+          targetExpectedNodeIdentity: string | undefined = expectedNodeIdentity,
         ): Promise<ToolResult> =>
           stripVerifiedLastObservedSchemaNote(
             summarizeSetWidgetEcho(
@@ -18527,6 +18576,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                   // and supplies that node's own type.
                   ...(targetExpectedNodeType
                     ? { expected_node_type: targetExpectedNodeType }
+                    : {}),
+                  ...(targetExpectedNodeIdentity
+                    ? { expected_node_identity: targetExpectedNodeIdentity }
                     : {}),
                   ...(targetExpectedScope
                     ? {
@@ -18588,7 +18640,14 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           const blocked = await refuseKnownBadWriteBeforeDispatch(ctx, nodeId, widget);
           if (blocked) return blocked;
           if (promotedRetry && promotedRetry.kind === "ordinary-write") {
-            return write(nodeId, widget, promotedRetry.expectedNodeType);
+            return write(
+              nodeId,
+              widget,
+              promotedRetry.expectedNodeType,
+              undefined,
+              undefined,
+              promotedRetry.expectedNodeIdentity,
+            );
           }
           return write(nodeId, widget, targetExpectedNodeType);
         };

@@ -78,6 +78,14 @@ function bridge(opts: {
   /** #2478: replace the ordinary node after the definitive refresh, so a raw
    * write would falsely succeed unless the handler carries the type fence. */
   ordinaryNodeTypeAfterRefresh?: string;
+  /** #2478: replace the ordinary node object after the definitive refresh
+   * without changing its id or type. The receiver must fence this incarnation
+   * change with the opaque identity witness. */
+  ordinaryNodeIdentityAfterRefresh?: string;
+  /** #2478: publish the preflight node row used by the ordinary recovery path. */
+  preflightNodeIdentity?: string;
+  preflightNodeType?: string;
+  preflightNodeIsSubgraph?: boolean;
   /** #2401: change the routing or panel connection identity after the async
    * ordinary-node scope probe has produced its result, before the caller can
    * take the fast path. */
@@ -164,6 +172,7 @@ function bridge(opts: {
   let mutations = 0;
   let subgraphReads = 0;
   let ordinaryNodeType = "OrdinaryNode";
+  let ordinaryNodeIdentity = opts.preflightNodeIdentity ?? "node:78:original";
   let postEnterGraphQueries = 0;
   let authoritativeScopeReads = 0;
   let inSubgraph = opts.startInSubgraph === true;
@@ -325,6 +334,13 @@ function bridge(opts: {
         ) {
           throw new Error("graph_set_widget expected node type changed before dispatch: Nothing was applied.");
         }
+        if (
+          cmd.expected_node_identity !== undefined &&
+          String(cmd.node_id) === "78" &&
+          cmd.expected_node_identity !== ordinaryNodeIdentity
+        ) {
+          throw new Error("graph_set_widget expected node identity changed before dispatch: Nothing was applied.");
+        }
         writes += 1;
         if (writes === 1 && opts.ambiguous) throw new Error(AMBIGUOUS);
         if (writes === 1 && opts.scopeLost) throw new Error(SCOPE_REFUSAL);
@@ -381,6 +397,9 @@ function bridge(opts: {
             if (subgraphReads === 2 && opts.ordinaryNodeTypeAfterRefresh !== undefined) {
               ordinaryNodeType = opts.ordinaryNodeTypeAfterRefresh;
             }
+            if (subgraphReads === 2 && opts.ordinaryNodeIdentityAfterRefresh !== undefined) {
+              ordinaryNodeIdentity = opts.ordinaryNodeIdentityAfterRefresh;
+            }
             throw selected;
           }
           return withCurrentViewing(selected);
@@ -431,6 +450,21 @@ function bridge(opts: {
         }
         if (opts.detailById && wantId && opts.detailById[wantId] !== undefined) {
           return returnGraphQuery(opts.detailById[wantId], wantId);
+        }
+        if (opts.preflightNodeIdentity !== undefined && wantId === "78") {
+          return returnGraphQuery(
+            {
+              nodes: [
+                {
+                  id: 78,
+                  type: opts.preflightNodeType ?? "PromotedContainer",
+                  is_subgraph: opts.preflightNodeIsSubgraph ?? true,
+                  node_identity: opts.preflightNodeIdentity,
+                },
+              ],
+            },
+            wantId,
+          );
         }
         if (opts.stackDataIdentity && !inSubgraph) return returnGraphQuery(opts.stackDataIdentity, wantId);
         if (opts.stackDataIdentity && inSubgraph) {
@@ -502,6 +536,7 @@ function bridge(opts: {
     // v0.15.85's hello DOES advertise this one, which is why a legacy build
     // reaches the scope checks at all instead of stopping at the node-type fence.
     tabExpectedNodeTypeFenceCapability: () => true,
+    tabExpectedNodeIdentityFenceCapability: () => true,
     tabExpectedScopeGraphIdentityFenceCapability: () =>
       opts.scopeGraphIdentityFence === true || (!legacyBuild && opts.scopeGraphIdentityFence !== false),
     tabPromotedTerminalWitnessCapability: () =>
@@ -3412,6 +3447,9 @@ describe("panel_set_widget transient promoted-subgraph read (#2478)", () => {
       { node_id: 78, widget: "steps", value: 8 },
       {
         firstWrite: "ok",
+        preflightNodeIdentity: "node:78:original",
+        preflightNodeType: "PromotedContainer",
+        preflightNodeIsSubgraph: true,
         subgraphSequence: [
           transientRead,
           new Error("Node 78 (OrdinaryNode) is not a subgraph"),
@@ -3421,13 +3459,14 @@ describe("panel_set_widget transient promoted-subgraph read (#2478)", () => {
 
     expect(isError).toBe(false);
     expect(mutations).toBe(1);
-    expect(bridgeRetryBudgets).toEqual([0, 0]);
+    expect(bridgeRetryBudgets.slice(0, 2)).toEqual([0, 0]);
     expect(calls.filter((call) => call.cmd === "graph_get_subgraph")).toHaveLength(2);
     expect(calls.filter((call) => call.cmd === "graph_set_widget")).toEqual([
       expect.objectContaining({
         node_id: 78,
         widget: "steps",
         expected_node_type: "OrdinaryNode",
+        expected_node_identity: "node:78:original",
       }),
     ]);
   });
@@ -3438,6 +3477,9 @@ describe("panel_set_widget transient promoted-subgraph read (#2478)", () => {
       {
         firstWrite: "ok",
         ordinaryNodeTypeAfterRefresh: "ReplacementNode",
+        preflightNodeIdentity: "node:78:original",
+        preflightNodeType: "PromotedContainer",
+        preflightNodeIsSubgraph: true,
         subgraphSequence: [
           transientRead,
           new Error("Node 78 (OrdinaryNode) is not a subgraph"),
@@ -3452,6 +3494,60 @@ describe("panel_set_widget transient promoted-subgraph read (#2478)", () => {
     expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(1);
     expect(writesApplied).toBe(0);
     expect(mutations).toBe(0);
+  });
+
+  it("refuses a same-type same-id replacement using the node identity fence", async () => {
+    const { isError, text, calls, writesApplied, mutations, bridgeRetryBudgets } = await setWidget(
+      { node_id: 78, widget: "steps", value: 8 },
+      {
+        firstWrite: "ok",
+        preflightNodeIdentity: "node:78:original",
+        preflightNodeType: "PromotedContainer",
+        preflightNodeIsSubgraph: true,
+        ordinaryNodeIdentityAfterRefresh: "node:78:replacement",
+        subgraphSequence: [
+          transientRead,
+          new Error("Node 78 (OrdinaryNode) is not a subgraph"),
+        ],
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/expected node identity changed before dispatch/);
+    expect(calls.filter((call) => call.cmd === "graph_get_subgraph")).toHaveLength(2);
+    expect(bridgeRetryBudgets).toEqual([0, 0]);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(1);
+    expect(writesApplied).toBe(0);
+    expect(mutations).toBe(0);
+  });
+
+  it.each([
+    "Panel tab tmp:panel is not open",
+    "socket hang up",
+    "WebSocket connection closed",
+    "no connected tab for the requested panel",
+    "genuinely gone",
+    "Failed to fetch",
+    "Panel not reachable",
+    "ECONNRESET",
+    "premature close",
+    "other side closed",
+    "ECONNABORTED",
+    "EPIPE",
+    'the panel is switching/refreshing "workflow-a" right now, so "graph_get_subgraph" was NOT applied — nothing changed',
+  ])("refreshes known transient refusal %s", async (message) => {
+    const { isError, calls, mutations, bridgeRetryBudgets } = await setWidget(
+      { node_id: 78, widget: "steps", value: 8 },
+      {
+        firstWrite: "ok",
+        subgraphSequence: [new Error(message), SUBGRAPH],
+      },
+    );
+
+    expect(isError).toBe(false);
+    expect(mutations).toBe(1);
+    expect(calls.filter((call) => call.cmd === "graph_get_subgraph")).toHaveLength(3);
+    expect(bridgeRetryBudgets.slice(0, 2)).toEqual([0, 0]);
   });
 
   it("does not spend the refresh on a permanent application error", async () => {

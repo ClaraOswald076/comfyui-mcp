@@ -162,7 +162,7 @@ async function startBridgeOnFreePort(
 function connectPanel(
   tabId?: string,
   title = "workflow-a",
-  opts: { tabSessionId?: string } = {},
+  opts: { tabSessionId?: string; expectedNodeIdentityFence?: boolean } = {},
 ): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
     const sock = new WebSocket(`ws://127.0.0.1:${port}`);
@@ -179,6 +179,7 @@ function connectPanel(
             enforces_workflow_stamp: true,
             enforces_workflow_stamp_at_write: true,
             enforces_expected_node_type_at_write: true,
+            enforces_expected_node_identity_at_write: opts.expectedNodeIdentityFence ?? true,
             enforces_expected_scope_at_write: true,
             enforces_expected_scope_graph_identity_at_write: true,
             enforces_promoted_parent_rail_at_write: true,
@@ -3474,6 +3475,73 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     expect(isCapabilityRefusal(caught)).toBe(true);
     expect(dispatchOutcomeOf(caught)).toBe(false);
     modern.close();
+  });
+
+  it("forwards expected_node_identity to a panel advertising the write fence", async () => {
+    const modern = await connectPanel("tmp:node-identity", "identity");
+    const frames: Array<Record<string, unknown>> = [];
+    modern.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString()) as Record<string, unknown>;
+      if (msg.rid && msg.cmd) frames.push(msg);
+    });
+    autoReply(modern, "identity");
+    await waitFor(() =>
+      expect(bridge.tabExpectedNodeIdentityFenceCapability("tmp:node-identity")).toBe(true),
+    );
+
+    await expect(
+      bridge.send(
+        {
+          cmd: "graph_set_widget",
+          node_id: 7,
+          widget: "steps",
+          value: 30,
+          expected_node_identity: "node:7:original",
+        },
+        { tabId: "tmp:node-identity" },
+      ),
+    ).resolves.toMatchObject({ from: "identity" });
+    expect(frames).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          cmd: "graph_set_widget",
+          expected_node_identity: "node:7:original",
+        }),
+      ]),
+    );
+    modern.close();
+  });
+
+  it("FAILS CLOSED when expected_node_identity reaches a panel without its write fence", async () => {
+    const old = await connectPanel("tmp:old-node-identity", "old identity", {
+      expectedNodeIdentityFence: false,
+    });
+    await waitFor(() =>
+      expect(bridge.tabs().some((t) => t.tab_id === "tmp:old-node-identity")).toBe(true),
+    );
+    expect(bridge.tabExpectedNodeIdentityFenceCapability("tmp:old-node-identity")).toBe(false);
+    const caught = await bridge
+      .send(
+        {
+          cmd: "graph_set_widget",
+          node_id: 7,
+          widget: "steps",
+          value: 30,
+          expected_node_identity: "node:7:original",
+        },
+        { tabId: "tmp:old-node-identity" },
+      )
+      .then(
+        () => null,
+        (err) => err,
+      );
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toMatch(
+      /atomic expected-node-identity write fence/,
+    );
+    expect(isCapabilityRefusal(caught)).toBe(true);
+    expect(dispatchOutcomeOf(caught)).toBe(false);
+    old.close();
   });
 
   it("FAILS CLOSED when expected_scope reaches a panel without #2314's receiver fence", async () => {

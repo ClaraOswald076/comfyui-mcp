@@ -224,6 +224,11 @@ interface Conn {
    * ignore the field and leave the node-replacement fence unenforced. */
   enforcesExpectedNodeTypeAtWrite: boolean;
   /** True only when THIS hello advertises that the panel validates an optional
+   * opaque expected_node_identity at the synchronous graph_set_widget write
+   * boundary. A same-type, same-id replacement must not satisfy a stale
+   * promoted-write preflight. */
+  enforcesExpectedNodeIdentityAtWrite: boolean;
+  /** True only when THIS hello advertises that the panel validates an optional
    * expected_scope (promoted owner/workflow witness) at the synchronous
    * graph_set_widget write boundary. Re-read per hello and fail closed when
    * absent: an older panel would silently ignore receiver identity and could
@@ -1625,6 +1630,10 @@ function fenceRefusal(tabId: string, fence: string, capability: string): Error {
 
 function expectedNodeTypeFenceRefusal(tabId: string): Error {
   return fenceRefusal(tabId, "expected-node-type", "enforces_expected_node_type_at_write");
+}
+
+function expectedNodeIdentityFenceRefusal(tabId: string): Error {
+  return fenceRefusal(tabId, "expected-node-identity", "enforces_expected_node_identity_at_write");
 }
 
 function expectedScopeFenceRefusal(tabId: string): Error {
@@ -3122,6 +3131,9 @@ export class UiBridge {
             (msg as { enforces_workflow_stamp_at_write?: unknown }).enforces_workflow_stamp_at_write === true,
           enforcesExpectedNodeTypeAtWrite:
             (msg as { enforces_expected_node_type_at_write?: unknown }).enforces_expected_node_type_at_write === true,
+          enforcesExpectedNodeIdentityAtWrite:
+            (msg as { enforces_expected_node_identity_at_write?: unknown })
+              .enforces_expected_node_identity_at_write === true,
           enforcesExpectedScopeAtWrite:
             (msg as { enforces_expected_scope_at_write?: unknown }).enforces_expected_scope_at_write === true,
           enforcesExpectedScopeGraphIdentityAtWrite:
@@ -3777,6 +3789,16 @@ export class UiBridge {
   tabExpectedNodeTypeFenceCapability(tabId: string): boolean {
     try {
       return this.resolveTarget(tabId).enforcesExpectedNodeTypeAtWrite === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Whether THIS connected panel enforces graph_set_widget's optional opaque
+   * expected-node-identity fence at the actual mutation boundary. */
+  tabExpectedNodeIdentityFenceCapability(tabId: string): boolean {
+    try {
+      return this.resolveTarget(tabId).enforcesExpectedNodeIdentityAtWrite === true;
     } catch {
       return false;
     }
@@ -5549,6 +5571,17 @@ export class UiBridge {
       );
       return Promise.reject(markCapabilityRefusal(refusal));
     }
+    if (
+      cmd.cmd === "graph_set_widget" &&
+      Object.prototype.hasOwnProperty.call(cmd, "expected_node_identity") &&
+      !conn.enforcesExpectedNodeIdentityAtWrite
+    ) {
+      const refusal = markDispatched(
+        expectedNodeIdentityFenceRefusal(conn.tabId),
+        false,
+      );
+      return Promise.reject(markCapabilityRefusal(refusal));
+    }
     // #2314 — an expected_scope is meaningful only when the receiving panel
     // compares it against its LIVE current graph at the synchronous mutation
     // boundary. An older panel silently ignoring this optional field could
@@ -5984,6 +6017,15 @@ export class UiBridge {
       ) {
         return Promise.reject(
           markCapabilityRefusal(markDispatched(expectedNodeTypeFenceRefusal(live.tabId), false)),
+        );
+      }
+      if (
+        cmd.cmd === "graph_set_widget" &&
+        Object.prototype.hasOwnProperty.call(cmd, "expected_node_identity") &&
+        !live.enforcesExpectedNodeIdentityAtWrite
+      ) {
+        return Promise.reject(
+          markCapabilityRefusal(markDispatched(expectedNodeIdentityFenceRefusal(live.tabId), false)),
         );
       }
       if (
