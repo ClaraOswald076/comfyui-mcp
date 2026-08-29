@@ -7104,18 +7104,47 @@ async function preparePromotedWidgetWrite(
     return null;
   }
 
-  const sub = await ctx.call({ cmd: "graph_get_subgraph", node_id: nodeId });
+  let sub = await ctx.call({ cmd: "graph_get_subgraph", node_id: nodeId });
   if (sub.isError) {
     if (isDefinitiveNonPromotedSubgraphRead(sub)) {
       const drift2 = panelBindingDriftReason(ctx, "after the subgraph read", hasIdentityApi, identityBefore, tabBefore);
       if (drift2) return promotedWriteRefusal(widget, drift2);
       return null;
     }
-    return promotedSubgraphReadRefusal(
-      widget,
-      sub,
-      "graph_get_subgraph could not determine whether the addressed node is a promoted container",
-    );
+    // A canvas/root divergence is a panel diagnosis with its own remedy, not a
+    // transient ownership read. Preserve that diagnosis instead of replacing it
+    // with a generic retry result (panel#1869).
+    if (textOfToolResult(sub).includes(CANVAS_ROOT_DIVERGENCE_MARKER)) {
+      return promotedSubgraphReadRefusal(
+        widget,
+        sub,
+        "graph_get_subgraph could not determine whether the addressed node is a promoted container",
+      );
+    }
+    // A binding/subgraph registration transition can make the first read
+    // indeterminate even though the same live container is readable immediately
+    // afterward. Refresh once, then keep the existing fail-closed classification
+    // and identity checks for the fresh reply.
+    const refreshedSub = await ctx.call({ cmd: "graph_get_subgraph", node_id: nodeId });
+    if (refreshedSub.isError) {
+      if (isDefinitiveNonPromotedSubgraphRead(refreshedSub)) {
+        const driftAfterRefresh = panelBindingDriftReason(
+          ctx,
+          "after the subgraph refresh",
+          hasIdentityApi,
+          identityBefore,
+          tabBefore,
+        );
+        if (driftAfterRefresh) return promotedWriteRefusal(widget, driftAfterRefresh);
+        return null;
+      }
+      return promotedSubgraphReadRefusal(
+        widget,
+        refreshedSub,
+        "graph_get_subgraph could not determine whether the addressed node is a promoted container",
+      );
+    }
+    sub = refreshedSub;
   }
   let payload = parseToolResultJson(sub);
   if (!payload || !promotedEnvelopeCarriesEvidence(payload)) {

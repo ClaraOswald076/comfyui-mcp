@@ -1038,7 +1038,11 @@ describe("panel_set_widget ordinary-node scope probe fence (#2401)", () => {
 
     expect(isError).toBe(true);
     expect(text).toMatch(/could not determine whether the addressed node is a promoted container/);
-    expect(calls.map((call) => call.cmd)).toEqual(["graph_query", "graph_get_subgraph"]);
+    expect(calls.map((call) => call.cmd)).toEqual([
+      "graph_query",
+      "graph_get_subgraph",
+      "graph_get_subgraph",
+    ]);
     expect(writesApplied).toBe(0);
     expect(mutations).toBe(0);
   });
@@ -1348,7 +1352,7 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
     expect(writes[0]).toMatchObject({ node_id: 76, widget });
   });
 
-  it("refuses an indeterminate graph_get_subgraph error before any container write", async () => {
+  it("refuses after one indeterminate graph_get_subgraph refresh before any container write", async () => {
     const { text, isError, calls } = await setWidget(
       { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
       {
@@ -1362,6 +1366,7 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
     expect(calls.map((c) => c.cmd)).toEqual([
       "graph_query",
       "graph_query",
+      "graph_get_subgraph",
       "graph_get_subgraph",
     ]);
   });
@@ -1430,7 +1435,7 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
     expect(text).not.toContain("This usually follows a ComfyUI backend restart");
   });
 
-  it("leaves every NON-diagnosed indeterminate read on its original wording", async () => {
+  it("leaves every NON-diagnosed indeterminate read on its original wording after one refresh", async () => {
     const { text, isError, calls, mutations } = await setWidget(
       { node_id: 78, widget: "quality_prompt", value: "masterpiece" },
       {
@@ -1441,9 +1446,14 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
 
     expect(isError).toBe(true);
     expect(mutations).toBe(0);
-    expect(calls.map((c) => c.cmd)).toEqual(["graph_query", "graph_query", "graph_get_subgraph"]);
-    // Unchanged from before panel#1869: a transport failure IS transient, so
-    // "retry once stable" is honest advice there and must survive.
+    expect(calls.map((c) => c.cmd)).toEqual([
+      "graph_query",
+      "graph_query",
+      "graph_get_subgraph",
+      "graph_get_subgraph",
+    ]);
+    // The refusal wording remains unchanged: a transport failure IS transient,
+    // so "retry once stable" is honest advice after the bounded refresh fails.
     expect(text).toContain("could not determine whether the addressed node is a promoted container");
     expect(text).toContain("retry only after the panel binding and subgraph mapping are stable");
     expect(text).not.toContain("[canvas-root-divergence]");
@@ -3329,6 +3339,47 @@ describe("#2393 promoted-terminal witness is judged on the requested alias", () 
     expect(isError).toBe(true);
     expect(text).toMatch(/malformed, stale, or incomplete ownership envelope/);
     expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(0);
+  });
+});
+
+describe("panel_set_widget transient promoted-subgraph read (#2478)", () => {
+  const transientRead = new Error("graph_get_subgraph temporarily unavailable during panel binding");
+
+  it("refreshes one indeterminate read before applying the validated promoted write", async () => {
+    const { isError, calls, writesApplied, mutations } = await setWidget(
+      { node_id: 78, widget: "steps", value: 8 },
+      {
+        firstWrite: "ok",
+        subgraphSequence: [transientRead, SUBGRAPH],
+      },
+    );
+
+    expect(isError).toBe(false);
+    expect(writesApplied).toBe(1);
+    expect(mutations).toBe(1);
+    // The shipped handler performs the initial read, exactly one transient
+    // refresh, and the pre-entry mapping confirmation before the inner write.
+    expect(calls.filter((call) => call.cmd === "graph_get_subgraph")).toHaveLength(3);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toEqual([
+      expect.objectContaining({ node_id: 75, widget: "steps", value: 8 }),
+    ]);
+  });
+
+  it("still refuses when the one refresh remains indeterminate", async () => {
+    const { isError, text, calls, writesApplied, mutations } = await setWidget(
+      { node_id: 78, widget: "steps", value: 8 },
+      {
+        firstWrite: "ok",
+        subgraphSequence: [transientRead, transientRead],
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/could not determine whether the addressed node is a promoted container/);
+    expect(calls.filter((call) => call.cmd === "graph_get_subgraph")).toHaveLength(2);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
+    expect(writesApplied).toBe(0);
+    expect(mutations).toBe(0);
   });
 });
 
