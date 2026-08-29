@@ -116,6 +116,12 @@ function bridge(opts: {
   /** panel#1925 P1: the missing fingerprint is replaced by a new session
    *  while the awaited pre-dispatch mapping read is in flight. */
   missingIdentityRebindDuringMapping?: boolean;
+  /** panel#1925 P1: another anonymous connection takes over after preflight,
+   *  immediately before the ordinary graph_set_widget dispatch. */
+  anonymousRebindBeforeWrite?: boolean;
+  /** panel#1925 P1: another anonymous connection takes over during mapping,
+   *  while the public tab-session fingerprint remains unavailable. */
+  anonymousIdentityRebindDuringMapping?: boolean;
   authoritativeScopeRead?: boolean;
   ownerNavigationAfterFinalQuery?: boolean;
   /** Navigation after MCP's final synchronous callback but before the panel
@@ -173,6 +179,7 @@ function bridge(opts: {
   const targetGraphIdentity = "graph:workflow-a-container-a";
   let currentGraphIdentity = inSubgraph ? targetGraphIdentity : "graph:workflow-a-root";
   let connectionIdentity = { generation: 1, tabSessionId: "browser-tab-a" };
+  let anonymousIncarnation = "anon:1";
   let observedPromotedScope: {
     known: true;
     scope: "root" | "subgraph";
@@ -261,7 +268,8 @@ function bridge(opts: {
       if (cmd.cmd === "graph_set_widget" && sendOpts?.beforeDispatch) {
         const mutation = beforeWrite.mutate;
         beforeWrite.mutate = undefined;
-        if (opts.receiverNavigationAfterMcpFence) {
+        const receiverNavigation = opts.receiverNavigationAfterMcpFence && cmd.expected_scope !== undefined;
+        if (receiverNavigation) {
           // The MCP callback is the last synchronous server-side check. The
           // browser can navigate after it returns and before the receiver
           // handler applies the frame; this is the architectural race the
@@ -275,7 +283,14 @@ function bridge(opts: {
           }
           mutation?.();
         } else {
-          mutation?.();
+          // The receiver-navigation scenario belongs to the expected_scope
+          // inner write. Keep the earlier outer recovery write on its original
+          // graph now that ordinary writes also have a final callback.
+          if (opts.receiverNavigationAfterMcpFence && cmd.expected_scope === undefined) {
+            beforeWrite.mutate = mutation;
+          } else {
+            mutation?.();
+          }
           sendOpts.beforeDispatch();
         }
         if (opts.parentRailRelinkAfterMcpFence) {
@@ -352,6 +367,9 @@ function bridge(opts: {
         if (opts.missingIdentityRebindDuringMapping && subgraphReads === 2) {
           connectionIdentity = { generation: 2, tabSessionId: "browser-tab-b" };
         }
+        if (opts.anonymousIdentityRebindDuringMapping && subgraphReads === 2) {
+          anonymousIncarnation = "anon:2";
+        }
         // #2409 — this read is the await the definitive-non-subgraph exit returns
         // across. Rebind here so that exit sees a receiver that moved under it.
         if (opts.subgraphReadIdentityChange === "connection") {
@@ -404,6 +422,7 @@ function bridge(opts: {
           if (cmd.fields === "detail" && cmd.max_chars === undefined) {
             if (opts.scopeProbeIdentityChange === "connection") {
               connectionIdentity = { generation: 2, tabSessionId: "browser-tab-a" };
+              anonymousIncarnation = "anon:2";
             }
             const mutation = afterScopeProbe.mutate;
             afterScopeProbe.mutate = undefined;
@@ -466,6 +485,7 @@ function bridge(opts: {
       !(opts.missingIdentityRebindDuringMapping && subgraphReads >= 2)
         ? undefined
         : connectionIdentity,
+    tabIncarnation: () => anonymousIncarnation,
     promotedScopeFor: () =>
       !inSubgraph && opts.preEntryScopeRead
         ? opts.preEntryScopeRead
@@ -520,6 +540,12 @@ function bridge(opts: {
       // A second browser tab for the same workflow keeps the workflow route
       // but has a different receiver session.
       connectionIdentity = { generation: 1, tabSessionId: "browser-tab-b" };
+    };
+  } else if (opts.anonymousRebindBeforeWrite) {
+    beforeWrite.mutate = () => {
+      // The new receiver has no tab_session_id, so only UiBridge's synthetic
+      // per-connection incarnation can distinguish it from the captured one.
+      anonymousIncarnation = "anon:2";
     };
   } else if (opts.receiverNavigationAfterMcpFence) {
     beforeWrite.mutate = () => {
@@ -1015,6 +1041,59 @@ describe("panel_set_widget ordinary-node scope probe fence (#2401)", () => {
     expect(calls.map((call) => call.cmd)).toEqual(["graph_query", "graph_set_widget"]);
     expect(writesApplied).toBe(1);
     expect(mutations).toBe(1);
+  });
+
+  it("fences an anonymous same-tab takeover after the ordinary preflight", async () => {
+    const { text, isError, calls, writesApplied, mutations } = await setWidget(
+      { node_id: 82, widget: "lora_1", value },
+      {
+        firstWrite: "ok",
+        promotedDetail: ordinaryRootDetail,
+        missingConnectionIdentity: true,
+        anonymousRebindBeforeWrite: true,
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/session or connection changed/);
+    expect(text).toContain("No graph_set_widget was dispatched");
+    expect(calls.map((call) => call.cmd)).toEqual(["graph_query"]);
+    expect(writesApplied).toBe(0);
+    expect(mutations).toBe(0);
+  });
+
+  it("keeps a stable anonymous connection on the ordinary fast path without an extra probe", async () => {
+    const { isError, calls, writesApplied, mutations } = await setWidget(
+      { node_id: 82, widget: "lora_1", value },
+      {
+        firstWrite: "ok",
+        promotedDetail: ordinaryRootDetail,
+        missingConnectionIdentity: true,
+      },
+    );
+
+    expect(isError).toBe(false);
+    expect(calls.map((call) => call.cmd)).toEqual(["graph_query", "graph_set_widget"]);
+    expect(writesApplied).toBe(1);
+    expect(mutations).toBe(1);
+  });
+
+  it("refuses an anonymous same-tab takeover observed during the ordinary scope probe", async () => {
+    const { text, isError, calls, writesApplied, mutations } = await setWidget(
+      { node_id: 82, widget: "lora_1", value },
+      {
+        firstWrite: "ok",
+        promotedDetail: ordinaryRootDetail,
+        missingConnectionIdentity: true,
+        scopeProbeIdentityChange: "connection",
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/session or connection changed.*after the scope probe/);
+    expect(calls.map((call) => call.cmd)).toEqual(["graph_query"]);
+    expect(writesApplied).toBe(0);
+    expect(mutations).toBe(0);
   });
 
   it("keeps an ordinary node in an active subgraph on the conservative path", async () => {
@@ -1746,6 +1825,26 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
     expect(text).toMatch(/session or connection changed/);
     expect(text).toContain("No graph_set_widget was dispatched");
     expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
+  });
+
+  it("#1925 refuses a missing captured identity that is taken over by another anonymous connection", async () => {
+    const { isError, text, calls, writesApplied, mutations } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "new" },
+      {
+        firstWrite: "ok",
+        promotedTerminalWitnesses: true,
+        subgraph: CURRENT_SAFE_PROMOTED_SUBGRAPH,
+        missingConnectionIdentity: true,
+        anonymousIdentityRebindDuringMapping: true,
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/session or connection changed/);
+    expect(text).toContain("No graph_set_widget was dispatched");
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
+    expect(writesApplied).toBe(0);
+    expect(mutations).toBe(0);
   });
 
   it("does not compare the child graph token with a parent view before entering it", async () => {

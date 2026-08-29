@@ -6492,6 +6492,8 @@ async function refuseKnownBadWriteBeforeDispatch(
 type PromotedWriteBinding = {
   tabId: string;
   identity: { generation: number; tabSessionId: string } | undefined;
+  /** UiBridge's always-present per-connection id, including anonymous sockets. */
+  incarnation?: string;
 };
 
 type PromotedWritePlan = {
@@ -6797,12 +6799,23 @@ function currentPromotedBindingError(
     return "the panel connection identity became unreadable";
   }
   if (!isUsablePanelConnectionIdentity(binding.identity)) {
-    // A binding captured without a fingerprint may remain incomparable, but it
-    // must not be upgraded to authorize a different connection later. The
-    // tab id is deliberately reusable across reconnects and new sessions.
-    return isUsablePanelConnectionIdentity(current)
-      ? "the panel session or connection changed"
-      : null;
+    // A binding captured without a public fingerprint can still be fenced by
+    // UiBridge's private per-connection incarnation. The tab id is deliberately
+    // reusable across reconnects and new sessions, so two missing fingerprints
+    // are not evidence of the same receiver.
+    if (isUsablePanelConnectionIdentity(current)) return "the panel session or connection changed";
+    let currentIncarnation: string | undefined;
+    try {
+      currentIncarnation = panelIncarnation(ctx, ctx.tabId);
+    } catch {
+      return "the panel connection incarnation became unreadable";
+    }
+    if (!isUsablePanelIncarnation(binding.incarnation) || !isUsablePanelIncarnation(currentIncarnation)) {
+      return "the anonymous panel connection generation was unavailable";
+    }
+    return binding.incarnation === currentIncarnation
+      ? null
+      : "the panel session or connection changed";
   }
   if (!isUsablePanelConnectionIdentity(current)) {
     return "the panel connection identity became unavailable";
@@ -6811,6 +6824,15 @@ function currentPromotedBindingError(
     return "the panel session or connection changed";
   }
   return null;
+}
+
+function capturePromotedWriteBinding(ctx: PanelToolCtx): PromotedWriteBinding | null {
+  if (typeof ctx.panelConnectionIdentity !== "function") return null;
+  return {
+    tabId: ctx.tabId,
+    identity: ctx.panelConnectionIdentity(),
+    incarnation: panelIncarnation(ctx, ctx.tabId),
+  };
 }
 
 /** The bridge's workflow stamp is the strongest synchronous receiver witness
@@ -7030,6 +7052,7 @@ function panelBindingDriftReason(
   where: string,
   hasIdentityApi: boolean,
   identityBefore: { generation: number; tabSessionId: string } | undefined,
+  incarnationBefore: string | undefined,
   tabBefore: string,
 ): string | undefined {
   if (!hasIdentityApi) return `the receiver identity was unavailable ${where}`;
@@ -7042,15 +7065,26 @@ function panelBindingDriftReason(
   if (ctx.tabId !== tabBefore) {
     return `the panel tab or connection changed ${where}`;
   }
-  // panel#1925 recurrence: after restart/hello, graph reads succeed but the
-  // fingerprint is missing (`tab_session_id` not yet on the socket). That is
-  // "cannot compare", not "the connection left". A usable-then-gone tuple is
-  // still drift.
-  if (!isUsablePanelConnectionIdentity(identityBefore) && !isUsablePanelConnectionIdentity(identityAfter)) {
-    return undefined;
-  }
   if (!isUsablePanelConnectionIdentity(identityBefore)) {
-    return `the panel connection identity was unavailable ${where}`;
+    // panel#1925 recurrence: after restart/hello, graph reads succeed but the
+    // public fingerprint is missing. UiBridge still has an always-present
+    // per-connection incarnation for this case; equal anonymous generations
+    // are comparable, while an absent/changed one is not.
+    if (isUsablePanelConnectionIdentity(identityAfter)) {
+      return `the panel session or connection changed ${where}`;
+    }
+    let incarnationAfter: string | undefined;
+    try {
+      incarnationAfter = panelIncarnation(ctx, ctx.tabId);
+    } catch {
+      return `the panel connection incarnation became unreadable ${where}`;
+    }
+    if (!isUsablePanelIncarnation(incarnationBefore) || !isUsablePanelIncarnation(incarnationAfter)) {
+      return `the anonymous panel connection generation was unavailable ${where}`;
+    }
+    return incarnationBefore === incarnationAfter
+      ? undefined
+      : `the panel session or connection changed ${where}`;
   }
   if (!isUsablePanelConnectionIdentity(identityAfter)) {
     return `the panel connection identity became unreadable ${where}`;
@@ -7091,9 +7125,13 @@ async function preparePromotedWidgetWrite(
   const tabBefore = ctx.tabId;
   const hasIdentityApi = typeof ctx.panelConnectionIdentity === "function";
   let identityBefore: { generation: number; tabSessionId: string } | undefined;
+  let incarnationBefore: string | undefined;
   if (hasIdentityApi) {
     try {
       identityBefore = ctx.panelConnectionIdentity?.();
+      if (!isUsablePanelConnectionIdentity(identityBefore)) {
+        incarnationBefore = panelIncarnation(ctx, ctx.tabId);
+      }
     } catch {
       return promotedWriteRefusal(widget, "the panel connection identity could not be read");
     }
@@ -7109,7 +7147,14 @@ async function preparePromotedWidgetWrite(
     // The scope probe crossed an await. Re-read the binding before taking the
     // ordinary fast path; otherwise a tab/connection rebind can make this
     // probe's ordinary classification authorize a write on the new receiver.
-    const drift = panelBindingDriftReason(ctx, "after the scope probe", hasIdentityApi, identityBefore, tabBefore);
+    const drift = panelBindingDriftReason(
+      ctx,
+      "after the scope probe",
+      hasIdentityApi,
+      identityBefore,
+      incarnationBefore,
+      tabBefore,
+    );
     if (drift) return promotedWriteRefusal(widget, drift);
     return null;
   }
@@ -7117,7 +7162,14 @@ async function preparePromotedWidgetWrite(
   const sub = await ctx.call({ cmd: "graph_get_subgraph", node_id: nodeId });
   if (sub.isError) {
     if (isDefinitiveNonPromotedSubgraphRead(sub)) {
-      const drift2 = panelBindingDriftReason(ctx, "after the subgraph read", hasIdentityApi, identityBefore, tabBefore);
+      const drift2 = panelBindingDriftReason(
+        ctx,
+        "after the subgraph read",
+        hasIdentityApi,
+        identityBefore,
+        incarnationBefore,
+        tabBefore,
+      );
       if (drift2) return promotedWriteRefusal(widget, drift2);
       return null;
     }
@@ -7182,6 +7234,7 @@ async function preparePromotedWidgetWrite(
     "while the mapping was read",
     hasIdentityApi,
     identityBefore,
+    incarnationBefore,
     tabBefore,
   );
   if (mappingDrift) return promotedWriteRefusal(widget, mappingDrift);
@@ -7329,7 +7382,7 @@ async function preparePromotedWidgetWrite(
     innerNodeType,
     ...(inner.terminal ? { terminal: inner.terminal } : {}),
     scope,
-    binding: { tabId: tabBefore, identity: identityAfter },
+    binding: { tabId: tabBefore, identity: identityAfter, incarnation: incarnationBefore },
   };
 }
 
@@ -7544,6 +7597,10 @@ function isUsablePanelConnectionIdentity(
     typeof identity.tabSessionId === "string" &&
     identity.tabSessionId.length > 0
   );
+}
+
+function isUsablePanelIncarnation(value: string | undefined): value is string {
+  return typeof value === "string" && value.length > 0;
 }
 
 function samePanelConnectionIdentity(
@@ -13579,6 +13636,7 @@ interface BridgeProbe {
   workflowUuidFor?: (tabId: string) => TabWorkflowUuidRead;
   promotedScopeFor?: (tabId: string) => TabPromotedScopeRead;
   readPromotedScope?: (tabId: string, innerNodeId: number | string) => Promise<TabPromotedScopeRead>;
+  tabIncarnation?: (tabId: string) => string | undefined;
   tabPromotedTerminalWitnessCapability?: (tabId: string) => boolean;
   tabPromotedParentRailFenceCapability?: (tabId: string) => boolean;
   lastFenceRefusal?: (tabId: string) => string | undefined;
@@ -18371,6 +18429,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // to the raw success reply so a later appendToolResultText disclosure
         // (which makes the text no longer parse as JSON) cannot dodge it.
         const echoFull = args.echo === "full";
+        let directWriteBinding: PromotedWriteBinding | null = null;
         const write = async (
           nodeId: unknown,
           widget: string,
@@ -18434,7 +18493,17 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 },
                 OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
                 undefined,
-                beforeDispatch,
+                beforeDispatch ??
+                  (directWriteBinding
+                    ? () => {
+                        const error = currentPromotedBindingError(ctx, directWriteBinding!);
+                        if (error) {
+                          throw new Error(
+                            `Refusing direct graph_set_widget: ${error}. No graph_set_widget was dispatched.`,
+                          );
+                        }
+                      }
+                    : undefined),
               ),
               echoFull,
             ),
@@ -18452,6 +18521,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           }
           const blocked = await refuseKnownBadWriteBeforeDispatch(ctx, nodeId, widget);
           if (blocked) return blocked;
+          try {
+            directWriteBinding = capturePromotedWriteBinding(ctx);
+          } catch {
+            return promotedWriteRefusal(widget, "the panel binding could not be read before dispatch");
+          }
           return write(nodeId, widget, targetExpectedNodeType);
         };
 
@@ -18685,6 +18759,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           const promotedWritten = await writePromotedInner(promotedPlan);
           if (!promotedWritten.isError) markPanelSchemaReady(panelSchemaKey(ctx));
           return promotedWritten;
+        }
+        try {
+          directWriteBinding = capturePromotedWriteBinding(ctx);
+        } catch {
+          return promotedWriteRefusal(args.widget as string, "the panel binding could not be read before dispatch");
         }
         let first = await write(args.node_id, args.widget as string);
         if (!first.isError) {
