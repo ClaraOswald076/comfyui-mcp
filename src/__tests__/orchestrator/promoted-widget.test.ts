@@ -113,6 +113,9 @@ function bridge(opts: {
   /** panel#1925 recurrence: hello/restart left tab_session_id unset so the
    *  fingerprint is missing even though graph reads succeed. */
   missingConnectionIdentity?: boolean;
+  /** panel#1925 P1: the missing fingerprint is replaced by a new session
+   *  while the awaited pre-dispatch mapping read is in flight. */
+  missingIdentityRebindDuringMapping?: boolean;
   authoritativeScopeRead?: boolean;
   ownerNavigationAfterFinalQuery?: boolean;
   /** Navigation after MCP's final synchronous callback but before the panel
@@ -346,6 +349,9 @@ function bridge(opts: {
       }
       if (cmd.cmd === "graph_get_subgraph") {
         subgraphReads += 1;
+        if (opts.missingIdentityRebindDuringMapping && subgraphReads === 2) {
+          connectionIdentity = { generation: 2, tabSessionId: "browser-tab-b" };
+        }
         // #2409 — this read is the await the definitive-non-subgraph exit returns
         // across. Rebind here so that exit sees a receiver that moved under it.
         if (opts.subgraphReadIdentityChange === "connection") {
@@ -455,7 +461,11 @@ function bridge(opts: {
     tabs: () => [{ tab_id: TAB, title: "wf", connected_at: 0 }],
     resolveActiveTabId: () => TAB,
     tabCanMutateGraph: () => true,
-    tabConnectionIdentity: () => (opts.missingConnectionIdentity ? undefined : connectionIdentity),
+    tabConnectionIdentity: () =>
+      opts.missingConnectionIdentity &&
+      !(opts.missingIdentityRebindDuringMapping && subgraphReads >= 2)
+        ? undefined
+        : connectionIdentity,
     promotedScopeFor: () =>
       !inSubgraph && opts.preEntryScopeRead
         ? opts.preEntryScopeRead
@@ -1719,6 +1729,23 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
     expect(calls.filter((call) => call.cmd === "graph_set_widget")).toEqual([
       expect.objectContaining({ node_id: 76, widget: "quality_prompt" }),
     ]);
+  });
+
+  it("#1925 refuses a missing captured identity that rebinds to a new session during mapping", async () => {
+    const { isError, text, calls } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "new" },
+      {
+        firstWrite: "ok",
+        promotedTerminalWitnesses: true,
+        subgraph: CURRENT_SAFE_PROMOTED_SUBGRAPH,
+        missingConnectionIdentity: true,
+        missingIdentityRebindDuringMapping: true,
+      },
+    );
+    expect(isError).toBe(true);
+    expect(text).toMatch(/session or connection changed/);
+    expect(text).toContain("No graph_set_widget was dispatched");
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
   });
 
   it("does not compare the child graph token with a parent view before entering it", async () => {

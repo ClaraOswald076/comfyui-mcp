@@ -6796,13 +6796,17 @@ function currentPromotedBindingError(
   } catch {
     return "the panel connection identity became unreadable";
   }
-  if (!isUsablePanelConnectionIdentity(binding.identity) && !isUsablePanelConnectionIdentity(current)) {
-    return null;
+  if (!isUsablePanelConnectionIdentity(binding.identity)) {
+    // A binding captured without a fingerprint may remain incomparable, but it
+    // must not be upgraded to authorize a different connection later. The
+    // tab id is deliberately reusable across reconnects and new sessions.
+    return isUsablePanelConnectionIdentity(current)
+      ? "the panel session or connection changed"
+      : null;
   }
   if (!isUsablePanelConnectionIdentity(current)) {
     return "the panel connection identity became unavailable";
   }
-  if (!isUsablePanelConnectionIdentity(binding.identity)) return null;
   if (!samePanelConnectionIdentity(binding.identity, current)) {
     return "the panel session or connection changed";
   }
