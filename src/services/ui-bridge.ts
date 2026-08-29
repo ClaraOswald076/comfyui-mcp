@@ -4998,7 +4998,11 @@ export class UiBridge {
    *  that stores per-tab state must scope to, so a different browser tab taking
    *  over a recurring `wf:` route key cannot read, settle or inherit it (#486). */
   tabIncarnation(tabId: string): string | undefined {
-    return this.conns.get(tabId)?.incarnationId;
+    try {
+      return this.resolveTarget(tabId).incarnationId;
+    } catch {
+      return undefined;
+    }
   }
 
   /** All currently connected tabs, most recent hello last. */

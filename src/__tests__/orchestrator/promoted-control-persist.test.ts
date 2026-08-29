@@ -51,6 +51,19 @@ const DIRECT_WARNING =
   `so the value you set will NOT persist. Set "control_after_generate" to 'fixed' to hold it — ` +
   `panel_set_widget(node_id=3, widget='control_after_generate', value='fixed').`;
 
+const PROMOTED_REPORTER_SUBGRAPH = {
+  subgraph_of: { node_id: 320, title: "LTX" },
+  instance_widgets: { value_2: 1280 },
+  node_count: 1,
+  nodes: [
+    {
+      id: 312,
+      type: "LTXInner",
+      widgets: { value_2: 1280, control_after_generate: "randomize" },
+    },
+  ],
+};
+
 describe("parseUnpromotedControlPersistRemedy", () => {
   it("parses the reporter's unpromoted LTX warning", () => {
     const parsed = parseUnpromotedControlPersistRemedy(REPORTER_WARNING);
@@ -188,31 +201,186 @@ async function setWidget(
   };
 }
 
+/** A small receiver model for the actual promoted-write path. The older bridge
+ * above intentionally exercises the legacy direct helper seam; this one also
+ * supplies the graph/scope/type capabilities that production uses to create a
+ * trustworthy follow-up binding. Its replacement options mutate the receiver
+ * only after MCP's synchronous callback, before the panel applies the frame. */
+function witnessedBridge(opts: {
+  replacement?: "graph" | "type" | "connection" | "anonymous";
+  anonymous?: boolean;
+  pinFails?: boolean;
+  persistExitFails?: boolean;
+  enterFailsAt?: number;
+} = {}) {
+  const calls: Array<Record<string, unknown>> = [];
+  let inSubgraph = false;
+  let graphIdentity = "graph:ltx-container-a";
+  let nodeType = "LTXInner";
+  let connectionIdentity = { generation: 1, tabSessionId: "browser-tab-a" };
+  let anonymousIncarnation = "anon:1";
+  let enters = 0;
+  let exits = 0;
+  let mutations = 0;
+  const scope = () => ({
+    known: true as const,
+    scope: inSubgraph ? ("subgraph" as const) : ("root" as const),
+    ownerNodeId: inSubgraph ? "320" : null,
+    workflowUuid: "workflow-a",
+    graphIdentity: inSubgraph ? graphIdentity : "graph:ltx-root",
+  });
+  const subgraph = {
+    ...PROMOTED_REPORTER_SUBGRAPH,
+    subgraph_of: {
+      ...PROMOTED_REPORTER_SUBGRAPH.subgraph_of,
+      graph_identity: "graph:ltx-container-a",
+    },
+    viewing: {
+      scope: "root",
+      workflow_uuid: "workflow-a",
+      graph_identity: "graph:ltx-root",
+    },
+  };
+  // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- the production bridge is intentionally modeled with only the dispatch and witness surface needed by this receiver test.
+  const b = {
+    send: async (
+      cmd: Record<string, unknown>,
+      sendOpts?: { beforeDispatch?: () => void },
+    ) => {
+      if (cmd.cmd === "graph_set_widget" && sendOpts?.beforeDispatch) {
+        if (cmd.widget === "control_after_generate") {
+          if (opts.replacement === "connection") {
+            connectionIdentity = { generation: 2, tabSessionId: "browser-tab-a" };
+          }
+          if (opts.replacement === "anonymous") anonymousIncarnation = "anon:2";
+        }
+        sendOpts.beforeDispatch();
+        if (cmd.widget === "control_after_generate") {
+          if (opts.replacement === "graph") graphIdentity = "graph:ltx-container-b";
+          if (opts.replacement === "type") nodeType = "ReplacementInner";
+        }
+      }
+      calls.push({ ...cmd });
+
+      if (cmd.cmd === "graph_query") {
+        const id = Array.isArray(cmd.ids) && cmd.ids.length ? String(cmd.ids[0]) : "";
+        if (id === "320") {
+          return {
+            viewing: {
+              scope: "root",
+              workflow_uuid: "workflow-a",
+              graph_identity: "graph:ltx-root",
+            },
+            nodes: [{ id: 320, type: "SubgraphNode", is_subgraph: true }],
+            truncated: false,
+          };
+        }
+        return {
+          viewing: {
+            scope: "subgraph",
+            owner_node_id: "320",
+            workflow_uuid: "workflow-a",
+            graph_identity: graphIdentity,
+          },
+          nodes: [{ id: 312, type: nodeType, is_subgraph: false }],
+          truncated: false,
+        };
+      }
+      if (cmd.cmd === "graph_get_subgraph") return subgraph;
+      if (cmd.cmd === "graph_enter_subgraph") {
+        enters += 1;
+        if (opts.enterFailsAt === enters) throw new Error("could not confirm entry");
+        inSubgraph = true;
+        graphIdentity = "graph:ltx-container-a";
+        return { scope: "subgraph", node_id: cmd.node_id };
+      }
+      if (cmd.cmd === "graph_exit_subgraph") {
+        exits += 1;
+        if (opts.persistExitFails && exits === 2) throw new Error("could not confirm exit");
+        inSubgraph = false;
+        return { scope: "root" };
+      }
+      if (cmd.cmd === "graph_set_widget") {
+        const expectedScope = cmd.expected_scope;
+        const expectedType = cmd.expected_node_type;
+        if (
+          !expectedScope ||
+          typeof expectedScope !== "object" ||
+          Array.isArray(expectedScope) ||
+          (expectedScope as Record<string, unknown>).scope !== "subgraph" ||
+          String((expectedScope as Record<string, unknown>).owner_node_id) !== "320" ||
+          (expectedScope as Record<string, unknown>).graph_identity !== graphIdentity ||
+          (expectedScope as Record<string, unknown>).workflow_uuid !== "workflow-a"
+        ) {
+          throw new Error("graph_set_widget receiver scope changed before dispatch: Nothing was applied.");
+        }
+        if (expectedType !== nodeType) {
+          throw new Error("graph_set_widget receiver node type changed before dispatch: Nothing was applied.");
+        }
+        if (cmd.widget === "control_after_generate") {
+          if (opts.pinFails) throw new Error("pin rejected");
+          mutations += 1;
+          return { set: { node_id: cmd.node_id, widget: cmd.widget, value: cmd.value } };
+        }
+        mutations += 1;
+        return {
+          set: { node_id: cmd.node_id, widget: cmd.widget, value: cmd.value },
+          warning: REPORTER_WARNING,
+        };
+      }
+      return { ok: true };
+    },
+    push: () => 1,
+    canReach: () => true,
+    isHeadless: () => false,
+    tabs: () => [{ tab_id: TAB, title: "wf", connected_at: 0 }],
+    resolveActiveTabId: () => TAB,
+    tabCanMutateGraph: () => true,
+    tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
+    tabConnectionIdentity: () => (opts.anonymous ? undefined : connectionIdentity),
+    tabIncarnation: () => anonymousIncarnation,
+    promotedScopeFor: () => scope(),
+    workflowUuidFor: () => ({ known: true, uuid: "workflow-a" }),
+    tabExpectedNodeTypeFenceCapability: () => true,
+    tabExpectedScopeGraphIdentityFenceCapability: () => true,
+    tabPromotedTerminalWitnessCapability: () => false,
+    tabPromotedParentRailFenceCapability: () => false,
+  } as unknown as PanelToolCtx["bridge"];
+  return { b, calls, get mutations() { return mutations; } };
+}
+
+async function setWidgetWithWitnessedBridge(
+  args: { node_id: number | string; widget: string; value: number | string },
+  opts: Parameters<typeof witnessedBridge>[0] = {},
+) {
+  const harness = witnessedBridge(opts);
+  const ctx = makePanelToolCtx(harness.b, TAB, new WorkflowTargetStore());
+  const def = buildPanelToolDefs().find((d) => d.name === "panel_set_widget");
+  if (!def) throw new Error("panel_set_widget is not registered");
+  const res: ToolResult = await def.handler(args as never, ctx);
+  return {
+    text: res.content.map((c) => (c as { text?: string }).text ?? "").join(" "),
+    isError: res.isError === true,
+    calls: harness.calls,
+    mutations: harness.mutations,
+  };
+}
+
 describe("panel_set_widget unpromoted control_after_generate persist (panel#1558)", () => {
-  it("the reporter's case: parent write succeeds, then enter → pin inner fixed → exit", async () => {
+  it("refuses an unwitnessed legacy success before entering the inner graph", async () => {
     const { text, isError, calls } = await setWidget(
       { node_id: 320, widget: "value_2", value: 1920 },
       { warning: REPORTER_WARNING },
     );
 
     expect(isError).toBe(false);
-    expect(calls.map((c) => c.cmd)).toEqual([
-      "graph_set_widget",
-      "graph_enter_subgraph",
-      "graph_set_widget",
-      "graph_exit_subgraph",
-    ]);
+    expect(calls.map((c) => c.cmd)).toEqual(["graph_set_widget"]);
     expect(calls[0]).toMatchObject({ node_id: 320, widget: "value_2", value: 1920 });
-    expect(calls[1]).toMatchObject({ cmd: "graph_enter_subgraph", node_id: "320" });
-    expect(calls[2]).toMatchObject({
-      node_id: "312",
-      widget: "control_after_generate",
-      value: "fixed",
-    });
     expect(text).toMatch(/"value": 1920/);
-    expect(text).toMatch(/control_after_generate_pinned/);
-    expect(text).not.toMatch(/will NOT persist/);
-    expect(text).not.toMatch(/Enter the owning subgraph/);
+    expect(text).toMatch(/trustworthy witness/);
+    expect(text).toMatch(/persistence write was NOT dispatched/);
+    expect(text).toMatch(/will NOT persist/);
+    expect(text).not.toMatch(/control_after_generate_pinned/);
   });
 
   it("fences the secondary pin when the public connection changes", async () => {
@@ -222,14 +390,9 @@ describe("panel_set_widget unpromoted control_after_generate persist (panel#1558
     );
 
     expect(isError).toBe(false);
-    expect(calls.map((c) => c.cmd)).toEqual([
-      "graph_set_widget",
-      "graph_enter_subgraph",
-      "graph_exit_subgraph",
-    ]);
-    expect(text).toMatch(/Refusing persisted control_after_generate graph_set_widget/);
-    expect(text).toMatch(/session or connection changed/);
-    expect(text).toContain("No graph_set_widget was dispatched");
+    expect(calls.map((c) => c.cmd)).toEqual(["graph_set_widget"]);
+    expect(text).toMatch(/trustworthy witness/);
+    expect(text).toContain("persistence write was NOT dispatched");
     expect(text).not.toMatch(/control_after_generate_pinned/);
   });
 
@@ -240,14 +403,10 @@ describe("panel_set_widget unpromoted control_after_generate persist (panel#1558
     );
 
     expect(isError).toBe(false);
-    expect(calls.map((c) => c.cmd)).toEqual([
-      "graph_set_widget",
-      "graph_enter_subgraph",
-      "graph_set_widget",
-      "graph_exit_subgraph",
-    ]);
-    expect(text).toMatch(/control_after_generate_pinned/);
-    expect(text).not.toMatch(/connection generation was unavailable/);
+    expect(calls.map((c) => c.cmd)).toEqual(["graph_set_widget"]);
+    expect(text).toMatch(/trustworthy witness/);
+    expect(text).toMatch(/persistence write was NOT dispatched/);
+    expect(text).not.toMatch(/control_after_generate_pinned/);
   });
 
   it("refuses an anonymous takeover before the secondary pin", async () => {
@@ -257,14 +416,9 @@ describe("panel_set_widget unpromoted control_after_generate persist (panel#1558
     );
 
     expect(isError).toBe(false);
-    expect(calls.map((c) => c.cmd)).toEqual([
-      "graph_set_widget",
-      "graph_enter_subgraph",
-      "graph_exit_subgraph",
-    ]);
-    expect(text).toMatch(/Refusing persisted control_after_generate graph_set_widget/);
-    expect(text).toMatch(/session or connection changed/);
-    expect(text).toContain("No graph_set_widget was dispatched");
+    expect(calls.map((c) => c.cmd)).toEqual(["graph_set_widget"]);
+    expect(text).toMatch(/trustworthy witness/);
+    expect(text).toContain("persistence write was NOT dispatched");
     expect(text).not.toMatch(/control_after_generate_pinned/);
   });
 
@@ -288,26 +442,14 @@ describe("panel_set_widget unpromoted control_after_generate persist (panel#1558
   });
 
   it("nested promotions enter every container, then exit the same number of times", async () => {
-    const { isError, calls } = await setWidget(
+    const { isError, calls, text } = await setWidget(
       { node_id: 70, widget: "seed", value: 7 },
       { warning: NESTED_WARNING },
     );
     expect(isError).toBe(false);
-    expect(calls.map((c) => c.cmd)).toEqual([
-      "graph_set_widget",
-      "graph_enter_subgraph",
-      "graph_enter_subgraph",
-      "graph_set_widget",
-      "graph_exit_subgraph",
-      "graph_exit_subgraph",
-    ]);
-    expect(calls[1]).toMatchObject({ node_id: "70" });
-    expect(calls[2]).toMatchObject({ node_id: "80" });
-    expect(calls[3]).toMatchObject({
-      node_id: "90",
-      widget: "control_after_generate",
-      value: "fixed",
-    });
+    expect(calls.map((c) => c.cmd)).toEqual(["graph_set_widget"]);
+    expect(text).toMatch(/trustworthy witness/);
+    expect(text).not.toMatch(/control_after_generate_pinned/);
   });
 
   it("keeps the original success + warning when enter fails, and does not pin", async () => {
@@ -316,9 +458,9 @@ describe("panel_set_widget unpromoted control_after_generate persist (panel#1558
       { warning: REPORTER_WARNING, enterFailsAt: 1 },
     );
     expect(isError).toBe(false);
-    expect(calls.map((c) => c.cmd)).toEqual(["graph_set_widget", "graph_enter_subgraph"]);
+    expect(calls.map((c) => c.cmd)).toEqual(["graph_set_widget"]);
     expect(text).toMatch(/will NOT persist/);
-    expect(text).toMatch(/panel_enter_subgraph\(node_id=320\) FAILED/);
+    expect(text).toMatch(/trustworthy witness/);
     expect(text).not.toMatch(/control_after_generate_pinned/);
     expect(calls.filter((c) => c.widget === "control_after_generate")).toHaveLength(0);
   });
@@ -329,14 +471,9 @@ describe("panel_set_widget unpromoted control_after_generate persist (panel#1558
       { warning: REPORTER_WARNING, pinFails: true },
     );
     expect(isError).toBe(false);
-    expect(calls.map((c) => c.cmd)).toEqual([
-      "graph_set_widget",
-      "graph_enter_subgraph",
-      "graph_set_widget",
-      "graph_exit_subgraph",
-    ]);
+    expect(calls.map((c) => c.cmd)).toEqual(["graph_set_widget"]);
     expect(text).toMatch(/will NOT persist/);
-    expect(text).toMatch(/pin rejected/);
+    expect(text).toMatch(/trustworthy witness/);
     expect(text).not.toMatch(/control_after_generate_pinned/);
   });
 
@@ -346,11 +483,10 @@ describe("panel_set_widget unpromoted control_after_generate persist (panel#1558
       { warning: REPORTER_WARNING, exitFails: true },
     );
     expect(isError).toBe(false);
-    expect(calls.map((c) => c.cmd)).toContain("graph_exit_subgraph");
-    expect(text).toMatch(/control_after_generate_pinned/);
-    expect(text).toMatch(/panel_exit_subgraph then FAILED/);
-    expect(text).toMatch(/Call panel_exit_subgraph/);
-    expect(text).not.toMatch(/will NOT persist/);
+    expect(calls.map((c) => c.cmd)).toEqual(["graph_set_widget"]);
+    expect(text).toMatch(/trustworthy witness/);
+    expect(text).toMatch(/persistence write was NOT dispatched/);
+    expect(text).not.toMatch(/control_after_generate_pinned/);
   });
 
   it("does not pin a warning about a different subgraph than the node just written", async () => {
@@ -362,5 +498,137 @@ describe("panel_set_widget unpromoted control_after_generate persist (panel#1558
     expect(calls.map((c) => c.cmd)).toEqual(["graph_set_widget"]);
     expect(text).toMatch(/will NOT persist/);
     expect(text).not.toMatch(/control_after_generate_pinned/);
+  });
+});
+
+describe("panel_set_widget promoted control persistence dispatch fences (#1925)", () => {
+  it("carries the primary inner type and scope into the secondary pin", async () => {
+    const { text, isError, calls, mutations } = await setWidgetWithWitnessedBridge(
+      { node_id: 320, widget: "value_2", value: 1920 },
+    );
+
+    const writes = calls.filter((call) => call.cmd === "graph_set_widget");
+    expect(isError).toBe(false);
+    expect(mutations).toBe(2);
+    expect(writes).toHaveLength(2);
+    expect(writes[0]).toMatchObject({ node_id: 312, widget: "value_2", expected_node_type: "LTXInner" });
+    expect(writes[1]).toMatchObject({
+      node_id: "312",
+      widget: "control_after_generate",
+      value: "fixed",
+      expected_node_type: "LTXInner",
+      expected_scope: {
+        scope: "subgraph",
+        owner_node_id: "320",
+        graph_identity: "graph:ltx-container-a",
+        workflow_uuid: "workflow-a",
+      },
+    });
+    expect(text).toMatch(/control_after_generate_pinned/);
+  });
+
+  it("refuses a same-connection replacement graph reusing the inner id and type", async () => {
+    const { text, isError, calls, mutations } = await setWidgetWithWitnessedBridge(
+      { node_id: 320, widget: "value_2", value: 1920 },
+      { replacement: "graph" },
+    );
+
+    const writes = calls.filter((call) => call.cmd === "graph_set_widget");
+    expect(isError).toBe(false);
+    expect(mutations).toBe(1);
+    expect(writes).toHaveLength(2);
+    expect(writes[1]).toMatchObject({
+      node_id: "312",
+      expected_node_type: "LTXInner",
+      expected_scope: expect.objectContaining({ graph_identity: "graph:ltx-container-a" }),
+    });
+    expect(text).toMatch(/pin rejected|Nothing was applied/);
+    expect(text).not.toMatch(/control_after_generate_pinned/);
+  });
+
+  it("refuses a same-graph replacement node with a different type", async () => {
+    const { text, isError, calls, mutations } = await setWidgetWithWitnessedBridge(
+      { node_id: 320, widget: "value_2", value: 1920 },
+      { replacement: "type" },
+    );
+
+    const writes = calls.filter((call) => call.cmd === "graph_set_widget");
+    expect(isError).toBe(false);
+    expect(mutations).toBe(1);
+    expect(writes).toHaveLength(2);
+    expect(writes[1]).toMatchObject({
+      node_id: "312",
+      expected_node_type: "LTXInner",
+      expected_scope: expect.objectContaining({ graph_identity: "graph:ltx-container-a" }),
+    });
+    expect(text).toMatch(/pin rejected|Nothing was applied/);
+    expect(text).not.toMatch(/control_after_generate_pinned/);
+  });
+
+  it("uses the private incarnation witness for a stable anonymous socket", async () => {
+    const { text, isError, calls, mutations } = await setWidgetWithWitnessedBridge(
+      { node_id: 320, widget: "value_2", value: 1920 },
+      { anonymous: true },
+    );
+
+    expect(isError).toBe(false);
+    expect(mutations).toBe(2);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(2);
+    expect(text).toMatch(/control_after_generate_pinned/);
+  });
+
+  it("refuses the secondary write when the public connection changes", async () => {
+    const { text, isError, calls, mutations } = await setWidgetWithWitnessedBridge(
+      { node_id: 320, widget: "value_2", value: 1920 },
+      { replacement: "connection" },
+    );
+
+    expect(isError).toBe(false);
+    expect(mutations).toBe(1);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(1);
+    expect(text).toMatch(/session or connection changed/);
+    expect(text).toContain("No graph_set_widget was dispatched");
+    expect(text).not.toMatch(/control_after_generate_pinned/);
+  });
+
+  it("keeps the primary success and exits when the secondary pin fails", async () => {
+    const { text, isError, calls, mutations } = await setWidgetWithWitnessedBridge(
+      { node_id: 320, widget: "value_2", value: 1920 },
+      { pinFails: true },
+    );
+
+    expect(isError).toBe(false);
+    expect(mutations).toBe(1);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(2);
+    expect(calls.map((call) => call.cmd)).toContain("graph_exit_subgraph");
+    expect(text).toMatch(/pin rejected/);
+    expect(text).not.toMatch(/control_after_generate_pinned/);
+  });
+
+  it("keeps the primary success when entering the persistence scope fails", async () => {
+    const { text, isError, calls, mutations } = await setWidgetWithWitnessedBridge(
+      { node_id: 320, widget: "value_2", value: 1920 },
+      { enterFailsAt: 2 },
+    );
+
+    expect(isError).toBe(false);
+    expect(mutations).toBe(1);
+    expect(calls.map((call) => call.cmd)).toContain("graph_enter_subgraph");
+    expect(text).toMatch(/could not confirm entry/);
+    expect(text).not.toMatch(/control_after_generate_pinned/);
+  });
+
+  it("discloses a failed secondary exit after the pin succeeds", async () => {
+    const { text, isError, calls, mutations } = await setWidgetWithWitnessedBridge(
+      { node_id: 320, widget: "value_2", value: 1920 },
+      { persistExitFails: true },
+    );
+
+    expect(isError).toBe(false);
+    expect(mutations).toBe(2);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(2);
+    expect(text).toMatch(/control_after_generate_pinned/);
+    expect(text).toMatch(/panel_exit_subgraph then FAILED/);
+    expect(text).toMatch(/Call panel_exit_subgraph/);
   });
 });

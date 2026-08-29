@@ -784,6 +784,8 @@ describe("UiBridge (typed dispatch outcome — panel #442 defect 4)", () => {
     const sock = await connectPanel("tmp:unsaved", "Untitled");
     replyGraphQueryWithViewing(sock);
     await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:unsaved")).toBe(true));
+    const anonymousIncarnation = bridge.tabIncarnation("tmp:unsaved");
+    expect(anonymousIncarnation).toBeTruthy();
     sock.send(
       JSON.stringify({
         type: "hello",
@@ -795,7 +797,6 @@ describe("UiBridge (typed dispatch outcome — panel #442 defect 4)", () => {
         enforces_expected_scope_at_write: true,
         enforces_expected_scope_graph_identity_at_write: true,
         enforces_promoted_parent_rail_at_write: true,
-        tab_session_id: "browser-tab-a",
       }),
     );
     await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:flux-klein.json")).toBe(true));
@@ -809,6 +810,8 @@ describe("UiBridge (typed dispatch outcome — panel #442 defect 4)", () => {
     });
     expect(bridge.promotedScopeFor("wf:flux-klein.json")).toMatchObject({ known: true });
     expect(bridge.promotedScopeFor(SHARED_SESSION_SCOPE)).toMatchObject({ known: true });
+    expect(bridge.tabIncarnation("tmp:unsaved")).toBe(anonymousIncarnation);
+    expect(bridge.tabIncarnation("wf:flux-klein.json")).toBe(anonymousIncarnation);
     sock.close();
   });
 
@@ -2045,6 +2048,8 @@ describe("UiBridge (multi-tab)", () => {
     const oldId = "6eccc826-592e-4abb-b280-35434e00ddd1";
     sock.send(JSON.stringify({ type: "hello", tab_id: oldId, title: "image_flux2_fp8" }));
     await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    const incarnation = bridge.tabIncarnation(oldId);
+    expect(incarnation).toBeTruthy();
 
     // Verify the old id works.
     const oldResult = await bridge.send({ cmd: "graph_outline" }, { tabId: oldId });
@@ -2057,6 +2062,8 @@ describe("UiBridge (multi-tab)", () => {
       expect(bridge.tabs()).toHaveLength(1);
       expect(bridge.tabs()[0].tab_id).toBe(newId);
     });
+    expect(bridge.tabIncarnation(oldId)).toBe(incarnation);
+    expect(bridge.tabIncarnation(newId)).toBe(incarnation);
 
     // 3) The old agent (still holding the old tabId) sends a command via the
     //    bridge — this MUST resolve via the migration map instead of throwing.

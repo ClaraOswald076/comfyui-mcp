@@ -5788,7 +5788,25 @@ async function persistUnpromotedControlAfterGenerate(
   binding: PromotedWriteBinding | null,
 ): Promise<ToolResult> {
   if (res.isError) return res;
-  const payload = parseToolResultJson(res);
+  // A successful promoted write carries its JSON reply plus the human-facing
+  // "Applied via..." disclosure added by writePromotedInner. Recover only that
+  // exact serialized prefix; do not broaden parseToolResultJson for unrelated
+  // tool results whose trailing prose is meaningful.
+  const payload = parseToolResultJson(res) ?? (() => {
+    const text = res.content.find((content) => content.type === "text")?.text;
+    const marker = "\n\n(Applied via the validated promoted inner widget:";
+    if (typeof text !== "string") return null;
+    const end = text.indexOf(marker);
+    if (end < 0) return null;
+    try {
+      const parsed = JSON.parse(text.slice(0, end)) as unknown;
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
+  })();
   if (!payload || typeof payload.warning !== "string") return res;
   const remedy = parseUnpromotedControlPersistRemedy(payload.warning);
   if (!remedy || !addressedNodeMatchesPersistRemedy(addressedNodeId, remedy)) {
@@ -5805,6 +5823,26 @@ async function persistUnpromotedControlAfterGenerate(
     }
   }
 
+  // The warning is not a witness for the node it names: it is the result of an
+  // earlier command, and its inner id can already refer to a replacement graph.
+  // Only a promoted primary write carries an authenticated scope/type witness
+  // that can be handed to the panel's final graph_set_widget fence. Never turn
+  // an unscoped legacy success into an automatic write here.
+  if (
+    !binding?.nodeType ||
+    !binding.scope ||
+    remedy.enterPath.length !== 1 ||
+    String(binding.scope.ownerNodeId) !== remedy.outerNodeId
+  ) {
+    return appendToolResultText(
+      res,
+      `\n\n(Tried to pin inner "${remedy.controlWidget}" to 'fixed' so this value would persist, ` +
+        `but the primary write did not carry a trustworthy witness for this inner node's ` +
+        `type and final graph scope. ` +
+        `The persistence write was NOT dispatched.)`,
+    );
+  }
+
   const entered: string[] = [];
   for (const id of remedy.enterPath) {
     const step = await ctx.call({ cmd: "graph_enter_subgraph", node_id: id }, 15000);
@@ -5819,23 +5857,37 @@ async function persistUnpromotedControlAfterGenerate(
     entered.push(id);
   }
 
-  const beforePinDispatch = binding
-    ? () => {
-        const error = currentPromotedBindingError(ctx, binding);
-        if (error) {
-          throw new Error(
-            `Refusing persisted control_after_generate graph_set_widget: ${error}. ` +
-              `No graph_set_widget was dispatched.`,
-          );
-        }
-      }
-    : undefined;
+  const beforePinDispatch = () => {
+    const error = currentPromotedBindingError(ctx, binding);
+    if (error) {
+      throw new Error(
+        `Refusing persisted control_after_generate graph_set_widget: ${error}. ` +
+          `No graph_set_widget was dispatched.`,
+      );
+    }
+    const scopeError = currentPromotedScopeError(ctx, binding.scope!, true);
+    if (scopeError) {
+      throw new Error(
+        `Refusing persisted control_after_generate graph_set_widget: ${scopeError}. ` +
+          `No graph_set_widget was dispatched.`,
+      );
+    }
+  };
   const pinned = await ctx.call(
     {
       cmd: "graph_set_widget",
       node_id: remedy.innerNodeId,
       widget: remedy.controlWidget,
       value: "fixed",
+      expected_node_type: binding.nodeType,
+      expected_scope: {
+        scope: "subgraph",
+        owner_node_id: binding.scope.ownerNodeId,
+        graph_identity: binding.scope.graphIdentity,
+        ...(binding.scope.workflowUuid !== undefined
+          ? { workflow_uuid: binding.scope.workflowUuid }
+          : {}),
+      },
     },
     OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
     undefined,
@@ -6508,6 +6560,10 @@ type PromotedWriteBinding = {
   identity: { generation: number; tabSessionId: string } | undefined;
   /** UiBridge's always-present per-connection id, including anonymous sockets. */
   incarnation?: string;
+  /** Witnesses captured from the promoted primary write and reused only for its
+   * automatic control_after_generate follow-up. */
+  nodeType?: string;
+  scope?: PromotedScopeWitness;
 };
 
 type PromotedWritePlan = {
@@ -7396,7 +7452,13 @@ async function preparePromotedWidgetWrite(
     innerNodeType,
     ...(inner.terminal ? { terminal: inner.terminal } : {}),
     scope,
-    binding: { tabId: tabBefore, identity: identityAfter, incarnation: incarnationBefore },
+    binding: {
+      tabId: tabBefore,
+      identity: identityAfter,
+      incarnation: incarnationBefore,
+      nodeType: innerNodeType,
+      scope,
+    },
   };
 }
 
@@ -18772,7 +18834,15 @@ export function buildPanelToolDefs(): PanelToolDef[] {
 
         if (promotedPlan) {
           const promotedWritten = await writePromotedInner(promotedPlan);
-          if (!promotedWritten.isError) markPanelSchemaReady(panelSchemaKey(ctx));
+          if (!promotedWritten.isError) {
+            markPanelSchemaReady(panelSchemaKey(ctx));
+            return persistUnpromotedControlAfterGenerate(
+              promotedWritten,
+              ctx,
+              args.node_id,
+              promotedPlan.binding,
+            );
+          }
           return promotedWritten;
         }
         try {
