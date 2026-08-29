@@ -10,10 +10,12 @@
  *
  * A post-removal snapshot of `node.inputs[i].link` cannot see this: it shares
  * the mutation's dependency and agrees with the reader. This note is a priori
- * from a landed `removed` object, not a detected divergence. The repair that
- * re-resolves the index is disconnect + reconnect remaining later host links
- * BY NAME. The reindex itself is panel-side (artokun/comfyui-mcp-panel#1969)
- * and must not be improvised here: panel#668 saw a SubgraphNode disconnect
+ * from a landed `removed` object, not a detected divergence — UNLESS the panel
+ * reports `removed.host_links_reindexed: true` (panel ≥0.15.120 / #1969), in
+ * which case survivors were already re-pointed and the note would be a lie
+ * (#2473). The repair that re-resolves the index is disconnect + reconnect
+ * remaining later host links BY NAME. The reindex itself is panel-side and
+ * must not be improvised here: panel#668 saw a SubgraphNode disconnect
  * cascade into deleting unrelated nodes.
  */
 
@@ -59,6 +61,7 @@ export function unexposeHostLinkShiftNote(
   const removed = removedRecord(payload);
   const slot = removed ? landedSlot(removed) : null;
   if (removed == null || slot == null) return null;
+  if (removed.host_links_reindexed === true) return null;
   if (laterSlotNames && laterSlotNames.length === 0) return null;
 
   const side = removed.side === "output" ? "output" : "input";
