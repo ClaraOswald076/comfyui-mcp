@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.147] - 2026-08-28
+
+### MCP
+
+#### Fixed
+- omit the unexpose reindex warning when the panel already reindexed
+
+
 ## [0.52.146] - 2026-08-27
 
 ### MCP
