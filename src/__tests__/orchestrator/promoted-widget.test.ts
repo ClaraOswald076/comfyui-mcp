@@ -132,6 +132,9 @@ function bridge(opts: {
   /** #2314 P1: emulate a current receiver that publishes the recursive
    * renamed-promotion terminal witness. */
   promotedTerminalWitnesses?: boolean;
+  /** #2478: leave inner node identities absent so the current-capability path
+   * proves it refuses an incomplete identity-bearing envelope. */
+  omitInnerNodeIdentity?: boolean;
   /** #2314 final-rail race: relink the parent input after MCP's last
    * synchronous callback but before the receiver applies graph_set_widget. */
   parentRailRelinkAfterMcpFence?: boolean;
@@ -205,6 +208,28 @@ function bridge(opts: {
     let result = Object.prototype.hasOwnProperty.call(value, "viewing")
       ? value
       : { ...value, viewing: currentViewing() };
+    if (
+      !legacyBuild &&
+      opts.promotedTerminalWitnesses === true &&
+      opts.omitInnerNodeIdentity !== true &&
+      Array.isArray(result.nodes)
+    ) {
+      // Current panel projections publish an opaque per-object identity for every
+      // inner node. Keep explicit malformed/replacement identities untouched, but
+      // give older fixtures the same current-build shape so the harness exercises
+      // the paired identity-forwarding contract instead of capability skew.
+      result = {
+        ...result,
+        nodes: result.nodes.map((raw) => {
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+          const node = raw as Record<string, unknown>;
+          if (!Object.prototype.hasOwnProperty.call(node, "id") || Object.prototype.hasOwnProperty.call(node, "node_identity")) {
+            return raw;
+          }
+          return { ...node, node_identity: `node-incarnation:test:${String(node.id)}` };
+        }),
+      };
+    }
     const rawOwnerEnvelope = result.subgraph_of;
     if (rawOwnerEnvelope && typeof rawOwnerEnvelope === "object" && !Array.isArray(rawOwnerEnvelope)) {
       const owner = rawOwnerEnvelope as Record<string, unknown>;
@@ -3563,6 +3588,102 @@ describe("panel_set_widget transient promoted-subgraph read (#2478)", () => {
     expect(text).toMatch(/could not determine whether the addressed node is a promoted container/);
     expect(calls.filter((call) => call.cmd === "graph_get_subgraph")).toHaveLength(1);
     expect(bridgeRetryBudgets).toEqual([0]);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
+    expect(mutations).toBe(0);
+  });
+});
+
+describe("panel_set_widget promoted inner identity forwarding (#2478)", () => {
+  const originalIdentity = "node-incarnation:inner-original";
+  const replacementIdentity = "node-incarnation:inner-replacement";
+  const currentEnvelope = (nodeIdentity: unknown) => ({
+    ...CURRENT_SAFE_PROMOTED_SUBGRAPH,
+    nodes: [
+      {
+        ...CURRENT_SAFE_PROMOTED_SUBGRAPH.nodes[0],
+        node_identity: nodeIdentity,
+      },
+    ],
+  });
+  const innerDetail = (nodeIdentity: unknown) => ({
+    nodes: [
+      {
+        id: 76,
+        type: "PrimitiveStringMultiline",
+        node_identity: nodeIdentity,
+      },
+    ],
+  });
+
+  it("forwards the immediate inner identity on the guarded write", async () => {
+    const { text, isError, calls, mutations } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "new" },
+      {
+        firstWrite: "ok",
+        promotedTerminalWitnesses: true,
+        subgraph: currentEnvelope(originalIdentity),
+        postEnterGraphQueryById: { "76": innerDetail(originalIdentity) },
+      },
+    );
+
+    expect(isError).toBe(false);
+    expect(text).toMatch(/applied|quality_prompt/);
+    expect(mutations).toBe(1);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toEqual([
+      expect.objectContaining({
+        node_id: 76,
+        widget: "quality_prompt",
+        expected_node_identity: originalIdentity,
+      }),
+    ]);
+  });
+
+  it("refuses a same-ID same-type inner replacement before dispatch", async () => {
+    const { text, isError, calls, mutations } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "new" },
+      {
+        firstWrite: "ok",
+        promotedTerminalWitnesses: true,
+        subgraph: currentEnvelope(originalIdentity),
+        postEnterGraphQueryById: { "76": innerDetail(replacementIdentity) },
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/identity|changed or became unverifiable|Nothing was applied/);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
+    expect(mutations).toBe(0);
+  });
+
+  it("refuses a current-capability envelope that omits the inner identity", async () => {
+    const { text, isError, calls, mutations } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "new" },
+      {
+        firstWrite: "ok",
+        promotedTerminalWitnesses: true,
+        omitInnerNodeIdentity: true,
+        subgraph: currentEnvelope(undefined),
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/trustworthy immediate inner-node identity fence/);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
+    expect(mutations).toBe(0);
+  });
+
+  it("refuses a malformed inner identity rather than treating it as a legacy omission", async () => {
+    const { text, isError, calls, mutations } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "new" },
+      {
+        firstWrite: "ok",
+        promotedTerminalWitnesses: true,
+        subgraph: currentEnvelope(42),
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/malformed, stale, or incomplete ownership envelope/);
     expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
     expect(mutations).toBe(0);
   });

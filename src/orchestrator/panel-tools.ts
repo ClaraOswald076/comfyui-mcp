@@ -6521,6 +6521,7 @@ type PromotedWritePlan = {
   inner: {
     innerNodeId: number | string;
     widget: string;
+    nodeIdentity?: string;
     parentRail?: PromotedParentRailWitness;
   };
   innerNodeType: string;
@@ -7442,6 +7443,28 @@ async function preparePromotedWidgetWrite(
     const terminalBlocked = refuseKnownBadPromotedTerminal(inner.terminal);
     if (terminalBlocked) return terminalBlocked;
   }
+  // A current receiver that publishes the complete promoted-terminal witness also
+  // publishes the immediate inner node's opaque incarnation identity. Carry it
+  // through the enter/recheck/write sequence so same-id, same-type replacement
+  // cannot satisfy the inner write fence. Older receivers retain the legacy
+  // omission when this capability is not advertised.
+  if (ctx.tabPromotedTerminalWitnessCapability?.() === true) {
+    if (ctx.tabExpectedNodeIdentityFenceCapability?.() !== true) {
+      return promotedPanelBuildRefusal(
+        ctx,
+        nodeId,
+        widget,
+        "does not advertise the atomic inner-node identity write fence",
+        "enforces_expected_node_identity_at_write",
+      );
+    }
+    if (!inner.nodeIdentity) {
+      return promotedWriteRefusal(
+        widget,
+        "the current receiver did not publish a trustworthy immediate inner-node identity fence",
+      );
+    }
+  }
   // panel#1859 — these three are capability skew, exactly like the missing
   // graph identity above: the hello either advertises the fence or it does not,
   // and a caller cannot change that by trying again.
@@ -7485,6 +7508,7 @@ type PromotedMappingProof = {
   inner: {
     innerNodeId: number | string;
     widget: string;
+    nodeIdentity?: string;
     parentRail?: PromotedParentRailWitness;
   };
   innerNodeType: string;
@@ -7502,6 +7526,7 @@ async function recheckPromotedOuterMapping(
   expectedInner: {
     innerNodeId: number | string;
     widget: string;
+    nodeIdentity?: string;
     parentRail?: PromotedParentRailWitness;
   },
   expectedScope: PromotedScopeWitness,
@@ -7546,6 +7571,7 @@ async function recheckPromotedOuterMapping(
     !inner ||
     canonicalQueriedNodeId(inner.innerNodeId) !== canonicalQueriedNodeId(expectedInner.innerNodeId) ||
     inner.widget !== expectedInner.widget ||
+    (expectedInner.nodeIdentity !== undefined && inner.nodeIdentity !== expectedInner.nodeIdentity) ||
     !samePromotedParentRail(inner.parentRail, expectedInner.parentRail) ||
     !samePromotedTerminal(inner.terminal, expectedTerminal)
   ) {
@@ -7585,6 +7611,7 @@ async function recheckPromotedInnerTarget(
   expectedInner: {
     innerNodeId: number | string;
     widget: string;
+    nodeIdentity?: string;
     parentRail?: PromotedParentRailWitness;
   },
   expectedNodeType: string,
@@ -7617,7 +7644,8 @@ async function recheckPromotedInnerTarget(
     !identity ||
     !expectedId ||
     identity.id !== expectedId ||
-    identity.type !== expectedNodeType
+    identity.type !== expectedNodeType ||
+    (expectedInner.nodeIdentity !== undefined && identity.nodeIdentity !== expectedInner.nodeIdentity)
   ) {
     return promotedWriteRefusal(
       widget,
@@ -7659,9 +7687,23 @@ async function recheckPromotedInnerTarget(
         "the nested promoted terminal mapping changed or became unverifiable after entering",
       );
     }
-    return { inner: expectedInner, innerNodeType: identity.type, terminal: expectedTerminal };
+    return {
+      inner: {
+        ...expectedInner,
+        ...(identity.nodeIdentity !== undefined ? { nodeIdentity: identity.nodeIdentity } : {}),
+      },
+      innerNodeType: identity.type,
+      terminal: expectedTerminal,
+    };
   }
-  return { inner: expectedInner, innerNodeType: identity.type, ...(expectedTerminal ? { terminal: expectedTerminal } : {}) };
+  return {
+    inner: {
+      ...expectedInner,
+      ...(identity.nodeIdentity !== undefined ? { nodeIdentity: identity.nodeIdentity } : {}),
+    },
+    innerNodeType: identity.type,
+    ...(expectedTerminal ? { terminal: expectedTerminal } : {}),
+  };
 }
 
 function daSiWaStackRefusal(type: string): ToolResult {
@@ -18846,6 +18888,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 parentRail: plan.inner.parentRail,
                 ...(plan.terminal ? { terminal: plan.terminal } : {}),
               },
+              ctx.tabExpectedNodeIdentityFenceCapability?.() === true
+                ? afterEnterMapping.inner.nodeIdentity ?? plan.inner.nodeIdentity
+                : undefined,
             );
             const exited = await leave();
             if (written.isError) {
@@ -19493,6 +19538,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           recoveryBeforeDispatch,
           recoveryScope
             ? { ...recoveryScope, ...(inner.terminal ? { terminal: inner.terminal } : {}) }
+            : undefined,
+          ctx.tabExpectedNodeIdentityFenceCapability?.() === true
+            ? legacyFinalMapping.inner.nodeIdentity ?? inner.nodeIdentity
             : undefined,
         );
         const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
