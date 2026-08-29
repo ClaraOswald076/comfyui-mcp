@@ -11,7 +11,7 @@ All notable changes to this project are documented here. This project adheres to
 ### MCP
 
 #### Fixed
-- omit the unexpose reindex warning when the panel already reindexed
+- omit the unexpose reindex warning when the panel already reindexed (#2474)
 
 
 ## [0.52.146] - 2026-08-27
