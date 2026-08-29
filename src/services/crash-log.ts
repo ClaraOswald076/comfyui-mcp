@@ -28,6 +28,21 @@ export interface CrashParseResult {
   culpritNode?: string;
   /** The deepest `<file>:<line>` frame (within the culprit node when known). */
   culpritFrame?: string;
+  /**
+   * The innermost frame overall, set ONLY when a culprit custom node was named
+   * but that node is NOT where the fault actually happened — i.e. a deeper frame
+   * outside custom_nodes sits between it and the crash.
+   *
+   * The culprit search deliberately PREFERS a custom_nodes frame, because a
+   * custom node is the usual cause and the one thing the user can act on. But
+   * when the innermost frame is core ComfyUI or a site-packages kernel, the
+   * custom node may be doing nothing but wrapping the call — TiledDiffusion
+   * monkey-patches KSAMPLER_sample and passes straight through, so it appears on
+   * every sampler stack it is installed for, including a SageAttention CUDA
+   * fault it had no part in (#2497). Naming it unhedged sent the user to update
+   * an innocent node and re-run the same crashing graph.
+   */
+  faultFrame?: string;
   /** A stable identifier for THIS crash (signature head + culprit), so the caller
    *  can inject a given crash at most once and not re-surface it on every later
    *  resume. Also set for the `unreadable` case below — the injection site skips
@@ -87,17 +102,122 @@ function unreadableFingerprint(u: { path: string; reason: string }): string {
 const MAX_BLOCK_CHARS = 4000; // the injected fatal block is capped to this
 
 /**
- * Match a stack frame that points INTO a custom node. Handles both quoted
- * `File "...custom_nodes/<Node>/<file.py>", line 338` (Windows fatal-exception
- * dumps + Python tracebacks) and bare `custom_nodes/<Node>/<file.py>:338` forms,
- * with either path separator.
+ * How much of the log ABOVE the fatal signature to keep as CAUSAL CONTEXT.
+ *
+ * A native fault is frequently PRECEDED by the only line that names what
+ * actually failed, and the signature itself says nothing. ComfyUI's Sage path
+ * logs `Error running sage attention: CUDA error: an illegal memory access was
+ * encountered, using pytorch attention instead.` and only then aborts with a
+ * bare `Fatal Python error: Aborted` (#2497). Anchoring the block AT the
+ * signature dropped exactly that line, so the agent was handed an abort with no
+ * cause — and the nearest custom node on the stack took the blame for a fault in
+ * a pip-installed CUDA kernel.
+ *
+ * A bounded window, not a search for error-ish words: the useful line has no
+ * fixed wording, so any prose predicate would miss the next variant. Two caps so
+ * a log with enormously long lines can't blow the budget on one of them.
  */
-const CUSTOM_NODE_FRAME =
-  /custom_nodes[\\/]+([^\\/]+)[\\/]+([^\s"',]+?\.py)(?:["']?,?\s*line\s*(\d+)|:(\d+))/gi;
+const MAX_CONTEXT_LINES = 25;
+const MAX_CONTEXT_CHARS = 1200;
 
-/** Any `<file>:<line>` or `File "...", line N` frame — the fallback culprit. */
-const ANY_FRAME =
-  /(?:File\s*["']([^"']+?\.py)["']?,?\s*line\s*(\d+))|([^\s"',()]+?\.py):(\d+)/gi;
+/**
+ * The contiguous stack that the frame at `index` belongs to.
+ *
+ * The culprit region runs from the signature to the END of the tail, which after
+ * a restart also holds log APPENDED post-crash. Comparing frame depth across
+ * that whole span lets a later, unrelated traceback supply the "innermost"
+ * frame: a segfault in custom_nodes/GoodNode followed by an ordinary
+ * comfy/server.py traceback would name server.py the fault site and tell the
+ * user NOT to update the node that actually crashed (gate r1 P1). Depth is only
+ * meaningful WITHIN one stack, so the comparison is bounded to one.
+ *
+ * A stack line is an indented frame/source line, or a bare `file.py:12` form.
+ * A blank line or an unindented log line ends the run — which is exactly what
+ * separates a crash dump from whatever the server printed next.
+ */
+function firstStackFrames(region: string): { frames: { path: string; line?: string }[]; start: number } {
+  const lines = region.split("\n");
+  let off = 0;
+  let runStart = 0;
+  let frames: { path: string; line?: string }[] = [];
+  let inRun = false;
+  for (const raw of lines) {
+    const lineStart = off;
+    off += raw.length + 1;
+    // A stack is a contiguous run of frame lines and their indented source
+    // lines. A blank or unindented log line ends it — which is exactly what
+    // separates a crash dump from whatever the server printed next.
+    const isStackLine = raw.trim() !== "" && (/^\s/.test(raw) || frameOnLine(raw) !== null);
+    if (isStackLine) {
+      if (!inRun) {
+        inRun = true;
+        runStart = lineStart;
+        frames = [];
+      }
+      const f = frameOnLine(raw);
+      if (f) frames.push(f);
+    } else {
+      if (inRun && frames.length > 0) return { frames, start: runStart };
+      inRun = false;
+    }
+  }
+  return inRun && frames.length > 0 ? { frames, start: runStart } : { frames: [], start: 0 };
+}
+
+/**
+ * Parse ONE line as a stack frame, or null if it is not one.
+ *
+ * Deliberately ANCHORED at the start of the (trimmed) line. An unanchored match
+ * hits anywhere, so an ordinary indented SOURCE line inside a traceback —
+ * `raise RuntimeError("bad.py:99")`, or `raise RuntimeError("custom_nodes/Fake/f.py:99")` —
+ * reads as a frame in a file that was never on the stack, and names a false
+ * fault site or a nonexistent culprit node (gate r2/r3 P1).
+ */
+function frameOnLine(line: string): { path: string; line?: string } | null {
+  const quoted = /^\s*File\s+["']([^"']+?\.py)["']?,?\s*line\s*(\d+)/i.exec(line);
+  if (quoted) return { path: quoted[1], line: quoted[2] };
+  const bare = /^\s*([^\s"',()]+?\.py):(\d+)/i.exec(line);
+  if (bare) return { path: bare[1], line: bare[2] };
+  return null;
+}
+
+/**
+ * Which end of THIS stack is innermost, from the nearest direction marker ABOVE
+ * it. Read globally, a marker printed after the restart reverses an earlier
+ * crash stack and flips the answer (gate r2 P1); the marker that governs a stack
+ * is the closest one preceding it. Falls back to the caller's global reading
+ * when this stack has no marker of its own.
+ */
+function traceDirectionFor(region: string, runStart: number, fallback: boolean): boolean {
+  const before = region.slice(0, runStart);
+  const first = before.toLowerCase().lastIndexOf("most recent call first");
+  const last = before.toLowerCase().lastIndexOf("most recent call last");
+  if (first < 0 && last < 0) return fallback;
+  return first > last;
+}
+
+/**
+ * The bounded run of lines immediately preceding `lineStart`, oldest-first.
+ * Returns "" when the signature is already at the top of the scanned tail.
+ */
+function precedingContext(text: string, lineStart: number): string {
+  if (lineStart <= 0) return "";
+  const lines = text.slice(0, lineStart).split("\n");
+  // slice(0, lineStart) ends ON the newline that opens the anchor line, so the
+  // split leaves a trailing "" that is not a real line.
+  if (lines[lines.length - 1] === "") lines.pop();
+  const kept: string[] = [];
+  let chars = 0;
+  for (let i = lines.length - 1; i >= 0 && kept.length < MAX_CONTEXT_LINES; i--) {
+    chars += lines[i].length + 1;
+    if (chars > MAX_CONTEXT_CHARS) break;
+    kept.unshift(lines[i]);
+  }
+  return kept.join("\n").trim();
+}
+
+/** The custom-node directory in a frame path: `custom_nodes/<NodeDir>/…`. */
+const CUSTOM_NODE_DIR = /custom_nodes[\\/]+([^\\/]+)/i;
 
 /**
  * True when a crash-signature hit sits inside a Python "Exception ignored in:"
@@ -168,7 +288,13 @@ export function parseCrashBlock(text: string): CrashParseResult {
   // The fatal block = from a little BEFORE the anchor (to include the header
   // line) to the end of the tail. Back up to the start of the anchor's line.
   const lineStart = text.lastIndexOf("\n", anchor) + 1;
-  let block = text.slice(lineStart).trim();
+  // What the block used to be, and STILL the basis for the fingerprint below:
+  // the dedupe key must not shift just because we now display more context.
+  const fatalRegion = text.slice(lineStart).trim();
+  // Prepend the bounded run of lines above the signature — for a whole class of
+  // faults the cause is stated there and nowhere else (#2497).
+  const context = precedingContext(text, lineStart);
+  let block = context ? `${context}\n${fatalRegion}` : fatalRegion;
   if (block.length > MAX_BLOCK_CHARS) {
     // Keep the HEAD of the block (the signature + the top frames matter most).
     // #809: "…(truncated)" said nothing actionable. Name the amount, the fixed cap, and
@@ -190,37 +316,40 @@ export function parseCrashBlock(text: string): CrashParseResult {
   // (the top custom-node frame), not its caller loadmodel.
   const region = text.slice(lineStart);
   const mostRecentFirst = /most recent call first/i.test(region);
-  /** Collect every match of a global regex against the region. */
-  const collectAll = (source: string, flags: string): RegExpExecArray[] => {
-    const g = new RegExp(source, flags);
-    const out: RegExpExecArray[] = [];
-    let m: RegExpExecArray | null;
-    while ((m = g.exec(region)) !== null) {
-      out.push(m);
-      if (m.index === g.lastIndex) g.lastIndex++;
-    }
-    return out;
-  };
-  /** Pick the innermost match given the trace order. */
-  const pickInnermost = <T>(matches: T[]): T | undefined =>
-    matches.length === 0 ? undefined : mostRecentFirst ? matches[0] : matches[matches.length - 1];
-
   let culpritNode: string | undefined;
   let culpritFrame: string | undefined;
-  const nodeMatch = pickInnermost(collectAll(CUSTOM_NODE_FRAME.source, CUSTOM_NODE_FRAME.flags));
-  if (nodeMatch) {
-    culpritNode = nodeMatch[1];
-    const file = baseName(nodeMatch[2]);
-    const line = nodeMatch[3] ?? nodeMatch[4];
-    culpritFrame = line ? `${file}:${line}` : file;
-  } else {
-    // Fallback: no custom-node frame — take the innermost ANY frame so the agent
-    // at least gets a file:line to look at (e.g. a core ComfyUI crash).
-    const anyMatch = pickInnermost(collectAll(ANY_FRAME.source, ANY_FRAME.flags));
-    if (anyMatch) {
-      const file = baseName(anyMatch[1] ?? anyMatch[3] ?? "");
-      const line = anyMatch[2] ?? anyMatch[4];
-      if (file) culpritFrame = line ? `${file}:${line}` : file;
+  let faultFrame: string | undefined;
+
+  // Blame is decided inside ONE stack: the first one after the fatal signature.
+  // The region reaches the end of the tail, so it also holds whatever the server
+  // printed after the restart, and every cross-stack question has a wrong answer
+  // available to it — a later dump's direction marker reverses this stack, and a
+  // later traceback's frames pose as this one's (gate r1/r2/r3 P1). Frames come
+  // from frameOnLine, so a `.py:N` inside a source line is not one.
+  const stack = firstStackFrames(region);
+  if (stack.frames.length > 0) {
+    const innerFirst = traceDirectionFor(region, stack.start, mostRecentFirst);
+    const ordered = innerFirst ? stack.frames : [...stack.frames].reverse();
+    const innermost = ordered[0];
+    // The deepest CUSTOM-NODE frame is the culprit when there is one — a custom
+    // node is the usual cause and the one thing the user can act on.
+    const nodeFrame = ordered.find((f) => CUSTOM_NODE_DIR.test(f.path));
+    if (nodeFrame) {
+      culpritNode = CUSTOM_NODE_DIR.exec(nodeFrame.path)?.[1];
+      const file = baseName(nodeFrame.path);
+      culpritFrame = nodeFrame.line ? `${file}:${nodeFrame.line}` : file;
+      // …but if a NON-custom-node frame is deeper still, the node is only on the
+      // stack, not at the fault site, and naming it alone is a confident wrong
+      // answer (#2497).
+      if (!CUSTOM_NODE_DIR.test(innermost.path)) {
+        const f = baseName(innermost.path);
+        faultFrame = innermost.line ? `${f}:${innermost.line}` : f;
+      }
+    } else {
+      // No custom-node frame — give the agent the innermost file:line anyway so
+      // it has something to look at (e.g. a core ComfyUI crash).
+      const file = baseName(innermost.path);
+      culpritFrame = innermost.line ? `${file}:${innermost.line}` : file;
     }
   }
 
@@ -228,7 +357,11 @@ export function parseCrashBlock(text: string): CrashParseResult {
   // — not the whole block, which grows as the log appends post-restart — so the
   // caller can dedupe: inject a given crash once, never re-surface it on later
   // resumes.
-  const fingerprintBasis = `${culpritNode ?? ""}|${culpritFrame ?? ""}|${block
+  // Hashed over the FATAL region, never the displayed block: the block now also
+  // carries preceding log context, and keying on that would both shift every
+  // existing crash's key and let an unrelated line drifting into the window mint
+  // a fresh key for a crash already injected.
+  const fingerprintBasis = `${culpritNode ?? ""}|${culpritFrame ?? ""}|${fatalRegion
     .split("\n")
     .slice(0, 4)
     .join("\n")}`;
@@ -240,6 +373,7 @@ export function parseCrashBlock(text: string): CrashParseResult {
     fingerprint,
     ...(culpritNode ? { culpritNode } : {}),
     ...(culpritFrame ? { culpritFrame } : {}),
+    ...(faultFrame ? { faultFrame } : {}),
   };
 }
 
@@ -324,6 +458,26 @@ export function formatCrashNote(result: CrashParseResult): string | null {
     );
   }
   if (!result.fatal) return null;
+  // A custom node was named, but a deeper NON-custom-node frame is where it
+  // actually died: report the fault site first and the node as a possibility,
+  // not as a verdict. Sending the user to update a node that only wraps the call
+  // costs them a re-run of the graph that just killed the server (#2497).
+  if (result.culpritNode && result.faultFrame) {
+    return (
+      "⚠️ ComfyUI crashed during your last action (a native fault captured in its log). " +
+      "Fatal log:\n" +
+      "```\n" +
+      result.block +
+      "\n```\n" +
+      `The innermost frame is ${result.faultFrame}, which is NOT inside a custom node — so the fault ` +
+      `happened in ComfyUI core or a native/pip library it called. ${result.culpritNode}` +
+      `${result.culpritFrame ? ` (${result.culpritFrame})` : ""} is the nearest custom node on the stack, ` +
+      "but it may only be wrapping the call and be blameless. Read the log lines ABOVE the signature — " +
+      "for this class of fault the failing subsystem is usually named there and nowhere else — and treat " +
+      `${result.faultFrame} as the fault site. Do NOT just re-run the same graph, and do not update ` +
+      `${result.culpritNode} on the strength of this trace alone.`
+    );
+  }
   const culprit = result.culpritNode
     ? `Most likely culprit custom node: ${result.culpritNode}${
         result.culpritFrame ? ` (${result.culpritFrame})` : ""
