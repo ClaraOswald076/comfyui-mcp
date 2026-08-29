@@ -6516,13 +6516,18 @@ type PromotedWritePlan = {
   binding: PromotedWriteBinding;
 };
 
+type OrdinaryWritePlan = {
+  kind: "ordinary-write";
+  expectedNodeType: string;
+};
+
 type PromotedExpectedScope = PromotedScopeWitness & {
   terminal?: PromotedTerminalWitness;
   promotedWidget?: string;
   parentRail?: PromotedParentRailWitness;
 };
 
-type PromotedWritePreflight = PromotedWritePlan | ToolResult | null;
+type PromotedWritePreflight = PromotedWritePlan | OrdinaryWritePlan | ToolResult | null;
 
 function promotedEnvelopeCarriesEvidence(payload: Record<string, unknown> | null): boolean {
   if (!payload) return false;
@@ -6570,6 +6575,41 @@ function isDefinitiveNonPromotedSubgraphRead(res: ToolResult): boolean {
   return /^Error:\s*Node\s+\S+(?:\s+\((?:(?:[^()]|\([^()]*\))*|[^)]*)\))?\s+is not a subgraph\b/i.test(
     textOfToolResult(res),
   );
+}
+
+/** Extract the receiver-published type from the definitive ordinary-node
+ * refusal. A definitive classification without a type is still enough to
+ * avoid treating the node as promoted, but not enough to fence a write after
+ * an indeterminate read: an id can have been reused while the read was away. */
+function definitiveNonPromotedNodeType(res: ToolResult): string | null {
+  if (!isDefinitiveNonPromotedSubgraphRead(res)) return null;
+  const match = /^Error:\s*Node\s+\S+\s+([\s\S]*?)\s+is not a subgraph\b/i.exec(
+    textOfToolResult(res),
+  );
+  if (!match) return null;
+  const type = match[1].trim();
+  if (!type.startsWith("(") || !type.endsWith(")")) return null;
+  const unwrapped = type.slice(1, -1).trim();
+  return unwrapped || null;
+}
+
+type PromotedSubgraphReadErrorKind = "definitive-ordinary" | "transient" | "permanent";
+
+/** The promoted-write refresh is deliberately narrower than the broad panel
+ * call retry classifier. Only known transport/reconnect shapes may consume the
+ * one explicit refresh; application refusals must not be replayed. */
+function classifyPromotedSubgraphReadError(res: ToolResult): PromotedSubgraphReadErrorKind {
+  if (!res.isError) return "permanent";
+  if (isDefinitiveNonPromotedSubgraphRead(res)) return "definitive-ordinary";
+  const text = textOfToolResult(res);
+  if (
+    /(?:websocket|socket).*(?:disconnected|closed|reset)|(?:disconnected|closed|reset).*(?:websocket|socket)|\b(?:no connected tab|genuinely gone|unavailable|panel not reachable|failed to fetch|ECONNRESET|ECONNABORTED|EPIPE|premature close|other side closed)\b/i.test(
+      text,
+    )
+  ) {
+    return "transient";
+  }
+  return "permanent";
 }
 
 /**
@@ -6779,16 +6819,22 @@ function resolvePromotedWriteTarget(
   return resolveLegacyInnerPromotedTarget(payload, widget, nodeId);
 }
 
+const PROMOTED_PREFLIGHT_READ_OPTIONS: PanelToolCallOptions = {
+  retry: false,
+  maxBridgeReconnectRetries: 0,
+};
+
 async function readPromotedTargetScope(
   ctx: PanelToolCtx,
   nodeId: unknown,
+  options: PanelToolCallOptions = PROMOTED_PREFLIGHT_READ_OPTIONS,
 ): Promise<QueriedNodeScope | null> {
   const probe = await ctx.call({
     cmd: "graph_query",
     ids: [nodeId],
     fields: "detail",
     limit: 1,
-  });
+  }, undefined, undefined, undefined, options);
   if (probe.isError) return null;
   return parseVerifiedQueriedNodeScope(parseToolResultJson(probe), nodeId);
 }
@@ -7094,7 +7140,11 @@ async function preparePromotedWidgetWrite(
   // promoted-container classifier to resolve a target that is intentionally
   // absent. An unreadable scope probe is not permission for an outer write;
   // it falls through to the existing conservative graph_get_subgraph path.
-  const targetScope = await readPromotedTargetScope(ctx, nodeId);
+  const targetScope = await readPromotedTargetScope(
+    ctx,
+    nodeId,
+    PROMOTED_PREFLIGHT_READ_OPTIONS,
+  );
   if (targetScope?.activeView === "root" && targetScope.node === "ordinary") {
     // The scope probe crossed an await. Re-read the binding before taking the
     // ordinary fast path; otherwise a tab/connection rebind can make this
@@ -7104,9 +7154,16 @@ async function preparePromotedWidgetWrite(
     return null;
   }
 
-  let sub = await ctx.call({ cmd: "graph_get_subgraph", node_id: nodeId });
+  let sub = await ctx.call(
+    { cmd: "graph_get_subgraph", node_id: nodeId },
+    undefined,
+    undefined,
+    undefined,
+    PROMOTED_PREFLIGHT_READ_OPTIONS,
+  );
   if (sub.isError) {
-    if (isDefinitiveNonPromotedSubgraphRead(sub)) {
+    const firstReadKind = classifyPromotedSubgraphReadError(sub);
+    if (firstReadKind === "definitive-ordinary") {
       const drift2 = panelBindingDriftReason(ctx, "after the subgraph read", hasIdentityApi, identityBefore, tabBefore);
       if (drift2) return promotedWriteRefusal(widget, drift2);
       return null;
@@ -7121,13 +7178,27 @@ async function preparePromotedWidgetWrite(
         "graph_get_subgraph could not determine whether the addressed node is a promoted container",
       );
     }
+    if (firstReadKind === "permanent") {
+      return promotedSubgraphReadRefusal(
+        widget,
+        sub,
+        "graph_get_subgraph could not determine whether the addressed node is a promoted container",
+      );
+    }
     // A binding/subgraph registration transition can make the first read
     // indeterminate even though the same live container is readable immediately
     // afterward. Refresh once, then keep the existing fail-closed classification
     // and identity checks for the fresh reply.
-    const refreshedSub = await ctx.call({ cmd: "graph_get_subgraph", node_id: nodeId });
+    const refreshedSub = await ctx.call(
+      { cmd: "graph_get_subgraph", node_id: nodeId },
+      undefined,
+      undefined,
+      undefined,
+      PROMOTED_PREFLIGHT_READ_OPTIONS,
+    );
     if (refreshedSub.isError) {
-      if (isDefinitiveNonPromotedSubgraphRead(refreshedSub)) {
+      const refreshedReadKind = classifyPromotedSubgraphReadError(refreshedSub);
+      if (refreshedReadKind === "definitive-ordinary") {
         const driftAfterRefresh = panelBindingDriftReason(
           ctx,
           "after the subgraph refresh",
@@ -7136,7 +7207,23 @@ async function preparePromotedWidgetWrite(
           tabBefore,
         );
         if (driftAfterRefresh) return promotedWriteRefusal(widget, driftAfterRefresh);
-        return null;
+        const expectedNodeType = definitiveNonPromotedNodeType(refreshedSub);
+        if (!expectedNodeType) {
+          return promotedWriteRefusal(
+            widget,
+            "the definitive ordinary refresh did not publish a node type fence",
+          );
+        }
+        if (ctx.tabExpectedNodeTypeFenceCapability?.() !== true) {
+          return promotedPanelBuildRefusal(
+            ctx,
+            nodeId,
+            widget,
+            "does not advertise the atomic ordinary-node write fence",
+            "enforces_expected_node_type_at_write",
+          );
+        }
+        return { kind: "ordinary-write", expectedNodeType };
       }
       return promotedSubgraphReadRefusal(
         widget,
@@ -13622,6 +13709,13 @@ export interface ExplicitCurrentRebindProof {
   savedIdentity: string;
 }
 
+export interface PanelToolCallOptions {
+  /** Disable the orchestrator's post-transport retry for a one-shot probe. */
+  retry?: boolean;
+  /** Limit UiBridge reconnect resumption for this call. */
+  maxBridgeReconnectRetries?: number;
+}
+
 export interface PanelToolCtx {
   /** Forward a command to the panel and wrap the reply as a tool result. An
    *  optional observer receives the bridge request id after the frame is written,
@@ -13634,6 +13728,7 @@ export interface PanelToolCtx {
     timeoutMs?: number,
     onDispatchedRid?: (rid: string) => void,
     beforeDispatch?: () => void,
+    options?: PanelToolCallOptions,
   ) => Promise<ToolResult>;
   /** Human-in-the-loop yes/no confirm card. Tri-state (#360): "yes" on an explicit
    *  affirmative, "no" on a decline / no-panel / transport error, "timeout" when the
@@ -14075,6 +14170,7 @@ export function makePanelToolCtx(
     timeoutMs?: number,
     onDispatchedRid?: (rid: string) => void,
     beforeDispatch?: () => void,
+    options?: PanelToolCallOptions,
   ): Promise<unknown> => {
     const target = workflowTargets?.get(ctx.tabId);
     const routed = target ? withWorkflowTarget(cmd, target) : cmd;
@@ -14083,6 +14179,7 @@ export function makePanelToolCtx(
       timeoutMs,
       onDispatchedRid,
       beforeDispatch,
+      maxReconnectRetries: options?.maxBridgeReconnectRetries,
     });
   };
 
@@ -14098,6 +14195,7 @@ export function makePanelToolCtx(
     // fourteenth is added, and the fact being carried belongs to the ERROR rather
     // than to any one of those wordings.
     onFailure?: (err: unknown) => void,
+    options?: PanelToolCallOptions,
   ): Promise<ToolResult> => {
     // #694: capture the rid of THIS call's dispatched attempt so an OUTCOME-UNKNOWN
     // mutating failure can name it as the caller's explicit retry token (see the
@@ -14135,7 +14233,7 @@ export function makePanelToolCtx(
       // The bridge owns the graph lane and re-resolves the live connection after
       // waiting. Pass the fence through so it runs at the actual socket dispatch,
       // not before that retarget window.
-      const firstTry = ok(await sendRouted(cmd, timeoutMs, observeRid, beforeDispatch));
+      const firstTry = ok(await sendRouted(cmd, timeoutMs, observeRid, beforeDispatch, options));
       // panel#1097 — a guard-domain command that SUCCEEDS is the evidence that the
       // switch is over, whichever attempt lands it. Without this an ordinary
       // first-attempt success left the old run in place, and a later unrelated
@@ -14171,11 +14269,12 @@ export function makePanelToolCtx(
       const workerTransportRetry =
         isWorkerTransportSendError(err) && isWorkerTransportRetrySafeCmd(cmd);
       if (
-        preExecutorRefusal ||
+        options?.retry !== false &&
+        (preExecutorRefusal ||
         (isRetrySafeCmd(cmd) &&
           (isTransientReconnectError(err) ||
             isWorkflowSwitchGuardRefusal(err) ||
-            workerTransportRetry))
+            workerTransportRetry)))
       ) {
         // panel#1097 — declared out here so the refusal branch below can see it,
         // and REASSIGNED after ensureReachable so it names the tab the command is
@@ -14219,7 +14318,9 @@ export function makePanelToolCtx(
           await awaitReachable();
           ensureReachable(); // rebinds a current-mode session onto the reconnected tab
           holdTab = ctx.tabId;
-          const retried = ok(await sendRouted(cmd, timeoutMs, observeRid, beforeDispatch));
+          const retried = ok(
+            await sendRouted(cmd, timeoutMs, observeRid, beforeDispatch, options),
+          );
           // Cleared HERE and nowhere else, and only when the failure this retried
           // was a SWITCH refusal. Clearing on every routed success let an unguarded
           // status read wipe the evidence while graph commands stayed refused
@@ -15052,11 +15153,19 @@ export function makePanelToolCtx(
     timeoutMs?: number,
     onDispatchedRid?: (rid: string) => void,
     beforeDispatch?: () => void,
+    options?: PanelToolCallOptions,
   ): Promise<ToolResult> => {
     let failure: unknown;
-    const res = await callOnce(cmd, timeoutMs, onDispatchedRid, beforeDispatch, (err) => {
-      failure = err;
-    });
+    const res = await callOnce(
+      cmd,
+      timeoutMs,
+      onDispatchedRid,
+      beforeDispatch,
+      (err) => {
+        failure = err;
+      },
+      options,
+    );
     return carryWorkflowListReadinessMark(
       failure,
       carryMidCommandDisconnectMark(failure, carryPanelAnsweredMark(failure, res)),
@@ -18375,9 +18484,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         const promotedPlan = promotedPreflight && promotedPreflight.kind === "promoted-write"
           ? promotedPreflight
           : null;
+        const ordinaryPlan = promotedPreflight && promotedPreflight.kind === "ordinary-write"
+          ? promotedPreflight
+          : null;
 
-        let expectedNodeType: string | undefined;
-        if (!promotedPlan && args.widget === DASIWA_STACK_WIDGET) {
+        let expectedNodeType: string | undefined = ordinaryPlan?.expectedNodeType;
+        if (!promotedPlan && !ordinaryPlan && args.widget === DASIWA_STACK_WIDGET) {
           const daSiWaFence = await verifyDaSiWaStackWriteFence(ctx, args.node_id);
           if (daSiWaFence && "content" in daSiWaFence) return daSiWaFence;
           expectedNodeType = daSiWaFence?.expectedNodeType;
@@ -18475,6 +18587,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           }
           const blocked = await refuseKnownBadWriteBeforeDispatch(ctx, nodeId, widget);
           if (blocked) return blocked;
+          if (promotedRetry && promotedRetry.kind === "ordinary-write") {
+            return write(nodeId, widget, promotedRetry.expectedNodeType);
+          }
           return write(nodeId, widget, targetExpectedNodeType);
         };
 

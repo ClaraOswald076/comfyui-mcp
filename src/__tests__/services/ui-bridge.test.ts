@@ -1153,6 +1153,30 @@ describe("UiBridge (multi-tab)", () => {
     a2.close();
   });
 
+  it("does not bridge-resume an identity-sensitive read when its budget is zero", async () => {
+    const a1 = await connectPanel("tab-2478-one-shot");
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    const firstFrames: Array<Record<string, unknown>> = [];
+    a1.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString()) as Record<string, unknown>;
+      if (msg.cmd === "graph_get_subgraph") firstFrames.push(msg);
+    });
+    const promise = bridge.send(
+      { cmd: "graph_get_subgraph", node_id: 78 },
+      { tabId: "tab-2478-one-shot", timeoutMs: 1000, maxReconnectRetries: 0 },
+    );
+    await waitFor(() => expect(firstFrames).toHaveLength(1));
+    a1.close();
+
+    const a2 = await connectPanel("tab-2478-one-shot");
+    const replacementFrames: Array<Record<string, unknown>> = [];
+    a2.on("message", (buf) => replacementFrames.push(JSON.parse(buf.toString())));
+    await expect(promise).rejects.toThrow(/disconnected mid-command|genuinely gone/);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(replacementFrames.some((msg) => msg.cmd === "graph_get_subgraph")).toBe(false);
+    a2.close();
+  });
+
   it("dropQueuedDeliveries CANCELS a parked read so it is NOT re-dispatched onto a replacement (#570 P0)", async () => {
     const a1 = await connectPanel("wf:foo.json");
     await waitFor(() => expect(bridge.tabs()).toHaveLength(1));

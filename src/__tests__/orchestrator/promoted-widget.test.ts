@@ -75,6 +75,9 @@ function bridge(opts: {
   /** #2393: successive graph_get_subgraph replies, used to model a witness
    * that is incomplete immediately after an official template load. */
   subgraphSequence?: Array<Record<string, unknown> | Error>;
+  /** #2478: replace the ordinary node after the definitive refresh, so a raw
+   * write would falsely succeed unless the handler carries the type fence. */
+  ordinaryNodeTypeAfterRefresh?: string;
   /** #2401: change the routing or panel connection identity after the async
    * ordinary-node scope probe has produced its result, before the caller can
    * take the fast path. */
@@ -156,9 +159,11 @@ function bridge(opts: {
   receiverUnresolvable?: boolean;
 }) {
   const calls: Array<Record<string, unknown>> = [];
+  const bridgeRetryBudgets: Array<number | undefined> = [];
   let writes = 0;
   let mutations = 0;
   let subgraphReads = 0;
+  let ordinaryNodeType = "OrdinaryNode";
   let postEnterGraphQueries = 0;
   let authoritativeScopeReads = 0;
   let inSubgraph = opts.startInSubgraph === true;
@@ -250,8 +255,11 @@ function bridge(opts: {
   const b = {
     send: async (
       cmd: Record<string, unknown>,
-      sendOpts?: { beforeDispatch?: () => void },
+      sendOpts?: { beforeDispatch?: () => void; maxReconnectRetries?: number },
     ) => {
+      if (cmd.cmd === "graph_get_subgraph") {
+        bridgeRetryBudgets.push(sendOpts?.maxReconnectRetries);
+      }
       if (cmd.cmd === "graph_set_widget" && sendOpts?.beforeDispatch) {
         const mutation = beforeWrite.mutate;
         beforeWrite.mutate = undefined;
@@ -309,6 +317,14 @@ function bridge(opts: {
             throw new Error("graph_set_widget promoted parent rail changed before dispatch: Nothing was applied.");
           }
         }
+        if (
+          opts.ordinaryNodeTypeAfterRefresh !== undefined &&
+          cmd.expected_node_type !== undefined &&
+          String(cmd.node_id) === "78" &&
+          cmd.expected_node_type !== ordinaryNodeType
+        ) {
+          throw new Error("graph_set_widget expected node type changed before dispatch: Nothing was applied.");
+        }
         writes += 1;
         if (writes === 1 && opts.ambiguous) throw new Error(AMBIGUOUS);
         if (writes === 1 && opts.scopeLost) throw new Error(SCOPE_REFUSAL);
@@ -361,7 +377,12 @@ function bridge(opts: {
         }
         if (opts.subgraphSequence && opts.subgraphSequence.length > 0) {
           const selected = opts.subgraphSequence[Math.min(subgraphReads - 1, opts.subgraphSequence.length - 1)];
-          if (selected instanceof Error) throw selected;
+          if (selected instanceof Error) {
+            if (subgraphReads === 2 && opts.ordinaryNodeTypeAfterRefresh !== undefined) {
+              ordinaryNodeType = opts.ordinaryNodeTypeAfterRefresh;
+            }
+            throw selected;
+          }
           return withCurrentViewing(selected);
         }
         if (inSubgraph) {
@@ -534,6 +555,9 @@ function bridge(opts: {
     get mutations() {
       return mutations;
     },
+    get bridgeRetryBudgets() {
+      return bridgeRetryBudgets;
+    },
   };
 }
 
@@ -565,6 +589,7 @@ async function setWidget(
     postEnterGraphQueries: harness.postEnterGraphQueries,
     writesApplied: harness.writesApplied,
     mutations: harness.mutations,
+    bridgeRetryBudgets: harness.bridgeRetryBudgets,
   };
 }
 
@@ -3379,6 +3404,70 @@ describe("panel_set_widget transient promoted-subgraph read (#2478)", () => {
     expect(calls.filter((call) => call.cmd === "graph_get_subgraph")).toHaveLength(2);
     expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
     expect(writesApplied).toBe(0);
+    expect(mutations).toBe(0);
+  });
+
+  it("fences a definitive ordinary refresh before the raw write", async () => {
+    const { isError, calls, mutations, bridgeRetryBudgets } = await setWidget(
+      { node_id: 78, widget: "steps", value: 8 },
+      {
+        firstWrite: "ok",
+        subgraphSequence: [
+          transientRead,
+          new Error("Node 78 (OrdinaryNode) is not a subgraph"),
+        ],
+      },
+    );
+
+    expect(isError).toBe(false);
+    expect(mutations).toBe(1);
+    expect(bridgeRetryBudgets).toEqual([0, 0]);
+    expect(calls.filter((call) => call.cmd === "graph_get_subgraph")).toHaveLength(2);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toEqual([
+      expect.objectContaining({
+        node_id: 78,
+        widget: "steps",
+        expected_node_type: "OrdinaryNode",
+      }),
+    ]);
+  });
+
+  it("refuses instead of falsely succeeding when the ordinary node is replaced", async () => {
+    const { isError, text, calls, writesApplied, mutations, bridgeRetryBudgets } = await setWidget(
+      { node_id: 78, widget: "steps", value: 8 },
+      {
+        firstWrite: "ok",
+        ordinaryNodeTypeAfterRefresh: "ReplacementNode",
+        subgraphSequence: [
+          transientRead,
+          new Error("Node 78 (OrdinaryNode) is not a subgraph"),
+        ],
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/expected node type changed before dispatch/);
+    expect(calls.filter((call) => call.cmd === "graph_get_subgraph")).toHaveLength(2);
+    expect(bridgeRetryBudgets).toEqual([0, 0]);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(1);
+    expect(writesApplied).toBe(0);
+    expect(mutations).toBe(0);
+  });
+
+  it("does not spend the refresh on a permanent application error", async () => {
+    const { isError, text, calls, mutations, bridgeRetryBudgets } = await setWidget(
+      { node_id: 78, widget: "steps", value: 8 },
+      {
+        firstWrite: "ok",
+        subgraph: new Error("graph_get_subgraph rejected a malformed response"),
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/could not determine whether the addressed node is a promoted container/);
+    expect(calls.filter((call) => call.cmd === "graph_get_subgraph")).toHaveLength(1);
+    expect(bridgeRetryBudgets).toEqual([0]);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
     expect(mutations).toBe(0);
   });
 });

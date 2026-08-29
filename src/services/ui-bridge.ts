@@ -91,8 +91,8 @@ export interface PanelTab {
 
 /** Shared per-send context that survives a re-dispatch (idempotent read retried
  *  onto a fresh socket after a mid-command reconnect). Carries the caller's
- *  resolve/reject, the original command, and an absolute deadline so retries are
- *  always bounded. */
+ *  resolve/reject, the original command, an absolute deadline, and a finite
+ *  reconnect retry budget. */
 type SendCtx = {
   resolve: (v: unknown) => void;
   reject: (e: Error) => void;
@@ -106,6 +106,8 @@ type SendCtx = {
   mutating: boolean;
   /** Absolute ms after which even an idempotent read stops waiting for reconnect. */
   deadline: number;
+  /** Remaining bridge-owned reconnect re-dispatches for this send. */
+  reconnectRetriesRemaining: number;
   /** #570 — the trusted per-instance workflow uuid this command was ISSUED FOR (the
    *  caller's intended tab), stamped onto the outgoing frame so the panel can refuse to
    *  EXECUTE it against a DIFFERENT workflow it has since switched to. Undefined for a tab
@@ -2351,6 +2353,9 @@ export class UiBridge {
   /** How long a dropped idempotent read waits for its tab to re-hello before we
    *  declare the panel genuinely gone. Bounded so a caller never hangs. */
   private static readonly RECONNECT_GRACE_MS = 4000;
+  /** No single bridge send may be re-dispatched more than once by reconnect
+   *  handling. Callers can lower this to zero for identity-sensitive probes. */
+  private static readonly MAX_RECONNECT_RETRIES = 1;
   /** Bridge commands with no side effect — safe to re-dispatch after a reconnect.
    *  Everything else is treated as mutating (no auto-retry) so a render/edit is
    *  never silently double-applied. Single source of truth at module scope
@@ -5453,6 +5458,9 @@ export class UiBridge {
       onDispatchedRid?: (rid: string) => void;
       /** Synchronous fence at the final live-connection dispatch boundary. */
       beforeDispatch?: () => void;
+      /** Maximum bridge-owned reconnect re-dispatches for this send. The bridge
+       * clamps this to its finite global bound; zero makes a read one-shot. */
+      maxReconnectRetries?: number;
     } = {},
   ): Promise<unknown> {
     // #357: read (idempotent) ops get a more tolerant default so a busy-but-alive
@@ -6031,6 +6039,19 @@ export class UiBridge {
         );
       }
       return new Promise((resolve, reject) => {
+        const requestedReconnectRetries = opts.maxReconnectRetries;
+        const reconnectRetriesRemaining =
+          requestedReconnectRetries === undefined
+            ? UiBridge.MAX_RECONNECT_RETRIES
+            : Number.isFinite(requestedReconnectRetries)
+              ? Math.max(
+                  0,
+                  Math.min(
+                    UiBridge.MAX_RECONNECT_RETRIES,
+                    Math.floor(requestedReconnectRetries),
+                  ),
+                )
+              : 0;
         const ctx: SendCtx = {
           resolve,
           reject,
@@ -6044,6 +6065,7 @@ export class UiBridge {
           // Timeout starts at DISPATCH, not enqueue: waiting for a sibling graph
           // read cannot itself produce the reporter's 30 s false timeout (#2069).
           deadline: Date.now() + timeoutMs,
+          reconnectRetriesRemaining,
           // #570 — graph ops resolve from the CALLER'S intended tab (opts.tabId), NOT
           // the canonical conn.tabId: after a same-socket switch the two differ, and
           // we must stamp the workflow the command was ISSUED FOR (so the panel, now
@@ -6358,19 +6380,25 @@ export class UiBridge {
     // Idempotent read, still within its deadline → park it for a bounded grace and
     // re-dispatch if the same tab re-hellos. Safe: re-running a read has no side
     // effect, and it was in `pending` (un-acked), so no reply was lost.
-    if (!ctx.mutating && Date.now() < ctx.deadline) {
+    if (
+      !ctx.mutating &&
+      ctx.reconnectRetriesRemaining > 0 &&
+      Date.now() < ctx.deadline
+    ) {
       // A replacement socket for this tab is ALREADY live (a reload/supersede whose
       // hello landed before this dead socket's close handler ran — so resume already
       // fired and won't fire again). Re-dispatch straight onto it instead of parking
       // and expiring as "gone". Safe: idempotent read, un-acked.
       const live = this.conns.get(ctx.tabId);
       if (live && live.sock !== pend.sock && live.sock.readyState === WebSocket.OPEN) {
+        ctx.reconnectRetriesRemaining -= 1;
         logger.info(
           `[ui-bridge] tab ${short} already reconnected — resuming "${cmd}" on the live socket`,
         );
         this.dispatch(live, ctx);
         return;
       }
+      ctx.reconnectRetriesRemaining -= 1;
       const list = this.awaitingReconnect.get(ctx.tabId) ?? [];
       const graceMs = Math.max(0, Math.min(UiBridge.RECONNECT_GRACE_MS, ctx.deadline - Date.now()));
       const entry = {
