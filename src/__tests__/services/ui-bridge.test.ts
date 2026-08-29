@@ -179,6 +179,7 @@ function connectPanel(
             enforces_workflow_stamp: true,
             enforces_workflow_stamp_at_write: true,
             enforces_expected_node_type_at_write: true,
+            enforces_expected_node_identity_at_write: true,
             enforces_expected_scope_at_write: true,
             enforces_expected_scope_graph_identity_at_write: true,
             enforces_promoted_parent_rail_at_write: true,
@@ -3401,19 +3402,19 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     old.close();
   });
 
-  it("FAILS CLOSED when expected_node_instance reaches a panel without its final fence", async () => {
+  it("FAILS CLOSED when expected_node_identity reaches a panel without its final fence", async () => {
     const old = new WebSocket(`ws://127.0.0.1:${port}`);
     await new Promise<void>((res, rej) => {
       old.on("open", () => {
         old.send(
           JSON.stringify({
             type: "hello",
-            tab_id: "tmp:old-node-instance-fence",
-            title: "old node-instance fence",
+            tab_id: "tmp:old-node-identity-fence",
+            title: "old node-identity fence",
             enforces_workflow_stamp: true,
             enforces_workflow_stamp_at_write: true,
             enforces_expected_node_type_at_write: true,
-            // Deliberately omit the cross-command node-instance fence. The
+            // Deliberately omit the cross-command node-identity fence. The
             // panel would otherwise silently ignore the witness and reopen
             // same-graph same-id same-type replacement.
           }),
@@ -3423,9 +3424,9 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       old.on("error", rej);
     });
     await waitFor(() =>
-      expect(bridge.tabs().some((t) => t.tab_id === "tmp:old-node-instance-fence")).toBe(true),
+      expect(bridge.tabs().some((t) => t.tab_id === "tmp:old-node-identity-fence")).toBe(true),
     );
-    expect(bridge.tabExpectedNodeInstanceFenceCapability("tmp:old-node-instance-fence")).toBe(false);
+    expect(bridge.tabExpectedNodeIdentityFenceCapability("tmp:old-node-identity-fence")).toBe(false);
     const caught = await bridge
       .send(
         {
@@ -3433,16 +3434,16 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
           node_id: 312,
           widget: "control_after_generate",
           value: "fixed",
-          expected_node_instance: "inner-node-instance-a",
+          expected_node_identity: "inner-node-instance-a",
         },
-        { tabId: "tmp:old-node-instance-fence" },
+        { tabId: "tmp:old-node-identity-fence" },
       )
       .then(
         () => null,
         (err) => err,
       );
     expect(caught).toBeInstanceOf(Error);
-    expect((caught as Error).message).toMatch(/atomic expected-node-instance write fence/);
+    expect((caught as Error).message).toMatch(/atomic expected-node-identity write fence/);
     expect((caught as Error).message).toMatch(/does not advertise/);
     expect(isCapabilityRefusal(caught)).toBe(true);
     expect(dispatchOutcomeOf(caught)).toBe(false);

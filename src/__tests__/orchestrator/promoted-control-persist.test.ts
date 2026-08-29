@@ -236,7 +236,7 @@ function witnessedBridge(opts: {
     ...PROMOTED_REPORTER_SUBGRAPH,
     nodes: PROMOTED_REPORTER_SUBGRAPH.nodes.map((node) => ({
       ...node,
-      node_instance: PROMOTED_INNER_NODE_INSTANCE,
+      node_identity: PROMOTED_INNER_NODE_INSTANCE,
     })),
     subgraph_of: {
       ...PROMOTED_REPORTER_SUBGRAPH.subgraph_of,
@@ -295,7 +295,7 @@ function witnessedBridge(opts: {
               id: 312,
               type: nodeType,
               is_subgraph: false,
-              node_instance: nodeInstanceWitness,
+              node_identity: nodeInstanceWitness,
             },
           ],
           truncated: false,
@@ -333,8 +333,8 @@ function witnessedBridge(opts: {
           throw new Error("graph_set_widget receiver node type changed before dispatch: Nothing was applied.");
         }
         if (
-          Object.prototype.hasOwnProperty.call(cmd, "expected_node_instance") &&
-          cmd.expected_node_instance !== nodeInstanceWitness
+          Object.prototype.hasOwnProperty.call(cmd, "expected_node_identity") &&
+          cmd.expected_node_identity !== nodeInstanceWitness
         ) {
           throw new Error("graph_set_widget receiver node instance changed before dispatch: Nothing was applied.");
         }
@@ -363,8 +363,7 @@ function witnessedBridge(opts: {
     promotedScopeFor: () => scope(),
     workflowUuidFor: () => ({ known: true, uuid: "workflow-a" }),
     tabExpectedNodeTypeFenceCapability: () => true,
-    tabPromotedNodeInstanceWitnessCapability: () => true,
-    tabExpectedNodeInstanceFenceCapability: () => true,
+    tabExpectedNodeIdentityFenceCapability: () => true,
     tabExpectedScopeGraphIdentityFenceCapability: () => true,
     tabPromotedTerminalWitnessCapability: () => false,
     tabPromotedParentRailFenceCapability: () => false,
@@ -601,13 +600,13 @@ describe("panel_set_widget promoted control persistence dispatch fences (#1925)"
     expect(writes[0]).toMatchObject({
       node_id: 312,
       expected_node_type: "LTXInner",
-      expected_node_instance: PROMOTED_INNER_NODE_INSTANCE,
+      expected_node_identity: PROMOTED_INNER_NODE_INSTANCE,
     });
     expect(writes[1]).toMatchObject({
       node_id: "312",
       widget: "control_after_generate",
       expected_node_type: "LTXInner",
-      expected_node_instance: PROMOTED_INNER_NODE_INSTANCE,
+      expected_node_identity: PROMOTED_INNER_NODE_INSTANCE,
     });
     expect(text).toMatch(/node instance changed|Nothing was applied/);
     expect(text).not.toMatch(/control_after_generate_pinned/);

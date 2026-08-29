@@ -232,12 +232,11 @@ interface Conn {
    * to a graph, so the older owner/workflow-only fence is insufficient for a
    * same-id cross-graph navigation. */
   enforcesExpectedScopeGraphIdentityAtWrite: boolean;
-  /** True only when THIS hello advertises both halves of the promoted
-   * node-instance witness protocol: graph_get_subgraph publishes an opaque
-   * token for each inner node and graph_set_widget checks expected_node_instance
-   * at the synchronous mutation boundary. Re-read per hello. */
-  publishesPromotedNodeInstanceWitnesses: boolean;
-  enforcesExpectedNodeInstanceAtWrite: boolean;
+  /** True only when THIS hello advertises that graph_set_widget checks the
+   * opaque node_identity witness at the synchronous mutation boundary. The
+   * same identity is included in graph projections by the panel. Re-read per
+   * hello. */
+  enforcesExpectedNodeIdentityAtWrite: boolean;
   /** True only when THIS hello advertises that graph_get_subgraph publishes
    * the complete renamed-promotion alias -> terminal witness consumed by the
    * orchestrator before a promoted write. */
@@ -1631,8 +1630,8 @@ function expectedNodeTypeFenceRefusal(tabId: string): Error {
   return fenceRefusal(tabId, "expected-node-type", "enforces_expected_node_type_at_write");
 }
 
-function expectedNodeInstanceFenceRefusal(tabId: string): Error {
-  return fenceRefusal(tabId, "expected-node-instance", "enforces_expected_node_instance_at_write");
+function expectedNodeIdentityFenceRefusal(tabId: string): Error {
+  return fenceRefusal(tabId, "expected-node-identity", "enforces_expected_node_identity_at_write");
 }
 
 function expectedScopeFenceRefusal(tabId: string): Error {
@@ -1657,8 +1656,8 @@ function commandCarriesExpectedGraphIdentity(cmd: BridgeCommand): boolean {
     Object.prototype.hasOwnProperty.call(scope, "graph_identity");
 }
 
-function commandCarriesExpectedNodeInstance(cmd: BridgeCommand): boolean {
-  return Object.prototype.hasOwnProperty.call(cmd, "expected_node_instance");
+function commandCarriesExpectedNodeIdentity(cmd: BridgeCommand): boolean {
+  return Object.prototype.hasOwnProperty.call(cmd, "expected_node_identity");
 }
 
 function commandCarriesPromotedParentRail(cmd: BridgeCommand): boolean {
@@ -3136,12 +3135,9 @@ export class UiBridge {
           enforcesExpectedScopeGraphIdentityAtWrite:
             (msg as { enforces_expected_scope_graph_identity_at_write?: unknown })
               .enforces_expected_scope_graph_identity_at_write === true,
-          publishesPromotedNodeInstanceWitnesses:
-            (msg as { publishes_promoted_node_instance_witnesses?: unknown })
-              .publishes_promoted_node_instance_witnesses === true,
-          enforcesExpectedNodeInstanceAtWrite:
-            (msg as { enforces_expected_node_instance_at_write?: unknown })
-              .enforces_expected_node_instance_at_write === true,
+          enforcesExpectedNodeIdentityAtWrite:
+            (msg as { enforces_expected_node_identity_at_write?: unknown })
+              .enforces_expected_node_identity_at_write === true,
           publishesPromotedTerminalWitnesses:
             (msg as { publishes_promoted_terminal_witnesses?: unknown })
               .publishes_promoted_terminal_witnesses === true,
@@ -3797,21 +3793,11 @@ export class UiBridge {
     }
   }
 
-  /** Whether THIS connected panel publishes the opaque node-instance witness
-   * consumed by the promoted control_after_generate persistence fence. */
-  tabPromotedNodeInstanceWitnessCapability(tabId: string): boolean {
-    try {
-      return this.resolveTarget(tabId).publishesPromotedNodeInstanceWitnesses === true;
-    } catch {
-      return false;
-    }
-  }
-
-  /** Whether THIS connected panel enforces expected_node_instance at the
+  /** Whether THIS connected panel enforces expected_node_identity at the
    * final graph_set_widget mutation boundary. */
-  tabExpectedNodeInstanceFenceCapability(tabId: string): boolean {
+  tabExpectedNodeIdentityFenceCapability(tabId: string): boolean {
     try {
-      return this.resolveTarget(tabId).enforcesExpectedNodeInstanceAtWrite === true;
+      return this.resolveTarget(tabId).enforcesExpectedNodeIdentityAtWrite === true;
     } catch {
       return false;
     }
@@ -5585,17 +5571,17 @@ export class UiBridge {
       );
       return Promise.reject(markCapabilityRefusal(refusal));
     }
-    // #2475 — an expected_node_instance is meaningful only when the receiving
+    // #2475 — an expected_node_identity is meaningful only when the receiving
     // panel compares its opaque token against the live node object immediately
     // before mutation. An older panel silently ignoring it would reopen the
     // same-graph, same-id, same-type replacement race, so refuse before dispatch.
     if (
       cmd.cmd === "graph_set_widget" &&
-      commandCarriesExpectedNodeInstance(cmd) &&
-      !conn.enforcesExpectedNodeInstanceAtWrite
+      commandCarriesExpectedNodeIdentity(cmd) &&
+      !conn.enforcesExpectedNodeIdentityAtWrite
     ) {
       const refusal = markDispatched(
-        expectedNodeInstanceFenceRefusal(conn.tabId),
+        expectedNodeIdentityFenceRefusal(conn.tabId),
         false,
       );
       return Promise.reject(markCapabilityRefusal(refusal));
@@ -6039,11 +6025,11 @@ export class UiBridge {
       }
       if (
         cmd.cmd === "graph_set_widget" &&
-        commandCarriesExpectedNodeInstance(cmd) &&
-        !live.enforcesExpectedNodeInstanceAtWrite
+        commandCarriesExpectedNodeIdentity(cmd) &&
+        !live.enforcesExpectedNodeIdentityAtWrite
       ) {
         return Promise.reject(
-          markCapabilityRefusal(markDispatched(expectedNodeInstanceFenceRefusal(live.tabId), false)),
+          markCapabilityRefusal(markDispatched(expectedNodeIdentityFenceRefusal(live.tabId), false)),
         );
       }
       if (

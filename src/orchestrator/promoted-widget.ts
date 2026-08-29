@@ -222,7 +222,7 @@ function innerNodeId(node: Record<string, unknown>): number | string | null {
  * structural fingerprint: accepting a guessed id/type/value would recreate
  * the same-node replacement race this witness exists to close. */
 function nodeInstanceWitness(node: Record<string, unknown>): string | undefined {
-  const value = node.node_instance;
+  const value = node.node_identity;
   return typeof value === "string" && value.length > 0 && value.length <= 256 ? value : undefined;
 }
 
@@ -334,7 +334,7 @@ export function validatePromotedSubgraphEnvelope(
   for (const raw of nodes) {
     if (!isRecord(raw) || innerNodeId(raw) == null) return null;
     if (
-      Object.prototype.hasOwnProperty.call(raw, "node_instance") &&
+      Object.prototype.hasOwnProperty.call(raw, "node_identity") &&
       nodeInstanceWitness(raw) === undefined
     ) {
       return null;
