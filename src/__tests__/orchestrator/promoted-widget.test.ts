@@ -2356,6 +2356,48 @@ describe("panel_set_widget promoted container success guards (#2314)", () => {
     expect(authoritativeScopeReads).toBe(1);
   });
 
+  it("allows legacy contradictory recovery on a stable anonymous connection", async () => {
+    const { text, isError, calls, writesApplied, mutations } = await setWidget(
+      { node_id: 78, widget: "Quality_Prompt", value: "masterpiece" },
+      {
+        firstWrite: "contradict",
+        firstWriteError: ANIMA_CONTRADICTORY,
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
+        subgraph: SAFE_ANIMA_SUBGRAPH,
+        detailById: SAFE_ANIMA_IDENTITY_BY_ID,
+        missingConnectionIdentity: true,
+      },
+    );
+
+    expect(isError).toBe(false);
+    expect(text).toMatch(/validated promoted inner widget/);
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(2);
+    expect(writesApplied).toBe(2);
+    expect(mutations).toBe(1);
+  });
+
+  it("refuses legacy anonymous recovery after the incarnation changes during mapping", async () => {
+    const { text, isError, calls, writesApplied, mutations } = await setWidget(
+      { node_id: 78, widget: "Quality_Prompt", value: "masterpiece" },
+      {
+        firstWrite: "contradict",
+        firstWriteError: ANIMA_CONTRADICTORY,
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
+        subgraph: SAFE_ANIMA_SUBGRAPH,
+        detailById: SAFE_ANIMA_IDENTITY_BY_ID,
+        missingConnectionIdentity: true,
+        anonymousIdentityRebindDuringMapping: true,
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/session or connection changed/);
+    expect(text).toContain("No graph_set_widget was dispatched");
+    expect(calls.filter((c) => c.cmd === "graph_set_widget")).toHaveLength(1);
+    expect(writesApplied).toBe(1);
+    expect(mutations).toBe(0);
+  });
+
   it("refuses a legacy retry when a same-id receiver graph changes after the MCP fence", async () => {
     const { text, isError, calls, writesApplied } = await setWidget(
       { node_id: 78, widget: "Quality_Prompt", value: "masterpiece" },

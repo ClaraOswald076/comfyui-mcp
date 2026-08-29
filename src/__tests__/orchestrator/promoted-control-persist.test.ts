@@ -101,11 +101,30 @@ function bridge(opts: {
   pinFails?: boolean;
   enterFailsAt?: number;
   exitFails?: boolean;
+  missingConnectionIdentity?: boolean;
+  connectionRebindBeforePin?: boolean;
+  anonymousRebindBeforePin?: boolean;
 } = {}) {
   const calls: Array<Record<string, unknown>> = [];
   let enters = 0;
+  let connectionIdentity = { generation: 1, tabSessionId: "browser-tab-a" };
+  let anonymousIncarnation = "anon:1";
   const b = {
-    send: async (cmd: Record<string, unknown>) => {
+    send: async (
+      cmd: Record<string, unknown>,
+      sendOpts?: { beforeDispatch?: () => void },
+    ) => {
+      if (cmd.cmd === "graph_set_widget" && sendOpts?.beforeDispatch) {
+        if (cmd.widget === "control_after_generate") {
+          if (opts.connectionRebindBeforePin) {
+            connectionIdentity = { generation: 2, tabSessionId: "browser-tab-a" };
+          }
+          if (opts.anonymousRebindBeforePin) {
+            anonymousIncarnation = "anon:2";
+          }
+        }
+        sendOpts.beforeDispatch();
+      }
       calls.push({ ...cmd });
       if (cmd.cmd === "graph_set_widget") {
         if (cmd.widget === "control_after_generate") {
@@ -144,6 +163,11 @@ function bridge(opts: {
     resolveActiveTabId: () => TAB,
     tabCanMutateGraph: () => true,
     tabGraphMutationCapability: () => ({ known: true, canMutate: true }),
+    tabConnectionIdentity: () =>
+      opts.missingConnectionIdentity || opts.anonymousRebindBeforePin
+        ? undefined
+        : connectionIdentity,
+    tabIncarnation: () => anonymousIncarnation,
   } as unknown as PanelToolCtx["bridge"];
   return { b, calls };
 }
@@ -189,6 +213,59 @@ describe("panel_set_widget unpromoted control_after_generate persist (panel#1558
     expect(text).toMatch(/control_after_generate_pinned/);
     expect(text).not.toMatch(/will NOT persist/);
     expect(text).not.toMatch(/Enter the owning subgraph/);
+  });
+
+  it("fences the secondary pin when the public connection changes", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 320, widget: "value_2", value: 1920 },
+      { warning: REPORTER_WARNING, connectionRebindBeforePin: true },
+    );
+
+    expect(isError).toBe(false);
+    expect(calls.map((c) => c.cmd)).toEqual([
+      "graph_set_widget",
+      "graph_enter_subgraph",
+      "graph_exit_subgraph",
+    ]);
+    expect(text).toMatch(/Refusing persisted control_after_generate graph_set_widget/);
+    expect(text).toMatch(/session or connection changed/);
+    expect(text).toContain("No graph_set_widget was dispatched");
+    expect(text).not.toMatch(/control_after_generate_pinned/);
+  });
+
+  it("allows a stable anonymous connection to pin through the real dispatch options", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 320, widget: "value_2", value: 1920 },
+      { warning: REPORTER_WARNING, missingConnectionIdentity: true },
+    );
+
+    expect(isError).toBe(false);
+    expect(calls.map((c) => c.cmd)).toEqual([
+      "graph_set_widget",
+      "graph_enter_subgraph",
+      "graph_set_widget",
+      "graph_exit_subgraph",
+    ]);
+    expect(text).toMatch(/control_after_generate_pinned/);
+    expect(text).not.toMatch(/connection generation was unavailable/);
+  });
+
+  it("refuses an anonymous takeover before the secondary pin", async () => {
+    const { text, isError, calls } = await setWidget(
+      { node_id: 320, widget: "value_2", value: 1920 },
+      { warning: REPORTER_WARNING, anonymousRebindBeforePin: true },
+    );
+
+    expect(isError).toBe(false);
+    expect(calls.map((c) => c.cmd)).toEqual([
+      "graph_set_widget",
+      "graph_enter_subgraph",
+      "graph_exit_subgraph",
+    ]);
+    expect(text).toMatch(/Refusing persisted control_after_generate graph_set_widget/);
+    expect(text).toMatch(/session or connection changed/);
+    expect(text).toContain("No graph_set_widget was dispatched");
+    expect(text).not.toMatch(/control_after_generate_pinned/);
   });
 
   it("a healthy write with no persist warning is untouched — one call, no enter", async () => {

@@ -5785,6 +5785,7 @@ async function persistUnpromotedControlAfterGenerate(
   res: ToolResult,
   ctx: PanelToolCtx,
   addressedNodeId: unknown,
+  binding: PromotedWriteBinding | null,
 ): Promise<ToolResult> {
   if (res.isError) return res;
   const payload = parseToolResultJson(res);
@@ -5818,6 +5819,17 @@ async function persistUnpromotedControlAfterGenerate(
     entered.push(id);
   }
 
+  const beforePinDispatch = binding
+    ? () => {
+        const error = currentPromotedBindingError(ctx, binding);
+        if (error) {
+          throw new Error(
+            `Refusing persisted control_after_generate graph_set_widget: ${error}. ` +
+              `No graph_set_widget was dispatched.`,
+          );
+        }
+      }
+    : undefined;
   const pinned = await ctx.call(
     {
       cmd: "graph_set_widget",
@@ -5826,6 +5838,8 @@ async function persistUnpromotedControlAfterGenerate(
       value: "fixed",
     },
     OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+    undefined,
+    beforePinDispatch,
   );
   const exits = await exitSubgraphLevels(ctx, entered.length);
   if (pinned.isError) {
@@ -18517,6 +18531,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           const promotedRetry = await preparePromotedWidgetWrite(ctx, nodeId, widget);
           if (promotedRetry && "content" in promotedRetry) return promotedRetry;
           if (promotedRetry && promotedRetry.kind === "promoted-write") {
+            directWriteBinding = promotedRetry.binding;
             return writePromotedInner(promotedRetry);
           }
           const blocked = await refuseKnownBadWriteBeforeDispatch(ctx, nodeId, widget);
@@ -18768,7 +18783,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         let first = await write(args.node_id, args.widget as string);
         if (!first.isError) {
           markPanelSchemaReady(panelSchemaKey(ctx));
-          return persistUnpromotedControlAfterGenerate(first, ctx, args.node_id);
+          return persistUnpromotedControlAfterGenerate(first, ctx, args.node_id, directWriteBinding);
         }
         // #2202 — stale-combo recovery may have retired the panel's last usable
         // whole-schema snapshot before its bounded refresh wait abandoned. The
@@ -18854,6 +18869,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               retried,
               ctx,
               args.node_id,
+              directWriteBinding,
             );
             return appendToolResultText(
               persisted,
@@ -18897,7 +18913,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           markPanelSchemaReady(schemaKey);
           const retried = await guardedWrite(args.node_id, args.widget as string);
           if (!retried.isError) {
-            return persistUnpromotedControlAfterGenerate(retried, ctx, args.node_id);
+            return persistUnpromotedControlAfterGenerate(retried, ctx, args.node_id, directWriteBinding);
           }
           if (isObjectInfoBudgetRefusal(retried)) {
             markPanelSchemaBlocked(schemaKey);
@@ -18923,7 +18939,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         if (refusal.widget !== args.widget) {
           const remapped = await guardedWrite(args.node_id, refusal.widget);
           if (!remapped.isError) {
-            return persistUnpromotedControlAfterGenerate(remapped, ctx, args.node_id);
+            return persistUnpromotedControlAfterGenerate(remapped, ctx, args.node_id, directWriteBinding);
           }
           if (
             !parseContradictoryPromotedWidgetRefusal(
@@ -18949,30 +18965,26 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         if (recoveryPreflight && recoveryPreflight.kind === "promoted-write") {
           const promotedWritten = await writePromotedInner(recoveryPreflight);
           if (!promotedWritten.isError) {
-            return persistUnpromotedControlAfterGenerate(promotedWritten, ctx, args.node_id);
+            return persistUnpromotedControlAfterGenerate(
+              promotedWritten,
+              ctx,
+              args.node_id,
+              recoveryPreflight.binding,
+            );
           }
           return appendToolResultText(first, `\n\n${textOfToolResult(promotedWritten)}`);
         }
 
-        const recoveryTabId = ctx.tabId;
-        let recoveryIdentity: { generation: number; tabSessionId: string } | undefined;
-        const recoveryBinding: PromotedWriteBinding | null =
-          typeof ctx.panelConnectionIdentity === "function"
-            ? (() => {
-                const identity = ctx.panelConnectionIdentity?.();
-                return isUsablePanelConnectionIdentity(identity)
-                  ? { tabId: recoveryTabId, identity }
-                  : null;
-              })()
-            : null;
+        let recoveryBinding: PromotedWriteBinding | null = null;
         if (typeof ctx.panelConnectionIdentity === "function") {
-          recoveryIdentity = recoveryBinding?.identity;
-          if (!isUsablePanelConnectionIdentity(recoveryIdentity)) {
+          try {
+            recoveryBinding = capturePromotedWriteBinding(ctx);
+          } catch {
             return appendToolResultText(
               first,
               `\n\n${textOfToolResult(promotedWriteRefusal(
                 refusal.widget,
-                "the panel connection identity was unavailable before the inner mapping read",
+                "the panel connection binding could not be read before the inner mapping read",
               ))}`,
             );
           }
@@ -18986,10 +18998,8 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               `${textOfToolResult(sub)})`,
           );
         }
-        if (recoveryIdentity) {
-          const recoveryBindingError = recoveryBinding
-            ? currentPromotedBindingError(ctx, recoveryBinding)
-            : null;
+        if (recoveryBinding) {
+          const recoveryBindingError = currentPromotedBindingError(ctx, recoveryBinding);
           if (recoveryBindingError) {
             return appendToolResultText(
               first,
