@@ -64,6 +64,8 @@ const PROMOTED_REPORTER_SUBGRAPH = {
   ],
 };
 
+const PROMOTED_INNER_NODE_INSTANCE = "inner-node-instance-a";
+
 describe("parseUnpromotedControlPersistRemedy", () => {
   it("parses the reporter's unpromoted LTX warning", () => {
     const parsed = parseUnpromotedControlPersistRemedy(REPORTER_WARNING);
@@ -207,7 +209,7 @@ async function setWidget(
  * trustworthy follow-up binding. Its replacement options mutate the receiver
  * only after MCP's synchronous callback, before the panel applies the frame. */
 function witnessedBridge(opts: {
-  replacement?: "graph" | "type" | "connection" | "anonymous";
+  replacement?: "graph" | "type" | "connection" | "anonymous" | "node";
   anonymous?: boolean;
   pinFails?: boolean;
   persistExitFails?: boolean;
@@ -217,6 +219,7 @@ function witnessedBridge(opts: {
   let inSubgraph = false;
   let graphIdentity = "graph:ltx-container-a";
   let nodeType = "LTXInner";
+  let nodeInstanceWitness = PROMOTED_INNER_NODE_INSTANCE;
   let connectionIdentity = { generation: 1, tabSessionId: "browser-tab-a" };
   let anonymousIncarnation = "anon:1";
   let enters = 0;
@@ -231,6 +234,10 @@ function witnessedBridge(opts: {
   });
   const subgraph = {
     ...PROMOTED_REPORTER_SUBGRAPH,
+    nodes: PROMOTED_REPORTER_SUBGRAPH.nodes.map((node) => ({
+      ...node,
+      node_instance: PROMOTED_INNER_NODE_INSTANCE,
+    })),
     subgraph_of: {
       ...PROMOTED_REPORTER_SUBGRAPH.subgraph_of,
       graph_identity: "graph:ltx-container-a",
@@ -253,6 +260,7 @@ function witnessedBridge(opts: {
             connectionIdentity = { generation: 2, tabSessionId: "browser-tab-a" };
           }
           if (opts.replacement === "anonymous") anonymousIncarnation = "anon:2";
+          if (opts.replacement === "node") nodeInstanceWitness = "inner-node-instance-b";
         }
         sendOpts.beforeDispatch();
         if (cmd.widget === "control_after_generate") {
@@ -282,7 +290,14 @@ function witnessedBridge(opts: {
             workflow_uuid: "workflow-a",
             graph_identity: graphIdentity,
           },
-          nodes: [{ id: 312, type: nodeType, is_subgraph: false }],
+          nodes: [
+            {
+              id: 312,
+              type: nodeType,
+              is_subgraph: false,
+              node_instance: nodeInstanceWitness,
+            },
+          ],
           truncated: false,
         };
       }
@@ -317,6 +332,12 @@ function witnessedBridge(opts: {
         if (expectedType !== nodeType) {
           throw new Error("graph_set_widget receiver node type changed before dispatch: Nothing was applied.");
         }
+        if (
+          Object.prototype.hasOwnProperty.call(cmd, "expected_node_instance") &&
+          cmd.expected_node_instance !== nodeInstanceWitness
+        ) {
+          throw new Error("graph_set_widget receiver node instance changed before dispatch: Nothing was applied.");
+        }
         if (cmd.widget === "control_after_generate") {
           if (opts.pinFails) throw new Error("pin rejected");
           mutations += 1;
@@ -342,6 +363,8 @@ function witnessedBridge(opts: {
     promotedScopeFor: () => scope(),
     workflowUuidFor: () => ({ known: true, uuid: "workflow-a" }),
     tabExpectedNodeTypeFenceCapability: () => true,
+    tabPromotedNodeInstanceWitnessCapability: () => true,
+    tabExpectedNodeInstanceFenceCapability: () => true,
     tabExpectedScopeGraphIdentityFenceCapability: () => true,
     tabPromotedTerminalWitnessCapability: () => false,
     tabPromotedParentRailFenceCapability: () => false,
@@ -562,6 +585,31 @@ describe("panel_set_widget promoted control persistence dispatch fences (#1925)"
       expected_scope: expect.objectContaining({ graph_identity: "graph:ltx-container-a" }),
     });
     expect(text).toMatch(/pin rejected|Nothing was applied/);
+    expect(text).not.toMatch(/control_after_generate_pinned/);
+  });
+
+  it("refuses a same-graph same-id same-type replacement at final dispatch", async () => {
+    const { text, isError, calls, mutations } = await setWidgetWithWitnessedBridge(
+      { node_id: 320, widget: "value_2", value: 1920 },
+      { replacement: "node" },
+    );
+
+    const writes = calls.filter((call) => call.cmd === "graph_set_widget");
+    expect(isError).toBe(false);
+    expect(mutations).toBe(1);
+    expect(writes).toHaveLength(2);
+    expect(writes[0]).toMatchObject({
+      node_id: 312,
+      expected_node_type: "LTXInner",
+      expected_node_instance: PROMOTED_INNER_NODE_INSTANCE,
+    });
+    expect(writes[1]).toMatchObject({
+      node_id: "312",
+      widget: "control_after_generate",
+      expected_node_type: "LTXInner",
+      expected_node_instance: PROMOTED_INNER_NODE_INSTANCE,
+    });
+    expect(text).toMatch(/node instance changed|Nothing was applied/);
     expect(text).not.toMatch(/control_after_generate_pinned/);
   });
 

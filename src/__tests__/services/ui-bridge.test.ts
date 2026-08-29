@@ -3401,6 +3401,54 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     old.close();
   });
 
+  it("FAILS CLOSED when expected_node_instance reaches a panel without its final fence", async () => {
+    const old = new WebSocket(`ws://127.0.0.1:${port}`);
+    await new Promise<void>((res, rej) => {
+      old.on("open", () => {
+        old.send(
+          JSON.stringify({
+            type: "hello",
+            tab_id: "tmp:old-node-instance-fence",
+            title: "old node-instance fence",
+            enforces_workflow_stamp: true,
+            enforces_workflow_stamp_at_write: true,
+            enforces_expected_node_type_at_write: true,
+            // Deliberately omit the cross-command node-instance fence. The
+            // panel would otherwise silently ignore the witness and reopen
+            // same-graph same-id same-type replacement.
+          }),
+        );
+        res();
+      });
+      old.on("error", rej);
+    });
+    await waitFor(() =>
+      expect(bridge.tabs().some((t) => t.tab_id === "tmp:old-node-instance-fence")).toBe(true),
+    );
+    expect(bridge.tabExpectedNodeInstanceFenceCapability("tmp:old-node-instance-fence")).toBe(false);
+    const caught = await bridge
+      .send(
+        {
+          cmd: "graph_set_widget",
+          node_id: 312,
+          widget: "control_after_generate",
+          value: "fixed",
+          expected_node_instance: "inner-node-instance-a",
+        },
+        { tabId: "tmp:old-node-instance-fence" },
+      )
+      .then(
+        () => null,
+        (err) => err,
+      );
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toMatch(/atomic expected-node-instance write fence/);
+    expect((caught as Error).message).toMatch(/does not advertise/);
+    expect(isCapabilityRefusal(caught)).toBe(true);
+    expect(dispatchOutcomeOf(caught)).toBe(false);
+    old.close();
+  });
+
   it("rechecks expected_node_type capability after a graph-lane wait and reconnect", async () => {
     const modern = await connectPanel("tmp:queued-node-type", "queued");
     await waitFor(() =>

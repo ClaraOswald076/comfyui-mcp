@@ -5825,11 +5825,14 @@ async function persistUnpromotedControlAfterGenerate(
 
   // The warning is not a witness for the node it names: it is the result of an
   // earlier command, and its inner id can already refer to a replacement graph.
-  // Only a promoted primary write carries an authenticated scope/type witness
-  // that can be handed to the panel's final graph_set_widget fence. Never turn
-  // an unscoped legacy success into an automatic write here.
+  // Only a promoted primary write carries the authenticated scope/type witness
+  // that can be handed to the panel's final graph_set_widget fence. The secondary
+  // write also requires the receiver-issued node-instance witness: id, type, and
+  // graph scope can all survive a same-graph replacement. Never turn an unscoped
+  // legacy success into an automatic write here.
   if (
     !binding?.nodeType ||
+    !isUsableNodeInstanceWitness(binding.nodeInstanceWitness) ||
     !binding.scope ||
     remedy.enterPath.length !== 1 ||
     String(binding.scope.ownerNodeId) !== remedy.outerNodeId
@@ -5838,8 +5841,34 @@ async function persistUnpromotedControlAfterGenerate(
       res,
       `\n\n(Tried to pin inner "${remedy.controlWidget}" to 'fixed' so this value would persist, ` +
         `but the primary write did not carry a trustworthy witness for this inner node's ` +
-        `type and final graph scope. ` +
+        `instance, type, and final graph scope. Nested and unscoped legacy persistence ` +
+        `is intentionally refused. ` +
         `The persistence write was NOT dispatched.)`,
+    );
+  }
+
+  // The node-instance field is meaningful only when the receiving panel both
+  // publishes its opaque node witness and enforces expected_node_instance at
+  // the final mutation boundary. An older panel would silently ignore that
+  // field, so keep the primary success and refuse only this best-effort follow-up.
+  let hasAtomicNodeInstanceWitness = false;
+  try {
+    hasAtomicNodeInstanceWitness =
+      typeof ctx.tabPromotedNodeInstanceWitnessCapability === "function" &&
+      typeof ctx.tabExpectedNodeInstanceFenceCapability === "function" &&
+      ctx.tabPromotedNodeInstanceWitnessCapability() === true &&
+      ctx.tabExpectedNodeInstanceFenceCapability() === true;
+  } catch {
+    // A capability probe that cannot be read is not a permission to dispatch
+    // an un-fenced persistence write.
+  }
+  if (!hasAtomicNodeInstanceWitness) {
+    return appendToolResultText(
+      res,
+      `\n\n(Tried to pin inner "${remedy.controlWidget}" to 'fixed' so this value would persist, ` +
+        `but the receiving panel did not advertise the atomic node-instance witness ` +
+        `needed to protect the final persistence write. The persistence write was NOT ` +
+        `dispatched.)`,
     );
   }
 
@@ -5880,6 +5909,7 @@ async function persistUnpromotedControlAfterGenerate(
       widget: remedy.controlWidget,
       value: "fixed",
       expected_node_type: binding.nodeType,
+      expected_node_instance: binding.nodeInstanceWitness,
       expected_scope: {
         scope: "subgraph",
         owner_node_id: binding.scope.ownerNodeId,
@@ -6064,7 +6094,7 @@ function parseQueriedNodeType(payload: Record<string, unknown> | null): string |
   return null;
 }
 
-type QueriedNodeIdentity = { id: string; type: string };
+type QueriedNodeIdentity = { id: string; type: string; nodeInstanceWitness?: string };
 
 function canonicalQueriedNodeId(value: unknown): string | null {
   if (typeof value === "number") {
@@ -6091,7 +6121,14 @@ function parseQueriedNodeIdentityRow(row: unknown): QueriedNodeIdentity | null {
     return null;
   }
   const resolvedType = typeof type === "string" ? type : classType;
-  return resolvedType ? { id, type: resolvedType } : null;
+  if (!resolvedType) return null;
+  const nodeInstance = record.node_instance;
+  if (nodeInstance !== undefined && !isUsableNodeInstanceWitness(nodeInstance)) return null;
+  return {
+    id,
+    type: resolvedType,
+    ...(nodeInstance !== undefined ? { nodeInstanceWitness: nodeInstance } : {}),
+  };
 }
 
 type QueriedNodeScope = {
@@ -6563,6 +6600,9 @@ type PromotedWriteBinding = {
   /** Witnesses captured from the promoted primary write and reused only for its
    * automatic control_after_generate follow-up. */
   nodeType?: string;
+  /** Receiver-issued identity for the exact inner node object. Id/type are
+   * deliberately insufficient because a same-graph replacement may reuse both. */
+  nodeInstanceWitness?: string;
   scope?: PromotedScopeWitness;
 };
 
@@ -6572,6 +6612,7 @@ type PromotedWritePlan = {
   inner: {
     innerNodeId: number | string;
     widget: string;
+    nodeInstanceWitness?: string;
     parentRail?: PromotedParentRailWitness;
   };
   innerNodeType: string;
@@ -7191,6 +7232,8 @@ async function preparePromotedWidgetWrite(
   // bundle that can classify renamed promotion aliases.
   const publishesCompleteTerminalWitness =
     ctx.tabPromotedTerminalWitnessCapability?.() === true;
+  const publishesNodeInstanceWitness =
+    ctx.tabPromotedNodeInstanceWitnessCapability?.() === true;
 
   const tabBefore = ctx.tabId;
   const hasIdentityApi = typeof ctx.panelConnectionIdentity === "function";
@@ -7417,6 +7460,12 @@ async function preparePromotedWidgetWrite(
     const terminalBlocked = refuseKnownBadPromotedTerminal(inner.terminal);
     if (terminalBlocked) return terminalBlocked;
   }
+  if (publishesNodeInstanceWitness && !isUsableNodeInstanceWitness(inner.nodeInstanceWitness)) {
+    return promotedWriteRefusal(
+      widget,
+      "the receiver advertised node-instance witnesses but omitted the mapped inner node witness",
+    );
+  }
   // panel#1859 — these three are capability skew, exactly like the missing
   // graph identity above: the hello either advertises the fence or it does not,
   // and a caller cannot change that by trying again.
@@ -7457,6 +7506,9 @@ async function preparePromotedWidgetWrite(
       identity: identityAfter,
       incarnation: incarnationBefore,
       nodeType: innerNodeType,
+      ...(publishesNodeInstanceWitness && inner.nodeInstanceWitness
+        ? { nodeInstanceWitness: inner.nodeInstanceWitness }
+        : {}),
       scope,
     },
   };
@@ -7466,6 +7518,7 @@ type PromotedMappingProof = {
   inner: {
     innerNodeId: number | string;
     widget: string;
+    nodeInstanceWitness?: string;
     parentRail?: PromotedParentRailWitness;
   };
   innerNodeType: string;
@@ -7483,6 +7536,7 @@ async function recheckPromotedOuterMapping(
   expectedInner: {
     innerNodeId: number | string;
     widget: string;
+    nodeInstanceWitness?: string;
     parentRail?: PromotedParentRailWitness;
   },
   expectedScope: PromotedScopeWitness,
@@ -7527,6 +7581,8 @@ async function recheckPromotedOuterMapping(
     !inner ||
     canonicalQueriedNodeId(inner.innerNodeId) !== canonicalQueriedNodeId(expectedInner.innerNodeId) ||
     inner.widget !== expectedInner.widget ||
+    (expectedInner.nodeInstanceWitness !== undefined &&
+      inner.nodeInstanceWitness !== expectedInner.nodeInstanceWitness) ||
     !samePromotedParentRail(inner.parentRail, expectedInner.parentRail) ||
     !samePromotedTerminal(inner.terminal, expectedTerminal)
   ) {
@@ -7566,6 +7622,7 @@ async function recheckPromotedInnerTarget(
   expectedInner: {
     innerNodeId: number | string;
     widget: string;
+    nodeInstanceWitness?: string;
     parentRail?: PromotedParentRailWitness;
   },
   expectedNodeType: string,
@@ -7598,7 +7655,9 @@ async function recheckPromotedInnerTarget(
     !identity ||
     !expectedId ||
     identity.id !== expectedId ||
-    identity.type !== expectedNodeType
+    identity.type !== expectedNodeType ||
+    (expectedInner.nodeInstanceWitness !== undefined &&
+      identity.nodeInstanceWitness !== expectedInner.nodeInstanceWitness)
   ) {
     return promotedWriteRefusal(
       widget,
@@ -7677,6 +7736,10 @@ function isUsablePanelConnectionIdentity(
 
 function isUsablePanelIncarnation(value: string | undefined): value is string {
   return typeof value === "string" && value.length > 0;
+}
+
+function isUsableNodeInstanceWitness(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256;
 }
 
 function samePanelConnectionIdentity(
@@ -13714,6 +13777,11 @@ interface BridgeProbe {
   readPromotedScope?: (tabId: string, innerNodeId: number | string) => Promise<TabPromotedScopeRead>;
   tabIncarnation?: (tabId: string) => string | undefined;
   tabPromotedTerminalWitnessCapability?: (tabId: string) => boolean;
+  /** Whether graph_get_subgraph publishes opaque node-instance witnesses that
+   * graph_set_widget can enforce at its final mutation boundary. */
+  tabPromotedNodeInstanceWitnessCapability?: (tabId: string) => boolean;
+  /** Whether graph_set_widget enforces the opaque node-instance witness. */
+  tabExpectedNodeInstanceFenceCapability?: (tabId: string) => boolean;
   tabPromotedParentRailFenceCapability?: (tabId: string) => boolean;
   lastFenceRefusal?: (tabId: string) => string | undefined;
   isHeadless?: (tabId: string) => boolean;
@@ -13870,6 +13938,12 @@ export interface PanelToolCtx {
   /** Whether the currently bound panel publishes the complete renamed-promotion
    * alias -> terminal witness needed for alias-independent preflight (#2314 P1). */
   tabPromotedTerminalWitnessCapability?: () => boolean;
+  /** Whether the currently bound panel publishes opaque node-instance witnesses
+   * for promoted inner nodes. */
+  tabPromotedNodeInstanceWitnessCapability?: () => boolean;
+  /** Whether the currently bound panel enforces expected_node_instance at the
+   * synchronous graph_set_widget mutation boundary. */
+  tabExpectedNodeInstanceFenceCapability?: () => boolean;
   /** Whether the currently bound panel re-resolves the promoted parent rail
    * synchronously at the final graph_set_widget mutation boundary. */
   tabPromotedParentRailFenceCapability?: () => boolean;
@@ -15370,6 +15444,12 @@ export function makePanelToolCtx(
   ctx.tabPromotedTerminalWitnessCapability = () =>
     typeof bridge.tabPromotedTerminalWitnessCapability === "function" &&
     bridge.tabPromotedTerminalWitnessCapability(ctx.tabId);
+  ctx.tabPromotedNodeInstanceWitnessCapability = () =>
+    typeof bridge.tabPromotedNodeInstanceWitnessCapability === "function" &&
+    bridge.tabPromotedNodeInstanceWitnessCapability(ctx.tabId);
+  ctx.tabExpectedNodeInstanceFenceCapability = () =>
+    typeof bridge.tabExpectedNodeInstanceFenceCapability === "function" &&
+    bridge.tabExpectedNodeInstanceFenceCapability(ctx.tabId);
   ctx.tabPromotedParentRailFenceCapability = () =>
     typeof bridge.tabPromotedParentRailFenceCapability === "function" &&
     bridge.tabPromotedParentRailFenceCapability(ctx.tabId);
@@ -18512,6 +18592,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           targetExpectedNodeType: string | undefined = expectedNodeType,
           beforeDispatch?: () => void,
           targetExpectedScope?: PromotedExpectedScope,
+          targetExpectedNodeInstance?: string,
         ): Promise<ToolResult> =>
           stripVerifiedLastObservedSchemaNote(
             summarizeSetWidgetEcho(
@@ -18527,6 +18608,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                   // and supplies that node's own type.
                   ...(targetExpectedNodeType
                     ? { expected_node_type: targetExpectedNodeType }
+                    : {}),
+                  ...(targetExpectedNodeInstance
+                    ? { expected_node_instance: targetExpectedNodeInstance }
                     : {}),
                   ...(targetExpectedScope
                     ? {
@@ -18800,6 +18884,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 parentRail: plan.inner.parentRail,
                 ...(plan.terminal ? { terminal: plan.terminal } : {}),
               },
+              ctx.tabExpectedNodeInstanceFenceCapability?.() === true
+                ? plan.inner.nodeInstanceWitness
+                : undefined,
             );
             const exited = await leave();
             if (written.isError) {

@@ -28,6 +28,10 @@ export type ContradictoryPromotedWidgetRefusal = {
 export type InnerPromotedTarget = {
   innerNodeId: number | string;
   widget: string;
+  /** Opaque receiver-issued identity of the live inner node object. This is
+   * intentionally separate from the graph-local id/type pair: both can be
+   * reused by a replacement node in the same graph. */
+  nodeInstanceWitness?: string;
   /** Current-panel witnesses must prove the exact local parent rail that
    * serializes this promoted value. Legacy envelopes omit this proof. */
   parentRail?: PromotedParentRailWitness;
@@ -214,6 +218,14 @@ function innerNodeId(node: Record<string, unknown>): number | string | null {
   return isNodeId(id) ? id : null;
 }
 
+/** A node-instance witness is an opaque, receiver-minted token. It is not a
+ * structural fingerprint: accepting a guessed id/type/value would recreate
+ * the same-node replacement race this witness exists to close. */
+function nodeInstanceWitness(node: Record<string, unknown>): string | undefined {
+  const value = node.node_instance;
+  return typeof value === "string" && value.length > 0 && value.length <= 256 ? value : undefined;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
@@ -321,6 +333,12 @@ export function validatePromotedSubgraphEnvelope(
   const normalized: Array<Record<string, unknown>> = [];
   for (const raw of nodes) {
     if (!isRecord(raw) || innerNodeId(raw) == null) return null;
+    if (
+      Object.prototype.hasOwnProperty.call(raw, "node_instance") &&
+      nodeInstanceWitness(raw) === undefined
+    ) {
+      return null;
+    }
     normalized.push(raw);
   }
   const promotedTerminals = Object.prototype.hasOwnProperty.call(subgraph, "promoted_terminals")
@@ -501,9 +519,11 @@ export function resolveInnerPromotedTarget(
       return candidateId !== null && canonicalPromotedNodeId(candidateId) === immediateId;
     });
     if (!immediateNode) return null;
+    const witness = nodeInstanceWitness(immediateNode);
     return {
       innerNodeId: entry.immediateNodeId,
       widget: entry.immediateWidget,
+      ...(witness !== undefined ? { nodeInstanceWitness: witness } : {}),
       parentRail: entry.parentRail,
       terminal: entry.terminal,
     };
@@ -514,7 +534,14 @@ export function resolveInnerPromotedTarget(
     const id = innerNodeId(node);
     if (id == null) continue;
     const matched = matchListedName(displayedWidget, widgetNamesOnInner(node));
-    if (matched) hits.push({ innerNodeId: id, widget: matched });
+    if (matched) {
+      const witness = nodeInstanceWitness(node);
+      hits.push({
+        innerNodeId: id,
+        widget: matched,
+        ...(witness !== undefined ? { nodeInstanceWitness: witness } : {}),
+      });
+    }
   }
   if (hits.length !== 1) return null;
   return hits[0];
