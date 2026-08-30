@@ -1261,6 +1261,15 @@ function jsonAttachmentRefusal(base64: string): JsonRefusal | null {
   return null;
 }
 
+export interface UploadedImageInput {
+  filename: string;
+  subfolder: string;
+  /** Whether a fresh LoadImage option list verified the returned reference. */
+  loaderSelectable: StageLoaderSelectability;
+  /** The requested nested reference, when a host required the root fallback. */
+  requestedFilename?: string;
+}
+
 /**
  * Upload a local image to ComfyUI via HTTP multipart POST.
  * Falls back to HTTP when COMFYUI_PATH is not available (remote ComfyUI).
@@ -1268,12 +1277,15 @@ function jsonAttachmentRefusal(base64: string): JsonRefusal | null {
  * The returned `subfolder` is part of the answer, not a detail: when the
  * requested `filename` carried a path ("minimax_h3/clip.png"), the server
  * stores the file UNDER that subfolder and the bare `name` does not resolve
- * in a loader — only `subfolder/name` does (#946).
+ * in a loader — only `subfolder/name` does (#946). If that qualified name is
+ * stored but `/object_info` does not expose it on LoadImage, the same bytes
+ * are also registered at the input root and the verified root filename is
+ * returned instead (#2498 / same check as action:"stage").
  */
 export async function uploadImageAuto(
   sourcePath: string,
   filename?: string,
-): Promise<{ filename: string; subfolder: string }> {
+): Promise<UploadedImageInput> {
   const resolvedFilename = filename ?? basename(sourcePath);
   const ext = extname(resolvedFilename).toLowerCase();
   if (!(ext in IMAGE_MIME)) {
@@ -1284,8 +1296,21 @@ export async function uploadImageAuto(
   const data = await nodeReadFile(sourcePath);
   const mimeType = IMAGE_MIME[ext] ?? "application/octet-stream";
   logger.info("Uploading image to ComfyUI via HTTP", { sourcePath, resolvedFilename });
-  const result = await uploadImageHttp(resolvedFilename, data, mimeType);
-  return { filename: result.name, subfolder: result.subfolder ?? "" };
+  const uploaded = await uploadAndVerifyLoaderReference({
+    kind: "image",
+    targetName: resolvedFilename,
+    data,
+    mimeType,
+    requestedName: resolvedFilename,
+  });
+  return {
+    filename: uploaded.filename,
+    subfolder: uploaded.subfolder,
+    loaderSelectable: uploaded.loaderSelectable,
+    ...(uploaded.requestedFilename
+      ? { requestedFilename: uploaded.requestedFilename }
+      : {}),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1533,6 +1558,79 @@ async function verifyLoaderReference(
   }
 }
 
+interface LoaderCheckedUpload {
+  filename: string;
+  subfolder: string;
+  type: string;
+  loaderSelectable: StageLoaderSelectability;
+  requestedFilename?: string;
+}
+
+/**
+ * POST the bytes, then refuse to return a nested reference that the live
+ * loader combo does not enumerate. Hosts that store `subfolder/name` but
+ * only list top-level input files get a second, non-overwriting root
+ * upload so the value handed to LoadImage / VHS_LoadVideo is selectable
+ * (#2082, #2498).
+ */
+async function uploadAndVerifyLoaderReference(args: {
+  kind: MediaKind;
+  targetName: string;
+  data: Buffer;
+  mimeType: string;
+  requestedName: string;
+}): Promise<LoaderCheckedUpload> {
+  const nestedRequested =
+    args.requestedName.includes("/") || args.requestedName.includes("\\");
+  const result = await uploadImageHttp(args.targetName, args.data, args.mimeType);
+  const stagedReference = comboReferenceOf({
+    filename: result.name,
+    subfolder: result.subfolder,
+  });
+  const nestedTarget = nestedRequested || Boolean(result.subfolder);
+  const nestedSelectable = await verifyLoaderReference(args.kind, stagedReference);
+  const requestedFilename = nestedRequested
+    ? args.requestedName.replace(/\\/g, "/")
+    : undefined;
+
+  if (nestedTarget && nestedSelectable === false) {
+    // Some ComfyUI builds store a nested upload correctly but do not expose
+    // nested input paths in the loader combo. Re-register the same bytes at the
+    // root so the returned value is actually selectable, rather than claiming
+    // that the nested path works because /upload/image returned 200.
+    const alreadyRoot = !result.subfolder && args.targetName === basename(args.targetName);
+    if (!alreadyRoot) {
+      const rootName = basename(args.targetName);
+      // Never replace an unrelated root file when the host requires this
+      // compatibility fallback. ComfyUI will choose a unique name when the
+      // requested root name already exists, and the returned name is verified
+      // below before being reported as selectable.
+      const rootResult = await uploadImageHttp(rootName, args.data, args.mimeType, false);
+      const rootSelectable = await verifyLoaderReference(
+        args.kind,
+        comboReferenceOf({
+          filename: rootResult.name,
+          subfolder: rootResult.subfolder,
+        }),
+      );
+      return {
+        filename: rootResult.name,
+        subfolder: rootResult.subfolder ?? "",
+        type: rootResult.type,
+        loaderSelectable: rootSelectable === true ? "root-fallback" : "unverified",
+        requestedFilename: requestedFilename ?? stagedReference,
+      };
+    }
+  }
+
+  return {
+    filename: result.name,
+    subfolder: result.subfolder ?? "",
+    type: result.type,
+    loaderSelectable: nestedSelectable === true ? "verified" : "unverified",
+  };
+}
+
 const MIME_BY_KIND: Record<MediaKind, Record<string, string>> = {
   image: IMAGE_MIME,
   video: VIDEO_MIME,
@@ -1637,53 +1735,30 @@ export async function stageOutputAsInput(
     targetName,
   });
 
-  const referenceOf = (result: { name: string; subfolder?: string }) =>
-    result.subfolder ? `${result.subfolder}/${result.name}` : result.name;
-  const result = await uploadImageHttp(targetName, data, mimeType);
-  const stagedReference = referenceOf(result);
-  const nestedTarget = nestedRequested || Boolean(result.subfolder);
-  const nestedSelectable = await verifyLoaderReference(kind, stagedReference);
+  const uploaded = await uploadAndVerifyLoaderReference({
+    kind,
+    targetName,
+    data,
+    mimeType,
+    requestedName,
+  });
   const requestedFilename = nestedRequested
     ? requestedName.replace(/\\/g, "/")
     : undefined;
 
-  if (nestedTarget && nestedSelectable === false) {
-    // Some ComfyUI builds store a nested upload correctly but do not expose
-    // nested input paths in the loader combo. Re-register the same bytes at the
-    // root so the returned value is actually selectable, rather than claiming
-    // that the nested path works because /upload/image returned 200.
-    const alreadyRoot = !result.subfolder && targetName === basename(targetName);
-    if (!alreadyRoot) {
-      const rootName = basename(targetName);
-      // Never replace an unrelated root file when the host requires this
-      // compatibility fallback. ComfyUI will choose a unique name when the
-      // requested root name already exists, and the returned name is verified
-      // below before being reported as selectable.
-      const rootResult = await uploadImageHttp(rootName, data, mimeType, false);
-      const rootReference = referenceOf(rootResult);
-      const rootSelectable = await verifyLoaderReference(kind, rootReference);
-      return withVideoPathReference({
-        filename: rootResult.name,
-        subfolder: rootResult.subfolder ?? "",
-        type: rootResult.type,
-        kind,
-        loaderSelectable: rootSelectable === true ? "root-fallback" : "unverified",
-        requestedFilename: requestedFilename ?? stagedReference,
-      });
-    }
-  }
-
   return withVideoPathReference({
-    filename: result.name,
-    subfolder: result.subfolder ?? "",
-    type: result.type,
+    filename: uploaded.filename,
+    subfolder: uploaded.subfolder,
+    type: uploaded.type,
     kind,
     loaderSelectable:
-      flattenVideoToRoot && nestedSelectable === true
+      flattenVideoToRoot && uploaded.loaderSelectable === "verified"
         ? "root-fallback"
-        : nestedSelectable === true
-          ? "verified"
-          : "unverified",
-    ...(flattenVideoToRoot && requestedFilename ? { requestedFilename } : {}),
+        : uploaded.loaderSelectable,
+    ...(uploaded.requestedFilename
+      ? { requestedFilename: uploaded.requestedFilename }
+      : flattenVideoToRoot && requestedFilename
+        ? { requestedFilename }
+        : {}),
   });
 }

@@ -523,6 +523,26 @@ describe("upload_image: each action writes to exactly one destination", () => {
     expect(uploadOutputMock).not.toHaveBeenCalled();
   });
 
+  it('action:"image" reports the verified root filename when LoadImage omits the nested path (#2498)', async () => {
+    uploadImageAutoMock.mockResolvedValue({
+      filename: "clean_profile_90_silhouette_v1.png",
+      subfolder: "",
+      loaderSelectable: "root-fallback",
+      requestedFilename: "story_mixer_refs/clean_profile_90_silhouette_v1.png",
+    });
+    const res = await uploadImage()({
+      action: "image",
+      source_path: "/tmp/profile.png",
+      filename: "story_mixer_refs/clean_profile_90_silhouette_v1.png",
+    });
+    const t = text(res);
+    expect(t).toContain("Filename: clean_profile_90_silhouette_v1.png");
+    expect(t).toContain('Use "clean_profile_90_silhouette_v1.png"');
+    expect(t).toContain("story_mixer_refs/clean_profile_90_silhouette_v1.png");
+    expect(t).toContain("LoadImage enumerates only top-level input files");
+    expect(t).not.toContain('Use "story_mixer_refs/clean_profile_90_silhouette_v1.png"');
+  });
+
   it('action:"image" reports the SUBFOLDER-qualified reference when the upload landed in one (#946)', async () => {
     // The recurrence: filename "minimax_h3/walter_ropeflow_clip1_end.png"
     // uploaded fine, but the tool answered with the bare name — which does not

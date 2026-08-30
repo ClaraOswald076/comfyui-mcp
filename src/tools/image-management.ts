@@ -917,7 +917,7 @@ export function registerImageManagementTools(server: McpServer): void {
   server.tool(
     "upload_image",
     "Put a file where ComfyUI (or cloud storage) can read it. Driven by the `action` parameter:\n" +
-      '- action:"image" — Upload a local image file to the connected ComfyUI\'s input/ directory via the HTTP /upload/image endpoint so it can be referenced in LoadImage nodes. Works for both local and remote ComfyUI. Returns the stored filename.\n' +
+      '- action:"image" — Upload a local image file to the connected ComfyUI\'s input/ directory via the HTTP /upload/image endpoint so it can be referenced in LoadImage nodes. Works for both local and remote ComfyUI. Nested filenames that LoadImage does not enumerate are re-registered at the input root; the returned filename is the one a LoadImage combo can select.\n' +
       '- action:"video" — Upload a local video file (.mp4, .mov, .webm, .avi, .mkv, .m4v) to the connected ComfyUI\'s input/ directory via the HTTP /upload/image endpoint for use in video-loading nodes such as VHS_LoadVideo (ComfyUI-VideoHelperSuite). Works for both local and remote ComfyUI. Returns the stored filename.\n' +
       '- action:"audio" — Upload a local audio file (.wav, .mp3, .flac, .ogg, .m4a, .aac) to the connected ComfyUI\'s input/ directory via the HTTP /upload/image endpoint for use in audio-conditioned workflows (e.g. LoadAudio). Works for both local and remote ComfyUI. Returns the stored filename.\n' +
       '- action:"stage" — Stage an EXISTING ComfyUI output (or temp/preview) as an INPUT so the next stage\'s loader (LoadImage / VHS_LoadVideo / LoadAudio) can read it. This is the CORRECT way to chain a multi-stage pipeline (e.g. Krea2 image → LTX video → WAN extend): it fetches the output\'s bytes from the server via /view and re-registers them as an input via /upload/image — the same endpoints get_image and the uploads above use. Because it goes entirely through the server API, it works even when ComfyUI was launched with a CUSTOM input/output directory. Do NOT instead copy the output file or guess a filesystem `input/` path — the server\'s input dir may be custom and it will reject the file ("Invalid image file"), wasting the render. Pass an existing output reference ({ filename, subfolder?, type? }); the media kind (image/video/audio) is inferred from the extension unless you set `kind`. Nested video as_filename values are staged at the input root because VHS_LoadVideo lists only top-level files. Returns { filename, subfolder, type: "input", kind } — drop `filename` into LoadImage / VHS_LoadVideo / LoadAudio combo widgets. VHS_LoadVideoPath needs the returned filesystem path, not that combo filename ("Invalid file path" otherwise).\n' +
@@ -945,7 +945,7 @@ export function registerImageManagementTools(server: McpServer): void {
         .string()
         .optional()
         .describe(
-          'Two meanings, one per action. actions "image"/"video"/"audio" — OPTIONAL override for the filename in ComfyUI\'s input/ directory (auto-detected from source_path if omitted). A path prefix (e.g. assets/clip.mp4) places the upload in that SUBFOLDER of input/ — ".." is refused — and the returned filename reference includes the subfolder, since loaders need the qualified path. action:"stage" — REQUIRED filename of the EXISTING output/temp asset to re-register (from get_history or get_image action:"list_outputs"), e.g. LTX_video_00001.mp4; its destination name override is `as_filename`, not this field.',
+          'Two meanings, one per action. actions "image"/"video"/"audio" — OPTIONAL override for the filename in ComfyUI\'s input/ directory (auto-detected from source_path if omitted). A path prefix (e.g. assets/clip.mp4) places the upload in that SUBFOLDER of input/ — ".." is refused — and the returned filename reference includes the subfolder when the loader enumerates it. action:"image" verifies the name against LoadImage /object_info and, if a nested path is stored but not listed, returns a verified root filename instead. action:"stage" — REQUIRED filename of the EXISTING output/temp asset to re-register (from get_history or get_image action:"list_outputs"), e.g. LTX_video_00001.mp4; its destination name override is `as_filename`, not this field.',
         ),
       subfolder: z
         .string()
@@ -1020,17 +1020,43 @@ export function registerImageManagementTools(server: McpServer): void {
             // file landed in that SUBFOLDER of input/ — and the bare name the
             // old text returned did not resolve in a loader (FileNotFoundError
             // on input/<name>). The reference a loader accepts is the
-            // subfolder-qualified path, so that is what we hand back.
+            // subfolder-qualified path, so that is what we hand back — unless
+            // LoadImage's combo does not enumerate nested paths, in which case
+            // action:"image" returns the verified root filename instead (#2498).
             const reference = result.subfolder
               ? `${result.subfolder}/${result.filename}`
               : result.filename;
+            const selectable =
+              "loaderSelectable" in result ? result.loaderSelectable : undefined;
+            const requested =
+              "requestedFilename" in result ? result.requestedFilename : undefined;
+            const selectabilityNote =
+              args.action !== "image"
+                ? ""
+                : selectable === "verified"
+                  ? `\n\nThe fresh /object_info loader list verifies that "${reference}" is selectable.`
+                  : selectable === "root-fallback"
+                    ? `\n\nThis ComfyUI stored the requested nested path "${requested}" ` +
+                      `but LoadImage enumerates only top-level input files, so the same bytes were ` +
+                      `registered at the root as "${reference}". The fresh /object_info loader ` +
+                      `list verifies the root combo reference; use that one on LoadImage.\n\n` +
+                      `NOTE: the open ComfyUI tab's loader dropdown was populated at page-load, ` +
+                      `so this just-registered input is not in it yet — call panel_refresh_nodes ` +
+                      `first (it re-pulls /object_info so the new file becomes selectable), THEN ` +
+                      `panel_set_widget the LoadImage node's image widget to "${reference}".`
+                    : selectable === "unverified" && (result.subfolder || requested)
+                      ? `\n\nThe upload succeeded, but a fresh /object_info response did not prove that ` +
+                        `"${reference}" is present in a LoadImage list. Do not assume the widget can ` +
+                        `select it; inspect the loader or retry after panel_refresh_nodes.`
+                      : "";
             return {
               content: [
                 {
                   type: "text" as const,
                   text:
                     `Uploaded via HTTP.\n\nFilename: ${reference}\n\n` +
-                    `Use "${reference}" ${nodeHint}.`,
+                    `Use "${reference}" ${nodeHint}.` +
+                    selectabilityNote,
                 },
               ],
             };
