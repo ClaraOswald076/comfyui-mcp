@@ -6,12 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### MCP
+
+#### Fixed
+- models_show local fallback does not report an arbitrary duplicate basename as the installed model (#2504)
+
 ## [0.52.154] - 2026-08-30
 
 ### MCP
 
 #### Fixed
-- models_show local fallback does not report an arbitrary duplicate basename as the installed model (#2504)
 - get_workflow get/analyze reads an absolute path under the live ComfyUI workspace from disk instead of sending it to /api/userdata/workflows/ (#2506)
 - z-image-turbo-inpainting no longer installs eight unused custom-node packs (#2484)
 - list_local_models reads inventory through the connected panel when the headless /models route is unreachable (#2511)
