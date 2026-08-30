@@ -6,12 +6,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### MCP
+
+#### Fixed
+- graph tools inherit a live bound/current tab after a multi-workflow reconnect instead of requiring a manual rebind (#1001)
+
+
 ## [0.52.148] - 2026-08-29
 
 ### MCP
 
 #### Fixed
 - bound compact identity probes (#2513, #2478)
+- only list history assets fetchable through /view (#2515)
 - fence same-type transient writes
 - fence transient promoted reads
 - omit the unexpose reindex warning when the panel already reindexed (#2474)

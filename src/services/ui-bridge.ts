@@ -5283,6 +5283,15 @@ export class UiBridge {
     }
   }
 
+  /** The tab the user last talked from, if that tab is still connected.
+   *  Unlike {@link resolveActiveScopeTab}, this does NOT fall back to the most
+   *  recently connected canvas — that fallback is a guess among 2+ tabs and
+   *  must not auto-clear an AMBIGUOUS pin (#1001). */
+  liveLastActiveTabId(): string | undefined {
+    if (this.lastActiveTabId && this.conns.has(this.lastActiveTabId)) return this.lastActiveTabId;
+    return undefined;
+  }
+
   /** The LIVE connection for a (possibly RETIRED) canonical tab id, scoped to the SOCKET
    *  that produced the reply. Returns the conn under `tabId` when it is STILL that exact
    *  socket, else the socket-scoped migration target it was renamed to (tmp:→wf:). Used

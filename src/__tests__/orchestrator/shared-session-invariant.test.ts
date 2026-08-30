@@ -201,6 +201,9 @@ describe("sessions are orchestrator-scoped, never workflow-scoped (#884)", () =>
     // ever names A) — is caught too.
     expect((src.match(/turnOrigins\.tabChangedBackend\(panelTab\);/g) ?? []).length).toBe(2);
     expect(src).toContain("liveTabOf: (tab) => bridge.liveTabIdFor(tab),");
+    expect(src).toContain("currentTabOf:");
+    expect(src).toContain("uniqueLiveTabOf:");
+    expect(src).toContain("bridge.liveLastActiveTabId()");
     // A cancelled queued message's origin dies with it.
     expect(src).toContain("turnOrigins.cancelMid(mid);");
     // The panel MCP servers bind the backend-QUALIFIED scope address so the
