@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.148] - 2026-08-29
+
+### MCP
+
+#### Fixed
+- bound compact identity probes
+- fence same-type transient writes
+- fence transient promoted reads
+- omit the unexpose reindex warning when the panel already reindexed
+
+
 ## [0.52.147] - 2026-08-28
 
 ### MCP
