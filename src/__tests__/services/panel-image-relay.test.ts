@@ -38,8 +38,9 @@ const PRODUCTION_OBJECT_INFO_DELAY_MS = 20_841;
 
 /** Model the Panel bridge's command dispatcher at the wire boundary: the MCP
  * relay must send the authenticated command, tab binding, and route-specific
- * deadline through this call before a Panel reply can exist. The Panel repo
- * separately drives the real helper/dispatcher implementation. */
+ * deadline through this call before a Panel reply can exist. The delayed
+ * producer honors that deadline, so a regression to the generic 8s budget
+ * fails this documented 20.841s success case instead of merely recording it. */
 function productionShapedPanelDispatcher(
   body: string,
   recordTimeout: (timeoutMs: number) => void,
@@ -48,12 +49,34 @@ function productionShapedPanelDispatcher(
     expect(command).toEqual({ cmd: "fetch_comfyui_read", operation: "object_info" });
     expect(options.tabId).toBe("panel-tab");
     recordTimeout(options.timeoutMs);
-    await new Promise((resolve) => setTimeout(resolve, PRODUCTION_OBJECT_INFO_DELAY_MS));
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let deadlineTimer: ReturnType<typeof setTimeout>;
+      let producerTimer: ReturnType<typeof setTimeout>;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadlineTimer);
+        clearTimeout(producerTimer);
+        if (error) reject(error);
+        else resolve();
+      };
+      deadlineTimer = setTimeout(
+        () => finish(Object.assign(new Error("Panel bridge command timed out"), { code: "TIMEOUT" })),
+        options.timeoutMs,
+      );
+      producerTimer = setTimeout(() => finish(), PRODUCTION_OBJECT_INFO_DELAY_MS);
+    });
     return {
       operation: "object_info",
       body,
       contentType: "application/json",
       bytes: Buffer.byteLength(body, "utf8"),
+      viewing: {
+        scope: "root",
+        workflow_uuid: "workflow-live-2283",
+        graph_identity: "graph:live-2283",
+      },
     };
   };
 }
