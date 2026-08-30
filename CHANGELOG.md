@@ -6,10 +6,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.149] - 2026-08-30
+
 ### MCP
 
 #### Fixed
 - graph tools inherit a live bound/current tab after a multi-workflow reconnect instead of requiring a manual rebind (#1001)
+
+### MCP
+
+#### Fixed
+- inherit a live bound/current tab after multi-workflow reconnect (#2557)
+- rewrite bare unknown <cmd> when panel_version is missing (#619) (#2555)
+
+#### Changed
+- raise the filing bar, drop the beta reporting bias (#2554)
 
 
 ## [0.52.148] - 2026-08-29
