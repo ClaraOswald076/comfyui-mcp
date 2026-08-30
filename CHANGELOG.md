@@ -6,13 +6,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.52.150] - 2026-08-30
+
 ### MCP
 
 #### Fixed
-- after a confirmed restart, load_workflow retries the live panel origin and loopback alias instead of a dead 8188 (#1845)
-- list_local_models does not treat a /models/unet 404 as proof the file is under diffusion_models (#2480)
-- panel_set_todo reconciles a missing ACK with a todo read-back and mutation receipt instead of leaving the outcome as a guess (#2481)
-- recognise ComfyUI Desktop-2 (`Comfy Desktop.exe` under `Programs/ComfyUI`, `.comfyui-desktop-2` / `.launcher/snapshots`, parent process) so `restart_comfyui action:"stop"` records a start path and does not report `stopped:false` when the server is already gone (#2482)
+- do not re-deliver run completions after a mid-reply interrupt (#2486, #2579)
+- retry the live origin after restart instead of a dead 8188 (#1845, #2573)
+- list configured unet dir instead of assuming diffusion_models on REST 404 (#2480, #2576)
+- recognise ComfyUI Desktop-2 so restart_comfyui stop records a start path (#2482, #2575)
+- panel_set_todo reconciles a missing ACK with a todo read-back and mutation receipt (#2481, #2572)
+- retry graph reads after enter or panel_run (#2395, #2567)
+- harden #619 command probe lookup (#2564)
+- do not refuse promoted writes when the connection fingerprint is missing (#2475)
 
 ## [0.52.149] - 2026-08-30
 
