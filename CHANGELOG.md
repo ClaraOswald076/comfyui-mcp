@@ -12,6 +12,7 @@ All notable changes to this project are documented here. This project adheres to
 - retry panel_connect against the live graph when a node reported by panel_graph_outline is refused as missing (#2502)
 - panel_open_workflow no longer treats frontend-normalized node fields as a failed load after reconnect (#2501)
 - make `resolve_missing` suggest `models/clip_vision/` for missing `CLIPVisionLoader.clip_name` models while keeping ordinary CLIP loaders on `models/text_encoders/` (#2604)
+- classify an existing `application/octet-stream` OBJ returned by `get_image` as an unsupported attachment instead of a missing file (#2608)
 
 
 ## [0.52.152] - 2026-08-30

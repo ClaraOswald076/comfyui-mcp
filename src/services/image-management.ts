@@ -1068,6 +1068,17 @@ export async function getOutputImage(
   // is the server reporting an ABSENT FILE, and calling that a content refusal sends the
   // caller to inspect a payload when the filename is the thing to look at.
   const contentRejected = jsonRefusal?.kind === "content";
+  // An OBJ is a real attachment, but it is not an image, supported media, or JSON
+  // attachment that get_image can save. ComfyUI commonly serves it as the generic
+  // octet-stream type, so do not send a successful non-empty response down the
+  // missing-file path.
+  const unsupportedObjAttachment =
+    ext === ".obj" &&
+    mime === "application/octet-stream" &&
+    result.base64.length > 0 &&
+    !isImage &&
+    !isMedia &&
+    !isJson;
 
   if ((!isImage && !isMedia && !isJson) || !imageContentOk || result.base64.length === 0) {
     const where = subfolder ? `${type}/${subfolder}` : type;
@@ -1078,7 +1089,11 @@ export async function getOutputImage(
           ? `invalid image content labeled "${result.mimeType}"`
           : `content-type "${result.mimeType}"`;
     throw new ComfyUIError(
-      contentRejected
+      unsupportedObjAttachment
+        ? `ComfyUI /view returned an existing OBJ attachment for "${filename}" (${where}), ` +
+          `but get_image cannot save this type. Nothing was saved. ` +
+          `Use ComfyUI's file browser or another raw-file download path for OBJ attachments.`
+        : contentRejected
         ? // NAME THE ACTUAL REASON (#1373). "The file may not exist" for a body that
           // arrived and was rejected on its CONTENT sends the caller to re-check a
           // filename that is perfectly correct — the wrong-cause failure this issue is
@@ -1100,7 +1115,11 @@ export async function getOutputImage(
       // having one — still read IMAGE_NOT_FOUND and went off to re-check a filename that
       // was never wrong. That is the same wrong-cause failure as the prose, one layer
       // down, and it is the layer that automation reads.
-      contentRejected ? "ATTACHMENT_CONTENT_REJECTED" : "IMAGE_NOT_FOUND",
+      unsupportedObjAttachment
+        ? "ATTACHMENT_TYPE_UNSUPPORTED"
+        : contentRejected
+          ? "ATTACHMENT_CONTENT_REJECTED"
+          : "IMAGE_NOT_FOUND",
       {
         filename,
         type,
