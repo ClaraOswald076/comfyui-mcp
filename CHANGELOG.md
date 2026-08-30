@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### MCP
+
+#### Fixed
+- panel_set_widget settles a missing ACK on a Power Lora lora_N row with a graph read-back instead of reporting outcome-unknown for a row that already landed (#2495)
+
 ## [0.52.157] - 2026-08-30
 
 ### MCP

@@ -4027,6 +4027,236 @@ async function settleSetTodoAfterAckTimeout(
   };
 }
 
+// ---- panel_set_widget Power Lora row settle-after-ack-timeout (#2495) ------
+// Creating lora_1 on a freshly added Power Lora Loader can apply the row and
+// then wait out a frontend refresh that never ACKs inside the 90s transport
+// bound. The next lora_2 write and a graph read both succeed, so the caller
+// was handed outcome-unknown for a mutation that landed. Take ONE detail
+// graph_query on the same tab and report applied / not-applied, or return the
+// original timeout WITH a mutation receipt when the read cannot answer.
+
+const POWER_LORA_RECONCILE_MS = 8_000;
+const POWER_LORA_ROW_WIDGET = /^lora_\d+$/i;
+
+function isPowerLoraDynamicRowWidget(widget: string): boolean {
+  return POWER_LORA_ROW_WIDGET.test(widget);
+}
+
+function powerLoraAppliedNote(widget: string): string {
+  return (
+    `CHECKED FOR YOU: the tab did not ACKNOWLEDGE the "${widget}" write within the window, but a ` +
+    `graph_query taken immediately afterwards, on that same tab, reports the requested row ` +
+    `object. No recovery step is needed and a retry would be wasted work. A missing ` +
+    `acknowledgement is not evidence the write failed; here it is evidence the tab was still ` +
+    `busy with a frontend refresh after the row was already inserted. refresh_pending:true ` +
+    `means that refresh may still be running — do not wait it out, and do not treat this as a ` +
+    `schema-ready signal.`
+  );
+}
+
+function powerLoraNotAppliedNote(widget: string): string {
+  return (
+    `CHECKED FOR YOU: a graph_query taken immediately after the missing acknowledgement does NOT ` +
+    `show the requested "${widget}" row. The write has not applied (or was overwritten). ` +
+    `Re-issuing the same named row is a merge, not a second row.`
+  );
+}
+
+function powerLoraUnknownNote(widget: string): string {
+  return (
+    `The node could not be read after the missing acknowledgement, so this result cannot say ` +
+    `whether "${widget}" applied. mutation_id is the delivery receipt for this attempt; ` +
+    `requested is the value that was sent. Re-issuing that exact named row cannot create a ` +
+    `duplicate widget. Do not guess.`
+  );
+}
+
+/** JSON-parse a whole-row string so a delivered object can be compared to the live widget. */
+function coercePowerLoraWidgetValue(value: unknown) {
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  if (!trimmed || (trimmed[0] !== "{" && trimmed[0] !== "[")) return value;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return value;
+  }
+}
+
+function powerLoraValuesMatch(requested: unknown, observed: unknown): boolean {
+  const want = coercePowerLoraWidgetValue(requested);
+  const got = coercePowerLoraWidgetValue(observed);
+  if (want !== null && typeof want === "object") {
+    if (got === null || typeof got !== "object") return false;
+    if (Array.isArray(want)) return JSON.stringify(want) === JSON.stringify(got);
+    if (Array.isArray(got)) return false;
+    const wantRec = want as Record<string, unknown>;
+    const gotRec = got as Record<string, unknown>;
+    for (const [key, value] of Object.entries(wantRec)) {
+      if (!powerLoraValuesMatch(value, gotRec[key])) return false;
+    }
+    return true;
+  }
+  return Object.is(want, got);
+}
+
+function powerLoraWidgetsFromProbe(
+  res: ToolResult,
+  nodeId: unknown,
+): { type: string; widgets: Record<string, unknown> } | null {
+  const payload = normalizeGraphQueryResult(res);
+  if (
+    Object.prototype.hasOwnProperty.call(payload, "truncated") &&
+    payload.truncated !== false
+  ) {
+    return null;
+  }
+  const requestedId = canonicalQueriedNodeId(nodeId);
+  const detail = parseVerifiedQueriedNodeDetail(payload);
+  if (
+    detail &&
+    requestedId &&
+    detail.id === requestedId &&
+    detail.widgets &&
+    /\bPower Lora Loader\b/i.test(detail.type)
+  ) {
+    return { type: detail.type, widgets: detail.widgets };
+  }
+  if (!Array.isArray(payload.nodes) || payload.nodes.length !== 1) return null;
+  const identity = parseQueriedNodeIdentityRow(payload.nodes[0]);
+  if (!identity || !requestedId || identity.id !== requestedId) return null;
+  const widgets = (payload.nodes[0] as Record<string, unknown>).widgets;
+  if (!widgets || typeof widgets !== "object" || Array.isArray(widgets)) return null;
+  if (!/\bPower Lora Loader\b/i.test(identity.type)) return null;
+  return { type: identity.type, widgets: widgets as Record<string, unknown> };
+}
+
+async function readPowerLoraNodeFromTab(
+  ctx: PanelToolCtx,
+  tabId: string,
+  nodeId: unknown,
+): Promise<ToolResult> {
+  const cmd = {
+    cmd: "graph_query",
+    ids: [nodeId],
+    fields: "detail",
+    limit: 1,
+    max_chars: DYNAMIC_COMBO_PROBE_MAX_CHARS,
+  };
+  if (tabId === ctx.tabId) return ctx.call(cmd, POWER_LORA_RECONCILE_MS);
+  return dispatchToTab(ctx, tabId, cmd, POWER_LORA_RECONCILE_MS);
+}
+
+function powerLoraTimeoutUnknown(
+  timedOut: ToolResult,
+  widget: string,
+  requested: unknown,
+  mutationId: string | undefined,
+): ToolResult {
+  return appendReplyNote(
+    timedOut,
+    JSON.stringify(
+      {
+        applied: "unknown",
+        acknowledged: false,
+        refresh_pending: true,
+        mutation_id: mutationId ?? null,
+        widget,
+        requested,
+        note: powerLoraUnknownNote(widget),
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+/**
+ * After an ack timeout on a Power Lora `lora_N` write, take ONE detail read and
+ * report whether the requested row is on the node. Returns the original timeout
+ * plus a mutation receipt when the read cannot answer — #1473's rule.
+ */
+async function settlePowerLoraWidgetAfterAckTimeout(
+  ctx: PanelToolCtx,
+  timedOut: ToolResult,
+  nodeId: unknown,
+  widget: string,
+  requested: unknown,
+  mutationId: string | undefined,
+  dispatchTab: string,
+): Promise<ToolResult> {
+  const probeOnSessionTab = ctx.tabId === dispatchTab;
+  const probe = await readPowerLoraNodeFromTab(ctx, dispatchTab, nodeId);
+  if (probeOnSessionTab && ctx.tabId !== dispatchTab) {
+    return powerLoraTimeoutUnknown(timedOut, widget, requested, mutationId);
+  }
+  const node = powerLoraWidgetsFromProbe(probe, nodeId);
+  if (node === null || !Object.prototype.hasOwnProperty.call(node.widgets, widget)) {
+    if (probe.isError || node === null) {
+      return powerLoraTimeoutUnknown(timedOut, widget, requested, mutationId);
+    }
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              applied: false,
+              acknowledged: false,
+              refresh_pending: true,
+              mutation_id: mutationId ?? null,
+              widget,
+              requested,
+              confirmed_by: "graph_query after ack timeout",
+              note: powerLoraNotAppliedNote(widget),
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+  const observed = node.widgets[widget];
+  if (!powerLoraValuesMatch(requested, observed)) {
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              applied: false,
+              acknowledged: false,
+              refresh_pending: true,
+              mutation_id: mutationId ?? null,
+              widget,
+              requested,
+              value: observed,
+              confirmed_by: "graph_query after ack timeout",
+              note: powerLoraNotAppliedNote(widget),
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+  return ok({
+    ok: true,
+    applied: true,
+    acknowledged: false,
+    refresh_pending: true,
+    mutation_id: mutationId ?? null,
+    created_widget: widget,
+    set: { node_id: nodeId, widget, value: observed },
+    confirmed_by: "graph_query after ack timeout",
+    note: powerLoraAppliedNote(widget),
+  });
+}
+
 // ---- panel_free_vram: verifiable when the canvas tab is frozen (#1249) -----
 // `free_vram` is a purely SERVER-SIDE operation — the panel's handler is a plain
 // `POST /free` against the ComfyUI the tab fronts — yet the tool treated the
@@ -19846,71 +20076,92 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           beforeDispatch?: () => void,
           targetExpectedScope?: PromotedExpectedScope,
           targetExpectedNodeIdentity: string | undefined = expectedNodeIdentity,
-        ): Promise<ToolResult> =>
-          stripVerifiedLastObservedSchemaNote(
-            summarizeSetWidgetEcho(
-              await ctx.call(
-                {
-                  cmd: "graph_set_widget",
-                  node_id: nodeId,
-                  widget,
-                  value,
-                  // The caller supplies the type proven for THIS addressed node.
-                  // The outer final fence is used for direct/re-mapped writes;
-                  // promoted recovery re-probes its inner node after entering
-                  // and supplies that node's own type.
-                  ...(targetExpectedNodeType
-                    ? { expected_node_type: targetExpectedNodeType }
-                    : {}),
-                  ...(targetExpectedNodeIdentity
-                    ? { expected_node_identity: targetExpectedNodeIdentity }
-                    : {}),
-                  ...(targetExpectedScope
-                    ? {
-                        expected_scope: {
-                          scope: "subgraph",
-                          owner_node_id: targetExpectedScope.ownerNodeId,
-                          graph_identity: targetExpectedScope.graphIdentity,
-                          ...(targetExpectedScope.promotedWidget && targetExpectedScope.parentRail
-                            ? {
-                                promoted_widget: targetExpectedScope.promotedWidget,
-                                parent_rail: {
-                                  authoritative: true,
-                                  widget: targetExpectedScope.parentRail.widget,
-                                  ...(targetExpectedScope.parentRail.widgetId !== undefined
-                                    ? { widget_id: targetExpectedScope.parentRail.widgetId }
-                                    : {}),
-                                },
-                              }
-                            : {}),
-                          ...(targetExpectedScope.workflowUuid !== undefined
-                            ? { workflow_uuid: targetExpectedScope.workflowUuid }
-                            : {}),
-                          ...(targetExpectedScope.terminal
-                            ? {
-                                terminal: {
-                                  node_id: targetExpectedScope.terminal.nodeId,
-                                  type: targetExpectedScope.terminal.nodeType,
-                                  widget: targetExpectedScope.terminal.widget,
-                                  inputs: targetExpectedScope.terminal.inputs,
-                                  chain_depth: targetExpectedScope.terminal.chainDepth,
-                                },
-                              }
-                            : {}),
-                        },
-                      }
-                    : {}),
-                  ...(args.defer_until_idle === true
-                    ? { defer_until_idle: true, expected_value: args.expected_value }
-                    : {}),
-                },
-                OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
-                undefined,
-                beforeDispatch,
-              ),
-              echoFull,
-            ),
+        ): Promise<ToolResult> => {
+          let mutationId: string | undefined;
+          const dispatchTab = ctx.tabId;
+          const written = await ctx.call(
+            {
+              cmd: "graph_set_widget",
+              node_id: nodeId,
+              widget,
+              value,
+              // The caller supplies the type proven for THIS addressed node.
+              // The outer final fence is used for direct/re-mapped writes;
+              // promoted recovery re-probes its inner node after entering
+              // and supplies that node's own type.
+              ...(targetExpectedNodeType
+                ? { expected_node_type: targetExpectedNodeType }
+                : {}),
+              ...(targetExpectedNodeIdentity
+                ? { expected_node_identity: targetExpectedNodeIdentity }
+                : {}),
+              ...(targetExpectedScope
+                ? {
+                    expected_scope: {
+                      scope: "subgraph",
+                      owner_node_id: targetExpectedScope.ownerNodeId,
+                      graph_identity: targetExpectedScope.graphIdentity,
+                      ...(targetExpectedScope.promotedWidget && targetExpectedScope.parentRail
+                        ? {
+                            promoted_widget: targetExpectedScope.promotedWidget,
+                            parent_rail: {
+                              authoritative: true,
+                              widget: targetExpectedScope.parentRail.widget,
+                              ...(targetExpectedScope.parentRail.widgetId !== undefined
+                                ? { widget_id: targetExpectedScope.parentRail.widgetId }
+                                : {}),
+                            },
+                          }
+                        : {}),
+                      ...(targetExpectedScope.workflowUuid !== undefined
+                        ? { workflow_uuid: targetExpectedScope.workflowUuid }
+                        : {}),
+                      ...(targetExpectedScope.terminal
+                        ? {
+                            terminal: {
+                              node_id: targetExpectedScope.terminal.nodeId,
+                              type: targetExpectedScope.terminal.nodeType,
+                              widget: targetExpectedScope.terminal.widget,
+                              inputs: targetExpectedScope.terminal.inputs,
+                              chain_depth: targetExpectedScope.terminal.chainDepth,
+                            },
+                          }
+                        : {}),
+                    },
+                  }
+                : {}),
+              ...(args.defer_until_idle === true
+                ? { defer_until_idle: true, expected_value: args.expected_value }
+                : {}),
+            },
+            OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+            (rid) => {
+              mutationId = rid;
+            },
+            beforeDispatch,
           );
+          const echoed = stripVerifiedLastObservedSchemaNote(
+            summarizeSetWidgetEcho(written, echoFull),
+          );
+          // #2495 — ONLY a tagged no-reply on a named Power Lora row is settled
+          // by a read. An acked executor error is a definite outcome.
+          if (
+            isReplyTimeoutResult(echoed) &&
+            isPowerLoraDynamicRowWidget(widget) &&
+            args.defer_until_idle !== true
+          ) {
+            return settlePowerLoraWidgetAfterAckTimeout(
+              ctx,
+              echoed,
+              nodeId,
+              widget,
+              value,
+              mutationId,
+              dispatchTab,
+            );
+          }
+          return echoed;
+        };
         let writePromotedInner: (plan: PromotedWritePlan) => Promise<ToolResult>;
         const guardedWrite = async (
           nodeId: unknown,
@@ -20216,7 +20467,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
 
         if (promotedPlan) {
           const promotedWritten = await writePromotedInner(promotedPlan);
-          if (!promotedWritten.isError) markPanelSchemaReady(panelSchemaKey(ctx));
+          if (!promotedWritten.isError && parseToolResultJson(promotedWritten)?.refresh_pending !== true) {
+            markPanelSchemaReady(panelSchemaKey(ctx));
+          }
           return promotedWritten;
         }
         let first = await write(
@@ -20230,7 +20483,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           expectedNodeIdentity,
         );
         if (!first.isError) {
-          markPanelSchemaReady(panelSchemaKey(ctx));
+          if (parseToolResultJson(first)?.refresh_pending !== true) {
+            markPanelSchemaReady(panelSchemaKey(ctx));
+          }
           return persistUnpromotedControlAfterGenerate(first, ctx, args.node_id);
         }
         // #2202 — stale-combo recovery may have retired the panel's last usable
