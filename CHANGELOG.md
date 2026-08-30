@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### MCP
+
+#### Fixed
+- make `resolve_missing` suggest `models/clip_vision/` for missing `CLIPVisionLoader.clip_name` models while keeping ordinary CLIP loaders on `models/text_encoders/` (#2604)
+
 ## [0.52.152] - 2026-08-30
 
 ### MCP
