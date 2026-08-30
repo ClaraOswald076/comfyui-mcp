@@ -1904,6 +1904,28 @@ export async function runPanelOrchestrator(): Promise<void> {
     // The provider-switch pin invalidation judges a pin by where the BRIDGE
     // routes it (path-compressed migration aliases included) — codex gate 4.
     liveTabOf: (tab) => bridge.liveTabIdFor(tab),
+    // #1001 — mixed-origin inherit: last established origin if it still
+    // routes, else the current/unique live canvas so graph tools do not need
+    // a manual rebind after reconnect re-delivers several workflow events.
+    currentTabOf: (key) => {
+      const active = bridge.liveLastActiveTabId();
+      if (!active || bridge.isHeadless(active)) return undefined;
+      return backendForTab(active) === backendOf(key) ? active : undefined;
+    },
+    uniqueLiveTabOf: (key) => {
+      const backend = backendOf(key);
+      const interactive = bridge
+        .tabs()
+        .map((t) => t.tab_id)
+        .filter((t) => !bridge.isHeadless(t));
+      const eligible = interactive.filter((t) => backendForTab(t) === backend);
+      if (eligible.length === 1) return eligible[0];
+      if (eligible.length === 0 && interactive.length === 1) return interactive[0];
+      return undefined;
+    },
+    claimTab: (tab, backend) => {
+      tabBackends.set(tab, backend);
+    },
     warn: (msg) => logger.warn(msg),
   });
   // #884 — ROUTING for agent output: every connected tab participating in this

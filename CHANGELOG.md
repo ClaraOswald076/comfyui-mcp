@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### MCP
+
+#### Fixed
+- graph tools inherit a live bound/current tab after a multi-workflow reconnect instead of requiring a manual rebind (#1001)
+
+
 ## [0.52.148] - 2026-08-29
 
 ### MCP
