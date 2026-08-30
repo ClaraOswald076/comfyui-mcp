@@ -34,6 +34,29 @@ import {
 
 const dirs: string[] = [];
 const SECRET = "a".repeat(64);
+const PRODUCTION_OBJECT_INFO_DELAY_MS = 20_841;
+
+/** Model the Panel bridge's command dispatcher at the wire boundary: the MCP
+ * relay must send the authenticated command, tab binding, and route-specific
+ * deadline through this call before a Panel reply can exist. The Panel repo
+ * separately drives the real helper/dispatcher implementation. */
+function productionShapedPanelDispatcher(
+  body: string,
+  recordTimeout: (timeoutMs: number) => void,
+): (command: { cmd: string; operation: string }, options: { tabId: string; timeoutMs: number }) => Promise<Record<string, unknown>> {
+  return async (command, options) => {
+    expect(command).toEqual({ cmd: "fetch_comfyui_read", operation: "object_info" });
+    expect(options.tabId).toBe("panel-tab");
+    recordTimeout(options.timeoutMs);
+    await new Promise((resolve) => setTimeout(resolve, PRODUCTION_OBJECT_INFO_DELAY_MS));
+    return {
+      operation: "object_info",
+      body,
+      contentType: "application/json",
+      bytes: Buffer.byteLength(body, "utf8"),
+    };
+  };
+}
 
 function tempChannel(): string {
   const dir = mkdtempSync(join(tmpdir(), "comfyui-mcp-image-relay-"));
@@ -790,14 +813,7 @@ describe("authenticated loopback panel image relay", () => {
       resolvePanelTab: () => "panel-tab",
       bridge: {
         canReach: () => true,
-        send: async (command, options) => {
-          bridgeTimeoutMs = options.timeoutMs;
-          if (command.operation === "object_info") {
-            await new Promise((resolve) => setTimeout(resolve, 8_050));
-            return { operation: "object_info", body, contentType: "application/json", bytes: Buffer.byteLength(body, "utf8") };
-          }
-          return { operation: "history", body: "{}", contentType: "application/json", bytes: 2 };
-        },
+        send: productionShapedPanelDispatcher(body, (timeoutMs) => { bridgeTimeoutMs = timeoutMs; }),
       },
     });
     try {
