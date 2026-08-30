@@ -12,6 +12,7 @@ All notable changes to this project are documented here. This project adheres to
 - panel_load_workflow restamps extra.comfyui_mcp.workflow_path (and uuid) to the active tab so an in-place save is not refused as belonging to the source workflow (#2505)
 - fall back to ComfyUI-Manager for install_custom_node action:"list" when the local comfy-cli version is unrecognized (#2603)
 - fence ordinary `panel_set_widget` writes against the current panel graph identity across reconnects, with an actionable rebind refusal (#2550)
+- clear terminal MCP panel refresh coordination state and reclaim only bounded, stale refresh records while keeping unknown completion fail-closed (#2549)
 
 ## [0.52.153] - 2026-08-30
 

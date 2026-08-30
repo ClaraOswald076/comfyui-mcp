@@ -5489,18 +5489,68 @@ function isObjectInfoBudgetRefusal(res: ToolResult): boolean {
  * The refresh is only a coordination primitive. Callers must still require the panel's
  * explicit `refreshed:true` result before retrying a write; a timeout, malformed reply,
  * `refresh_still_running`, or any other non-authoritative result remains fail-closed.
+ * The bridge already gives this idempotent read one bounded reconnect retry, so a
+ * generation change alone does not make a still-young record stale. A record that has
+ * outlived that same bounded request window may be replaced once the current bridge
+ * generation is known and monotonic; replacing the coordinator record does not cancel
+ * or authorize the old request.
  */
+type PanelSchemaRefreshRecord = {
+  token: object;
+  promise: Promise<ToolResult>;
+  startedAt: number;
+  generation: number | undefined;
+};
+
 const panelSchemaRefreshes = new Map<
   string,
-  { token: object; promise: Promise<ToolResult> }
+  PanelSchemaRefreshRecord
 >();
+
+function panelSchemaRefreshGeneration(ctx: PanelToolCtx): number | undefined {
+  const bridge = ctx.bridge as
+    | { tabConnectionGeneration?: (tabId: string) => number | undefined }
+    | undefined;
+  if (typeof bridge?.tabConnectionGeneration !== "function") return undefined;
+  try {
+    const generation = bridge.tabConnectionGeneration(journalTabFor(ctx));
+    return typeof generation === "number" && Number.isSafeInteger(generation) && generation >= 0
+      ? generation
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function panelSchemaRefreshIsStale(
+  record: PanelSchemaRefreshRecord,
+  ctx: PanelToolCtx,
+  now = Date.now(),
+): boolean {
+  // A refresh can legitimately be parked and resumed by UiBridge after a reconnect.
+  // Do not replace it merely because the hello generation changed, or because the
+  // generation probe is unavailable. Only a record beyond the same finite request
+  // bound, with a known non-regressing current generation, is reclaimable.
+  if (now - record.startedAt < OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS) return false;
+  const currentGeneration = panelSchemaRefreshGeneration(ctx);
+  return (
+    record.generation !== undefined &&
+    currentGeneration !== undefined &&
+    currentGeneration >= record.generation
+  );
+}
 
 function sharedPanelSchemaRefresh(ctx: PanelToolCtx): Promise<ToolResult> {
   const key = panelSchemaKey(ctx);
   const existing = panelSchemaRefreshes.get(key);
-  if (existing) return existing.promise;
+  if (existing && !panelSchemaRefreshIsStale(existing, ctx)) return existing.promise;
+  // Replacing a stale record is deliberately not cancellation: the old bridge read
+  // may still settle later. Its token-guarded finally cannot remove this new record.
+  if (existing) panelSchemaRefreshes.delete(key);
 
   const token = {};
+  const startedAt = Date.now();
+  const generation = panelSchemaRefreshGeneration(ctx);
   // Yield before dispatch so the map is installed before even a synchronously-throwing
   // bridge stub can settle this promise and run its cleanup.
   const promise = (async () => {
@@ -5513,7 +5563,7 @@ function sharedPanelSchemaRefresh(ctx: PanelToolCtx): Promise<ToolResult> {
       if (panelSchemaRefreshes.get(key)?.token === token) panelSchemaRefreshes.delete(key);
     }
   })();
-  panelSchemaRefreshes.set(key, { token, promise });
+  panelSchemaRefreshes.set(key, { token, promise, startedAt, generation });
   return promise;
 }
 
