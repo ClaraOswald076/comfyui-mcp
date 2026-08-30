@@ -73,6 +73,7 @@ function connectPanel(): Promise<WebSocket> {
           enforces_workflow_stamp: true,
           enforces_workflow_stamp_at_write: true,
           enforces_expected_node_type_at_write: true,
+          enforces_expected_node_identity_at_write: true,
         }),
       );
       resolve(sock);
@@ -82,7 +83,13 @@ function connectPanel(): Promise<WebSocket> {
 }
 
 function viewing() {
-  return { scope: "root", kind: "root", workflow: "video_minimax_h3_i2v.json", workflow_uuid: WORKFLOW_UUID };
+  return {
+    scope: "root",
+    kind: "root",
+    workflow: "video_minimax_h3_i2v.json",
+    workflow_uuid: WORKFLOW_UUID,
+    graph_identity: "graph:root-2559",
+  };
 }
 
 function ordinaryNode(id: unknown) {
