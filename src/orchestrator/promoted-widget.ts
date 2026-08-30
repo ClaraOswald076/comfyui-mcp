@@ -28,6 +28,8 @@ export type ContradictoryPromotedWidgetRefusal = {
 export type InnerPromotedTarget = {
   innerNodeId: number | string;
   widget: string;
+  /** Opaque panel-owned identity of the immediate inner node, when published. */
+  nodeIdentity?: string;
   /** Current-panel witnesses must prove the exact local parent rail that
    * serializes this promoted value. Legacy envelopes omit this proof. */
   parentRail?: PromotedParentRailWitness;
@@ -321,6 +323,13 @@ export function validatePromotedSubgraphEnvelope(
   const normalized: Array<Record<string, unknown>> = [];
   for (const raw of nodes) {
     if (!isRecord(raw) || innerNodeId(raw) == null) return null;
+    const nodeIdentity = raw.node_identity;
+    if (
+      nodeIdentity !== undefined &&
+      (typeof nodeIdentity !== "string" || nodeIdentity.length === 0 || nodeIdentity.length > 256)
+    ) {
+      return null;
+    }
     normalized.push(raw);
   }
   const promotedTerminals = Object.prototype.hasOwnProperty.call(subgraph, "promoted_terminals")
@@ -504,6 +513,9 @@ export function resolveInnerPromotedTarget(
     return {
       innerNodeId: entry.immediateNodeId,
       widget: entry.immediateWidget,
+      ...(typeof immediateNode.node_identity === "string"
+        ? { nodeIdentity: immediateNode.node_identity }
+        : {}),
       parentRail: entry.parentRail,
       terminal: entry.terminal,
     };
@@ -514,7 +526,13 @@ export function resolveInnerPromotedTarget(
     const id = innerNodeId(node);
     if (id == null) continue;
     const matched = matchListedName(displayedWidget, widgetNamesOnInner(node));
-    if (matched) hits.push({ innerNodeId: id, widget: matched });
+    if (matched) {
+      hits.push({
+        innerNodeId: id,
+        widget: matched,
+        ...(typeof node.node_identity === "string" ? { nodeIdentity: node.node_identity } : {}),
+      });
+    }
   }
   if (hits.length !== 1) return null;
   return hits[0];

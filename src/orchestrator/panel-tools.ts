@@ -6006,7 +6006,7 @@ function parseQueriedNodeType(payload: Record<string, unknown> | null): string |
   return null;
 }
 
-type QueriedNodeIdentity = { id: string; type: string };
+type QueriedNodeIdentity = { id: string; type: string; nodeIdentity?: string };
 
 function canonicalQueriedNodeId(value: unknown): string | null {
   if (typeof value === "number") {
@@ -6033,12 +6033,23 @@ function parseQueriedNodeIdentityRow(row: unknown): QueriedNodeIdentity | null {
     return null;
   }
   const resolvedType = typeof type === "string" ? type : classType;
-  return resolvedType ? { id, type: resolvedType } : null;
+  const nodeIdentity = record.node_identity;
+  if (
+    nodeIdentity !== undefined &&
+    (typeof nodeIdentity !== "string" || nodeIdentity.length === 0 || nodeIdentity.length > 256)
+  ) {
+    return null;
+  }
+  return resolvedType
+    ? { id, type: resolvedType, ...(nodeIdentity !== undefined ? { nodeIdentity } : {}) }
+    : null;
 }
 
 type QueriedNodeScope = {
   activeView: "root" | "subgraph";
   node: "ordinary" | "container";
+  nodeType: string;
+  nodeIdentity?: string;
 };
 
 /** Read the active viewing scope and node's explicit container bit before
@@ -6091,6 +6102,8 @@ function parseVerifiedQueriedNodeScope(
   return {
     activeView,
     node: isSubgraph ? "container" : "ordinary",
+    nodeType: identity.type,
+    ...(identity.nodeIdentity !== undefined ? { nodeIdentity: identity.nodeIdentity } : {}),
   };
 }
 
@@ -6272,6 +6285,11 @@ const DYNAMIC_COMBO_REFUSED_CHILD_TYPE = "STRING";
  *  The node most likely to overflow that budget is the node already holding a long
  *  prompt, i.e. exactly the #2299 report ("<any long prompt>"). */
 const DYNAMIC_COMBO_PROBE_MAX_CHARS = 60000;
+// #2478 — the Panel's one-ID compact projection carries a minimal structured
+// node witness, including its opaque incarnation identity. Keep every strict
+// identity probe below the graph_query floor's bounded budget; broad/detail
+// reads retain their existing budgets and semantics.
+const PROMOTED_IDENTITY_PROBE_MAX_CHARS = 2048;
 
 function dynamicComboSubWidgetRefusal(
   nodeType: string,
@@ -6508,6 +6526,7 @@ type PromotedWritePlan = {
   inner: {
     innerNodeId: number | string;
     widget: string;
+    nodeIdentity?: string;
     parentRail?: PromotedParentRailWitness;
   };
   innerNodeType: string;
@@ -6516,13 +6535,19 @@ type PromotedWritePlan = {
   binding: PromotedWriteBinding;
 };
 
+type OrdinaryWritePlan = {
+  kind: "ordinary-write";
+  expectedNodeType: string;
+  expectedNodeIdentity: string;
+};
+
 type PromotedExpectedScope = PromotedScopeWitness & {
   terminal?: PromotedTerminalWitness;
   promotedWidget?: string;
   parentRail?: PromotedParentRailWitness;
 };
 
-type PromotedWritePreflight = PromotedWritePlan | ToolResult | null;
+type PromotedWritePreflight = PromotedWritePlan | OrdinaryWritePlan | ToolResult | null;
 
 function promotedEnvelopeCarriesEvidence(payload: Record<string, unknown> | null): boolean {
   if (!payload) return false;
@@ -6570,6 +6595,49 @@ function isDefinitiveNonPromotedSubgraphRead(res: ToolResult): boolean {
   return /^Error:\s*Node\s+\S+(?:\s+\((?:(?:[^()]|\([^()]*\))*|[^)]*)\))?\s+is not a subgraph\b/i.test(
     textOfToolResult(res),
   );
+}
+
+/** Extract the receiver-published type from the definitive ordinary-node
+ * refusal. A definitive classification without a type is still enough to
+ * avoid treating the node as promoted, but not enough to fence a write after
+ * an indeterminate read: an id can have been reused while the read was away. */
+function definitiveNonPromotedNodeType(res: ToolResult): string | null {
+  if (!isDefinitiveNonPromotedSubgraphRead(res)) return null;
+  const match = /^Error:\s*Node\s+\S+\s+([\s\S]*?)\s+is not a subgraph\b/i.exec(
+    textOfToolResult(res),
+  );
+  if (!match) return null;
+  const type = match[1].trim();
+  if (!type.startsWith("(") || !type.endsWith(")")) return null;
+  const unwrapped = type.slice(1, -1).trim();
+  return unwrapped || null;
+}
+
+type PromotedSubgraphReadErrorKind = "definitive-ordinary" | "transient" | "permanent";
+
+/** The promoted-write refresh is deliberately narrower than the broad panel
+ * call retry classifier. Only known transport/reconnect shapes may consume the
+ * one explicit refresh; application refusals must not be replayed. */
+function classifyPromotedSubgraphReadError(res: ToolResult): PromotedSubgraphReadErrorKind {
+  if (!res.isError) return "permanent";
+  if (isDefinitiveNonPromotedSubgraphRead(res)) return "definitive-ordinary";
+  const text = textOfToolResult(res);
+  // Keep this list aligned with the bridge's established reconnect classifier.
+  // The promoted preflight opts out of the ordinary retry wrapper, so this is
+  // the one place that decides whether its explicit refresh is allowed. The
+  // panel's workflow-switch guard is a separate, known-safe pre-executor
+  // refusal: it explicitly says nothing was applied and asks for a retry.
+  if (
+    isTransientReconnectError(new Error(text)) ||
+    /(?:websocket|socket).*(?:disconnected|closed|reset)|(?:disconnected|closed|reset).*(?:websocket|socket)/i.test(
+      text,
+    ) ||
+    /\bunavailable\b/i.test(text) ||
+    isWorkflowSwitchGuardRefusal(new Error(text))
+  ) {
+    return "transient";
+  }
+  return "permanent";
 }
 
 /**
@@ -6779,16 +6847,22 @@ function resolvePromotedWriteTarget(
   return resolveLegacyInnerPromotedTarget(payload, widget, nodeId);
 }
 
+const PROMOTED_PREFLIGHT_READ_OPTIONS: PanelToolCallOptions = {
+  retry: false,
+  maxBridgeReconnectRetries: 0,
+};
+
 async function readPromotedTargetScope(
   ctx: PanelToolCtx,
   nodeId: unknown,
+  options: PanelToolCallOptions = PROMOTED_PREFLIGHT_READ_OPTIONS,
 ): Promise<QueriedNodeScope | null> {
   const probe = await ctx.call({
     cmd: "graph_query",
     ids: [nodeId],
     fields: "detail",
     limit: 1,
-  });
+  }, undefined, undefined, undefined, options);
   if (probe.isError) return null;
   return parseVerifiedQueriedNodeScope(parseToolResultJson(probe), nodeId);
 }
@@ -7094,7 +7168,11 @@ async function preparePromotedWidgetWrite(
   // promoted-container classifier to resolve a target that is intentionally
   // absent. An unreadable scope probe is not permission for an outer write;
   // it falls through to the existing conservative graph_get_subgraph path.
-  const targetScope = await readPromotedTargetScope(ctx, nodeId);
+  const targetScope = await readPromotedTargetScope(
+    ctx,
+    nodeId,
+    PROMOTED_PREFLIGHT_READ_OPTIONS,
+  );
   if (targetScope?.activeView === "root" && targetScope.node === "ordinary") {
     // The scope probe crossed an await. Re-read the binding before taking the
     // ordinary fast path; otherwise a tab/connection rebind can make this
@@ -7104,18 +7182,100 @@ async function preparePromotedWidgetWrite(
     return null;
   }
 
-  const sub = await ctx.call({ cmd: "graph_get_subgraph", node_id: nodeId });
+  let sub = await ctx.call(
+    { cmd: "graph_get_subgraph", node_id: nodeId },
+    undefined,
+    undefined,
+    undefined,
+    PROMOTED_PREFLIGHT_READ_OPTIONS,
+  );
   if (sub.isError) {
-    if (isDefinitiveNonPromotedSubgraphRead(sub)) {
+    const firstReadKind = classifyPromotedSubgraphReadError(sub);
+    if (firstReadKind === "definitive-ordinary") {
       const drift2 = panelBindingDriftReason(ctx, "after the subgraph read", hasIdentityApi, identityBefore, tabBefore);
       if (drift2) return promotedWriteRefusal(widget, drift2);
       return null;
     }
-    return promotedSubgraphReadRefusal(
-      widget,
-      sub,
-      "graph_get_subgraph could not determine whether the addressed node is a promoted container",
+    // A canvas/root divergence is a panel diagnosis with its own remedy, not a
+    // transient ownership read. Preserve that diagnosis instead of replacing it
+    // with a generic retry result (panel#1869).
+    if (textOfToolResult(sub).includes(CANVAS_ROOT_DIVERGENCE_MARKER)) {
+      return promotedSubgraphReadRefusal(
+        widget,
+        sub,
+        "graph_get_subgraph could not determine whether the addressed node is a promoted container",
+      );
+    }
+    if (firstReadKind === "permanent") {
+      return promotedSubgraphReadRefusal(
+        widget,
+        sub,
+        "graph_get_subgraph could not determine whether the addressed node is a promoted container",
+      );
+    }
+    // A binding/subgraph registration transition can make the first read
+    // indeterminate even though the same live container is readable immediately
+    // afterward. Refresh once, then keep the existing fail-closed classification
+    // and identity checks for the fresh reply.
+    const refreshedSub = await ctx.call(
+      { cmd: "graph_get_subgraph", node_id: nodeId },
+      undefined,
+      undefined,
+      undefined,
+      PROMOTED_PREFLIGHT_READ_OPTIONS,
     );
+    if (refreshedSub.isError) {
+      const refreshedReadKind = classifyPromotedSubgraphReadError(refreshedSub);
+      if (refreshedReadKind === "definitive-ordinary") {
+        const driftAfterRefresh = panelBindingDriftReason(
+          ctx,
+          "after the subgraph refresh",
+          hasIdentityApi,
+          identityBefore,
+          tabBefore,
+        );
+        if (driftAfterRefresh) return promotedWriteRefusal(widget, driftAfterRefresh);
+        const expectedNodeType = definitiveNonPromotedNodeType(refreshedSub);
+        if (!expectedNodeType) {
+          return promotedWriteRefusal(
+            widget,
+            "the definitive ordinary refresh did not publish a node type fence",
+          );
+        }
+        const expectedNodeIdentity = targetScope?.nodeIdentity;
+        if (!expectedNodeIdentity) {
+          return promotedWriteRefusal(
+            widget,
+            "the preflight ordinary-node read did not publish a trustworthy node identity fence",
+          );
+        }
+        if (ctx.tabExpectedNodeTypeFenceCapability?.() !== true) {
+          return promotedPanelBuildRefusal(
+            ctx,
+            nodeId,
+            widget,
+            "does not advertise the atomic ordinary-node write fence",
+            "enforces_expected_node_type_at_write",
+          );
+        }
+        if (ctx.tabExpectedNodeIdentityFenceCapability?.() !== true) {
+          return promotedPanelBuildRefusal(
+            ctx,
+            nodeId,
+            widget,
+            "does not advertise the atomic ordinary-node identity write fence",
+            "enforces_expected_node_identity_at_write",
+          );
+        }
+        return { kind: "ordinary-write", expectedNodeType, expectedNodeIdentity };
+      }
+      return promotedSubgraphReadRefusal(
+        widget,
+        refreshedSub,
+        "graph_get_subgraph could not determine whether the addressed node is a promoted container",
+      );
+    }
+    sub = refreshedSub;
   }
   let payload = parseToolResultJson(sub);
   if (!payload || !promotedEnvelopeCarriesEvidence(payload)) {
@@ -7288,6 +7448,28 @@ async function preparePromotedWidgetWrite(
     const terminalBlocked = refuseKnownBadPromotedTerminal(inner.terminal);
     if (terminalBlocked) return terminalBlocked;
   }
+  // A current receiver that publishes the complete promoted-terminal witness also
+  // publishes the immediate inner node's opaque incarnation identity. Carry it
+  // through the enter/recheck/write sequence so same-id, same-type replacement
+  // cannot satisfy the inner write fence. Older receivers retain the legacy
+  // omission when this capability is not advertised.
+  if (ctx.tabPromotedTerminalWitnessCapability?.() === true) {
+    if (ctx.tabExpectedNodeIdentityFenceCapability?.() !== true) {
+      return promotedPanelBuildRefusal(
+        ctx,
+        nodeId,
+        widget,
+        "does not advertise the atomic inner-node identity write fence",
+        "enforces_expected_node_identity_at_write",
+      );
+    }
+    if (!inner.nodeIdentity) {
+      return promotedWriteRefusal(
+        widget,
+        "the current receiver did not publish a trustworthy immediate inner-node identity fence",
+      );
+    }
+  }
   // panel#1859 — these three are capability skew, exactly like the missing
   // graph identity above: the hello either advertises the fence or it does not,
   // and a caller cannot change that by trying again.
@@ -7331,6 +7513,7 @@ type PromotedMappingProof = {
   inner: {
     innerNodeId: number | string;
     widget: string;
+    nodeIdentity?: string;
     parentRail?: PromotedParentRailWitness;
   };
   innerNodeType: string;
@@ -7348,6 +7531,7 @@ async function recheckPromotedOuterMapping(
   expectedInner: {
     innerNodeId: number | string;
     widget: string;
+    nodeIdentity?: string;
     parentRail?: PromotedParentRailWitness;
   },
   expectedScope: PromotedScopeWitness,
@@ -7392,6 +7576,7 @@ async function recheckPromotedOuterMapping(
     !inner ||
     canonicalQueriedNodeId(inner.innerNodeId) !== canonicalQueriedNodeId(expectedInner.innerNodeId) ||
     inner.widget !== expectedInner.widget ||
+    (expectedInner.nodeIdentity !== undefined && inner.nodeIdentity !== expectedInner.nodeIdentity) ||
     !samePromotedParentRail(inner.parentRail, expectedInner.parentRail) ||
     !samePromotedTerminal(inner.terminal, expectedTerminal)
   ) {
@@ -7431,6 +7616,7 @@ async function recheckPromotedInnerTarget(
   expectedInner: {
     innerNodeId: number | string;
     widget: string;
+    nodeIdentity?: string;
     parentRail?: PromotedParentRailWitness;
   },
   expectedNodeType: string,
@@ -7443,6 +7629,7 @@ async function recheckPromotedInnerTarget(
     ids: [expectedInner.innerNodeId],
     fields: "compact",
     limit: 1,
+    max_chars: PROMOTED_IDENTITY_PROBE_MAX_CHARS,
   });
   if (probe.isError) {
     return promotedWriteRefusal(
@@ -7463,7 +7650,8 @@ async function recheckPromotedInnerTarget(
     !identity ||
     !expectedId ||
     identity.id !== expectedId ||
-    identity.type !== expectedNodeType
+    identity.type !== expectedNodeType ||
+    (expectedInner.nodeIdentity !== undefined && identity.nodeIdentity !== expectedInner.nodeIdentity)
   ) {
     return promotedWriteRefusal(
       widget,
@@ -7505,9 +7693,23 @@ async function recheckPromotedInnerTarget(
         "the nested promoted terminal mapping changed or became unverifiable after entering",
       );
     }
-    return { inner: expectedInner, innerNodeType: identity.type, terminal: expectedTerminal };
+    return {
+      inner: {
+        ...expectedInner,
+        ...(identity.nodeIdentity !== undefined ? { nodeIdentity: identity.nodeIdentity } : {}),
+      },
+      innerNodeType: identity.type,
+      terminal: expectedTerminal,
+    };
   }
-  return { inner: expectedInner, innerNodeType: identity.type, ...(expectedTerminal ? { terminal: expectedTerminal } : {}) };
+  return {
+    inner: {
+      ...expectedInner,
+      ...(identity.nodeIdentity !== undefined ? { nodeIdentity: identity.nodeIdentity } : {}),
+    },
+    innerNodeType: identity.type,
+    ...(expectedTerminal ? { terminal: expectedTerminal } : {}),
+  };
 }
 
 function daSiWaStackRefusal(type: string): ToolResult {
@@ -7585,6 +7787,7 @@ async function refuseDaSiWaStackWrite(
       ids: [nodeId],
       fields: "compact",
       limit: 1,
+      max_chars: PROMOTED_IDENTITY_PROBE_MAX_CHARS,
     });
   } catch {
     return daSiWaIdentityRefusal("the graph_query probe failed before identity could be verified");
@@ -7658,6 +7861,7 @@ async function verifyDaSiWaStackWriteFence(
       ids: [nodeId],
       fields: "compact",
       limit: 1,
+      max_chars: PROMOTED_IDENTITY_PROBE_MAX_CHARS,
     });
   } catch {
     return daSiWaIdentityRefusal("the final graph_query fence failed before dispatch");
@@ -13575,6 +13779,7 @@ interface BridgeProbe {
   readPromotedScope?: (tabId: string, innerNodeId: number | string) => Promise<TabPromotedScopeRead>;
   tabPromotedTerminalWitnessCapability?: (tabId: string) => boolean;
   tabPromotedParentRailFenceCapability?: (tabId: string) => boolean;
+  tabExpectedNodeIdentityFenceCapability?: (tabId: string) => boolean;
   lastFenceRefusal?: (tabId: string) => string | undefined;
   isHeadless?: (tabId: string) => boolean;
   canReach?: (tabId: string) => boolean;
@@ -13593,6 +13798,13 @@ export interface ExplicitCurrentRebindProof {
   savedIdentity: string;
 }
 
+export interface PanelToolCallOptions {
+  /** Disable the orchestrator's post-transport retry for a one-shot probe. */
+  retry?: boolean;
+  /** Limit UiBridge reconnect resumption for this call. */
+  maxBridgeReconnectRetries?: number;
+}
+
 export interface PanelToolCtx {
   /** Forward a command to the panel and wrap the reply as a tool result. An
    *  optional observer receives the bridge request id after the frame is written,
@@ -13605,6 +13817,7 @@ export interface PanelToolCtx {
     timeoutMs?: number,
     onDispatchedRid?: (rid: string) => void,
     beforeDispatch?: () => void,
+    options?: PanelToolCallOptions,
   ) => Promise<ToolResult>;
   /** Human-in-the-loop yes/no confirm card. Tri-state (#360): "yes" on an explicit
    *  affirmative, "no" on a decline / no-panel / transport error, "timeout" when the
@@ -13723,6 +13936,11 @@ export interface PanelToolCtx {
    * expected_node_type at the synchronous mutation boundary. Real contexts
    * provide this; omitted/false is a fail-closed answer for #2107. */
   tabExpectedNodeTypeFenceCapability?: () => boolean;
+  /** Whether the currently bound panel enforces the opaque node-incarnation
+   * expected_node_identity at the synchronous mutation boundary. Real contexts
+   * provide this; omitted/false is a fail-closed answer for the transient
+   * ordinary-node recovery path. */
+  tabExpectedNodeIdentityFenceCapability?: () => boolean;
   /** Whether the currently bound panel enforces the stable graph identity in
    * expected_scope at the synchronous mutation boundary. Real contexts provide
    * this; omitted/false is a fail-closed answer for promoted writes (#2314 P1). */
@@ -14046,6 +14264,7 @@ export function makePanelToolCtx(
     timeoutMs?: number,
     onDispatchedRid?: (rid: string) => void,
     beforeDispatch?: () => void,
+    options?: PanelToolCallOptions,
   ): Promise<unknown> => {
     const target = workflowTargets?.get(ctx.tabId);
     const routed = target ? withWorkflowTarget(cmd, target) : cmd;
@@ -14054,6 +14273,7 @@ export function makePanelToolCtx(
       timeoutMs,
       onDispatchedRid,
       beforeDispatch,
+      maxReconnectRetries: options?.maxBridgeReconnectRetries,
     });
   };
 
@@ -14069,6 +14289,7 @@ export function makePanelToolCtx(
     // fourteenth is added, and the fact being carried belongs to the ERROR rather
     // than to any one of those wordings.
     onFailure?: (err: unknown) => void,
+    options?: PanelToolCallOptions,
   ): Promise<ToolResult> => {
     // #694: capture the rid of THIS call's dispatched attempt so an OUTCOME-UNKNOWN
     // mutating failure can name it as the caller's explicit retry token (see the
@@ -14106,7 +14327,7 @@ export function makePanelToolCtx(
       // The bridge owns the graph lane and re-resolves the live connection after
       // waiting. Pass the fence through so it runs at the actual socket dispatch,
       // not before that retarget window.
-      const firstTry = ok(await sendRouted(cmd, timeoutMs, observeRid, beforeDispatch));
+      const firstTry = ok(await sendRouted(cmd, timeoutMs, observeRid, beforeDispatch, options));
       // panel#1097 — a guard-domain command that SUCCEEDS is the evidence that the
       // switch is over, whichever attempt lands it. Without this an ordinary
       // first-attempt success left the old run in place, and a later unrelated
@@ -14142,11 +14363,12 @@ export function makePanelToolCtx(
       const workerTransportRetry =
         isWorkerTransportSendError(err) && isWorkerTransportRetrySafeCmd(cmd);
       if (
-        preExecutorRefusal ||
+        options?.retry !== false &&
+        (preExecutorRefusal ||
         (isRetrySafeCmd(cmd) &&
           (isTransientReconnectError(err) ||
             isWorkflowSwitchGuardRefusal(err) ||
-            workerTransportRetry))
+            workerTransportRetry)))
       ) {
         // panel#1097 — declared out here so the refusal branch below can see it,
         // and REASSIGNED after ensureReachable so it names the tab the command is
@@ -14190,7 +14412,9 @@ export function makePanelToolCtx(
           await awaitReachable();
           ensureReachable(); // rebinds a current-mode session onto the reconnected tab
           holdTab = ctx.tabId;
-          const retried = ok(await sendRouted(cmd, timeoutMs, observeRid, beforeDispatch));
+          const retried = ok(
+            await sendRouted(cmd, timeoutMs, observeRid, beforeDispatch, options),
+          );
           // Cleared HERE and nowhere else, and only when the failure this retried
           // was a SWITCH refusal. Clearing on every routed success let an unguarded
           // status read wipe the evidence while graph commands stayed refused
@@ -15023,11 +15247,19 @@ export function makePanelToolCtx(
     timeoutMs?: number,
     onDispatchedRid?: (rid: string) => void,
     beforeDispatch?: () => void,
+    options?: PanelToolCallOptions,
   ): Promise<ToolResult> => {
     let failure: unknown;
-    const res = await callOnce(cmd, timeoutMs, onDispatchedRid, beforeDispatch, (err) => {
-      failure = err;
-    });
+    const res = await callOnce(
+      cmd,
+      timeoutMs,
+      onDispatchedRid,
+      beforeDispatch,
+      (err) => {
+        failure = err;
+      },
+      options,
+    );
     return carryWorkflowListReadinessMark(
       failure,
       carryMidCommandDisconnectMark(failure, carryPanelAnsweredMark(failure, res)),
@@ -15225,6 +15457,9 @@ export function makePanelToolCtx(
   ctx.tabCanMutateGraph = () => bridge.tabCanMutateGraph(ctx.tabId);
   ctx.tabExpectedNodeTypeFenceCapability = () =>
     bridge.tabExpectedNodeTypeFenceCapability(ctx.tabId);
+  ctx.tabExpectedNodeIdentityFenceCapability = () =>
+    typeof bridge.tabExpectedNodeIdentityFenceCapability === "function" &&
+    bridge.tabExpectedNodeIdentityFenceCapability(ctx.tabId);
   ctx.tabExpectedScopeGraphIdentityFenceCapability = () =>
     bridge.tabExpectedScopeGraphIdentityFenceCapability(ctx.tabId);
   ctx.tabPromotedTerminalWitnessCapability = () =>
@@ -18346,9 +18581,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         const promotedPlan = promotedPreflight && promotedPreflight.kind === "promoted-write"
           ? promotedPreflight
           : null;
+        const ordinaryPlan = promotedPreflight && promotedPreflight.kind === "ordinary-write"
+          ? promotedPreflight
+          : null;
 
-        let expectedNodeType: string | undefined;
-        if (!promotedPlan && args.widget === DASIWA_STACK_WIDGET) {
+        let expectedNodeType: string | undefined = ordinaryPlan?.expectedNodeType;
+        let expectedNodeIdentity: string | undefined = ordinaryPlan?.expectedNodeIdentity;
+        if (!promotedPlan && !ordinaryPlan && args.widget === DASIWA_STACK_WIDGET) {
           const daSiWaFence = await verifyDaSiWaStackWriteFence(ctx, args.node_id);
           if (daSiWaFence && "content" in daSiWaFence) return daSiWaFence;
           expectedNodeType = daSiWaFence?.expectedNodeType;
@@ -18371,6 +18610,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           targetExpectedNodeType: string | undefined = expectedNodeType,
           beforeDispatch?: () => void,
           targetExpectedScope?: PromotedExpectedScope,
+          targetExpectedNodeIdentity: string | undefined = expectedNodeIdentity,
         ): Promise<ToolResult> =>
           stripVerifiedLastObservedSchemaNote(
             summarizeSetWidgetEcho(
@@ -18386,6 +18626,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                   // and supplies that node's own type.
                   ...(targetExpectedNodeType
                     ? { expected_node_type: targetExpectedNodeType }
+                    : {}),
+                  ...(targetExpectedNodeIdentity
+                    ? { expected_node_identity: targetExpectedNodeIdentity }
                     : {}),
                   ...(targetExpectedScope
                     ? {
@@ -18446,6 +18689,16 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           }
           const blocked = await refuseKnownBadWriteBeforeDispatch(ctx, nodeId, widget);
           if (blocked) return blocked;
+          if (promotedRetry && promotedRetry.kind === "ordinary-write") {
+            return write(
+              nodeId,
+              widget,
+              promotedRetry.expectedNodeType,
+              undefined,
+              undefined,
+              promotedRetry.expectedNodeIdentity,
+            );
+          }
           return write(nodeId, widget, targetExpectedNodeType);
         };
 
@@ -18643,6 +18896,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 parentRail: plan.inner.parentRail,
                 ...(plan.terminal ? { terminal: plan.terminal } : {}),
               },
+              ctx.tabExpectedNodeIdentityFenceCapability?.() === true
+                ? afterEnterMapping.inner.nodeIdentity ?? plan.inner.nodeIdentity
+                : undefined,
             );
             const exited = await leave();
             if (written.isError) {
@@ -19086,7 +19342,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // reject a valid inner node, while omitting a fence would let a same-
           // type replacement mutate a detached object and report false success.
           const innerProbe = await ctx.call(
-            { cmd: "graph_query", ids: [inner.innerNodeId], fields: "compact", limit: 1 },
+            {
+              cmd: "graph_query",
+              ids: [inner.innerNodeId],
+              fields: "compact",
+              limit: 1,
+              max_chars: PROMOTED_IDENTITY_PROBE_MAX_CHARS,
+            },
             OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
           );
           const innerIdentity = innerProbe.isError
@@ -19290,6 +19552,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           recoveryBeforeDispatch,
           recoveryScope
             ? { ...recoveryScope, ...(inner.terminal ? { terminal: inner.terminal } : {}) }
+            : undefined,
+          ctx.tabExpectedNodeIdentityFenceCapability?.() === true
+            ? legacyFinalMapping.inner.nodeIdentity ?? inner.nodeIdentity
             : undefined,
         );
         const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
