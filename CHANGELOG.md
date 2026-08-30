@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### MCP
+
+#### Fixed
+- fall back to ComfyUI-Manager for install_custom_node action:"list" when the local comfy-cli version is unrecognized (#2603)
+
 ## [0.52.153] - 2026-08-30
 
 ### MCP
