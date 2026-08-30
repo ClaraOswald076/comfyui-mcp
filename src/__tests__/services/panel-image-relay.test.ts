@@ -789,9 +789,13 @@ describe("authenticated loopback panel image relay", () => {
       resolvePanelTab: () => "panel-tab",
       bridge: {
         canReach: () => true,
-        send: async (command) => command.operation === "object_info"
-          ? { operation: "object_info", body, contentType: "application/json", bytes: Buffer.byteLength(body, "utf8") }
-          : { operation: "history", body: "{}", contentType: "application/json", bytes: 2 },
+        send: async (command) => {
+          if (command.operation === "object_info") {
+            await new Promise((resolve) => setTimeout(resolve, 8_050));
+            return { operation: "object_info", body, contentType: "application/json", bytes: Buffer.byteLength(body, "utf8") };
+          }
+          return { operation: "history", body: "{}", contentType: "application/json", bytes: 2 };
+        },
       },
     });
     try {
