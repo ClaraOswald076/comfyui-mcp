@@ -323,44 +323,46 @@ export const MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS = "0.11.4";
  *  graph_outline has existed since panel 0.4.6, so a "too old — update to ≥0.11.4"
  *  verdict for it is a false, inflated requirement (#352). Anything not listed
  *  falls back to MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS (the full-set baseline). */
-export const BRIDGE_CMD_MIN_PANEL_VERSION: Readonly<Record<string, string>> = {
-  graph_outline: "0.4.6",
-  graph_find_nodes: "0.4.6",
-  graph_query: "0.7.0",
-  graph_serialize: "0.8.2",
-  // #1006 — the panel serving its OWN /object_info first shipped in panel 0.13.0. An
-  // AUTHORITATIVE entry, because without one the command falls back to the bridge
-  // baseline and an older panel answers the raw dispatch error `Unknown command
-  // "graph_get_object_info"`, which reads like a broken ComfyUI rather than an old panel.
-  //
-  // Established from the release commit, not from tags: this repo does not tag its
-  // releases (`git tag --contains` finds nothing), so ancestry would have pointed at the
-  // first tag that happens to exist and named a version four releases too late.
-  graph_get_object_info: "0.13.0",
-  // #608 forced-refresh executor shipped in panel 0.11.28. Older panels (e.g. the
-  // 0.11.20 in #619) register no `refresh_nodes` handler and reply with the raw
-  // dispatch error `Unknown command "refresh_nodes"`. Without this AUTHORITATIVE
-  // entry the command falls back to the 0.11.4 baseline, which a 0.11.20 panel
-  // already exceeds — so makeUnknownCommandError's false-negative guard mistook it
-  // for "new enough" and leaked the opaque raw error instead of an actionable
-  // "update your panel to ≥0.11.28" verdict. Listing it here also lets the #392
-  // PROACTIVE gate reject the very first call on a <0.11.28 panel before dispatch.
-  refresh_nodes: "0.11.28",
-  // #619 recurrence — panel_resize_node's bridge executor shipped in panel 0.11.25
-  // (panel CHANGELOG: "panel_resize_node resizes a node on the live canvas", #530).
-  // The reporter's 0.11.21 panel predates it, but untabled the command inherited the
-  // 0.11.4 baseline, producing the self-contradictory verdict `too old for
-  // "graph_resize_node" (detected 0.11.21) — update … to ≥0.11.4`. Tabled, it quotes
-  // the true minimum and the #392 proactive gate rejects the first call pre-dispatch.
-  graph_resize_node: "0.11.25",
-  // #1400 — the panel serving its frontend's VIRTUAL-type registry ships in the
-  // panel release carrying the `graph_get_virtual_types` executor. The entry is
-  // deliberately on the LOW side of whatever that release turns out to be: the
-  // only caller (the orchestrator's hello-time pull) degrades silently on an
-  // unknown-command reply, so a too-low floor can never produce a wrong verdict —
-  // it just lets an old panel answer "Unknown command", which the pull swallows.
-  graph_get_virtual_types: "0.15.11",
-};
+export const BRIDGE_CMD_MIN_PANEL_VERSION: Readonly<Record<string, string>> = Object.freeze(
+  Object.assign(Object.create(null) as Record<string, string>, {
+    graph_outline: "0.4.6",
+    graph_find_nodes: "0.4.6",
+    graph_query: "0.7.0",
+    graph_serialize: "0.8.2",
+    // #1006 — the panel serving its OWN /object_info first shipped in panel 0.13.0. An
+    // AUTHORITATIVE entry, because without one the command falls back to the bridge
+    // baseline and an older panel answers the raw dispatch error `Unknown command
+    // "graph_get_object_info"`, which reads like a broken ComfyUI rather than an old panel.
+    //
+    // Established from the release commit, not from tags: this repo does not tag its
+    // releases (`git tag --contains` finds nothing), so ancestry would have pointed at the
+    // first tag that happens to exist and named a version four releases too late.
+    graph_get_object_info: "0.13.0",
+    // #608 forced-refresh executor shipped in panel 0.11.28. Older panels (e.g. the
+    // 0.11.20 in #619) register no `refresh_nodes` handler and reply with the raw
+    // dispatch error `Unknown command "refresh_nodes"`. Without this AUTHORITATIVE
+    // entry the command falls back to the 0.11.4 baseline, which a 0.11.20 panel
+    // already exceeds — so makeUnknownCommandError's false-negative guard mistook it
+    // for "new enough" and leaked the opaque raw error instead of an actionable
+    // "update your panel to ≥0.11.28" verdict. Listing it here also lets the #392
+    // PROACTIVE gate reject the very first call on a <0.11.28 panel before dispatch.
+    refresh_nodes: "0.11.28",
+    // #619 recurrence — panel_resize_node's bridge executor shipped in panel 0.11.25
+    // (panel CHANGELOG: "panel_resize_node resizes a node on the live canvas", #530).
+    // The reporter's 0.11.21 panel predates it, but untabled the command inherited the
+    // 0.11.4 baseline, producing the self-contradictory verdict `too old for
+    // "graph_resize_node" (detected 0.11.21) — update … to ≥0.11.4`. Tabled, it quotes
+    // the true minimum and the #392 proactive gate rejects the first call pre-dispatch.
+    graph_resize_node: "0.11.25",
+    // #1400 — the panel serving its frontend's VIRTUAL-type registry ships in the
+    // panel release carrying the `graph_get_virtual_types` executor. The entry is
+    // deliberately on the LOW side of whatever that release turns out to be: the
+    // only caller (the orchestrator's hello-time pull) degrades silently on an
+    // unknown-command reply, so a too-low floor can never produce a wrong verdict —
+    // it just lets an old panel answer "Unknown command", which the pull swallows.
+    graph_get_virtual_types: "0.15.11",
+  }),
+);
 
 /**
  * The panel version each non-command bridge capability was ACTUALLY introduced
