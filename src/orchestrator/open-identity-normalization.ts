@@ -507,15 +507,18 @@ export function openLiveMatchesDestContent(live: unknown, dest: unknown): boolea
 }
 
 /**
- * #2501 — dest vs live after reconnect, once identity and node id/type/link
- * topology already agree. The panel's post-restart serialize fills
- * inputs/outputs/properties and rewrites widgets_values / widgets_values_named
- * (envelopes, extra default slots, named-vs-positional). Those frontend-derived
- * bags are not a failed load.
+ * #2501 / #2494 — dest vs live after reconnect or an already-open tab switch,
+ * once identity and node id/type/link topology already agree. The panel's
+ * serialize fills inputs/outputs/properties and rewrites widgets_values /
+ * widgets_values_named (envelopes, extra default slots, named-vs-positional,
+ * ue_properties). Those frontend-derived bags are not a failed load.
  *
  * Additive to {@link openLiveMatchesDestContent}: named-first dest bags still
- * fail that matcher when live only holds positional/envelope widgets. Fail closed
- * on a missing node, a rewired link, or a dest widget value live does not hold.
+ * fail that matcher when live only holds positional/envelope widgets. A live
+ * serialize of an already-open tab can omit nested definitions while the root
+ * node set still matches — recurse only when the inner graph is present (#2494).
+ * Fail closed on a missing node, a rewired link, or a dest widget value live
+ * does not hold.
  */
 type FrontendWidgetAtom = string | number | boolean | null;
 type FrontendWidgetValue =
@@ -632,7 +635,10 @@ export function openLiveMatchesDestAfterReconnect(live: unknown, dest: unknown):
   if (!destSgs || !liveSgs) return false;
   for (const [id, destSg] of destSgs) {
     const liveSg = liveSgs.get(id);
-    if (!liveSg) return false;
+    // Live serialize of an already-open tab can omit nested definitions while
+    // the root node set still matches. Recurse only when the inner graph is
+    // actually present to compare (#2494).
+    if (!liveSg) continue;
     if (!openLiveMatchesDestAfterReconnect(liveSg, destSg)) return false;
   }
   return true;
