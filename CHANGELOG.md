@@ -6,13 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### MCP
+
+#### Fixed
+- drain an empty-success Git install enqueue before using the verified local clone fallback (#2620)
+
 ## [0.52.155] - 2026-08-30
 
 ### MCP
 
 #### Fixed
 - models_show local fallback does not report an arbitrary duplicate basename as the installed model (#2504, #2614)
-
 
 ## [0.52.154] - 2026-08-30
 
@@ -24,7 +28,6 @@ All notable changes to this project are documented here. This project adheres to
 - list_local_models reads inventory through the connected panel when the headless /models route is unreachable (#2511)
 - install_custom_node action:"fix" does not report repaired when Manager's task result is not-found/error (#2490)
 - panel_load_workflow restamps extra.comfyui_mcp.workflow_path (and uuid) to the active tab so an in-place save is not refused as belonging to the source workflow (#2505)
-- drain an empty-success Git install enqueue before using the verified local clone fallback (#2620)
 - fall back to ComfyUI-Manager for install_custom_node action:"list" when the local comfy-cli version is unrecognized (#2603)
 - fence ordinary `panel_set_widget` writes against the current panel graph identity across reconnects, with an actionable rebind refusal (#2550)
 - clear terminal MCP panel refresh coordination state and reclaim only bounded, stale refresh records while keeping unknown completion fail-closed (#2549)
