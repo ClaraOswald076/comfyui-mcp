@@ -3605,12 +3605,23 @@ describe("panel_set_widget promoted inner identity forwarding (#2478)", () => {
       },
     ],
   });
-  const innerDetail = (nodeIdentity: unknown) => ({
+  // This is the actual one-ID compact graph_query envelope emitted by the
+  // Panel: the human-readable compact line is accompanied by the bounded,
+  // identity-bearing structured witness. Keep the response shape here in sync
+  // with browser_tests/unit/graph-query-detail-budget.test.mjs so this test
+  // exercises the producer/consumer contract rather than a bare nodes array.
+  const innerCompactResponse = (nodeIdentity: unknown) => ({
+    truncated: false,
+    truncated_by: null,
+    text:
+      "1 match(es) of 1 in scope (viewing: 2 nodes)\n" +
+      "#76 PrimitiveStringMultiline · quality_prompt=new",
     nodes: [
       {
         id: 76,
         type: "PrimitiveStringMultiline",
         node_identity: nodeIdentity,
+        is_subgraph: false,
       },
     ],
   });
@@ -3622,13 +3633,20 @@ describe("panel_set_widget promoted inner identity forwarding (#2478)", () => {
         firstWrite: "ok",
         promotedTerminalWitnesses: true,
         subgraph: currentEnvelope(originalIdentity),
-        postEnterGraphQueryById: { "76": innerDetail(originalIdentity) },
+        postEnterGraphQueryById: { "76": innerCompactResponse(originalIdentity) },
       },
     );
 
     expect(isError).toBe(false);
     expect(text).toMatch(/applied|quality_prompt/);
     expect(mutations).toBe(1);
+    expect(calls.filter((call) => call.cmd === "graph_query" && call.ids?.[0] === 76)).toContainEqual(
+      expect.objectContaining({
+        fields: "compact",
+        limit: 1,
+        max_chars: 2048,
+      }),
+    );
     expect(calls.filter((call) => call.cmd === "graph_set_widget")).toEqual([
       expect.objectContaining({
         node_id: 76,
@@ -3638,6 +3656,27 @@ describe("panel_set_widget promoted inner identity forwarding (#2478)", () => {
     ]);
   });
 
+  it("refuses a legacy compact text row that omits the current node identity", async () => {
+    const { text, isError, calls, mutations } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "new" },
+      {
+        firstWrite: "ok",
+        promotedTerminalWitnesses: true,
+        subgraph: currentEnvelope(originalIdentity),
+        postEnterGraphQueryById: {
+          "76": {
+            text: "1 match(es) of 1 in scope (viewing: 1 nodes)\n#76 PrimitiveStringMultiline",
+          },
+        },
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/identity|changed or became unverifiable/);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
+    expect(mutations).toBe(0);
+  });
+
   it("refuses a same-ID same-type inner replacement before dispatch", async () => {
     const { text, isError, calls, mutations } = await setWidget(
       { node_id: 78, widget: "quality_prompt", value: "new" },
@@ -3645,7 +3684,7 @@ describe("panel_set_widget promoted inner identity forwarding (#2478)", () => {
         firstWrite: "ok",
         promotedTerminalWitnesses: true,
         subgraph: currentEnvelope(originalIdentity),
-        postEnterGraphQueryById: { "76": innerDetail(replacementIdentity) },
+        postEnterGraphQueryById: { "76": innerCompactResponse(replacementIdentity) },
       },
     );
 

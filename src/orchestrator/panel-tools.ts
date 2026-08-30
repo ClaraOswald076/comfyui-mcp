@@ -6285,6 +6285,11 @@ const DYNAMIC_COMBO_REFUSED_CHILD_TYPE = "STRING";
  *  The node most likely to overflow that budget is the node already holding a long
  *  prompt, i.e. exactly the #2299 report ("<any long prompt>"). */
 const DYNAMIC_COMBO_PROBE_MAX_CHARS = 60000;
+// #2478 — the Panel's one-ID compact projection carries a minimal structured
+// node witness, including its opaque incarnation identity. Keep every strict
+// identity probe below the graph_query floor's bounded budget; broad/detail
+// reads retain their existing budgets and semantics.
+const PROMOTED_IDENTITY_PROBE_MAX_CHARS = 2048;
 
 function dynamicComboSubWidgetRefusal(
   nodeType: string,
@@ -7624,6 +7629,7 @@ async function recheckPromotedInnerTarget(
     ids: [expectedInner.innerNodeId],
     fields: "compact",
     limit: 1,
+    max_chars: PROMOTED_IDENTITY_PROBE_MAX_CHARS,
   });
   if (probe.isError) {
     return promotedWriteRefusal(
@@ -7781,6 +7787,7 @@ async function refuseDaSiWaStackWrite(
       ids: [nodeId],
       fields: "compact",
       limit: 1,
+      max_chars: PROMOTED_IDENTITY_PROBE_MAX_CHARS,
     });
   } catch {
     return daSiWaIdentityRefusal("the graph_query probe failed before identity could be verified");
@@ -7854,6 +7861,7 @@ async function verifyDaSiWaStackWriteFence(
       ids: [nodeId],
       fields: "compact",
       limit: 1,
+      max_chars: PROMOTED_IDENTITY_PROBE_MAX_CHARS,
     });
   } catch {
     return daSiWaIdentityRefusal("the final graph_query fence failed before dispatch");
@@ -19334,7 +19342,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // reject a valid inner node, while omitting a fence would let a same-
           // type replacement mutate a detached object and report false success.
           const innerProbe = await ctx.call(
-            { cmd: "graph_query", ids: [inner.innerNodeId], fields: "compact", limit: 1 },
+            {
+              cmd: "graph_query",
+              ids: [inner.innerNodeId],
+              fields: "compact",
+              limit: 1,
+              max_chars: PROMOTED_IDENTITY_PROBE_MAX_CHARS,
+            },
             OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
           );
           const innerIdentity = innerProbe.isError
