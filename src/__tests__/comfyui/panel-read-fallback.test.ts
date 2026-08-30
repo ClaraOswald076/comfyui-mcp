@@ -70,7 +70,11 @@ import {
   resetObjectInfoCache,
   resetClient,
 } from "../../comfyui/client.js";
-import { PanelComfyUIReadRelayError } from "../../services/panel-image-relay.js";
+import {
+  PanelComfyUIReadRelayError,
+  PANEL_COMFYUI_READ_MAX_BYTES,
+  PANEL_COMFYUI_READ_OBJECT_INFO_MAX_BYTES,
+} from "../../services/panel-image-relay.js";
 
 function transportFailure(): TypeError {
   return new TypeError(
@@ -135,6 +139,27 @@ describe("authenticated panel-backed ComfyUI read fallback (#2283)", () => {
     });
 
     await expect(getObjectInfo()).resolves.toEqual(JSON.parse(body));
+    expect(panelRead).toHaveBeenCalledWith("object_info");
+  });
+
+  it("parses a production-sized relayed /object_info body above the generic read cap", async () => {
+    const body = JSON.stringify({
+      KSampler: {
+        ...VALID_OBJECT_INFO.KSampler,
+        description: "x".repeat(PANEL_COMFYUI_READ_MAX_BYTES + 1),
+      },
+    });
+    expect(Buffer.byteLength(body, "utf8")).toBeGreaterThan(PANEL_COMFYUI_READ_MAX_BYTES);
+    expect(Buffer.byteLength(body, "utf8")).toBeLessThanOrEqual(PANEL_COMFYUI_READ_OBJECT_INFO_MAX_BYTES);
+    fetchApi.mockRejectedValue(transportFailure());
+    panelRead.mockResolvedValue({
+      operation: "object_info",
+      body,
+      contentType: "application/json",
+      bytes: Buffer.byteLength(body, "utf8"),
+    });
+
+    await expect(getObjectInfo()).resolves.toMatchObject({ KSampler: { name: "KSampler" } });
     expect(panelRead).toHaveBeenCalledWith("object_info");
   });
 

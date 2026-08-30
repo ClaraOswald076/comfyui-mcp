@@ -781,6 +781,7 @@ describe("authenticated loopback panel image relay", () => {
         output_node: false,
       },
     });
+    let bridgeTimeoutMs = 0;
     const server = await startPanelImageRelayServer({
       resolvePanelAgent: (value) =>
         "operation" in value && verifyPanelComfyUIReadRelayCapability(SECRET, value)
@@ -789,7 +790,8 @@ describe("authenticated loopback panel image relay", () => {
       resolvePanelTab: () => "panel-tab",
       bridge: {
         canReach: () => true,
-        send: async (command) => {
+        send: async (command, options) => {
+          bridgeTimeoutMs = options.timeoutMs;
           if (command.operation === "object_info") {
             await new Promise((resolve) => setTimeout(resolve, 8_050));
             return { operation: "object_info", body, contentType: "application/json", bytes: Buffer.byteLength(body, "utf8") };
@@ -805,6 +807,8 @@ describe("authenticated loopback panel image relay", () => {
         operation: "object_info",
         bytes: body.length,
       });
+      expect(bridgeTimeoutMs).toBeGreaterThan(PANEL_IMAGE_RELAY_TIMEOUT_MS);
+      expect(bridgeTimeoutMs).toBeLessThanOrEqual(PANEL_COMFYUI_READ_OBJECT_INFO_TIMEOUT_MS);
     } finally {
       await server.close();
     }

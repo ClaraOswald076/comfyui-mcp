@@ -946,7 +946,7 @@ export async function startPanelImageRelayServer(
                     isReadRelayRequest(request)
                       ? { cmd: "fetch_comfyui_read", operation: request.operation }
                       : { cmd: "fetch_image", filename: request.filename, subfolder: request.subfolder, type: request.type },
-                    { tabId: panelTab, timeoutMs: Math.min(PANEL_IMAGE_RELAY_TIMEOUT_MS, remainingMs) },
+                    { tabId: panelTab, timeoutMs: Math.min(requestTimeoutMs(request), remainingMs) },
                   ),
                   requestDeadline(request),
                 );

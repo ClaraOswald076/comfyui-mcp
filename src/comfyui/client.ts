@@ -31,6 +31,7 @@ import {
   PanelComfyUIReadRelayError,
   PanelImageRelayError,
   PANEL_COMFYUI_READ_MAX_BYTES,
+  PANEL_COMFYUI_READ_OBJECT_INFO_MAX_BYTES,
   requestPanelComfyUIRead,
   requestPanelImage,
   type PanelComfyUIReadSuccess,
@@ -517,7 +518,7 @@ export async function getObjectInfo(): Promise<ObjectInfo> {
           if (relayed) {
             const info = await readComfyJson<ObjectInfo>(panelReadResponse(relayed), {
               url: "/object_info",
-              maxBytes: PANEL_COMFYUI_READ_MAX_BYTES,
+              maxBytes: PANEL_COMFYUI_READ_OBJECT_INFO_MAX_BYTES,
               expectShape: looksLikeObjectInfo,
               shapeHint: "a ComfyUI /object_info node registry object",
             });
