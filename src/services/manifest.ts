@@ -1019,10 +1019,11 @@ async function resolveLocalManifestCustomNodesBase(): Promise<string | undefined
 
 /**
  * Manager can report a successful-but-empty enqueue or an empty queue/status
- * response after a warm dialect cache. Both are deliberately tagged UNKNOWN
- * by node-management: the request may already have reached the host, so no
- * caller may reissue it or authorize a local clone. Keep that meaning intact
- * when apply_manifest assembles its structured per-item result.
+ * response after a warm dialect cache. For apply_manifest, both are
+ * deliberately tagged UNKNOWN by node-management: the request may already
+ * have reached the host, so no caller may reissue it or authorize a local
+ * clone. Keep that meaning intact when apply_manifest assembles its
+ * structured per-item result.
  */
 function isUnknownManagerInstallOutcome(err: unknown): boolean {
   if (!err || typeof err !== "object") return false;
@@ -1233,6 +1234,10 @@ async function applyManifestSections(
       ...(isGitManifestSource
         ? { localCloneFallback: "verified-only" as const }
         : {}),
+      // A budget timeout may return apply_manifest while the Manager enqueue
+      // is still unresolved. Keep an empty enqueue UNKNOWN/fail-closed here
+      // so a late completion cannot authorize a background local clone.
+      ...(isGitManifestSource ? { allowEmptyV2Enqueue: false } : {}),
       managerBase,
       targetGeneration,
       localFallbackBinding: fallbackBinding,

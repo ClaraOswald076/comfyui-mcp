@@ -6,13 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### MCP
+
+#### Fixed
+- drain an empty-success Git install enqueue before using the verified local clone fallback (#2620)
+
 ## [0.52.155] - 2026-08-30
 
 ### MCP
 
 #### Fixed
 - models_show local fallback does not report an arbitrary duplicate basename as the installed model (#2504, #2614)
-
 
 ## [0.52.154] - 2026-08-30
 
