@@ -322,10 +322,11 @@ describe("get_image: each action reaches exactly one service", () => {
     });
   }
 
-  it('action:"get" forwards filename/type/subfolder and the allowMedia flag unchanged', async () => {
+  it('action:"get" forwards filename/type/subfolder and all fetch capability flags', async () => {
     await getImage()({ action: "get", filename: "p.png", type: "temp", subfolder: "sub" });
     expect(getOutputImageMock).toHaveBeenCalledWith("p.png", "temp", "sub", {
       allowMedia: true,
+      allowAttachment: true,
       // #1373 — the input dir legitimately holds workflow .json files.
       allowJson: true,
     });
@@ -338,6 +339,7 @@ describe("get_image: each action reaches exactly one service", () => {
     await getImage()({ action: "get", filename: "p.png" });
     expect(getOutputImageMock).toHaveBeenCalledWith("p.png", "output", "", {
       allowMedia: true,
+      allowAttachment: true,
       allowJson: true,
     });
   });
@@ -642,6 +644,7 @@ describe("guards test ABSENCE, never falsiness", () => {
     await getImage()({ action: "get", filename: "" });
     expect(getOutputImageMock).toHaveBeenCalledWith("", "output", "", {
       allowMedia: true,
+      allowAttachment: true,
       allowJson: true,
     });
   });

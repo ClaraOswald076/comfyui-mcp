@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { join, resolve } from "node:path";
 
 const mocks = vi.hoisted(() => ({
   fetchImage: vi.fn(),
@@ -58,8 +59,8 @@ beforeEach(() => {
   mocks.writeFile.mockResolvedValue(undefined);
 });
 
-describe("get_image action:get — existing OBJ attachments (#2608)", () => {
-  it("does not mistake an existing OBJ attachment for a missing file or save it", async () => {
+describe("get_image action:get — existing OBJ attachments (#2540)", () => {
+  it("saves an existing OBJ attachment instead of mistaking it for a missing file", async () => {
     const out = await getHandler("get_image")({
       action: "get",
       filename: "mesh.obj",
@@ -67,17 +68,17 @@ describe("get_image action:get — existing OBJ attachments (#2608)", () => {
       save_dir: "test-fixtures/saved-obj",
     });
 
-    expect(out.isError).toBe(true);
-    const payload = JSON.parse(out.content.map((block) => block.text ?? "").join("")) as {
-      error?: string;
-      message?: string;
-    };
-    expect(payload.error).toBe("ATTACHMENT_TYPE_UNSUPPORTED");
-    expect(payload.message).toContain("existing OBJ attachment");
-    expect(payload.message).toContain("get_image cannot save this type");
-    expect(payload.message).not.toContain("may not exist");
+    expect(out.isError).toBeUndefined();
+    const text = out.content.map((block) => block.text ?? "").join("");
+    expect(text).toContain("Saved to:");
+    expect(text).toContain("mesh.obj");
+    expect(text).toContain("application/octet-stream");
     expect(mocks.fetchImage).toHaveBeenCalledWith("mesh.obj", "output", "");
-    expect(mocks.mkdir).not.toHaveBeenCalled();
-    expect(mocks.writeFile).not.toHaveBeenCalled();
+    expect(mocks.mkdir).toHaveBeenCalledWith(resolve("test-fixtures/saved-obj"), { recursive: true });
+    expect(mocks.writeFile).toHaveBeenCalledWith(
+      join(resolve("test-fixtures/saved-obj"), "mesh.obj"),
+      Buffer.from("# ComfyUI OBJ output\no Cube\nv 0 0 0\nf 1 1 1\n", "utf8"),
+    );
+    expect(out.content.some((block) => block.type === "image")).toBe(false);
   });
 });

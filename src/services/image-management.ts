@@ -901,6 +901,21 @@ const IMAGE_EXTENSIONS = new Set([
 ]);
 
 /**
+ * Attachment extensions that get_image may save when ComfyUI serves the file
+ * as an opaque octet-stream. This is deliberately an explicit, small allowlist
+ * rather than an extension-shaped bypass for the image-content guard.
+ */
+const ATTACHMENT_EXTENSIONS = new Set([
+  ".obj",
+  ".glb",
+  ".gltf",
+  ".fbx",
+  ".ply",
+  ".stl",
+  ".mtl",
+]);
+
+/**
  * The history reconciler needs stronger evidence than an image/* header. Keep
  * this check bounded: /view already caps the response bytes, and Sharp's input
  * pixel limit bounds decoding before the result is reduced to one pixel.
@@ -976,6 +991,13 @@ export async function getOutputImage(
   {
     allowMedia = false,
     /**
+     * Accept a known mesh/material attachment for get_image (action:"get").
+     * ComfyUI serves these files as application/octet-stream, so there is no
+     * reliable MIME subtype to sniff. The caller must opt in explicitly and the
+     * requested filename must use the narrow attachment extension allowlist.
+     */
+    allowAttachment = false,
+    /**
      * Accept a `.json` attachment whose bytes actually PARSE as JSON (#1373).
      *
      * A ComfyUI input directory legitimately holds workflow `.json` files, and `get_image`
@@ -1001,6 +1023,7 @@ export async function getOutputImage(
     signal,
   }: {
     allowMedia?: boolean;
+    allowAttachment?: boolean;
     allowJson?: boolean;
     requireImageContent?: boolean;
     signal?: AbortSignal;
@@ -1054,6 +1077,16 @@ export async function getOutputImage(
     extOk &&
     (mime === "application/octet-stream" ||
       MEDIA_FORMAT_BY_MIME[mime] === sniffedFormat);
+  // ComfyUI serves mesh/material outputs as opaque octet-streams. There is no
+  // MIME subtype or universal magic header to validate, so acceptance is gated
+  // by the caller plus the explicit filename allowlist above. This option is
+  // used only by get_image (action:"get"); image analysis/conversion keep the
+  // default refusal behavior.
+  const isAttachment =
+    allowAttachment &&
+    ATTACHMENT_EXTENSIONS.has(ext) &&
+    mime === "application/octet-stream" &&
+    result.base64.length > 0;
   // A `.json` request whose bytes parse as JSON is accepted whatever the server called
   // them (#1373). Gated on the REQUESTED extension so this can never widen the image or
   // media paths, and on a successful parse so the rejection this function exists for is
@@ -1076,11 +1109,12 @@ export async function getOutputImage(
     ext === ".obj" &&
     mime === "application/octet-stream" &&
     result.base64.length > 0 &&
+    !allowAttachment &&
     !isImage &&
     !isMedia &&
     !isJson;
 
-  if ((!isImage && !isMedia && !isJson) || !imageContentOk || result.base64.length === 0) {
+  if ((!isImage && !isMedia && !isJson && !isAttachment) || !imageContentOk || result.base64.length === 0) {
     const where = subfolder ? `${type}/${subfolder}` : type;
     const received =
       result.base64.length === 0

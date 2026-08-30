@@ -105,6 +105,45 @@ describe("getOutputImage — happy path (legitimate ComfyUI references)", () => 
       getOutputImage("a.png", "temp", ""),
     ).resolves.toBeDefined();
   });
+
+  it("accepts a non-empty allowlisted OBJ attachment served as octet-stream", async () => {
+    const obj = Buffer.from("# mesh\nv 0 0 0\n", "utf8");
+    fetchImageMock.mockResolvedValue({
+      base64: obj.toString("base64"),
+      mimeType: "application/octet-stream",
+    });
+
+    await expect(
+      getOutputImage("mesh.OBJ", "output", "meshes", { allowAttachment: true }),
+    ).resolves.toMatchObject({
+      base64: obj.toString("base64"),
+      mimeType: "application/octet-stream",
+      filename: "mesh.OBJ",
+    });
+  });
+
+  it("does not allow an octet-stream attachment without the explicit opt-in", async () => {
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from("mesh", "utf8").toString("base64"),
+      mimeType: "application/octet-stream",
+    });
+
+    await expect(getOutputImage("mesh.obj", "output", "", {})).rejects.toMatchObject({
+      code: "ATTACHMENT_TYPE_UNSUPPORTED",
+    });
+  });
+
+  it.each([
+    ["wrong extension", "mesh.txt", "application/octet-stream", "bWVzaA=="],
+    ["wrong MIME", "mesh.obj", "model/obj", "bWVzaA=="],
+    ["empty body", "mesh.obj", "application/octet-stream", ""],
+  ])("rejects an attachment with %s", async (_label, filename, mimeType, base64) => {
+    fetchImageMock.mockResolvedValue({ base64, mimeType });
+
+    await expect(
+      getOutputImage(filename, "output", "", { allowAttachment: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
 });
 
 describe("getOutputImage — local fallback for ComfyUI's 400 rejection (#2194)", () => {
