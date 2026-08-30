@@ -226,9 +226,29 @@ function looksLikeSystemStats(body: unknown): boolean {
 
 /** A relayed /object_info document must be an object registry, not an HTML or
  * gateway JSON envelope that happens to parse successfully. Empty registries
- * are valid for a backend with no installed node definitions. */
+ * are valid for a backend with no installed node definitions; every non-empty
+ * entry must retain the required ComfyUI node-definition fields. */
 function looksLikeObjectInfo(body: unknown): boolean {
-  return Boolean(body && typeof body === "object" && !Array.isArray(body));
+  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+  return Object.entries(body as Record<string, unknown>).every(([nodeType, definition]) => {
+    if (!nodeType.trim() || !definition || typeof definition !== "object" || Array.isArray(definition)) return false;
+    const def = definition as Record<string, unknown>;
+    const input = def.input;
+    return Boolean(
+      Object.prototype.hasOwnProperty.call(def, "input") &&
+      input &&
+      typeof input === "object" &&
+      !Array.isArray(input) &&
+      Array.isArray(def.output) &&
+      Array.isArray(def.output_is_list) &&
+      Array.isArray(def.output_name) &&
+      typeof def.name === "string" &&
+      typeof def.display_name === "string" &&
+      typeof def.description === "string" &&
+      typeof def.category === "string" &&
+      typeof def.output_node === "boolean",
+    );
+  });
 }
 
 function panelReadResponse(read: PanelComfyUIReadSuccess): Response {

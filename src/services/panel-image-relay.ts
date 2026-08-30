@@ -85,6 +85,18 @@ export interface PanelComfyUIReadSuccess {
   bytes: number;
 }
 
+/** The Panel dispatcher appends this witness to successful object results.
+ * It is context metadata, not relay authorization: the HMAC and resolved tab
+ * remain the authority. The relay validates this known shape, then drops it
+ * while normalizing the four-field ComfyUI read contract. */
+interface PanelComfyUIReadViewingWitness {
+  scope: "root" | "subgraph";
+  owner_node_id?: number | string | null;
+  title?: string;
+  workflow_uuid?: string;
+  graph_identity?: string;
+}
+
 interface PanelImageRelayResponseFailure {
   version: typeof PANEL_IMAGE_RELAY_VERSION;
   requestId: string;
@@ -397,13 +409,33 @@ function validateReadPayload(value: unknown): PanelComfyUIReadSuccess | undefine
   if (!value || typeof value !== "object") return undefined;
   const record = value as Record<string, unknown>;
   if (
-    !hasOnlyKeys(record, ["operation", "body", "contentType", "bytes"]) ||
+    !hasOnlyKeys(record, ["operation", "body", "contentType", "bytes", "viewing"]) ||
     typeof record.operation !== "string" ||
     !READ_OPERATIONS.has(record.operation as PanelComfyUIReadOperation) ||
     typeof record.body !== "string" ||
     (record.contentType !== null &&
       (typeof record.contentType !== "string" || !isSafeText(record.contentType, 128)))
   ) return undefined;
+  if (hasOwn(record, "viewing")) {
+    const viewing = record.viewing;
+    if (!viewing || typeof viewing !== "object" || Array.isArray(viewing)) return undefined;
+    const witness = viewing as PanelComfyUIReadViewingWitness & Record<string, unknown>;
+    if (
+      !hasOnlyKeys(witness, ["scope", "owner_node_id", "title", "workflow_uuid", "graph_identity"]) ||
+      (witness.scope !== "root" && witness.scope !== "subgraph")
+    ) return undefined;
+    if (hasOwn(witness, "owner_node_id")) {
+      const owner = witness.owner_node_id;
+      if (
+        owner !== null &&
+        !(typeof owner === "number" && Number.isSafeInteger(owner)) &&
+        !(typeof owner === "string" && isSafeText(owner, 256))
+      ) return undefined;
+    }
+    if (hasOwn(witness, "title") && !isSafeText(witness.title, 256)) return undefined;
+    if (hasOwn(witness, "workflow_uuid") && !isSafeText(witness.workflow_uuid, 256)) return undefined;
+    if (hasOwn(witness, "graph_identity") && !isSafeText(witness.graph_identity, 256)) return undefined;
+  }
   const bytes = record.bytes;
   if (
     typeof bytes !== "number" ||

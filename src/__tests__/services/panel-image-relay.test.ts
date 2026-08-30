@@ -671,7 +671,23 @@ describe("authenticated loopback panel image relay", () => {
     "relays the fixed %s ComfyUI read and authenticates/parses its reply",
     async (operation) => {
       const seen: Array<{ cmd: string; operation?: string }> = [];
-      const body = operation === "logs" ? "ERROR: render failed\n" : JSON.stringify({ operation });
+      const body = operation === "logs"
+        ? "ERROR: render failed\n"
+        : operation === "object_info"
+          ? JSON.stringify({
+              KSampler: {
+                input: { required: {} },
+                output: ["MODEL"],
+                output_is_list: [false],
+                output_name: ["model"],
+                name: "KSampler",
+                display_name: "KSampler",
+                description: "",
+                category: "sampling",
+                output_node: false,
+              },
+            })
+          : JSON.stringify({ operation });
       const server = await startPanelImageRelayServer({
         resolvePanelAgent: (value) =>
           "operation" in value && verifyPanelComfyUIReadRelayCapability(SECRET, value)
@@ -687,6 +703,17 @@ describe("authenticated loopback panel image relay", () => {
               body,
               contentType: operation === "logs" ? "text/plain" : "application/json",
               bytes: Buffer.byteLength(body, "utf8"),
+              ...(operation === "object_info"
+                ? {
+                    // This is the exact metadata shape added by the Panel's
+                    // withViewingWitness dispatcher wrapper.
+                    viewing: {
+                      scope: "root",
+                      workflow_uuid: "workflow-live-2283",
+                      graph_identity: "graph:live-2283",
+                    },
+                  }
+                : {}),
             };
           },
         },
@@ -707,6 +734,34 @@ describe("authenticated loopback panel image relay", () => {
       }
     },
   );
+
+  it("rejects an invalid viewing witness instead of widening the read contract", async () => {
+    const body = JSON.stringify({ KSampler: { input: { required: {} } } });
+    const server = await startPanelImageRelayServer({
+      resolvePanelAgent: (value) =>
+        "operation" in value && verifyPanelComfyUIReadRelayCapability(SECRET, value)
+          ? { agentKey: "orchestrator::claude", secret: SECRET }
+          : undefined,
+      resolvePanelTab: () => "panel-tab",
+      bridge: {
+        canReach: () => true,
+        send: async () => ({
+          operation: "object_info",
+          body,
+          contentType: "application/json",
+          bytes: Buffer.byteLength(body, "utf8"),
+          viewing: { scope: "root", graph_identity: 17 },
+        }),
+      },
+    });
+    try {
+      process.env.COMFYUI_MCP_RELAY_SECRET = SECRET;
+      process.env.COMFYUI_MCP_RELAY_URL = server.endpointUrl;
+      await expect(requestPanelComfyUIRead("object_info")).rejects.toMatchObject({ code: "MALFORMED_REPLY" });
+    } finally {
+      await server.close();
+    }
+  });
 
   it("applies the read relay deadline to the authenticated bridge command", async () => {
     let timeoutMs = 0;

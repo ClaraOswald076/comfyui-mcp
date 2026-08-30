@@ -3,6 +3,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const panelRead = vi.hoisted(() => vi.fn());
 const fetchApi = vi.hoisted(() => vi.fn());
 
+const VALID_OBJECT_INFO = {
+  KSampler: {
+    input: { required: {} },
+    output: ["MODEL"],
+    output_is_list: [false],
+    output_name: ["model"],
+    name: "KSampler",
+    display_name: "KSampler",
+    description: "",
+    category: "sampling",
+    output_node: false,
+  },
+};
+
 vi.mock("../../config.js", async () => {
   const actual = await vi.importActual<typeof import("../../config.js")>("../../config.js");
   return {
@@ -112,7 +126,7 @@ describe("authenticated panel-backed ComfyUI read fallback (#2283)", () => {
 
   it("maps a transport-failed /object_info retry to the authenticated panel and parses the registry", async () => {
     fetchApi.mockRejectedValue(transportFailure());
-    const body = JSON.stringify({ KSampler: { input: { required: {} } } });
+    const body = JSON.stringify(VALID_OBJECT_INFO);
     panelRead.mockResolvedValue({
       operation: "object_info",
       body,
@@ -122,6 +136,35 @@ describe("authenticated panel-backed ComfyUI read fallback (#2283)", () => {
 
     await expect(getObjectInfo()).resolves.toEqual(JSON.parse(body));
     expect(panelRead).toHaveBeenCalledWith("object_info");
+  });
+
+  it.each([
+    ["an error envelope", { error: "upstream unavailable" }],
+    ["a status envelope", { status: "ok" }],
+    ["a message envelope", { message: "not a node registry" }],
+  ])("does not cache %s as object_info", async (_label, invalidBody) => {
+    fetchApi.mockRejectedValue(transportFailure());
+    const invalid = JSON.stringify(invalidBody);
+    const valid = JSON.stringify(VALID_OBJECT_INFO);
+    panelRead
+      .mockResolvedValueOnce({
+        operation: "object_info",
+        body: invalid,
+        contentType: "application/json",
+        bytes: Buffer.byteLength(invalid, "utf8"),
+      })
+      .mockResolvedValueOnce({
+        operation: "object_info",
+        body: valid,
+        contentType: "application/json",
+        bytes: Buffer.byteLength(valid, "utf8"),
+      });
+
+    await expect(getObjectInfo()).rejects.toThrow(
+      /not a ComfyUI \/object_info node registry object/,
+    );
+    await expect(getObjectInfo()).resolves.toEqual(JSON.parse(valid));
+    expect(panelRead).toHaveBeenCalledTimes(2);
   });
 
   it("does not use the panel for a configured-route HTTP error, timeout, or prompt-scoped history", async () => {
