@@ -138,9 +138,46 @@ describe("getOutputImage — local fallback for ComfyUI's 400 rejection (#2194)"
     expect(openMock).toHaveBeenCalledWith(localPath, "r");
   });
 
+  it("preserves image/avif through the local 400 fallback and validates the bytes", async () => {
+    const avifFilename = "frame.avif";
+    const avif = Buffer.from(
+      "AAAAHGZ0eXBhdmlmAAAAAG1pZjFhdmlmbWlhZgAAANRtZXRhAAAAAAAAACFoZGxyAAAAAAAAAABwaWN0AAAAAAAAAAAAAAAAAAAAACJpbG9jAAAAAERAAAEAAQAAAAAA+AABAAAAAAAAACAAAAAjaWluZgAAAAAAAQAAABVpbmZlAgAAAAABAABhdjAxAAAAAA5waXRtAAAAAAABAAAAVGlwcnAAAAA2aXBjbwAAAAxhdjFDgSACAAAAABRpc3BlAAAAAAAAAAIAAAACAAAADnBpeGkAAAAAAQgAAAAWaXBtYQAAAAAAAAABAAEDgQIDAAAAKG1kYXQSAAoHOAA2kBDQaTITGUJjBMAANAAAkEDJHGFCYtTGSg==",
+      "base64",
+    );
+    const root = resolve("/comfy", "input");
+    const localPath = resolve(root, avifFilename);
+    let position = 0;
+    fetchImageMock.mockRejectedValue(
+      new ComfyUIError(
+        `ComfyUI /view returned 400 for "${avifFilename}" (input).`,
+        "VIEW_ERROR",
+        { status: 400, filename: avifFilename, type: "input", subfolder: "" },
+      ),
+    );
+    realpathMock.mockImplementation(async (path: string) => path);
+    statMock.mockResolvedValue({ isFile: () => true, size: avif.length });
+    openMock.mockResolvedValue({
+      read: async (buffer: Buffer, offset: number, length: number) => {
+        const slice = avif.subarray(position, position + length);
+        slice.copy(buffer, offset);
+        position += slice.length;
+        return { bytesRead: slice.length, buffer };
+      },
+      close: async () => undefined,
+    });
+
+    await expect(
+      getOutputImage(avifFilename, "input", "", { requireImageContent: true }),
+    ).resolves.toMatchObject({ base64: avif.toString("base64"), mimeType: "image/avif" });
+    expect(realpathMock).toHaveBeenCalledWith(root);
+    expect(realpathMock).toHaveBeenCalledWith(localPath);
+  });
+
   it.each([
     ["a filename traversal", "../outside.mp4", ""],
     ["a subfolder traversal", "safe.mp4", "../outside"],
+    ["a filename drive-relative path", "C:outside.mp4", ""],
+    ["a subfolder drive-relative path", "safe.mp4", "C:outside"],
   ])("rejects %s before the local fallback can read it", async (_label, name, subfolder) => {
     fetchImageMock.mockRejectedValue(view400());
 
@@ -216,6 +253,14 @@ describe("getOutputImage — path-traversal sanitisation (CWE-22)", () => {
     await expect(
       getOutputImage("..\\..\\windows\\win.ini", "output", ""),
     ).rejects.toBeInstanceOf(ValidationError);
+    expect(fetchImageMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a filename drive-relative path", "C:outside.png", ""],
+    ["a subfolder drive-relative path", "hero.png", "C:outside"],
+  ])("rejects %s before /view is called", async (_label, filename, subfolder) => {
+    await expect(getOutputImage(filename, "output", subfolder)).rejects.toBeInstanceOf(ValidationError);
     expect(fetchImageMock).not.toHaveBeenCalled();
   });
 

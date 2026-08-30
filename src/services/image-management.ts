@@ -11,6 +11,7 @@ import type { ObjectInfo } from "../comfyui/types.js";
 import { ValidationError, ModelError, ComfyUIError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { resolveOutputDir, resolveInputDir } from "./output-dir.js";
+import { tryLoadSharp } from "./sharp-loader.js";
 
 /**
  * Resolve ComfyUI's REAL input directory (honors a custom --input-directory /
@@ -521,12 +522,13 @@ function assertSafeViewRef(filename: string, subfolder: string): void {
   if (
     filename.includes("/") ||
     filename.includes("\\") ||
+    /^[A-Za-z]:/.test(filename) ||
     filename === "." ||
     filename === ".." ||
     filename.split(/[\\/]/).some((s) => s === "..")
   ) {
     throw new ValidationError(
-      `Invalid filename "${filename}": must be a single filename without path separators or '..' segments`,
+      `Invalid filename "${filename}": must be a single filename without path separators, drive prefixes, or '..' segments`,
     );
   }
   if (!subfolder) return;
@@ -535,7 +537,7 @@ function assertSafeViewRef(filename: string, subfolder: string): void {
   if (
     subfolder.startsWith("/") ||
     subfolder.startsWith("\\") ||
-    /^[A-Za-z]:[\\/]/.test(subfolder)
+    /^[A-Za-z]:/.test(subfolder)
   ) {
     throw new ValidationError(
       `Invalid subfolder "${subfolder}": must be relative to the ComfyUI media directory`,
@@ -833,6 +835,61 @@ const IMAGE_EXTENSIONS = new Set([
 ]);
 
 /**
+ * The history reconciler needs stronger evidence than an image/* header. Keep
+ * this check bounded: /view already caps the response bytes, and Sharp's input
+ * pixel limit bounds decoding before the result is reduced to one pixel.
+ */
+const HISTORY_IMAGE_MAX_INPUT_PIXELS = 192_000_000;
+const MAX_VIEW_RESPONSE_BASE64_CHARS = Math.ceil((MAX_VIEW_RESPONSE_BYTES / 3)) * 4;
+
+async function hasActualImageContent(base64: string, filename: string): Promise<boolean> {
+  // The transport normally enforces this first, but keep the consumer safe if
+  // another fetch implementation or a test seam hands it an oversized string.
+  if (base64.length === 0 || base64.length > MAX_VIEW_RESPONSE_BASE64_CHARS) return false;
+
+  const loaded = await tryLoadSharp();
+  if (!loaded.ok) {
+    logger.debug("Cannot validate history image content because sharp is unavailable", { filename });
+    return false;
+  }
+
+  try {
+    const bytes = Buffer.from(base64, "base64");
+    if (bytes.length === 0 || bytes.length > MAX_VIEW_RESPONSE_BYTES) return false;
+    const sharpOptions = {
+      limitInputPixels: HISTORY_IMAGE_MAX_INPUT_PIXELS,
+      // The default is warning, but keep the strict untrusted-input setting
+      // explicit: malformed pixel data must not be certified by metadata alone.
+      failOn: "warning" as const,
+    };
+    const metadata = await loaded.sharp(bytes, sharpOptions).metadata();
+    const hasDimensions =
+      typeof metadata.format === "string" &&
+      Number.isInteger(metadata.width) &&
+      metadata.width > 0 &&
+      Number.isInteger(metadata.height) &&
+      metadata.height > 0;
+    if (!hasDimensions) return false;
+
+    // metadata() only inspects headers. Decode and reduce to one pixel so
+    // corrupt compressed data is rejected while the output allocation stays
+    // constant even for a large, valid image.
+    await loaded
+      .sharp(bytes, sharpOptions)
+      .resize({ width: 1, height: 1, fit: "inside", withoutEnlargement: true })
+      .raw()
+      .toBuffer();
+    return true;
+  } catch (error) {
+    logger.debug("History image probe could not decode the /view body", {
+      filename,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
+/**
  * Fetch a generated image from ComfyUI via HTTP /view endpoint.
  * Does NOT require COMFYUI_PATH — works with remote ComfyUI instances.
  *
@@ -869,12 +926,26 @@ export async function getOutputImage(
      * are said to be — and simply asks the question JSON can answer directly.
      */
     allowJson = false,
-  }: { allowMedia?: boolean; allowJson?: boolean } = {},
+    /**
+     * Require an image/* response body to contain decodable image content.
+     * This is intentionally opt-in for the history availability probe; the
+     * ordinary get_image fetch path keeps its existing MIME-based contract.
+     */
+    requireImageContent = false,
+    signal,
+  }: {
+    allowMedia?: boolean;
+    allowJson?: boolean;
+    requireImageContent?: boolean;
+    signal?: AbortSignal;
+  } = {},
 ): Promise<{ base64: string; mimeType: string; filename: string }> {
   assertSafeViewRef(filename, subfolder);
   let result: { base64: string; mimeType: string };
   try {
-    result = await fetchImage(filename, type, subfolder);
+    result = signal
+      ? await fetchImage(filename, type, subfolder, { signal })
+      : await fetchImage(filename, type, subfolder);
   } catch (error) {
     if (!isViewBadRequest(error)) throw error;
     const local = await readLocalViewFallback(filename, type, subfolder);
@@ -901,6 +972,8 @@ export async function getOutputImage(
   // signature passes.
   const mime = result.mimeType.toLowerCase();
   const isImage = mime.startsWith("image/");
+  const imageContentOk =
+    !requireImageContent || (isImage && (await hasActualImageContent(result.base64, filename)));
   const sniffedFormat = allowMedia ? sniffMediaFormat(result.base64) : null;
   const ext = extname(filename).toLowerCase();
   // The sniffed format must satisfy EVERY claim present: the declared
@@ -930,8 +1003,14 @@ export async function getOutputImage(
   // caller to inspect a payload when the filename is the thing to look at.
   const contentRejected = jsonRefusal?.kind === "content";
 
-  if ((!isImage && !isMedia && !isJson) || result.base64.length === 0) {
+  if ((!isImage && !isMedia && !isJson) || !imageContentOk || result.base64.length === 0) {
     const where = subfolder ? `${type}/${subfolder}` : type;
+    const received =
+      result.base64.length === 0
+        ? "an empty response"
+        : requireImageContent && isImage && !imageContentOk
+          ? `invalid image content labeled "${result.mimeType}"`
+          : `content-type "${result.mimeType}"`;
     throw new ComfyUIError(
       contentRejected
         ? // NAME THE ACTUAL REASON (#1373). "The file may not exist" for a body that
@@ -947,7 +1026,7 @@ export async function getOutputImage(
             `Nothing was saved. The file may not exist in the ComfyUI ${type} directory — ` +
             `check the filename/subfolder (e.g. via get_image (action:"list_outputs") or get_history).`
           : `ComfyUI /view did not return an image for "${filename}" (${where}); ` +
-          `got ${result.base64.length === 0 ? "an empty response" : `content-type "${result.mimeType}"`}. ` +
+          `got ${received}. ` +
           `The file may not exist in the ComfyUI ${type} directory — ` +
           `check the filename/subfolder (e.g. via get_image (action:"list_outputs") or get_history).`,
       // THE CODE HAS TO AGREE WITH THE MESSAGE (codex P2). The message names the real
@@ -1105,6 +1184,7 @@ const IMAGE_MIME: Record<string, string> = {
   ".gif": "image/gif",
   ".tiff": "image/tiff",
   ".tif": "image/tiff",
+  ".avif": "image/avif",
 };
 
 const VIDEO_MIME: Record<string, string> = {
