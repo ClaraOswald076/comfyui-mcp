@@ -6518,6 +6518,13 @@ async function refuseKnownBadWriteBeforeDispatch(
 type PromotedWriteBinding = {
   tabId: string;
   identity: { generation: number; tabSessionId: string };
+  /** The node-identity write-fence capability observed when this target was
+   * captured. A same-socket re-hello can change hello capabilities without
+   * changing the connection identity, so the final write must not silently
+   * drop or add this fence. */
+  nodeIdentityFenceAdvertised: boolean;
+  /** The opaque identity of the exact inner node captured with the binding. */
+  nodeIdentity?: string;
 };
 
 type PromotedWritePlan = {
@@ -6887,6 +6894,49 @@ function currentPromotedBindingError(
   return null;
 }
 
+/** A promoted write must retain the node-identity fence capability observed at
+ * capture through the final synchronous dispatch. UiBridge deliberately keeps
+ * anonymous same-socket incarnations stable across re-hello, but re-reads the
+ * capability flags from each hello. Treat either direction of capability drift
+ * as a refusal: a false -> true upgrade cannot authorize a target captured
+ * without its witness, and a true -> false withdrawal cannot authorize an
+ * unfenced write on the old target. */
+function currentPromotedNodeIdentityFenceError(
+  ctx: PanelToolCtx,
+  binding: PromotedWriteBinding,
+): string | null {
+  let currentCapability: boolean;
+  try {
+    currentCapability = ctx.tabExpectedNodeIdentityFenceCapability?.() === true;
+  } catch {
+    return "the panel node-identity write fence became unreadable";
+  }
+  if (currentCapability !== binding.nodeIdentityFenceAdvertised) {
+    return binding.nodeIdentityFenceAdvertised
+      ? "the panel node-identity write fence was withdrawn or became unavailable"
+      : "the panel node-identity write fence changed after the promoted target was captured";
+  }
+  if (currentCapability && !binding.nodeIdentity) {
+    return "the panel node-identity write fence was advertised without a captured node witness";
+  }
+  return null;
+}
+
+function capturePromotedWriteBinding(ctx: PanelToolCtx): PromotedWriteBinding | null {
+  if (typeof ctx.panelConnectionIdentity !== "function") return null;
+  const identity = ctx.panelConnectionIdentity();
+  if (!isUsablePanelConnectionIdentity(identity)) return null;
+  let nodeIdentityFenceAdvertised = false;
+  if (typeof ctx.tabExpectedNodeIdentityFenceCapability === "function") {
+    nodeIdentityFenceAdvertised = ctx.tabExpectedNodeIdentityFenceCapability() === true;
+  }
+  return {
+    tabId: ctx.tabId,
+    identity,
+    nodeIdentityFenceAdvertised,
+  };
+}
+
 /** The bridge's workflow stamp is the strongest synchronous receiver witness
  * available at the actual socket send. It complements the panel's structured
  * `viewing` scope read: the latter proves the graph/subgraph after an await,
@@ -7151,6 +7201,16 @@ async function preparePromotedWidgetWrite(
   // bundle that can classify renamed promotion aliases.
   const publishesCompleteTerminalWitness =
     ctx.tabPromotedTerminalWitnessCapability?.() === true;
+  // Snapshot this independently from the terminal-witness capability. UiBridge
+  // rereads hello flags on a same-socket re-hello, while the target and all of
+  // the reads below belong to this one preflight. A later dispatch must not
+  // silently switch between witnessed and legacy writes.
+  let nodeIdentityFenceAdvertised = false;
+  try {
+    nodeIdentityFenceAdvertised = ctx.tabExpectedNodeIdentityFenceCapability?.() === true;
+  } catch {
+    return promotedWriteRefusal(widget, "the panel node-identity write fence could not be read");
+  }
 
   const tabBefore = ctx.tabId;
   const hasIdentityApi = typeof ctx.panelConnectionIdentity === "function";
@@ -7448,27 +7508,25 @@ async function preparePromotedWidgetWrite(
     const terminalBlocked = refuseKnownBadPromotedTerminal(inner.terminal);
     if (terminalBlocked) return terminalBlocked;
   }
-  // A current receiver that publishes the complete promoted-terminal witness also
-  // publishes the immediate inner node's opaque incarnation identity. Carry it
-  // through the enter/recheck/write sequence so same-id, same-type replacement
-  // cannot satisfy the inner write fence. Older receivers retain the legacy
-  // omission when this capability is not advertised.
-  if (ctx.tabPromotedTerminalWitnessCapability?.() === true) {
-    if (ctx.tabExpectedNodeIdentityFenceCapability?.() !== true) {
-      return promotedPanelBuildRefusal(
-        ctx,
-        nodeId,
-        widget,
-        "does not advertise the atomic inner-node identity write fence",
-        "enforces_expected_node_identity_at_write",
-      );
-    }
-    if (!inner.nodeIdentity) {
-      return promotedWriteRefusal(
-        widget,
-        "the current receiver did not publish a trustworthy immediate inner-node identity fence",
-      );
-    }
+  // A receiver that advertises the identity fence must publish the immediate
+  // inner node's opaque identity. Carry the captured value through the
+  // enter/recheck/write sequence so a same-id, same-type replacement cannot
+  // satisfy the inner write fence. The capability is intentionally the value
+  // observed at the start of this preflight, not a later re-hello's value.
+  if (publishesCompleteTerminalWitness && !nodeIdentityFenceAdvertised) {
+    return promotedPanelBuildRefusal(
+      ctx,
+      nodeId,
+      widget,
+      "does not advertise the atomic inner-node identity write fence",
+      "enforces_expected_node_identity_at_write",
+    );
+  }
+  if (nodeIdentityFenceAdvertised && !inner.nodeIdentity) {
+    return promotedWriteRefusal(
+      widget,
+      "the current receiver did not publish a trustworthy immediate inner-node identity fence",
+    );
   }
   // panel#1859 — these three are capability skew, exactly like the missing
   // graph identity above: the hello either advertises the fence or it does not,
@@ -7505,7 +7563,14 @@ async function preparePromotedWidgetWrite(
     innerNodeType,
     ...(inner.terminal ? { terminal: inner.terminal } : {}),
     scope,
-    binding: { tabId: tabBefore, identity: identityAfter },
+    binding: {
+      tabId: tabBefore,
+      identity: identityAfter,
+      nodeIdentityFenceAdvertised,
+      ...(nodeIdentityFenceAdvertised && inner.nodeIdentity
+        ? { nodeIdentity: inner.nodeIdentity }
+        : {}),
+    },
   };
 }
 
@@ -18878,6 +18943,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                     `Refusing promoted inner graph_set_widget: ${error}. No graph_set_widget was dispatched.`,
                   );
                 }
+                const nodeIdentityError = currentPromotedNodeIdentityFenceError(ctx, plan.binding);
+                if (nodeIdentityError) {
+                  throw new Error(
+                    `Refusing promoted inner graph_set_widget: ${nodeIdentityError}. ` +
+                      `No graph_set_widget was dispatched.`,
+                  );
+                }
                 const scopeError = currentPromotedScopeError(
                   ctx,
                   plan.scope,
@@ -18896,9 +18968,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 parentRail: plan.inner.parentRail,
                 ...(plan.terminal ? { terminal: plan.terminal } : {}),
               },
-              ctx.tabExpectedNodeIdentityFenceCapability?.() === true
-                ? afterEnterMapping.inner.nodeIdentity ?? plan.inner.nodeIdentity
-                : undefined,
+              plan.binding.nodeIdentity,
             );
             const exited = await leave();
             if (written.isError) {
@@ -19125,20 +19195,20 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           return appendToolResultText(first, `\n\n${textOfToolResult(promotedWritten)}`);
         }
 
-        const recoveryTabId = ctx.tabId;
-        let recoveryIdentity: { generation: number; tabSessionId: string } | undefined;
-        const recoveryBinding: PromotedWriteBinding | null =
-          typeof ctx.panelConnectionIdentity === "function"
-            ? (() => {
-                const identity = ctx.panelConnectionIdentity?.();
-                return isUsablePanelConnectionIdentity(identity)
-                  ? { tabId: recoveryTabId, identity }
-                  : null;
-              })()
-            : null;
+        let recoveryBinding: PromotedWriteBinding | null = null;
         if (typeof ctx.panelConnectionIdentity === "function") {
-          recoveryIdentity = recoveryBinding?.identity;
-          if (!isUsablePanelConnectionIdentity(recoveryIdentity)) {
+          try {
+            recoveryBinding = capturePromotedWriteBinding(ctx);
+          } catch {
+            return appendToolResultText(
+              first,
+              `\n\n${textOfToolResult(promotedWriteRefusal(
+                refusal.widget,
+                "the panel connection binding could not be read before the inner mapping read",
+              ))}`,
+            );
+          }
+          if (!recoveryBinding) {
             return appendToolResultText(
               first,
               `\n\n${textOfToolResult(promotedWriteRefusal(
@@ -19157,10 +19227,8 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               `${textOfToolResult(sub)})`,
           );
         }
-        if (recoveryIdentity) {
-          const recoveryBindingError = recoveryBinding
-            ? currentPromotedBindingError(ctx, recoveryBinding)
-            : null;
+        if (recoveryBinding) {
+          const recoveryBindingError = currentPromotedBindingError(ctx, recoveryBinding);
           if (recoveryBindingError) {
             return appendToolResultText(
               first,
@@ -19522,12 +19590,31 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           );
         }
 
+        const recoveryWriteBinding = recoveryBinding
+          ? {
+              ...recoveryBinding,
+              ...(recoveryBinding.nodeIdentityFenceAdvertised && inner.nodeIdentity
+                ? { nodeIdentity: inner.nodeIdentity }
+                : {}),
+            }
+          : null;
+
         const recoveryBeforeDispatch = recoveryBinding
           ? () => {
-              const error = currentPromotedBindingError(ctx, recoveryBinding);
+              const error = currentPromotedBindingError(ctx, recoveryWriteBinding!);
               if (error) {
                 throw new Error(
                   `Refusing promoted inner graph_set_widget: ${error}. No graph_set_widget was dispatched.`,
+                );
+              }
+              const nodeIdentityError = currentPromotedNodeIdentityFenceError(
+                ctx,
+                recoveryWriteBinding!,
+              );
+              if (nodeIdentityError) {
+                throw new Error(
+                  `Refusing promoted inner graph_set_widget: ${nodeIdentityError}. ` +
+                    `No graph_set_widget was dispatched.`,
                 );
               }
               const scopeError = recoveryScope
@@ -19553,9 +19640,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           recoveryScope
             ? { ...recoveryScope, ...(inner.terminal ? { terminal: inner.terminal } : {}) }
             : undefined,
-          ctx.tabExpectedNodeIdentityFenceCapability?.() === true
-            ? legacyFinalMapping.inner.nodeIdentity ?? inner.nodeIdentity
-            : undefined,
+          recoveryWriteBinding?.nodeIdentity,
         );
         const exited = await ctx.call({ cmd: "graph_exit_subgraph" }, 15000);
         if (!written.isError) {

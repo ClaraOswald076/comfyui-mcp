@@ -132,6 +132,13 @@ function bridge(opts: {
   /** #2314 P1: emulate a current receiver that publishes the recursive
    * renamed-promotion terminal witness. */
   promotedTerminalWitnesses?: boolean;
+  /** Re-hello the same socket with a changed node-identity write capability
+   * while a promoted write is between its mapping read and final dispatch. */
+  identityFenceChange?: "upgrade" | "withdraw";
+  /** Live inner-node identity used by the production-shaped recovery receiver. */
+  innerNodeIdentity?: string;
+  /** Replace that same inner node after MCP's final callback, before receiver apply. */
+  innerNodeIdentityAfterMcpFence?: string;
   /** #2478: leave inner node identities absent so the current-capability path
    * proves it refuses an incomplete identity-bearing envelope. */
   omitInnerNodeIdentity?: boolean;
@@ -184,6 +191,9 @@ function bridge(opts: {
   const targetGraphIdentity = "graph:workflow-a-container-a";
   let currentGraphIdentity = inSubgraph ? targetGraphIdentity : "graph:workflow-a-root";
   let connectionIdentity = { generation: 1, tabSessionId: "browser-tab-a" };
+  let identityFenceCapability = opts.identityFenceChange === "upgrade" ? false : true;
+  let identityFenceChangeApplied = false;
+  let liveInnerNodeIdentity = opts.innerNodeIdentity;
   let observedPromotedScope: {
     known: true;
     scope: "root" | "subgraph";
@@ -210,7 +220,7 @@ function bridge(opts: {
       : { ...value, viewing: currentViewing() };
     if (
       !legacyBuild &&
-      opts.promotedTerminalWitnesses === true &&
+      identityFenceCapability &&
       opts.omitInnerNodeIdentity !== true &&
       Array.isArray(result.nodes)
     ) {
@@ -314,6 +324,12 @@ function bridge(opts: {
           mutation?.();
           sendOpts.beforeDispatch();
         }
+        if (
+          opts.innerNodeIdentityAfterMcpFence !== undefined &&
+          String(cmd.node_id) === "76"
+        ) {
+          liveInnerNodeIdentity = opts.innerNodeIdentityAfterMcpFence;
+        }
         if (opts.parentRailRelinkAfterMcpFence) {
           // The final MCP callback has already returned. A live panel relation
           // can change in this window; the expected_scope parent_rail must be
@@ -365,6 +381,14 @@ function bridge(opts: {
           cmd.expected_node_identity !== ordinaryNodeIdentity
         ) {
           throw new Error("graph_set_widget expected node identity changed before dispatch: Nothing was applied.");
+        }
+        if (
+          cmd.expected_node_identity !== undefined &&
+          String(cmd.node_id) === "76" &&
+          liveInnerNodeIdentity !== undefined &&
+          cmd.expected_node_identity !== liveInnerNodeIdentity
+        ) {
+          throw new Error("graph_set_widget inner node identity changed before dispatch: Nothing was applied.");
         }
         writes += 1;
         if (writes === 1 && opts.ambiguous) throw new Error(AMBIGUOUS);
@@ -443,6 +467,10 @@ function bridge(opts: {
       }
       if (cmd.cmd === "graph_enter_subgraph") {
       if (opts.enterFails) throw new Error("could not enter subgraph 78");
+        if (opts.identityFenceChange && !identityFenceChangeApplied) {
+          identityFenceChangeApplied = true;
+          identityFenceCapability = opts.identityFenceChange === "upgrade";
+        }
         inSubgraph = true;
         currentGraphIdentity = targetGraphIdentity;
         return { scope: "subgraph", node_id: cmd.node_id };
@@ -505,7 +533,25 @@ function bridge(opts: {
             candidate && typeof candidate === "object" && String(candidate.id) === wantId,
           );
           if (node && typeof node.type === "string") {
-            return returnGraphQuery({ nodes: [{ id: node.id, type: node.type }] }, wantId);
+            const nodeIdentity =
+              opts.omitInnerNodeIdentity !== true
+                ? liveInnerNodeIdentity ??
+                  (!legacyBuild && identityFenceCapability
+                    ? `node-incarnation:test:${String(node.id)}`
+                    : undefined)
+                : undefined;
+            return returnGraphQuery(
+              {
+                nodes: [
+                  {
+                    id: node.id,
+                    type: node.type,
+                    ...(nodeIdentity !== undefined ? { node_identity: nodeIdentity } : {}),
+                  },
+                ],
+              },
+              wantId,
+            );
           }
         }
         return returnGraphQuery(
@@ -561,7 +607,7 @@ function bridge(opts: {
     // v0.15.85's hello DOES advertise this one, which is why a legacy build
     // reaches the scope checks at all instead of stopping at the node-type fence.
     tabExpectedNodeTypeFenceCapability: () => true,
-    tabExpectedNodeIdentityFenceCapability: () => true,
+    tabExpectedNodeIdentityFenceCapability: () => !legacyBuild && identityFenceCapability,
     tabExpectedScopeGraphIdentityFenceCapability: () =>
       opts.scopeGraphIdentityFence === true || (!legacyBuild && opts.scopeGraphIdentityFence !== false),
     tabPromotedTerminalWitnessCapability: () =>
@@ -3709,6 +3755,75 @@ describe("panel_set_widget promoted inner identity forwarding (#2478)", () => {
     expect(text).toMatch(/trustworthy immediate inner-node identity fence/);
     expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
     expect(mutations).toBe(0);
+  });
+
+  it("refuses a witness-less promoted target after a same-socket capability upgrade", async () => {
+    // The fake receiver keeps its connection identity unchanged while an
+    // anonymous same-socket re-hello upgrades only the node-identity fence.
+    // The target was captured from the legacy, witness-less capability state;
+    // that upgrade must not authorize a later fenced write retroactively.
+    const { text, isError, calls, mutations } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "new" },
+      {
+        firstWrite: "ok",
+        identityFenceChange: "upgrade",
+        subgraph: SAFE_ANIMA_SUBGRAPH,
+      },
+    );
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/node-identity write fence changed|No graph_set_widget was dispatched/);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
+    expect(mutations).toBe(0);
+  });
+
+  it("carries the captured identity through contradictory-refusal recovery", async () => {
+    const originalIdentity = "node-incarnation:recovery-original";
+    const replacementIdentity = "node-incarnation:recovery-replacement";
+    const recoverySubgraph = {
+      ...SAFE_ANIMA_SUBGRAPH,
+      nodes: [
+        {
+          ...SAFE_ANIMA_SUBGRAPH.nodes[0],
+          node_identity: originalIdentity,
+        },
+      ],
+    };
+    const recoveryInnerQuery = {
+      nodes: [
+        {
+          id: 76,
+          type: "PrimitiveStringMultiline",
+          node_identity: originalIdentity,
+        },
+      ],
+    };
+    const { text, isError, calls, mutations } = await setWidget(
+      { node_id: 78, widget: "quality_prompt", value: "new" },
+      {
+        firstWriteError: ANIMA_CONTRADICTORY,
+        preflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
+        // Keep the second prepare on the legacy path; the following recovery
+        // graph_get_subgraph is the envelope used by the fallback write.
+        recoveryPreflightSubgraph: DEFINITIVE_NON_PROMOTED_SUBGRAPH,
+        subgraph: recoverySubgraph,
+        innerNodeIdentity: originalIdentity,
+        innerNodeIdentityAfterMcpFence: replacementIdentity,
+        postEnterGraphQueryById: { "76": recoveryInnerQuery },
+      },
+    );
+
+    const writes = calls.filter((call) => call.cmd === "graph_set_widget");
+    expect(isError).toBe(true);
+    expect(mutations).toBe(0);
+    expect(writes).toHaveLength(2);
+    expect(writes[1]).toMatchObject({
+      node_id: 76,
+      widget: "quality_prompt",
+      expected_node_type: "PrimitiveStringMultiline",
+      expected_node_identity: originalIdentity,
+    });
+    expect(text).toMatch(/inner node identity changed|Nothing was applied/);
   });
 
   it("refuses a malformed inner identity rather than treating it as a legacy omission", async () => {
