@@ -11,10 +11,14 @@ All notable changes to this project are documented here. This project adheres to
 ### MCP
 
 #### Fixed
-- bound compact identity probes
+- bound compact identity probes (#2513, #2478)
 - fence same-type transient writes
 - fence transient promoted reads
-- omit the unexpose reindex warning when the panel already reindexed
+- omit the unexpose reindex warning when the panel already reindexed (#2474)
+- keep the causal line above a native fault and stop blaming a pass-through node (#2508)
+- direct-clone local git installs when Manager queue is unavailable (#2509)
+- make the Kimi Code backend usable (#2552)
+- reconcile release citations (#2519, #2520)
 
 
 ## [0.52.147] - 2026-08-28
