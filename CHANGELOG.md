@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### MCP
+
+#### Fixed
+- models_show local fallback does not report an arbitrary duplicate basename as the installed model (#2504)
+
 ## [0.52.154] - 2026-08-30
 
 ### MCP
