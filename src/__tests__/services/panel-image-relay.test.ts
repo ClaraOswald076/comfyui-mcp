@@ -667,7 +667,7 @@ describe("authenticated loopback panel image relay", () => {
     }
   });
 
-  it.each(["history", "system_stats", "logs"] as const)(
+  it.each(["history", "system_stats", "logs", "object_info"] as const)(
     "relays the fixed %s ComfyUI read and authenticates/parses its reply",
     async (operation) => {
       const seen: Array<{ cmd: string; operation?: string }> = [];

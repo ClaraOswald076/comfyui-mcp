@@ -1958,6 +1958,11 @@ _No user-facing changes._
 
 ## Unreleased
 
+### MCP
+
+#### Fixed
+- use the authenticated connected panel for headless `/object_info` reads when the configured ComfyUI route is unreachable (#2283)
+
 ## [0.52.43] - 2026-08-20
 
 ### MCP

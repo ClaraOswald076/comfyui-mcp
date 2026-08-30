@@ -31,6 +31,10 @@ vi.mock("@stable-canvas/comfyui-client", () => ({
       return await fetchApi(url, init);
     }
 
+    async getNodeDefs(): Promise<Record<string, unknown>> {
+      return await fetchApi("/object_info");
+    }
+
     fetchApi = fetchApi;
     close() {}
   },
@@ -47,7 +51,9 @@ import {
   fetchImage,
   getHistory,
   getLogs,
+  getObjectInfo,
   getSystemStats,
+  resetObjectInfoCache,
   resetClient,
 } from "../../comfyui/client.js";
 import { PanelComfyUIReadRelayError } from "../../services/panel-image-relay.js";
@@ -63,6 +69,7 @@ beforeEach(() => {
   fetchApi.mockReset();
   panelRead.mockReset();
   resetClient();
+  resetObjectInfoCache();
   vi.stubGlobal("fetch", vi.fn(async () => { throw transportFailure(); }));
 });
 
@@ -101,6 +108,20 @@ describe("authenticated panel-backed ComfyUI read fallback (#2283)", () => {
       "system_stats",
       "logs",
     ]);
+  });
+
+  it("maps a transport-failed /object_info retry to the authenticated panel and parses the registry", async () => {
+    fetchApi.mockRejectedValue(transportFailure());
+    const body = JSON.stringify({ KSampler: { input: { required: {} } } });
+    panelRead.mockResolvedValue({
+      operation: "object_info",
+      body,
+      contentType: "application/json",
+      bytes: Buffer.byteLength(body, "utf8"),
+    });
+
+    await expect(getObjectInfo()).resolves.toEqual(JSON.parse(body));
+    expect(panelRead).toHaveBeenCalledWith("object_info");
   });
 
   it("does not use the panel for a configured-route HTTP error, timeout, or prompt-scoped history", async () => {

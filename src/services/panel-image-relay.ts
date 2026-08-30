@@ -39,11 +39,11 @@ const RELAY_ID_RE = /^[A-Za-z0-9_-]{16,80}$/;
 const RELAY_CAPABILITY_RE = /^[a-f0-9]{64}$/;
 const RELAY_SECRET_RE = /^[a-f0-9]{64}$/;
 const IMAGE_TYPES = new Set<PanelImageType>(["output", "input", "temp"]);
-const READ_OPERATIONS = new Set<PanelComfyUIReadOperation>(["history", "system_stats", "logs"]);
+const READ_OPERATIONS = new Set<PanelComfyUIReadOperation>(["history", "system_stats", "logs", "object_info"]);
 const MIME_RE = /^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,62}\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,62}$/;
 
 export type PanelImageType = "output" | "input" | "temp";
-export type PanelComfyUIReadOperation = "history" | "system_stats" | "logs";
+export type PanelComfyUIReadOperation = "history" | "system_stats" | "logs" | "object_info";
 
 export interface PanelImageRelayRequest {
   version: typeof PANEL_IMAGE_RELAY_VERSION;
