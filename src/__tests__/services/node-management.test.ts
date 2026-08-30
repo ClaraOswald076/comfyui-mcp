@@ -63,6 +63,15 @@ const liveServerSnapshot = vi.hoisted(() => ({
   value: { reachable: true, argv: undefined as string[] | undefined } as { reachable: boolean; argv?: string[] },
 }));
 
+/** Proven live custom_nodes scan root for uninstall disk verification (#2485).
+ *  Default undefined = requireLive cannot prove a scan root, so uninstall falls
+ *  back to the configured workspace. `throwUnavailable` models a declared
+ *  --base-directory that is currently missing. */
+const liveCustomNodesScan = vi.hoisted(() => ({
+  value: undefined as string | undefined,
+  throwUnavailable: false,
+}));
+
 vi.mock("../../services/workspace-env.js", async () => {
   const actual = await vi.importActual<
     typeof import("../../services/workspace-env.js")
@@ -76,6 +85,18 @@ vi.mock("../../services/workspace-env.js", async () => {
     resolveEffectiveComfyUICodeBase: () =>
       config.comfyuiCodePath ?? config.comfyuiPath ?? savedDefault.value,
     getLiveServerSnapshot: async () => liveServerSnapshot.value,
+    resolveCustomNodesScanBaseLiveStrict: async (
+      options?: { requireLive?: boolean },
+    ) => {
+      if (liveCustomNodesScan.throwUnavailable) {
+        throw new Error(
+          'The connected ComfyUI declares --base-directory "missing" but that directory is currently unavailable.',
+        );
+      }
+      if (liveCustomNodesScan.value !== undefined) return liveCustomNodesScan.value;
+      if (options?.requireLive) return undefined;
+      return config.comfyuiPath ?? savedDefault.value;
+    },
   };
 });
 
@@ -479,6 +500,8 @@ describe("node-management service", () => {
     // and never touches the checkout. It exists so the suite can prove that even the
     // most local-looking configuration is refused, not to model permission.
     liveRoot.value = "/fake/comfy";
+    liveCustomNodesScan.value = undefined;
+    liveCustomNodesScan.throwUnavailable = false;
     // Default: live server is reachable. Tests that exercise the cm-cli unavailable
     // path (no COMFYUI_PATH) must set this to { reachable: false } to avoid the actual
     // dev machine's ComfyUI from interfering.
@@ -3534,6 +3557,161 @@ describe("node-management service", () => {
       expect(mockedExec).toHaveBeenCalled();
       expect(res.message).toMatch(/Uninstalled "my-pack"/);
       expect(res.message).toMatch(/no matching directory remains/);
+    });
+
+    it("uninstall disk verification uses the live Desktop custom_nodes root, not COMFYUI_PATH (#2485)", async () => {
+      // ComfyUI Desktop: COMFYUI_PATH is a workspace without custom_nodes, while
+      // the running server scans a different --base-directory data root. Scanning
+      // the configured workspace reports "custom_nodes does not exist" even when
+      // the pack is gone from (or still sitting in) the live scan root.
+      const workspace = resolve("/workspace/no-nodes");
+      const desktop = resolve("/desktop/user-data");
+      config.comfyuiPath = workspace;
+      liveCustomNodesScan.value = desktop;
+      mockedExists.mockImplementation((p: unknown) => {
+        const norm = String(p).replace(/\\/g, "/").toLowerCase();
+        return !norm.includes("/workspace/no-nodes/custom_nodes");
+      });
+      fsCtl.readdirSync = (p) => {
+        const norm = p.replace(/\\/g, "/");
+        if (norm.includes("/desktop/user-data/") && /\/custom_nodes$/i.test(norm)) return [];
+        if (/\/custom_nodes$/i.test(norm)) {
+          throw new Error(`scanned the wrong custom_nodes: ${p}`);
+        }
+        return [];
+      };
+      let listCalls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            listCalls++;
+            return jsonResponse(listCalls === 1 ? installedEnabled : {});
+          }
+          if (path === "/v2/manager/queue/status") return jsonResponse(drained);
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await uninstallCustomNode({ id: "my-pack" });
+      expect(res.message).toMatch(/Uninstalled "my-pack"/);
+      expect(res.message).toMatch(/gone from disk/);
+      expect(res.message).not.toMatch(/inconclusive/);
+      expect(res.message).not.toMatch(/does not exist/);
+    });
+
+    it("uninstall reports STILL on disk when the leftover is under the live Desktop root (#2485)", async () => {
+      const workspace = resolve("/workspace/no-nodes");
+      const desktop = resolve("/desktop/user-data");
+      config.comfyuiPath = workspace;
+      liveCustomNodesScan.value = desktop;
+      mockedExists.mockImplementation((p: unknown) => {
+        const norm = String(p).replace(/\\/g, "/").toLowerCase();
+        return !norm.includes("/workspace/no-nodes/custom_nodes");
+      });
+      fsCtl.readdirSync = (p) => {
+        const norm = p.replace(/\\/g, "/");
+        if (norm.includes("/desktop/user-data/") && /\/custom_nodes$/i.test(norm)) {
+          return [dirEnt("my-pack")];
+        }
+        return [];
+      };
+      let listCalls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            listCalls++;
+            return jsonResponse(listCalls === 1 ? installedEnabled : {});
+          }
+          if (path === "/v2/manager/queue/status") return jsonResponse(drained);
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await uninstallCustomNode({ id: "my-pack" });
+      expect(res.message).toMatch(/STILL on disk/);
+      expect(res.message).toMatch(/NOT a completed uninstall/);
+      expect(res.message).not.toMatch(/inconclusive/);
+      expect(res.message).not.toMatch(/^Uninstalled/);
+    });
+
+    it("uninstall does not fall back to COMFYUI_PATH when live --base-directory is unavailable (#2485)", async () => {
+      const workspace = resolve("/workspace/no-nodes");
+      config.comfyuiPath = workspace;
+      liveCustomNodesScan.throwUnavailable = true;
+      mockedExists.mockImplementation((p: unknown) => {
+        const norm = String(p).replace(/\\/g, "/").toLowerCase();
+        return !norm.includes("/workspace/no-nodes/custom_nodes");
+      });
+      fsCtl.readdirSync = (p) => {
+        const norm = p.replace(/\\/g, "/");
+        if (norm.includes("/workspace/no-nodes/") && /\/custom_nodes$/i.test(norm)) {
+          throw new Error(`fell back to COMFYUI_PATH custom_nodes: ${p}`);
+        }
+        return [];
+      };
+      let listCalls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            listCalls++;
+            return jsonResponse(listCalls === 1 ? installedEnabled : {});
+          }
+          if (path === "/v2/manager/queue/status") return jsonResponse(drained);
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await uninstallCustomNode({ id: "my-pack" });
+      expect(res.message).toMatch(/Uninstalled "my-pack"/);
+      expect(res.message).toMatch(/no disk check was possible/);
+      expect(res.message).not.toMatch(/inconclusive/);
+    });
+
+    it("CLI uninstall disk verification uses the live Desktop scan root, not COMFYUI_PATH (#2485)", async () => {
+      const workspace = resolve("/workspace/no-nodes");
+      const desktop = resolve("/desktop/user-data");
+      config.comfyuiPath = workspace;
+      liveCustomNodesScan.value = desktop;
+      mockedExists.mockImplementation((p: unknown) => {
+        const norm = String(p).replace(/\\/g, "/").toLowerCase();
+        return !norm.includes("/workspace/no-nodes/custom_nodes");
+      });
+      let removed = false;
+      fsCtl.readdirSync = (p) => {
+        const norm = p.replace(/\\/g, "/");
+        if (norm.includes("/desktop/user-data/") && /\/custom_nodes$/i.test(norm)) {
+          return removed ? [] : [dirEnt("my-pack")];
+        }
+        return [];
+      };
+      fsCtl.readFileSync = () => {
+        throw new Error("ENOENT");
+      };
+      mockedExec.mockImplementation(() => {
+        removed = true;
+        return cliEnvelope({ message: "uninstalled" }) as never;
+      });
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            return new Response("boom", { status: 500 });
+          }
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse(drained);
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await uninstallCustomNode({ id: "my-pack", useCmCli: true });
+      expect(res.mechanism).toBe("comfy-cli");
+      expect(res.message).toMatch(/Uninstalled "my-pack"/);
+      expect(res.message).toMatch(/no matching directory remains/);
+      expect(res.message).not.toMatch(/inconclusive/);
     });
 
     it("the CLI uninstall disk verification uses the ENTRY-captured workspace, not a retargeted one", async () => {

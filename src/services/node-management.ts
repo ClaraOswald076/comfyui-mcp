@@ -5385,12 +5385,41 @@ export async function uninstallCustomNode(opts: NodeStateOptions): Promise<NodeO
   );
 }
 
+/**
+ * Disk root for uninstall presence / postcondition checks (#2485).
+ *
+ * comfy-cli still runs against the configured workspace. Disk verification must
+ * use the custom_nodes tree the LIVE server actually scans — on ComfyUI Desktop
+ * `--base-directory` is commonly a different data root than COMFYUI_PATH, and
+ * scanning the configured workspace reports "custom_nodes does not exist"
+ * while the pack may still sit under the live scan root.
+ *
+ * Fall back to the configured workspace only when the live server cannot prove
+ * a scan root. An explicit unavailable `--base-directory` is contradictory
+ * evidence and must not fall back — that would recreate the false inconclusive.
+ */
+async function resolveUninstallPresenceDiskRoot(
+  configuredWorkspace: string | undefined,
+): Promise<string | undefined> {
+  if (isRemoteMode()) return undefined;
+  try {
+    const liveScan = await resolveCustomNodesScanBaseLiveStrict({ requireLive: true });
+    if (liveScan) return liveScan;
+  } catch {
+    return undefined;
+  }
+  return configuredWorkspace;
+}
+
 async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpResult> {
   const { id } = opts;
   const base = managerBaseUrl();
   // Pinned with the target, same as in setCustomNodeEnabled (codex gate round 5).
   const cliWorkspace = resolveEffectiveComfyUIBase();
-  const presenceCtx = capturePackPresenceContext(cliWorkspace);
+  const presenceDiskRoot = await resolveUninstallPresenceDiskRoot(cliWorkspace);
+  const presenceCtx = capturePackPresenceContext(presenceDiskRoot, {
+    allowConfiguredFallback: presenceDiskRoot !== undefined,
+  });
 
   // CLI availability probe FIRST (#808 fallback discipline) — but nothing runs
   // until the presence pre-check below has answered what there is to remove.
@@ -5471,9 +5500,12 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
     // The disk postcondition applies to EVERY CLI uninstall (a CLI session is
     // always a local one), and for a pack that was never Manager-tracked
     // (on-disk pre-state) it is the ONLY meaningful one. Checked against the
-    // ENTRY-captured workspace, never a recomputed one: a retarget during the
-    // awaits must not verify against a different install (codex gate round 6).
-    const diskAfter = cliWorkspace ? findPackOnDisk(id, cliWorkspace) : undefined;
+    // ENTRY-captured presence disk root (the live scan root when proven), never
+    // a recomputed one: a retarget during the awaits must not verify against a
+    // different install (codex gate round 6).
+    const diskAfter = presenceCtx.diskRoot
+      ? findPackOnDisk(id, presenceCtx.diskRoot)
+      : undefined;
     if (diskAfter?.state === "found") {
       return {
         mechanism: "comfy-cli",
