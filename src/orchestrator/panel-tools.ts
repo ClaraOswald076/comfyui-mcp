@@ -12042,6 +12042,25 @@ function pinHonorsLiveCanvas(
 }
 
 /**
+ * Automatic fence repair needs stronger identity than legacy pin resolution.
+ * `activeMatchesTarget` intentionally accepts filename/basename aliases for
+ * compatibility, but a basename cannot prove which saved workflow is live
+ * when two directories contain the same filename. Use only a canonical path
+ * or a canonical key here; otherwise leave the dispatch fence refusing.
+ */
+function exactPinnedSavedPathMatchesLive(
+  pinPath: string,
+  liveActive: Record<string, unknown> | undefined,
+): boolean {
+  const expected = canonicalSavedWorkflowPath(pinPath);
+  if (!expected || !expected.includes("/") || !liveActive) return false;
+  const observed = liveActive as { path?: unknown; key?: unknown };
+  return [observed.path, observed.key].some(
+    (value) => canonicalSavedWorkflowPath(value) === expected,
+  );
+}
+
+/**
  * The ONE remedy that is actually reachable from every wedged state below, and
  * the one the reporters found to be the only thing that worked.
  *
@@ -16448,6 +16467,97 @@ export function makePanelToolCtx(
  * first derailed real sessions (deleted placeholder files, 404 tabs).
  */
 /**
+ * #2487 — whether the dispatch-time stamp-target gate would refuse a fenced
+ * graph command from this session.
+ *
+ * TRI-STATE on purpose. The gate compares the session stamp against the routed
+ * tab's LAST ADVERTISED identity, which is not the pin and is not the live
+ * canvas. A missing or throwing probe is an unmade observation, not "no
+ * disagreement".
+ */
+function stampTargetDisagrees(ctx: PanelToolCtx): boolean | undefined {
+  try {
+    const cap = ctx.tabGraphMutationCapability?.();
+    if (!cap) return undefined;
+    if (cap.known !== true) return undefined;
+    return cap.canMutate === false && cap.because === "target_disagreement";
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * #2487 — a pin is a PATH, not the last-active tab's advertised instance.
+ *
+ * After a verified pin, subgraph enter/exit can succeed (they go through
+ * `ctx.call`) while the next live-canvas capture — `panel_strip_workflow({})`
+ * via `bridge.send` — is refused because the routed tab still advertises a
+ * different workflow instance. The refusal names `mode:"current"`, which
+ * RELEASES the pin.
+ *
+ * Re-resolve the pin against the live canvas. If it still NAMES that canvas,
+ * reconcile a stale advertisement (#2209) or refresh a reminted instance
+ * stamp (#1913: honoring the path is not abandoning it). A pin to a
+ * DIFFERENT canvas is left alone — that refusal is the fence working.
+ *
+ * Returns whether a repair actually happened, so a caller can retry a
+ * capture that was refused for this reason and not for any other.
+ */
+async function repairPinnedStampForLiveCanvas(ctx: PanelToolCtx): Promise<boolean> {
+  let pin: { mode?: string; path?: string } | undefined;
+  try {
+    pin = ctx.workflowTarget?.get(ctx.tabId);
+  } catch {
+    return false;
+  }
+  if (pin?.mode !== "pinned" || typeof pin.path !== "string" || pin.path.length === 0) {
+    return false;
+  }
+  if (typeof ctx.call !== "function") return false;
+
+  let probe: WorkflowFenceRebind;
+  try {
+    probe = await rebindWorkflowFence(ctx, { adopt: false });
+  } catch {
+    return false;
+  }
+  // pinHonorsLiveCanvas is the UUID-adoption gate: it needs routing_key ===
+  // wf:<path>. Current panels advertise wf:<route>:<path> (#640), which that
+  // gate reads as indeterminate. Path/filename/key equality still proves the
+  // pin names this canvas. A path/key match is required when the panel's
+  // routing shape is indeterminate; a bare filename is never enough.
+  const live = liveActiveFromProbe(probe);
+  const namesLive =
+    pinHonorsLiveCanvas(pin, live) ||
+    exactPinnedSavedPathMatchesLive(pin.path, live);
+  if (!namesLive) return false;
+
+  if (probe.status === "already_current") {
+    return reconcileStampTarget(ctx, probe.uuid).ok;
+  }
+  if (probe.status === "diverged") {
+    const identity = probe.active ?? { workflow_uuid: probe.uuid };
+    if (!refreshWorkflowUuid(ctx, identity)) return false;
+    const rec = reconcileStampTarget(ctx, probe.uuid);
+    return rec.ok || rec.why === "no_disagreement";
+  }
+  return false;
+}
+
+/** Live-canvas capture: the same pin injection `ctx.call` applies, over the
+ *  direct `bridge.send` this path has to use (it needs the raw graph, not a
+ *  ToolResult wrapper). */
+async function sendLiveCanvasGraphCmd(
+  ctx: PanelToolCtx,
+  cmd: "graph_serialize" | "graph_get_state",
+  timeoutMs: number,
+) {
+  const target = ctx.workflowTarget?.get(ctx.tabId);
+  const routed = target ? withWorkflowTarget({ cmd }, target) : { cmd };
+  return ctx.bridge.send(routed as { cmd: string }, { tabId: ctx.tabId, timeoutMs });
+}
+
+/**
  * Rebuild a UI-format workflow ({ nodes, links }) from the panel's back-compat
  * `graph_get_state` reply (the #384 fallback). Each summarized node carries its
  * widget values keyed BY NAME (`widgets`) and its inputs' upstream source
@@ -16655,18 +16765,26 @@ async function resolveWorkflowInput(
   let reply: unknown;
   try {
     ctx.ensureReachable?.();
-    // Route to the SAME authoritative target as ctx.call: when the session is
-    // pinned, inject the pinned workflow_path so the live-canvas capture serializes
-    // the PINNED workflow, not whatever tab is visible (codex — this direct send
-    // otherwise bypasses withWorkflowTarget and reads the wrong graph).
-    const target = ctx.workflowTarget?.get(ctx.tabId);
-    const cmd = target
-      ? withWorkflowTarget({ cmd: "graph_serialize" }, target)
-      : { cmd: "graph_serialize" };
-    reply = await ctx.bridge.send(cmd as { cmd: string }, {
-      tabId: ctx.tabId,
-      timeoutMs: 30000,
-    });
+    // #2487 — honor a verified pin BEFORE the capture is compared against the
+    // routed tab's last-advertised identity. That advertisement is unrelated
+    // active-tab state: subgraph enter/exit can leave it stale while the pin
+    // still names the live canvas. Re-resolve here rather than telling the
+    // caller to `mode:"current"`, which would release the pin. Cheap when the
+    // gate is not refusing; a missing probe is not treated as disagreement.
+    if (stampTargetDisagrees(ctx) === true) {
+      await repairPinnedStampForLiveCanvas(ctx);
+    }
+    try {
+      reply = await sendLiveCanvasGraphCmd(ctx, "graph_serialize", 30000);
+    } catch (err) {
+      // The capability probe is optional (lightweight ctxs omit it) and can
+      // miss a disagreement the send() gate still sees. One repair+retry, and
+      // only for this refusal — any other capture error keeps its own path.
+      if (!isWorkflowInstanceMismatch(err) || !(await repairPinnedStampForLiveCanvas(ctx))) {
+        throw err;
+      }
+      reply = await sendLiveCanvasGraphCmd(ctx, "graph_serialize", 30000);
+    }
   } catch (err) {
     // #384: a panel too old to register graph_serialize (added at 0.8.2) still
     // answers the back-compat `graph_get_state`. On an unsupported-command
@@ -16682,14 +16800,7 @@ async function resolveWorkflowInput(
     const msg = err instanceof Error ? err.message : String(err);
     if (allowStateFallback && isPanelCmdUnsupportedError(err, "graph_serialize")) {
       try {
-        const target = ctx.workflowTarget?.get(ctx.tabId);
-        const stateCmd = target
-          ? withWorkflowTarget({ cmd: "graph_get_state" }, target)
-          : { cmd: "graph_get_state" };
-        const stateReply = await ctx.bridge.send(stateCmd as { cmd: string }, {
-          tabId: ctx.tabId,
-          timeoutMs: 30000,
-        });
+        const stateReply = await sendLiveCanvasGraphCmd(ctx, "graph_get_state", 30000);
         const rebuilt = reconstructUiFromState(stateReply);
         if (rebuilt) return rebuilt;
       } catch {
@@ -16724,14 +16835,7 @@ async function resolveWorkflowInput(
   if (allowStateFallback && notes) {
     let stateReply: unknown;
     try {
-      const target = ctx.workflowTarget?.get(ctx.tabId);
-      const stateCmd = target
-        ? withWorkflowTarget({ cmd: "graph_get_state" }, target)
-        : { cmd: "graph_get_state" };
-      stateReply = await ctx.bridge.send(stateCmd as { cmd: string }, {
-        tabId: ctx.tabId,
-        timeoutMs: 30000,
-      });
+      stateReply = await sendLiveCanvasGraphCmd(ctx, "graph_get_state", 30000);
     } catch (err) {
       // Never fatal: strip already HAS a usable graph. Losing the cross-check
       // degrades fidelity, and that degradation is what gets reported.

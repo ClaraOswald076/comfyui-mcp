@@ -10,7 +10,7 @@ All notable changes to this project are documented here. This project adheres to
 
 #### Fixed
 - panel_strip_workflow applies live capturedWidgetValues to promoted subgraph widgets instead of stale definition defaults (#2522)
-
+- panel_strip_workflow honors a verified pin when capturing the live canvas instead of refusing a stale last-advertised workflow instance (#2487)
 
 ## [0.52.156] - 2026-08-30
 
