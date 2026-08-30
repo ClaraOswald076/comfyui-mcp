@@ -225,13 +225,14 @@ function looksLikeSystemStats(body: unknown): boolean {
   return (b.system != null && typeof b.system === "object") || Array.isArray(b.devices);
 }
 
-/** A relayed /object_info document must be an object registry, not an HTML or
- * gateway JSON envelope that happens to parse successfully. Empty registries
- * are valid for a backend with no installed node definitions; every non-empty
+/** A relayed /object_info document must be a non-empty object registry, not an
+ * HTML or gateway JSON envelope that happens to parse successfully. Every
  * entry must retain the required ComfyUI node-definition fields. */
 function looksLikeObjectInfo(body: unknown): boolean {
   if (!body || typeof body !== "object" || Array.isArray(body)) return false;
-  return Object.entries(body as Record<string, unknown>).every(([nodeType, definition]) => {
+  const entries = Object.entries(body as Record<string, unknown>);
+  if (entries.length === 0) return false;
+  return entries.every(([nodeType, definition]) => {
     if (!nodeType.trim() || !definition || typeof definition !== "object" || Array.isArray(definition)) return false;
     const def = definition as Record<string, unknown>;
     const input = def.input;

@@ -164,6 +164,7 @@ describe("authenticated panel-backed ComfyUI read fallback (#2283)", () => {
   });
 
   it.each([
+    ["an empty registry", {}],
     ["an error envelope", { error: "upstream unavailable" }],
     ["a status envelope", { status: "ok" }],
     ["a message envelope", { message: "not a node registry" }],
