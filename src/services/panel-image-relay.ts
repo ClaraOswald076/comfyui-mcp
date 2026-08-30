@@ -24,6 +24,8 @@ export const PANEL_IMAGE_RELAY_STALE_MS = 15_000;
 export const PANEL_IMAGE_RELAY_MAX_REQUEST_FILE_BYTES = 16 * 1024;
 export const PANEL_IMAGE_RELAY_MAX_RESPONSE_FILE_BYTES = 48 * 1024 * 1024;
 export const PANEL_COMFYUI_READ_MAX_BYTES = 16 * 1024 * 1024;
+export const PANEL_COMFYUI_READ_OBJECT_INFO_MAX_BYTES = 32 * 1024 * 1024;
+export const PANEL_COMFYUI_READ_OBJECT_INFO_TIMEOUT_MS = 30_000;
 export const PANEL_IMAGE_RELAY_MAX_CONCURRENT = 4;
 export const PANEL_IMAGE_RELAY_MAX_REQUESTS_PER_TICK = 4;
 export const PANEL_IMAGE_RELAY_MAX_DIRECTORY_ENTRIES_PER_TICK = 128;
@@ -441,7 +443,7 @@ function validateReadPayload(value: unknown): PanelComfyUIReadSuccess | undefine
     typeof bytes !== "number" ||
     !Number.isSafeInteger(bytes) ||
     bytes < 0 ||
-    bytes > PANEL_COMFYUI_READ_MAX_BYTES ||
+    bytes > readMaxBytes(record.operation as PanelComfyUIReadOperation) ||
     Buffer.byteLength(record.body, "utf8") !== bytes
   ) return undefined;
   return {
@@ -492,13 +494,25 @@ function validateReadRequest(value: unknown, requestId: string): PanelComfyUIRea
     !Number.isSafeInteger(createdAt) ||
     !Number.isSafeInteger(deadlineAt) ||
     deadlineAt < createdAt ||
-    deadlineAt - createdAt > PANEL_IMAGE_RELAY_TIMEOUT_MS
+    deadlineAt - createdAt > readTimeoutMs(record.operation as PanelComfyUIReadOperation)
   ) return undefined;
   return record as unknown as PanelComfyUIReadRelayRequest;
 }
 
 function isReadRelayRequest(request: PanelRelayRequest): request is PanelComfyUIReadRelayRequest {
   return "operation" in request;
+}
+
+function readTimeoutMs(operation: PanelComfyUIReadOperation): number {
+  return operation === "object_info" ? PANEL_COMFYUI_READ_OBJECT_INFO_TIMEOUT_MS : PANEL_IMAGE_RELAY_TIMEOUT_MS;
+}
+
+function readMaxBytes(operation: PanelComfyUIReadOperation): number {
+  return operation === "object_info" ? PANEL_COMFYUI_READ_OBJECT_INFO_MAX_BYTES : PANEL_COMFYUI_READ_MAX_BYTES;
+}
+
+function requestTimeoutMs(request: PanelRelayRequest): number {
+  return isReadRelayRequest(request) ? readTimeoutMs(request.operation) : PANEL_IMAGE_RELAY_TIMEOUT_MS;
 }
 
 function validateResponse(value: unknown, requestId: string): PanelImageRelayResponse {
@@ -743,7 +757,7 @@ async function readHttpResponseBounded(response: Response, maxBytes: number): Pr
 }
 
 function requestDeadline(request: PanelRelayRequest): number {
-  return Math.min(request.deadlineAt, request.createdAt + PANEL_IMAGE_RELAY_TIMEOUT_MS);
+  return Math.min(request.deadlineAt, request.createdAt + requestTimeoutMs(request));
 }
 
 function errorCodeFromHttpBody(value: unknown, status: number): string {
@@ -982,7 +996,7 @@ export async function startPanelImageRelayServer(
     })();
   });
   server.headersTimeout = 2_000;
-  server.requestTimeout = PANEL_IMAGE_RELAY_TIMEOUT_MS + 1_000;
+  server.requestTimeout = PANEL_COMFYUI_READ_OBJECT_INFO_TIMEOUT_MS + 1_000;
   await new Promise<void>((resolve, reject) => {
     const onError = (error: Error) => {
       server.removeListener("listening", onListening);
@@ -1097,13 +1111,14 @@ export async function requestPanelComfyUIRead(
   const secret = process.env.COMFYUI_MCP_RELAY_SECRET;
   if (!endpoint || !isSafeRelaySecret(secret)) return undefined;
   const createdAt = Date.now();
+  const timeoutMs = readTimeoutMs(operation);
   const request: PanelComfyUIReadRelayRequest = {
     version: PANEL_IMAGE_RELAY_VERSION,
     requestId: `${Date.now().toString(36)}-${process.pid.toString(36)}-${randomBytes(8).toString("hex")}`,
     capability: "",
     operation,
     createdAt,
-    deadlineAt: createdAt + PANEL_IMAGE_RELAY_TIMEOUT_MS,
+    deadlineAt: createdAt + timeoutMs,
   };
   request.capability = makePanelComfyUIReadRelayCapability(secret, request);
   const body = Buffer.from(JSON.stringify(request), "utf8");
@@ -1117,7 +1132,7 @@ export async function requestPanelComfyUIRead(
       headers: { "content-type": "application/json", "content-length": String(body.byteLength) },
       body,
       redirect: "error",
-      signal: AbortSignal.timeout(PANEL_IMAGE_RELAY_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (error) {
     if (error instanceof PanelComfyUIReadRelayError) throw error;

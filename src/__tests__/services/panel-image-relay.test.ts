@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   PANEL_COMFYUI_READ_MAX_BYTES,
+  PANEL_COMFYUI_READ_OBJECT_INFO_MAX_BYTES,
+  PANEL_COMFYUI_READ_OBJECT_INFO_TIMEOUT_MS,
   PANEL_IMAGE_RELAY_MAX_BYTES,
   PANEL_IMAGE_RELAY_MAX_CONCURRENT,
   PANEL_IMAGE_RELAY_MAX_PENDING_REQUESTS,
@@ -763,6 +765,69 @@ describe("authenticated loopback panel image relay", () => {
     }
   });
 
+  it("allows a documented large and slow object_info registry without widening other reads", async () => {
+    expect(PANEL_COMFYUI_READ_OBJECT_INFO_MAX_BYTES).toBeGreaterThan(25_104_088);
+    expect(PANEL_COMFYUI_READ_OBJECT_INFO_TIMEOUT_MS).toBeGreaterThan(20_840);
+    const body = JSON.stringify({
+      KSampler: {
+        input: { required: {} },
+        output: ["MODEL"],
+        output_is_list: [false],
+        output_name: ["model"],
+        name: "KSampler",
+        display_name: "KSampler",
+        description: "x".repeat(25_104_088),
+        category: "sampling",
+        output_node: false,
+      },
+    });
+    const server = await startPanelImageRelayServer({
+      resolvePanelAgent: (value) =>
+        "operation" in value && verifyPanelComfyUIReadRelayCapability(SECRET, value)
+          ? { agentKey: "orchestrator::claude", secret: SECRET }
+          : undefined,
+      resolvePanelTab: () => "panel-tab",
+      bridge: {
+        canReach: () => true,
+        send: async (command) => command.operation === "object_info"
+          ? { operation: "object_info", body, contentType: "application/json", bytes: Buffer.byteLength(body, "utf8") }
+          : { operation: "history", body: "{}", contentType: "application/json", bytes: 2 },
+      },
+    });
+    try {
+      process.env.COMFYUI_MCP_RELAY_SECRET = SECRET;
+      process.env.COMFYUI_MCP_RELAY_URL = server.endpointUrl;
+      await expect(requestPanelComfyUIRead("object_info")).resolves.toMatchObject({
+        operation: "object_info",
+        bytes: body.length,
+      });
+    } finally {
+      await server.close();
+    }
+  }, 45_000);
+
+  it("fails closed for an object_info body over its route-specific cap", async () => {
+    const body = "x".repeat(PANEL_COMFYUI_READ_OBJECT_INFO_MAX_BYTES + 1);
+    const server = await startPanelImageRelayServer({
+      resolvePanelAgent: (value) =>
+        "operation" in value && verifyPanelComfyUIReadRelayCapability(SECRET, value)
+          ? { agentKey: "orchestrator::claude", secret: SECRET }
+          : undefined,
+      resolvePanelTab: () => "panel-tab",
+      bridge: {
+        canReach: () => true,
+        send: async () => ({ operation: "object_info", body, contentType: "application/json", bytes: body.length }),
+      },
+    });
+    try {
+      process.env.COMFYUI_MCP_RELAY_SECRET = SECRET;
+      process.env.COMFYUI_MCP_RELAY_URL = server.endpointUrl;
+      await expect(requestPanelComfyUIRead("object_info")).rejects.toMatchObject({ code: "MALFORMED_REPLY" });
+    } finally {
+      await server.close();
+    }
+  }, 45_000);
+
   it("applies the read relay deadline to the authenticated bridge command", async () => {
     let timeoutMs = 0;
     const server = await startPanelImageRelayServer({
@@ -795,6 +860,37 @@ describe("authenticated loopback panel image relay", () => {
       expect(await response.json()).toMatchObject({ ok: false, error: "TIMEOUT", requestId: short.requestId });
       expect(timeoutMs).toBeGreaterThan(0);
       expect(timeoutMs).toBeLessThanOrEqual(30);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("fails closed when a slow object_info read reaches its caller deadline", async () => {
+    const server = await startPanelImageRelayServer({
+      resolvePanelAgent: (value) =>
+        "operation" in value && verifyPanelComfyUIReadRelayCapability(SECRET, value)
+          ? { agentKey: "orchestrator::claude", secret: SECRET }
+          : undefined,
+      resolvePanelTab: () => "panel-tab",
+      bridge: {
+        canReach: () => true,
+        send: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          return { operation: "object_info", body: "{}", contentType: "application/json", bytes: 2 };
+        },
+      },
+    });
+    try {
+      const short = readRequest("short-object-info-deadline", "object_info");
+      short.deadlineAt = short.createdAt + 30;
+      short.capability = makePanelComfyUIReadRelayCapability(SECRET, short);
+      const response = await fetch(server.endpointUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(short),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ ok: false, error: "TIMEOUT", requestId: short.requestId });
     } finally {
       await server.close();
     }
