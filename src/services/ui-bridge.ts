@@ -1006,9 +1006,11 @@ function buildPanelTooOldError(
           // would be a claim nothing here supports.
           ` (this connection advertised no panel version; an earlier connection for this tab ` +
           `reported ${reading.inherited}, which may be out of date${mcpTail})`
-        : mcpVersion
-          ? ` (detected mcp ${mcpVersion})`
-          : "";
+        // No advertised version at all (legacy/cached sidebar that predates
+        // `panel_version` in hello — #619 recurrence). Still name the connected
+        // panel as unknown so the skew message is complete; do not omit the
+        // parenthetical and skip the upgrade remedy.
+        : ` (detected panel unknown${mcpTail})`;
   const min = BRIDGE_CMD_MIN_PANEL_VERSION[cmd];
   // "TOO OLD" IS AN AGE VERDICT, and it may only be reached from an age
   // OBSERVATION: a version that parsed AND compares below the command's known
@@ -1058,9 +1060,10 @@ export function isPanelCmdUnsupportedError(err: unknown, cmd?: string): boolean 
     ?.panelCmdUnsupported;
   if (typeof tag === "string") return cmd == null || tag === cmd;
   const msg = err instanceof Error ? err.message : String(err ?? "");
+  const parsed = parseUnknownCommandReply(msg);
+  if (parsed) return cmd == null || parsed === cmd;
   const cmdPat = cmd ? cmd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : "[\\w.-]+";
   return (
-    new RegExp(`unknown command\\s*["“']?${cmdPat}`, "i").test(msg) ||
     new RegExp(`too old for\\s*["“']?${cmdPat}`, "i").test(msg) ||
     new RegExp(`does not implement\\s*["“']?${cmdPat}`, "i").test(msg)
   );
@@ -1076,18 +1079,43 @@ export function isPanelCmdUnsupportedError(err: unknown, cmd?: string): boolean 
  * into an actionable "update your panel" message instead of surfacing the opaque
  * internal command name to the agent/user. Returns null when `error` is anything
  * else (a genuine command failure), so the happy/normal-error path is untouched.
+ *
+ * Also matches the legacy/cached spelling `unknown <cmd>` (no "command" word,
+ * no quotes) that a sidebar tab predating the current dispatcher used — the
+ * #619 recurrence on 0.52.147 leaked `Error: unknown graph_outline` because
+ * only the `Unknown command "…"` shape was recognized.
  */
-/** The panel dispatcher's raw "Unknown command" reply shape (anchored, quote- and
- *  case-tolerant). Shared by makeUnknownCommandError and isUnknownCommandReply so the
- *  reactive rewrite and the #422 veto-revocation agree on exactly one definition. */
+/** Current dispatcher: `Unknown command "graph_query"` (quotes optional). */
 const UNKNOWN_COMMAND_RE = /^unknown command\s*["“']?([\w.-]+)["”']?/i;
+/** Legacy/cached dispatcher: the entire message is `unknown graph_outline`. */
+const UNKNOWN_BARE_CMD_RE = /^unknown\s+["“']?([\w.-]+)["”']?\s*$/i;
+
+/** True when `token` is a bridge command name, not English (`unknown node`). */
+function looksLikeBridgeCommand(cmd: string): boolean {
+  if (BRIDGE_CMD_MIN_PANEL_VERSION[cmd]) return true;
+  return /^(?:graph|ui|workflow|refresh|nodes)_[\w.-]+$/.test(cmd);
+}
+
+/** Extract the command from either dispatcher spelling. Shared so the rewrite,
+ *  the #422 veto-revocation, and the tagless unsupported detector agree. */
+function parseUnknownCommandReply(error: string): string | null {
+  const text = String(error ?? "")
+    .trim()
+    .replace(/^error:\s+/i, "")
+    .trim();
+  const withCommand = UNKNOWN_COMMAND_RE.exec(text);
+  if (withCommand) return withCommand[1];
+  const bare = UNKNOWN_BARE_CMD_RE.exec(text);
+  if (!bare) return null;
+  return looksLikeBridgeCommand(bare[1]) ? bare[1] : null;
+}
 
 /** True when `error` is the panel's own "Unknown command" dispatch reply — proof this
  *  build does NOT implement the command, INDEPENDENT of any advertised-version guard
  *  (#422). Used to revoke a stale proven-supported veto even when the version is new
  *  enough to suppress the "too old" rewrite, so a genuine downgrade always re-gates. */
 export function isUnknownCommandReply(error: string): boolean {
-  return UNKNOWN_COMMAND_RE.test(String(error ?? "").trim());
+  return parseUnknownCommandReply(error) != null;
 }
 
 export function makeUnknownCommandError(
@@ -1097,14 +1125,11 @@ export function makeUnknownCommandError(
   panelVersion?: string | PanelVersionReading,
   mcpVersion?: string,
 ): Error | null {
-  // Match the panel's exact shape: `Unknown command "graph_query"` (quotes
-  // optional/variable). ANCHORED at the start of the (trimmed) message so an
-  // unrelated error that merely QUOTES an unknown-command phrase somewhere in its
-  // text is never rewritten — only the panel dispatcher's own reply, which is
-  // exactly this string. Case-insensitive, tolerant of straight or smart quotes.
-  const m = UNKNOWN_COMMAND_RE.exec(error.trim());
-  if (!m) return null;
-  const cmd = m[1];
+  // Current shape: `Unknown command "graph_query"`. Recurrence shape: `unknown
+  // graph_outline` (and the MCP-prefixed `Error: unknown graph_outline`). Start-
+  // anchored so an error that merely quotes the phrase mid-message is not rewritten.
+  const cmd = parseUnknownCommandReply(error);
+  if (!cmd) return null;
   // #352 FALSE-NEGATIVE GUARD: if the panel advertised a version that already
   // meets this command's real minimum, the panel is NOT too old — an "Unknown
   // command" reply here means something else (a genuinely retired/renamed command,
