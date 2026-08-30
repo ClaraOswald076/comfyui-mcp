@@ -16,7 +16,7 @@ All notable changes to this project are documented here. This project adheres to
 ### MCP
 
 #### Fixed
-- suppress already-acknowledged run-finished replays after panel reconnects while preserving undelivered completion recovery (#2591)
+- suppress already-acknowledged run-finished replays after panel reconnects while preserving undelivered completion recovery
 - concurrent panel_set_widget calls each settle after frontend acknowledgement instead of hanging the combined tool call (#2559, #2605)
 - panel_set_widget does not refuse an ordinary-root write when the panel connection identity is missing after a successful scope probe (#2551, #2601)
 - persist subgraph viewing scope across panel tool calls so interior mutations do not silently fall back to root (#2553, #2602)
