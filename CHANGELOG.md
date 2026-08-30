@@ -19,6 +19,7 @@ All notable changes to this project are documented here. This project adheres to
 - panel_free_vram reports VRAM after CUDA release settles (#2050)
 - panel_open_workflow treats nested opened.routing_key as unsaved-open proof instead of failing a proven tmp: open as an unconfirmed filename (#2477)
 - omit the #2437 unexpose reindex warning when the removed slot is last or the panel already reindexed (#2491)
+- panel_get_errors reports unavailable saved LoadImage values instead of reasonless stale flags (#2587)
 
 ## [0.52.150] - 2026-08-30
 
