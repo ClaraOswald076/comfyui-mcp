@@ -867,44 +867,64 @@ describe("node-management service", () => {
       ).toBeDefined();
     });
 
-    it("fails closed when Manager accepts a git enqueue with an empty success body", async () => {
+    it("drains before falling back when Manager accepts a git enqueue with an empty success body", async () => {
       const { calls } = stubFetch({ installedBody: {}, queueOpEmpty: true });
+      let cloned = false;
+      mockedExists.mockImplementation((p: unknown) => {
+        const s = String(p);
+        if (s.includes("requirements.txt") || s.includes("install.py")) return false;
+        if (s.includes(".venv") || s.includes("cm-cli.py")) return false;
+        if (s.includes(NODE_DIR_UTILS) || s.endsWith("comfyui-teskors-utils")) return cloned;
+        return false;
+      });
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") cloned = true;
+        return "";
+      }) as never);
 
-      await expect(
-        installCustomNode({
-          id: "https://github.com/teskor-hub/comfyui-teskors-utils",
-          source: "git",
-        }),
-      ).rejects.toMatchObject({
-        details: { kind: "manager-enqueue-empty-success" },
+      const res = await installCustomNode({
+        id: "https://github.com/teskor-hub/comfyui-teskors-utils",
+        source: "git",
       });
 
-      // The successful empty enqueue is ambiguous: do not start/poll it and
-      // never race a possible Manager task with a local clone.
+      expect(res.mechanism).toBe("git-clone");
+      // An empty successful body is not a pre-queue refusal. Drain the task
+      // before the exact installed-pack/disk check authorizes the clone.
       expect(calls.some((c) => c.url.endsWith("/v2/manager/queue/task"))).toBe(true);
-      expect(calls.some((c) => c.url.endsWith("/v2/manager/queue/start"))).toBe(false);
+      expect(calls.some((c) => c.url.endsWith("/v2/manager/queue/start"))).toBe(true);
+      expect(calls.some((c) => c.url.endsWith("/manager/queue/status"))).toBe(true);
       expect(
         mockedExec.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone"),
-      ).toBeUndefined();
+      ).toBeDefined();
     });
 
-    it("fails closed when Manager accepts a git enqueue with JSON null", async () => {
+    it("drains before falling back when Manager accepts a git enqueue with JSON null", async () => {
       const { calls } = stubFetch({ installedBody: {}, queueOpNull: true });
+      let cloned = false;
+      mockedExists.mockImplementation((p: unknown) => {
+        const s = String(p);
+        if (s.includes("requirements.txt") || s.includes("install.py")) return false;
+        if (s.includes(".venv") || s.includes("cm-cli.py")) return false;
+        if (s.includes(NODE_DIR_UTILS) || s.endsWith("comfyui-teskors-utils")) return cloned;
+        return false;
+      });
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") cloned = true;
+        return "";
+      }) as never);
 
-      await expect(
-        installCustomNode({
-          id: "https://github.com/teskor-hub/comfyui-teskors-utils",
-          source: "git",
-        }),
-      ).rejects.toMatchObject({
-        details: { kind: "manager-enqueue-empty-success" },
+      const res = await installCustomNode({
+        id: "https://github.com/teskor-hub/comfyui-teskors-utils",
+        source: "git",
       });
 
+      expect(res.mechanism).toBe("git-clone");
       expect(calls.some((c) => c.url.endsWith("/v2/manager/queue/task"))).toBe(true);
-      expect(calls.some((c) => c.url.endsWith("/v2/manager/queue/start"))).toBe(false);
+      expect(calls.some((c) => c.url.endsWith("/v2/manager/queue/start"))).toBe(true);
+      expect(calls.some((c) => c.url.endsWith("/manager/queue/status"))).toBe(true);
       expect(
         mockedExec.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone"),
-      ).toBeUndefined();
+      ).toBeDefined();
     });
 
     it("fails closed when a warm dialect cache later returns an empty queue status", async () => {

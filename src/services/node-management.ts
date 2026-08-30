@@ -1517,8 +1517,10 @@ async function reclassifyAfterEmptyQueueStatus(
 }
 
 interface ManagerEnqueueOptions {
-  /** A git install may fall back to a local clone, so an empty 2xx is unsafe. */
+  /** Callers may reject an empty 2xx when they cannot safely verify afterward. */
   rejectEmptyEnqueue?: boolean;
+  /** Allow an empty v4 unified enqueue to proceed to drain/verification. */
+  allowEmptyV2Enqueue?: boolean;
 }
 
 type ManagerEnqueueResponse = Record<string, unknown> | string | null | undefined;
@@ -1531,7 +1533,11 @@ function assertManagerEnqueueResponse(
   path: string,
   base: string,
 ): void {
-  if (!options.rejectEmptyEnqueue || (response !== undefined && response !== null)) return;
+  if (
+    !options.rejectEmptyEnqueue ||
+    (response !== undefined && response !== null) ||
+    (api === "v2" && options.allowEmptyV2Enqueue)
+  ) return;
   throw new NodeManagementError(
     `ComfyUI-Manager returned a successful but empty response for the ${kind} enqueue ` +
       `on the "${api}" dialect. The task may have been submitted, so its outcome is ` +
@@ -3734,6 +3740,12 @@ export interface InstallOptions {
   /** The caller has already resolved the only safe local clone root. When set,
    *  an absent comfyuiPath means Manager-only, never a second local-root lookup. */
   localCloneFallback?: "verified-only";
+  /**
+   * Internal caller policy for an empty Manager v4 Git enqueue. Direct installs
+   * can drain and verify before cloning; budgeted apply_manifest keeps the
+   * UNKNOWN/no-background-write behavior.
+   */
+  allowEmptyV2Enqueue?: boolean;
   /** Call-scoped Manager base captured with the target generation at operation entry. */
   managerBase?: string;
   /** Monotonic ComfyUI target generation captured with managerBase. */
@@ -4070,6 +4082,10 @@ async function installCustomNodeImpl(
     // Only a PRE-QUEUE refusal diverts (see managerEnqueueRefusal): the response
     // describes the request, so nothing is running and the clone cannot race a
     // Manager task writing to the same directory. Everything else rethrows.
+    // An empty successful enqueue is not a pre-queue refusal: Manager may
+    // have accepted the task and simply omitted its acknowledgement body.
+    // Start and drain the queue first, then the exact installed-pack/disk
+    // verification below decides whether a local clone is still needed.
     let refusedBy: number | undefined;
     const enqueue = async (): Promise<unknown> =>
       await queueManagerTask(
@@ -4105,10 +4121,14 @@ async function installCustomNodeImpl(
             mode: opts.mode ?? "cache",
           },
       managerBase,
-      // This branch can authorize a local clone after Manager returns. An
-      // empty successful enqueue is ambiguous, so fail before start/status
-      // rather than treating it as a safe pre-queue refusal.
-      { rejectEmptyEnqueue: true },
+      // Manager v4 may accept the task while omitting its acknowledgement
+      // body. Direct installs can safely drain and verify before cloning;
+      // apply_manifest opts out so a late completion cannot start a local
+      // write after that budgeted call has returned UNKNOWN/pending.
+      {
+        rejectEmptyEnqueue: true,
+        allowEmptyV2Enqueue: opts.allowEmptyV2Enqueue !== false,
+      },
     );
 
     let status: unknown;
