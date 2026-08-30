@@ -179,10 +179,36 @@ import {
   NodeManagementError,
 } from "../../services/node-management.js";
 import { ProcessControlError, ValidationError } from "../../utils/errors.js";
+import { withPanelMutationLock } from "../../services/panel-pin-guard.js";
+import { applyManifest } from "../../services/manifest.js";
 
 const mockedExec = vi.mocked(execFileSync);
 const mockedExists = vi.mocked(existsSync);
 let priorComfyuiPathEnv: string | undefined;
+
+/** Hold the shared writer lock so a production install call can prove which
+ * work is actually inside its critical section. */
+function holdPanelMutationLock() {
+  let releaseLock!: () => void;
+  let markReady!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    markReady = resolve;
+  });
+  const done = withPanelMutationLock(async () => {
+    await new Promise<void>((resolve) => {
+      releaseLock = resolve;
+      markReady();
+    });
+  });
+  return { ready, done, release: () => releaseLock() };
+}
+
+async function settlesBefore<T>(promise: Promise<T>, timeoutMs = 500): Promise<boolean> {
+  return Promise.race([
+    promise.then(() => true, () => true),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
+  ]);
+}
 
 // The product builds these paths with node:path (join), so they use the
 // platform separator (backslashes on Windows). Build the expected values the
@@ -207,9 +233,17 @@ interface Call {
  * Install a fetch stub that records every call and returns canned responses.
  * The queue status returns "done" on the first poll so runManagerQueue resolves.
  */
+type QueueStatusFixture = {
+  total_count: number;
+  done_count: number;
+  in_progress_count: number;
+  is_processing: boolean;
+  pending_count?: number;
+};
+
 function stubFetch(opts: {
   installedBody?: unknown;
-  statusSequence?: unknown[];
+  statusSequence?: QueueStatusFixture[] | (() => QueueStatusFixture);
   /** Fires when a queue op is submitted — lets a test make the install REAL. */
   onQueue?: () => void;
   /**
@@ -220,6 +254,12 @@ function stubFetch(opts: {
   queueOpStatus?: number;
   /** Exact body returned by the Manager queue operation when queueOpStatus is set. */
   queueOpBody?: string;
+  /** Return an empty successful body for a custom-node install enqueue. */
+  queueOpEmpty?: boolean;
+  /** Return JSON null for a custom-node install enqueue. */
+  queueOpNull?: boolean;
+  /** Delay a custom-node install enqueue response to exercise apply_manifest's late race. */
+  queueOpDelayMs?: number;
   /** Body for `https://api.comfy.org/nodes/:id` (registry-zip empty-pack fallback). */
   registryDetails?: unknown;
   /** Body for v4 per-task queue history lookups. */
@@ -227,6 +267,9 @@ function stubFetch(opts: {
   /** Shape of both Manager queue/status dialect probes for fallback tests. */
   managerQueueStatus?:
     | "absent"
+    | "manager-unavailable"
+    | "manager-unavailable-null"
+    | "manager-unavailable-explicit"
     | "malformed"
     | "timeout"
     | "server-error"
@@ -257,8 +300,16 @@ function stubFetch(opts: {
         if (opts.managerQueueStatus === "absent") {
           return new Response("missing", { status: 404 });
         }
+        if (opts.managerQueueStatus === "manager-unavailable") {
+          // H3/Desktop shape: the route answers, but no Manager queue/status
+          // payload exists. It is not a frontend HTML catchall.
+          return new Response("", { status: 200 });
+        }
+        if (opts.managerQueueStatus === "manager-unavailable-explicit") {
+          return jsonResponse({ error: "ComfyUI-Manager not reachable" });
+        }
         if (opts.managerQueueStatus === "malformed") {
-          return new Response("<!doctype html>", { status: 200 });
+          return new Response("<!doctype html><title>ComfyUI-Manager unavailable</title>", { status: 200 });
         }
         if (opts.managerQueueStatus === "timeout") {
           throw new Error("request timed out");
@@ -271,7 +322,9 @@ function stubFetch(opts: {
         }
       }
       if (path === "/v2/manager/queue/status") {
-        const s = statusSeq[Math.min(statusIdx, statusSeq.length - 1)];
+        const s = typeof statusSeq === "function"
+          ? statusSeq()
+          : statusSeq[Math.min(statusIdx, statusSeq.length - 1)];
         statusIdx++;
         return jsonResponse(s);
       }
@@ -297,6 +350,35 @@ function stubFetch(opts: {
               "A security error has occurred. Please check the terminal logs",
             { status: opts.queueOpStatus },
           );
+        }
+        if (opts.queueOpDelayMs && isInstallOp) {
+          await new Promise<void>((resolve) => setTimeout(resolve, opts.queueOpDelayMs));
+        }
+        if (opts.queueOpNull && isInstallOp) {
+          opts.onQueue?.();
+          return jsonResponse(null);
+        }
+        if (opts.queueOpEmpty && isInstallOp) {
+          opts.onQueue?.();
+          return new Response("", { status: 200 });
+        }
+        if (opts.managerQueueStatus === "manager-unavailable-null") {
+          // A JSON null is a successful response with no queue evidence. It
+          // must take the same fail-closed path as the empty 200 body.
+          return jsonResponse(null);
+        }
+        // A 405 on the unified task route is retried through v2-batch; model
+        // that downgrade as an acknowledged enqueue for the existing race
+        // coverage below.
+        if (opts.queueOpStatus === 405 && path.endsWith("/queue/batch")) {
+          opts.onQueue?.();
+          return jsonResponse({ accepted: true });
+        }
+        // A successful install enqueue normally has an acknowledgement body;
+        // keep that distinct from the adversarial empty-2xx race fixture.
+        if (isInstallOp) {
+          opts.onQueue?.();
+          return jsonResponse({ accepted: true });
         }
         opts.onQueue?.();
       }
@@ -673,7 +755,7 @@ describe("node-management service", () => {
       });
     });
 
-    it("falls back to a direct git clone when the Manager can't resolve the repo", async () => {
+    it("falls back to a direct git clone after a non-empty accepted Manager enqueue", async () => {
       // Manager drains "done" but the pack never appears → unregistered repo.
       const { calls } = stubFetch({ installedBody: {} });
       // Simulate clone landing the dir on disk, with no requirements/install.py.
@@ -707,6 +789,8 @@ describe("node-management service", () => {
       expect(taskOf(calls, "install").params).toMatchObject({
         id: "comfyui-teskors-utils",
       });
+      expect(calls.some((c) => c.url.endsWith("/v2/manager/queue/task"))).toBe(true);
+      expect(calls.some((c) => c.url.endsWith("/v2/manager/queue/start"))).toBe(true);
       // git clone was invoked with the URL + the target node dir (shallow, no ref).
       const cloneCall = mockedExec.mock.calls.find(
         (c) => c[0] === "git" && (c[1] as string[])[0] === "clone",
@@ -754,6 +838,348 @@ describe("node-management service", () => {
       expect(res.mechanism).toBe("git-clone");
       expect(res.message).toMatch(/confirmed absent/);
       expect(res.message).toMatch(/both queue\/status dialects returned HTTP 404/);
+      expect(
+        mockedExec.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone"),
+      ).toBeDefined();
+    });
+
+    it("fails closed when Manager accepts a git enqueue with an empty success body", async () => {
+      const { calls } = stubFetch({ installedBody: {}, queueOpEmpty: true });
+
+      await expect(
+        installCustomNode({
+          id: "https://github.com/teskor-hub/comfyui-teskors-utils",
+          source: "git",
+        }),
+      ).rejects.toMatchObject({
+        details: { kind: "manager-enqueue-empty-success" },
+      });
+
+      // The successful empty enqueue is ambiguous: do not start/poll it and
+      // never race a possible Manager task with a local clone.
+      expect(calls.some((c) => c.url.endsWith("/v2/manager/queue/task"))).toBe(true);
+      expect(calls.some((c) => c.url.endsWith("/v2/manager/queue/start"))).toBe(false);
+      expect(
+        mockedExec.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone"),
+      ).toBeUndefined();
+    });
+
+    it("fails closed when Manager accepts a git enqueue with JSON null", async () => {
+      const { calls } = stubFetch({ installedBody: {}, queueOpNull: true });
+
+      await expect(
+        installCustomNode({
+          id: "https://github.com/teskor-hub/comfyui-teskors-utils",
+          source: "git",
+        }),
+      ).rejects.toMatchObject({
+        details: { kind: "manager-enqueue-empty-success" },
+      });
+
+      expect(calls.some((c) => c.url.endsWith("/v2/manager/queue/task"))).toBe(true);
+      expect(calls.some((c) => c.url.endsWith("/v2/manager/queue/start"))).toBe(false);
+      expect(
+        mockedExec.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone"),
+      ).toBeUndefined();
+    });
+
+    it("fails closed when a warm dialect cache later returns an empty queue status", async () => {
+      const fetchOptions = {
+        managerQueueStatus: undefined as
+          | "manager-unavailable"
+          | "manager-unavailable-null"
+          | undefined,
+      };
+      const { calls } = stubFetch(fetchOptions);
+
+      // Warm the production dialect cache through a real Manager operation.
+      await installModelViaManager({
+        name: "warmup.safetensors",
+        url: "https://example.com/warmup.safetensors",
+        filename: "warmup.safetensors",
+        type: "checkpoints",
+      });
+      fetchOptions.managerQueueStatus = "manager-unavailable";
+
+      let cloned = false;
+      mockedExists.mockImplementation((p: unknown) => {
+        const s = String(p);
+        if (s.includes("requirements.txt") || s.includes("install.py")) return false;
+        if (s.includes(".venv") || s.includes("cm-cli.py")) return false;
+        if (s.includes(NODE_DIR_UTILS) || s.endsWith("comfyui-teskors-utils")) return cloned;
+        return false;
+      });
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") cloned = true;
+        return "";
+      }) as never);
+
+      const res = await installCustomNode({
+        id: "https://github.com/teskor-hub/comfyui-teskors-utils",
+        source: "git",
+      }).catch((err) => err);
+
+      expect(res).toMatchObject({
+        details: { kind: "manager-queue-empty-status" },
+      });
+      expect(res.message).toMatch(/outcome is UNKNOWN/);
+      expect(res.message).toMatch(/no local fallback is authorized/);
+      expect(
+        mockedExec.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone"),
+      ).toBeUndefined();
+      // The task was accepted with a non-empty acknowledgement, then status
+      // went empty. Reclassification is still attempted, but cannot authorize
+      // a clone after the enqueue has happened.
+      expect(calls.some((c) => c.url.endsWith("/v2/manager/queue/task"))).toBe(true);
+      expect(calls.some((c) => c.url.endsWith("/v2/manager/queue/start"))).toBe(true);
+      expect(calls.some((c) => c.url.endsWith("/manager/queue/status"))).toBe(true);
+    });
+
+    it("preserves UNKNOWN in production apply_manifest after a warm cached enqueue sees JSON null status (#1129)", async () => {
+      const fetchOptions = {
+        managerQueueStatus: undefined as "manager-unavailable-null" | undefined,
+      };
+      const { calls } = stubFetch(fetchOptions);
+
+      // Warm the real Manager dialect cache, then make both queue/status
+      // dialects answer JSON null. The custom-node enqueue still returns an
+      // acknowledgement, so apply_manifest must report UNKNOWN/pending rather
+      // than converting the tagged error into failed or authorizing a clone.
+      await installModelViaManager({
+        name: "warmup.safetensors",
+        url: "https://example.com/warmup.safetensors",
+        filename: "warmup.safetensors",
+        type: "checkpoints",
+      });
+      fetchOptions.managerQueueStatus = "manager-unavailable-null";
+
+      const started = Date.now();
+      const result = await applyManifest({
+        manifest: {
+          custom_nodes: ["https://github.com/teskor-hub/comfyui-teskors-utils"],
+        },
+      });
+
+      expect(Date.now() - started).toBeLessThan(1000);
+      expect(result.success).toBe(false);
+      expect(result.summary).toMatchObject({ applied: 0, failed: 0, pending: 1 });
+      expect(result.results[0]).toMatchObject({
+        action: "custom_node",
+        status: "pending",
+      });
+      expect(result.results[0].message).toMatch(/outcome is UNKNOWN/i);
+      expect(result.results[0].message).toMatch(/no local fallback is authorized/i);
+      expect(result.partial).toMatchObject({
+        not_started: [],
+        still_installing: ["https://github.com/teskor-hub/comfyui-teskors-utils"],
+        outcome_unknown: ["https://github.com/teskor-hub/comfyui-teskors-utils"],
+      });
+      expect(calls.some((c) => c.url.endsWith("/v2/manager/queue/task"))).toBe(true);
+      expect(
+        mockedExec.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone"),
+      ).toBeUndefined();
+    });
+
+    it("#1129 falls back when both queue-status dialects repeatedly answer empty", async () => {
+      stubFetch({ managerQueueStatus: "manager-unavailable" });
+      let cloned = false;
+      mockedExists.mockImplementation((p: unknown) => {
+        const s = String(p);
+        if (s.includes("requirements.txt") || s.includes("install.py")) return false;
+        if (s.includes(".venv") || s.includes("cm-cli.py")) return false;
+        if (s.includes(NODE_DIR_UTILS) || s.endsWith("comfyui-teskors-utils")) return cloned;
+        return false;
+      });
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") cloned = true;
+        return "";
+      }) as never);
+
+      const res = await installCustomNode({
+        id: "https://github.com/teskor-hub/comfyui-teskors-utils",
+        source: "git",
+      });
+
+      expect(res.mechanism).toBe("git-clone");
+      expect(res.message).toMatch(/queue\/status surface was unavailable/);
+      expect(res.message).toMatch(/before any install task was submitted/);
+      expect(
+        mockedExec.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone"),
+      ).toBeDefined();
+    });
+
+    it("keeps apply_manifest truthful when a late Manager drain selects local fallback (#1129)", async () => {
+      const previousBudget = process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS;
+      process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS = "80";
+      const pending = {
+        total_count: 1,
+        done_count: 0,
+        in_progress_count: 1,
+        is_processing: true,
+      };
+      const drainedStatus = {
+        total_count: 1,
+        done_count: 1,
+        in_progress_count: 0,
+        is_processing: false,
+      };
+      let statusCalls = 0;
+      let drained = false;
+      const { calls } = stubFetch({
+        installedBody: {},
+        // The first status response is the dialect probe. Hold the real queue
+        // open until apply_manifest has returned, then let installCustomNode's
+        // actual post-drain verification select its local clone fallback.
+        statusSequence: () =>
+          statusCalls++ === 0 || drained ? drainedStatus : pending,
+      });
+      let cloned = false;
+      let markCloneStarted!: () => void;
+      const cloneStarted = new Promise<void>((resolve) => {
+        markCloneStarted = resolve;
+      });
+      mockedExists.mockImplementation((p: unknown) => {
+        const s = String(p);
+        if (s.includes("requirements.txt") || s.includes("install.py")) return false;
+        if (s.includes(NODE_DIR_UTILS) || s.endsWith("comfyui-teskors-utils")) return cloned;
+        return false;
+      });
+      fsCtl.readdirSync = (p) => {
+        const norm = p.replace(/\\/g, "/");
+        return norm.endsWith("/comfyui-teskors-utils") ? ["__init__.py"] : [];
+      };
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") {
+          cloned = true;
+          markCloneStarted();
+        }
+        return "";
+      }) as never);
+
+      try {
+        const result = await applyManifest({
+          manifest: {
+            custom_nodes: [
+              "https://github.com/teskor-hub/comfyui-teskors-utils",
+              "next-pack",
+            ],
+          },
+        });
+
+        const first = result.results[0];
+        expect(result.summary).toMatchObject({ applied: 0, failed: 0, pending: 2 });
+        expect(first).toMatchObject({
+          action: "custom_node",
+          item: "https://github.com/teskor-hub/comfyui-teskors-utils",
+          status: "pending",
+        });
+        expect(first.message).toMatch(/outcome is UNKNOWN/i);
+        expect(first.message).toMatch(/no local direct-install fallback is authorized/i);
+        expect(first.message).not.toMatch(/may transition.*local direct-install fallback/i);
+        expect(first.message).not.toMatch(/poll panel_node_queue_status/i);
+        expect(result.partial).toMatchObject({
+          not_started: ["next-pack"],
+          still_installing: ["https://github.com/teskor-hub/comfyui-teskors-utils"],
+          outcome_unknown: ["https://github.com/teskor-hub/comfyui-teskors-utils"],
+        });
+        expect(result.partial).not.toHaveProperty("local_fallback_pending");
+        expect(result.partial?.message).toMatch(/outcome is UNKNOWN/i);
+        expect(result.partial?.message).toMatch(/no local direct-install fallback is authorized/i);
+        expect(result.partial?.message).not.toMatch(/ON the queue, pollable/i);
+
+        // This is the production late transition: the queue drains after the
+        // response, then the real installCustomNode path verifies Manager's
+        // empty installed list and runs git clone.
+        drained = true;
+        const late = await Promise.race([
+          cloneStarted.then(() => "cloned" as const),
+          new Promise<"timed-out">((resolve) => setTimeout(() => resolve("timed-out"), 500)),
+        ]);
+        expect(late).toBe("cloned");
+        expect(calls.some((c) => c.url.endsWith("/v2/manager/queue/task"))).toBe(true);
+        expect(
+          mockedExec.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone"),
+        ).toBeDefined();
+      } finally {
+        if (previousBudget === undefined) delete process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS;
+        else process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS = previousBudget;
+      }
+    });
+
+    it("does not authorize a late local clone when Manager enqueue eventually returns null (#1129)", async () => {
+      const previousBudget = process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS;
+      process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS = "40";
+      const { calls } = stubFetch({
+        installedBody: {},
+        queueOpNull: true,
+        queueOpDelayMs: 100,
+      });
+      let cloned = false;
+      mockedExists.mockImplementation((p: unknown) => {
+        const s = String(p);
+        if (s.includes("requirements.txt") || s.includes("install.py")) return false;
+        if (s.includes(NODE_DIR_UTILS) || s.endsWith("comfyui-teskors-utils")) return cloned;
+        return false;
+      });
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") cloned = true;
+        return "";
+      }) as never);
+
+      try {
+        const result = await applyManifest({
+          manifest: {
+            custom_nodes: [
+              "https://github.com/teskor-hub/comfyui-teskors-utils",
+              "next-pack",
+            ],
+          },
+        });
+
+        expect(result.summary).toMatchObject({ applied: 0, failed: 0, pending: 2 });
+        expect(result.results[0].message).toMatch(/outcome is UNKNOWN/i);
+        expect(result.results[0].message).toMatch(/no local direct-install fallback is authorized/i);
+        expect(result.partial).toMatchObject({
+          not_started: ["next-pack"],
+          still_installing: ["https://github.com/teskor-hub/comfyui-teskors-utils"],
+          outcome_unknown: ["https://github.com/teskor-hub/comfyui-teskors-utils"],
+        });
+        expect(result.partial).not.toHaveProperty("local_fallback_pending");
+        expect(calls.some((c) => c.url.endsWith("/v2/manager/queue/task"))).toBe(true);
+
+        await new Promise<void>((resolve) => setTimeout(resolve, 130));
+        expect(cloned).toBe(false);
+        expect(
+          mockedExec.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone"),
+        ).toBeUndefined();
+      } finally {
+        if (previousBudget === undefined) delete process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS;
+        else process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS = previousBudget;
+      }
+    });
+
+    it("#1129 accepts repeated explicit Manager-unavailable responses", async () => {
+      stubFetch({ managerQueueStatus: "manager-unavailable-explicit" });
+      let cloned = false;
+      mockedExists.mockImplementation((p: unknown) => {
+        const s = String(p);
+        if (s.includes("requirements.txt") || s.includes("install.py")) return false;
+        if (s.includes(".venv") || s.includes("cm-cli.py")) return false;
+        if (s.includes(NODE_DIR_UTILS) || s.endsWith("comfyui-teskors-utils")) return cloned;
+        return false;
+      });
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") cloned = true;
+        return "";
+      }) as never);
+
+      const res = await installCustomNode({
+        id: "https://github.com/teskor-hub/comfyui-teskors-utils",
+        source: "git",
+      });
+
+      expect(res.mechanism).toBe("git-clone");
+      expect(res.message).toMatch(/queue\/status surface was unavailable/);
       expect(
         mockedExec.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone"),
       ).toBeDefined();
@@ -2132,6 +2558,34 @@ describe("node-management service", () => {
       expect(taskOf(calls, "install").params).toMatchObject({ id: "my-pack" });
     });
 
+    it("does not wait on the local writer lock while unavailable comfy-cli falls back to Manager", async () => {
+      mockedExists.mockReturnValue(false);
+      let markManagerReached!: () => void;
+      const managerReached = new Promise<void>((resolve) => {
+        markManagerReached = resolve;
+      });
+      const { calls } = stubFetch({
+        installedBody: {
+          "my-pack": { ver: "1.0.0", cnr_id: "my-pack", enabled: true },
+        },
+        onQueue: markManagerReached,
+      });
+      const held = holdPanelMutationLock();
+      await held.ready;
+      const install = installCustomNode({ id: "my-pack", useCmCli: true });
+      try {
+        // This is the Manager-only branch: it must reach the queue while a
+        // separate local writer is still holding the shared lock.
+        expect(await settlesBefore(managerReached)).toBe(true);
+        expect(await settlesBefore(install)).toBe(true);
+      } finally {
+        held.release();
+        await held.done;
+      }
+      await expect(install).resolves.toMatchObject({ mechanism: "manager-http" });
+      expect(taskOf(calls, "install").params).toMatchObject({ id: "my-pack" });
+    });
+
     it("useCmCli still uses comfy-cli when it IS available", async () => {
       mockedExec.mockReturnValue(cliEnvelope({ message: "ok" }) as never);
       const res = await installCustomNode({ id: "my-pack", useCmCli: true });
@@ -2244,6 +2698,34 @@ describe("node-management service", () => {
       expect(gitCalls.some((args) => args[2] === "checkout")).toBe(false);
     });
 
+  });
+
+  describe("local install writer lock boundary (#2509)", () => {
+    it("does not wait on the local writer lock before refusing an accepted remote git fallback", async () => {
+      remoteFlags.remoteMode = true;
+      let markManagerReached!: () => void;
+      const managerReached = new Promise<void>((resolve) => {
+        markManagerReached = resolve;
+      });
+      stubFetch({ installedBody: {}, onQueue: markManagerReached });
+      const held = holdPanelMutationLock();
+      await held.ready;
+      const install = installCustomNode({
+        id: "https://github.com/foo/unregistered-pack",
+        source: "git",
+      });
+      try {
+        // Manager may be contacted while the local writer lock is occupied.
+        // The eventual clone helper refusal is also a non-write path and must
+        // not wait for that lock.
+        expect(await settlesBefore(managerReached)).toBe(true);
+        expect(await settlesBefore(install)).toBe(true);
+      } finally {
+        held.release();
+        await held.done;
+      }
+      await expect(install).rejects.toThrow(/REMOTE ComfyUI/);
+    });
   });
 
   // ---- disable / enable / uninstall (#775) ----------------------------------
@@ -3466,6 +3948,9 @@ describe("node-management service", () => {
           if (path === "/customnode/installed") {
             return jsonResponse(opts.installedBody ?? {});
           }
+          if (path === "/manager/queue/install") {
+            return jsonResponse({ accepted: true });
+          }
           return new Response("", { status: 200 });
         },
       );
@@ -3938,7 +4423,11 @@ describe("node-management service", () => {
   describe("v2 task 405 → v2-batch negotiation (issue #464)", () => {
     /** Stub a build whose /v2 queue surface answers status but 405s the unified
      *  task route, with `is_legacy_manager_ui` absent (catchall HTML). */
-    function stub464Fetch(opts: { failed?: unknown[]; installedBody?: unknown } = {}) {
+    function stub464Fetch(opts: {
+      failed?: unknown[];
+      installedBody?: unknown;
+      batchResponse?: "accepted" | "empty" | "null";
+    } = {}) {
       const calls: Call[] = [];
       const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
         const method = init?.method ?? "GET";
@@ -3962,6 +4451,8 @@ describe("node-management service", () => {
           return new Response("405: Method Not Allowed", { status: 405 });
         }
         if (path === "/v2/manager/queue/batch" && method === "POST") {
+          if (opts.batchResponse === "empty") return new Response("", { status: 200 });
+          if (opts.batchResponse === "null") return jsonResponse(null);
           return jsonResponse({ failed: opts.failed ?? [] });
         }
         if (path === "/v2/manager/queue/start" && method === "POST") {
@@ -3971,6 +4462,59 @@ describe("node-management service", () => {
       });
       vi.stubGlobal("fetch", fetchMock);
       return { calls };
+    }
+
+    function armGitCloneFixture(): () => boolean {
+      let cloned = false;
+      mockedExists.mockImplementation((p: unknown) => {
+        const s = String(p);
+        if (s.includes("requirements.txt") || s.includes("install.py")) return false;
+        if (s.includes(".venv") || s.includes("cm-cli.py")) return false;
+        return s.includes("comfyui-teskors-utils") ? cloned : false;
+      });
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") cloned = true;
+        return "";
+      }) as never);
+      return () => cloned;
+    }
+
+    it("uses the verified local fallback after an accepted v2-to-v2-batch downgrade", async () => {
+      const { calls } = stub464Fetch({ installedBody: {} });
+      const wasCloned = armGitCloneFixture();
+
+      const res = await installCustomNode({
+        id: "https://github.com/teskor-hub/comfyui-teskors-utils",
+      });
+
+      expect(res.mechanism).toBe("git-clone");
+      expect(calls.some((c) => new URL(c.url).pathname === "/v2/manager/queue/task")).toBe(true);
+      expect(calls.some((c) => new URL(c.url).pathname === "/v2/manager/queue/batch")).toBe(true);
+      expect(calls.some((c) => new URL(c.url).pathname === "/v2/manager/queue/start")).toBe(true);
+      expect(wasCloned()).toBe(true);
+    });
+
+    for (const [label, batchResponse] of [
+      ["an empty success body", "empty"],
+      ["JSON null", "null"],
+    ] as const) {
+      it(`fails closed when a v2-to-v2-batch downgrade returns ${label}`, async () => {
+        const { calls } = stub464Fetch({ installedBody: {}, batchResponse });
+        const wasCloned = armGitCloneFixture();
+
+        await expect(
+          installCustomNode({
+            id: "https://github.com/teskor-hub/comfyui-teskors-utils",
+          }),
+        ).rejects.toMatchObject({
+          details: { kind: "manager-enqueue-empty-success" },
+        });
+
+        expect(calls.some((c) => new URL(c.url).pathname === "/v2/manager/queue/task")).toBe(true);
+        expect(calls.some((c) => new URL(c.url).pathname === "/v2/manager/queue/batch")).toBe(true);
+        expect(calls.some((c) => new URL(c.url).pathname === "/v2/manager/queue/start")).toBe(false);
+        expect(wasCloned()).toBe(false);
+      });
     }
 
     it("panel_update_node succeeds via batch when /v2 task 405s (no raw 405 surfaced)", async () => {

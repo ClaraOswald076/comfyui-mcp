@@ -55,6 +55,7 @@ import { logger } from "../utils/logger.js";
 import {
   buildManifestPartial,
   describeManifestSource,
+  formatLocalFallbackMessage,
   formatNotStartedMessage,
   formatStillInstallingMessage,
   recordManifestPartial,
@@ -74,7 +75,8 @@ function manifestDownloadGraceMs(): number {
  *  big pack. Blocking apply_manifest until it drains blows past the MCP tools/call
  *  timeout (300s) and the caller sees a FALSE failure while the Manager keeps
  *  installing (#489). Bounding the phase well under that cap lets us hand back a
- *  "pending" result (poll the Manager queue) instead. Env-tunable; default 240s. */
+ *  "pending" result (poll the Manager queue when the operation really is
+ *  server-side). Env-tunable; default 240s. */
 function manifestNodeBudgetMs(): number {
   const raw = Number(process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS);
   return Number.isFinite(raw) && raw > 0 ? raw : 240_000;
@@ -258,9 +260,9 @@ export interface ApplyManifestResult {
   summary: Record<ManifestItemStatus, number>;
   results: ManifestItemReport[];
   /**
-   * Present only when some custom_nodes were never submitted to ComfyUI-Manager
-   * (#1699). Names the PARTIAL INSTALL. A drained Manager queue does not include
-   * these entries — re-run apply_manifest to submit them.
+   * Present when custom_nodes were never submitted or a submitted operation
+   * remains unresolved (#1699/#1129). Names the PARTIAL INSTALL. A drained
+   * Manager queue does not by itself account for these entries.
    */
   partial?: ManifestPartialInstall;
 }
@@ -990,7 +992,8 @@ async function resolveLocalManifestBase(): Promise<string | undefined> {
 }
 
 function looksLikeGitManifestSource(id: string): boolean {
-  return /^(?:https?:\/\/|git@|git\+)/i.test(id) || /\.git(?:[?#]|$)/i.test(id);
+  const candidate = id.trim();
+  return /^(?:https?:\/\/|git@|git\+)/i.test(candidate) || /\.git(?:[?#]|$)/i.test(candidate);
 }
 
 async function resolveLocalManifestCustomNodesBase(): Promise<string | undefined> {
@@ -1007,6 +1010,21 @@ async function resolveLocalManifestCustomNodesBase(): Promise<string | undefined
     // It only removes the optional local-clone route.
     return undefined;
   }
+}
+
+/**
+ * Manager can report a successful-but-empty enqueue or an empty queue/status
+ * response after a warm dialect cache. Both are deliberately tagged UNKNOWN
+ * by node-management: the request may already have reached the host, so no
+ * caller may reissue it or authorize a local clone. Keep that meaning intact
+ * when apply_manifest assembles its structured per-item result.
+ */
+function isUnknownManagerInstallOutcome(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const details = (err as { details?: unknown }).details;
+  if (!details || typeof details !== "object") return false;
+  const kind = (details as { kind?: unknown }).kind;
+  return kind === "manager-enqueue-empty-success" || kind === "manager-queue-empty-status";
 }
 
 async function applyManifestSections(
@@ -1118,8 +1136,10 @@ async function applyManifestSections(
   // tools/call timeout (300s) and the caller sees a FALSE failure while the
   // Manager keeps installing. So we mirror the model-download grace pattern:
   // install sequentially, but RACE each install against the remaining budget. If
-  // the budget wins, the install keeps running SERVER-SIDE (we stop awaiting it,
-  // swallowing its late result) and is reported "pending" — never failed — and
+  // the budget wins, the install keeps running and its late result is swallowed;
+  // before that result settles, only the already-fired local-fallback callback can
+  // establish a local route. Otherwise the outcome is explicitly UNKNOWN and is
+  // reported "pending" — never failed — and
   // every not-yet-started node is reported "pending" too.
   //
   // #1699: a "not started" pending is NOT on the Manager queue. Telling the
@@ -1131,6 +1151,7 @@ async function applyManifestSections(
   const nodeDeadline = Date.now() + manifestNodeBudgetMs();
   const notStarted: string[] = [];
   const stillInstalling: string[] = [];
+  const outcomeUnknown: string[] = [];
   let nodeBudgetSpent = false;
   // Even the INITIAL installed-list probe is budget-bounded — a hung Manager here
   // must not blow the tools/call timeout before we can report anything.
@@ -1138,6 +1159,9 @@ async function applyManifestSections(
   const installedNodes = initialList === BUDGET_TIMEOUT ? [] : initialList;
   if (initialList === BUDGET_TIMEOUT) nodeBudgetSpent = true;
   for (const id of manifest.custom_nodes) {
+    const normalizedId = id.trim();
+    const isGitManifestSource = looksLikeGitManifestSource(normalizedId);
+
     if (getComfyuiTargetGeneration() !== targetGeneration) {
       results.push(
         report(
@@ -1150,7 +1174,7 @@ async function applyManifestSections(
       );
       continue;
     }
-    const isPanelTarget = targetsPanelPackExactly(id);
+    const isPanelTarget = targetsPanelPackExactly(normalizedId);
     if (isPanelTarget) {
       // `apply_manifest` has a Manager target but no authoritative association
       // between that target and a local served-panel root. In particular,
@@ -1169,7 +1193,7 @@ async function applyManifestSections(
       );
       continue;
     }
-    if (nodeAlreadyInstalled(id, installedNodes)) {
+    if (nodeAlreadyInstalled(normalizedId, installedNodes)) {
       results.push(report("custom_node", id, "skipped", "Custom node is already installed."));
       continue;
     }
@@ -1185,35 +1209,66 @@ async function applyManifestSections(
     // Thread the call-scoped DATA/base (no global config mutation) so the
     // git-clone / ref-checkout fallback writes into the tree the runtime scans
     // (#1715/#1770). Pip uses codeBase independently above.
+    let localFallbackSelected = false;
     const installOutcome = installCustomNode({
-      id,
+      id: normalizedId,
       ...(customNodesBase ? { comfyuiPath: customNodesBase } : {}),
-      ...(looksLikeGitManifestSource(id)
+      ...(isGitManifestSource
         ? { localCloneFallback: "verified-only" as const }
         : {}),
       managerBase,
       targetGeneration,
+      onLocalFallback: () => {
+        localFallbackSelected = true;
+      },
     })
       .then((res) => ({ kind: "settled" as const, res }))
       .catch((err) => ({ kind: "error" as const, err }));
     const outcome = await raceDeadline(installOutcome, nodeDeadline);
 
     if (outcome === BUDGET_TIMEOUT) {
-      // Budget spent mid-install: leave it running server-side (installOutcome
-      // already has a .catch, so its eventual settle is safely ignored) and stop
-      // blocking on the remaining nodes.
+      // Budget spent mid-install: leave it running, but distinguish a local
+      // direct fallback only after its callback has actually fired. If a Git
+      // install is still unresolved, its eventual Manager response may be
+      // empty/null or otherwise fail closed; local mode/root/Git syntax alone
+      // cannot authorize cloning. Both promises already have a .catch, so
+      // their eventual settle is safely ignored.
       nodeBudgetSpent = true;
-      stillInstalling.push(id);
-      results.push(report("custom_node", id, "pending", formatStillInstallingMessage()));
+      if (localFallbackSelected) {
+        results.push(report("custom_node", id, "pending", formatLocalFallbackMessage()));
+      } else {
+        stillInstalling.push(id);
+        const outcomeIsUnknown = isGitManifestSource;
+        if (outcomeIsUnknown) outcomeUnknown.push(id);
+        results.push(
+          report(
+            "custom_node",
+            id,
+            "pending",
+            formatStillInstallingMessage({ outcomeUnknown: outcomeIsUnknown }),
+          ),
+        );
+      }
       continue;
     }
     if (outcome.kind === "error") {
+      const message =
+        outcome.err instanceof Error ? outcome.err.message : String(outcome.err);
+      if (isUnknownManagerInstallOutcome(outcome.err)) {
+        // UNKNOWN is an unsettled, fail-closed result, not a hard failure. The
+        // Manager may have accepted the task; preserve the no-reissue/no-clone
+        // disclosure and keep it visible to panel_node_queue_status.
+        stillInstalling.push(id);
+        outcomeUnknown.push(id);
+        results.push(report("custom_node", id, "pending", message));
+        continue;
+      }
       results.push(
         report(
           "custom_node",
           id,
           "failed",
-          outcome.err instanceof Error ? outcome.err.message : String(outcome.err),
+          message,
         ),
       );
       continue;
@@ -1603,7 +1658,12 @@ async function applyManifestSections(
   // #1699 — name the PARTIAL INSTALL (unsubmitted custom_nodes) so a drained
   // Manager queue cannot be read as completion. Replacing the leftover record
   // on every apply keeps queue-status honest about THIS call only.
-  const partial = buildManifestPartial({ source, notStarted, stillInstalling });
+  const partial = buildManifestPartial({
+    source,
+    notStarted,
+    stillInstalling,
+    outcomeUnknown,
+  });
   recordManifestPartial(partial);
 
   return {
