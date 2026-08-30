@@ -185,13 +185,21 @@ describe("upload subfolder propagation (#946 recurrence)", () => {
       type: "input",
     });
     const r = await uploadImageAuto("/src/frame.png", "assets/frame.png");
-    expect(r).toEqual({ filename: "frame.png", subfolder: "assets" });
+    expect(r).toEqual({
+      filename: "frame.png",
+      subfolder: "assets",
+      loaderSelectable: "unverified",
+    });
   });
 
   it("defaults the subfolder to '' when the server omits it", async () => {
     uploadImageHttpMock.mockResolvedValueOnce({ name: "in.png" });
     const r = await uploadImageAuto("/src/in.png");
-    expect(r).toEqual({ filename: "in.png", subfolder: "" });
+    expect(r).toEqual({
+      filename: "in.png",
+      subfolder: "",
+      loaderSelectable: "unverified",
+    });
   });
 
   it("passes the path-shaped override through to the transport, which owns the split", async () => {
@@ -206,6 +214,89 @@ describe("upload subfolder propagation (#946 recurrence)", () => {
       expect.any(Buffer),
       "video/mp4",
     );
+  });
+});
+
+describe("uploadImageAuto LoadImage enumeration (#2498)", () => {
+  // action:"image" used to return a nested filename as soon as /upload/image
+  // answered 200. LoadImage's combo on some hosts lists only top-level input/
+  // files, so panel_set_widget then refused the value after a schema refresh.
+  const loadImageInfo = (comboFiles: string[]) => ({
+    LoadImage: {
+      input: { required: { image: ["COMBO", { options: comboFiles }] } },
+    },
+  });
+
+  it("keeps a nested filename when LoadImage enumerates it", async () => {
+    uploadImageHttpMock.mockResolvedValueOnce({
+      name: "clean_profile_90_silhouette_v1.png",
+      subfolder: "story_mixer_refs",
+      type: "input",
+    });
+    const comboFiles = ["story_mixer_refs/clean_profile_90_silhouette_v1.png", "other.png"];
+    getObjectInfoMock.mockResolvedValueOnce(loadImageInfo(comboFiles));
+
+    const r = await uploadImageAuto(
+      "/src/profile.png",
+      "story_mixer_refs/clean_profile_90_silhouette_v1.png",
+    );
+
+    expect(uploadImageHttpMock).toHaveBeenCalledTimes(1);
+    expect(r).toMatchObject({
+      filename: "clean_profile_90_silhouette_v1.png",
+      subfolder: "story_mixer_refs",
+      loaderSelectable: "verified",
+    });
+    const reference = r.subfolder ? `${r.subfolder}/${r.filename}` : r.filename;
+    expect(comboFiles).toContain(reference);
+  });
+
+  it("falls back to a verified root filename when LoadImage omits the nested path", async () => {
+    const nestedName = "clean_profile_90_silhouette_v1.png";
+    const nestedRef = `story_mixer_refs/${nestedName}`;
+    uploadImageHttpMock
+      .mockResolvedValueOnce({ name: nestedName, subfolder: "story_mixer_refs", type: "input" })
+      .mockResolvedValueOnce({ name: nestedName, subfolder: "", type: "input" });
+    const rootCombo = [nestedName, "other.png"];
+    getObjectInfoMock
+      .mockResolvedValueOnce(loadImageInfo(["other.png"]))
+      .mockResolvedValueOnce(loadImageInfo(rootCombo));
+
+    const r = await uploadImageAuto("/src/profile.png", nestedRef);
+
+    expect(uploadImageHttpMock).toHaveBeenCalledTimes(2);
+    expect(uploadImageHttpMock.mock.calls[1]).toEqual([
+      nestedName,
+      expect.any(Buffer),
+      "image/png",
+      false,
+    ]);
+    expect(r).toMatchObject({
+      filename: nestedName,
+      subfolder: "",
+      loaderSelectable: "root-fallback",
+      requestedFilename: nestedRef,
+    });
+    const reference = r.subfolder ? `${r.subfolder}/${r.filename}` : r.filename;
+    expect(rootCombo).toContain(reference);
+    expect(reference).not.toContain("/");
+  });
+
+  it("does not claim selectability when /object_info is unavailable", async () => {
+    uploadImageHttpMock.mockResolvedValueOnce({
+      name: "clean_profile_90_silhouette_v1.png",
+      subfolder: "story_mixer_refs",
+      type: "input",
+    });
+    getObjectInfoMock.mockRejectedValueOnce(new Error("server unavailable"));
+
+    const r = await uploadImageAuto(
+      "/src/profile.png",
+      "story_mixer_refs/clean_profile_90_silhouette_v1.png",
+    );
+
+    expect(r.loaderSelectable).toBe("unverified");
+    expect(uploadImageHttpMock).toHaveBeenCalledTimes(1);
   });
 });
 
