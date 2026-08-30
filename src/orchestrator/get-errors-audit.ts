@@ -216,6 +216,17 @@ function optionsLookLikeFiles(options: string[]): boolean {
   return options.filter((s) => FILE_LIKE.test(s)).length * 2 >= options.length;
 }
 
+/**
+ * Upload combos can carry paths that the combo list deliberately cannot
+ * enumerate. The panel's /view probe is the authority for those values, so a
+ * stale outline must remain unknown until that evidence exists. Root-level
+ * names are different: those are the values the refreshed list is expected to
+ * enumerate, which is the evidence #2587 needs for the missing-value report.
+ */
+function isNonEnumerableUploadPath(value: string): boolean {
+  return /^\[(?:input|output|temp)\]/i.test(value) || /[\\/]/.test(value);
+}
+
 function rewriteTextPayload(res: GetErrorsToolResult, payload: Record<string, unknown>): GetErrorsToolResult {
   const idx = res.content.findIndex((c) => c.type === "text");
   if (idx < 0) return res;
@@ -421,12 +432,12 @@ function judgeLeftoverCombos(
  * completion scanner: only the concrete LoadImage.image combo is reclassified,
  * and only when both reads prove the current node and current view.
  *
- * Upload-input paths that are not enumerated by `/object_info` are still judged
- * here because this path exists specifically for the panel_set_widget refusal
- * reported by #2587: the panel has already presented a successfully refreshed
- * option list as authoritative for this saved value. Unreadable schema, missing
- * node detail, a linked image input, and a value that is present in the list all
- * preserve the original stale flag.
+ * Upload-input paths that are not enumerated by `/object_info` stay unknown here:
+ * only the panel's `/view`/existence evidence can distinguish a valid nested or
+ * annotated path from a missing file. A root-level value absent from the refreshed
+ * list is the #2587 case. Unreadable schema, missing node detail, a linked image
+ * input, and a value that is present in the list all preserve the original stale
+ * flag.
  */
 function judgeStaleLoadImages(
   staleFlags: UncheckedEntry[],
@@ -448,6 +459,7 @@ function judgeStaleLoadImages(
     const value = node.widgets.image;
     if (typeof value !== "string" || value === "") continue;
     if (options.includes(value)) continue;
+    if (isUploadCombo(specs.image) && isNonEnumerableUploadPath(value)) continue;
 
     unavailable.push({
       id: node.id,
@@ -606,7 +618,15 @@ function viewingIdentity(payload: Record<string, unknown> | null): ViewingIdenti
   const raw = payload?.viewing;
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const v = raw as ViewingIdentity;
-  const keys = ["workflow_uuid", "workflow", "kind", "scope", "owner_node_id", "title"];
+  const keys = [
+    "workflow_uuid",
+    "workflow",
+    "graph_identity",
+    "kind",
+    "scope",
+    "owner_node_id",
+    "title",
+  ];
   const identity = Object.fromEntries(keys.filter((key) => key in v).map((key) => [key, v[key]]));
   return Object.keys(identity).length > 0 ? identity : null;
 }
@@ -644,6 +664,21 @@ function sameViewingIdentity(
   // replace the per-instance UUID: the same saved path may be reopened in place.
   if ("workflow" in a || "workflow" in b) {
     if (!("workflow" in a) || !("workflow" in b) || !Object.is(a.workflow, b.workflow)) return false;
+  }
+  // Ownerless subgraphs in one workflow are still distinct graphs. A graph
+  // replacement/reconnect can also retain the workflow UUID while changing
+  // this object-keyed identity, so never let an omitted or mismatched witness
+  // retire the primary read's leftovers.
+  if ("graph_identity" in a || "graph_identity" in b) {
+    if (
+      typeof a.graph_identity !== "string" ||
+      typeof b.graph_identity !== "string" ||
+      a.graph_identity.length === 0 ||
+      b.graph_identity.length === 0 ||
+      !Object.is(a.graph_identity, b.graph_identity)
+    ) {
+      return false;
+    }
   }
   const shared = Object.keys(a).filter((key) => key in b);
   return shared.length > 0 && shared.every((key) => Object.is(a[key], b[key]));
