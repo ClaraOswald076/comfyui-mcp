@@ -18,6 +18,7 @@ All notable changes to this project are documented here. This project adheres to
 
 #### Fixed
 - bound compact identity probes (#2513, #2478)
+- only list history assets fetchable through /view (#2515)
 - fence same-type transient writes
 - fence transient promoted reads
 - omit the unexpose reindex warning when the panel already reindexed (#2474)
