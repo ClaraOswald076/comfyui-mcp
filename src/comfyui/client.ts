@@ -30,6 +30,8 @@ import {
 import {
   PanelComfyUIReadRelayError,
   PanelImageRelayError,
+  PANEL_COMFYUI_READ_MAX_BYTES,
+  PANEL_COMFYUI_READ_OBJECT_INFO_MAX_BYTES,
   requestPanelComfyUIRead,
   requestPanelImage,
   type PanelComfyUIReadSuccess,
@@ -223,6 +225,34 @@ function looksLikeSystemStats(body: unknown): boolean {
   return (b.system != null && typeof b.system === "object") || Array.isArray(b.devices);
 }
 
+/** A relayed /object_info document must be a non-empty object registry, not an
+ * HTML or gateway JSON envelope that happens to parse successfully. Every
+ * entry must retain the required ComfyUI node-definition fields. */
+function looksLikeObjectInfo(body: unknown): boolean {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+  const entries = Object.entries(body as Record<string, unknown>);
+  if (entries.length === 0) return false;
+  return entries.every(([nodeType, definition]) => {
+    if (!nodeType.trim() || !definition || typeof definition !== "object" || Array.isArray(definition)) return false;
+    const def = definition as Record<string, unknown>;
+    const input = def.input;
+    return Boolean(
+      Object.prototype.hasOwnProperty.call(def, "input") &&
+      input &&
+      typeof input === "object" &&
+      !Array.isArray(input) &&
+      Array.isArray(def.output) &&
+      Array.isArray(def.output_is_list) &&
+      Array.isArray(def.output_name) &&
+      typeof def.name === "string" &&
+      typeof def.display_name === "string" &&
+      typeof def.description === "string" &&
+      typeof def.category === "string" &&
+      typeof def.output_node === "boolean",
+    );
+  });
+}
+
 function panelReadResponse(read: PanelComfyUIReadSuccess): Response {
   const headers = new Headers();
   if (read.contentType) headers.set("content-type", read.contentType);
@@ -232,7 +262,7 @@ function panelReadResponse(read: PanelComfyUIReadSuccess): Response {
 /** Ask the authenticated panel only after the configured headless route failed
  * at the transport layer. No browser origin is selected or contacted here. */
 async function panelReadFallback(
-  operation: "history" | "system_stats" | "logs",
+  operation: "history" | "system_stats" | "logs" | "object_info",
   primaryError: unknown,
 ): Promise<PanelComfyUIReadSuccess | undefined> {
   try {
@@ -484,6 +514,18 @@ export async function getObjectInfo(): Promise<ObjectInfo> {
       try {
         return commit((await getClient().getNodeDefs()) as ObjectInfo);
       } catch (retryErr) {
+        if (isComfyTransportFailure(err) && isComfyTransportFailure(retryErr)) {
+          const relayed = await panelReadFallback("object_info", retryErr);
+          if (relayed) {
+            const info = await readComfyJson<ObjectInfo>(panelReadResponse(relayed), {
+              url: "/object_info",
+              maxBytes: PANEL_COMFYUI_READ_OBJECT_INFO_MAX_BYTES,
+              expectShape: looksLikeObjectInfo,
+              shapeHint: "a ComfyUI /object_info node registry object",
+            });
+            return commit(info);
+          }
+        }
         // The client library parses JSON itself, so an HTML body reaches us as a
         // bare "Unexpected token '<'" naming neither the URL nor the responder
         // (#828). Re-probe the endpoint ONCE to say what actually answered; if
