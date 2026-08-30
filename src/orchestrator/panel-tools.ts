@@ -4103,7 +4103,7 @@ function powerLoraValuesMatch(requested: unknown, observed: unknown): boolean {
 function powerLoraWidgetsFromProbe(
   res: ToolResult,
   nodeId: unknown,
-): Record<string, unknown> | null {
+): { type: string; widgets: Record<string, unknown> } | null {
   const payload = normalizeGraphQueryResult(res);
   if (
     Object.prototype.hasOwnProperty.call(payload, "truncated") &&
@@ -4113,13 +4113,22 @@ function powerLoraWidgetsFromProbe(
   }
   const requestedId = canonicalQueriedNodeId(nodeId);
   const detail = parseVerifiedQueriedNodeDetail(payload);
-  if (detail && requestedId && detail.id === requestedId) return detail.widgets;
+  if (
+    detail &&
+    requestedId &&
+    detail.id === requestedId &&
+    detail.widgets &&
+    /\bPower Lora Loader\b/i.test(detail.type)
+  ) {
+    return { type: detail.type, widgets: detail.widgets };
+  }
   if (!Array.isArray(payload.nodes) || payload.nodes.length !== 1) return null;
   const identity = parseQueriedNodeIdentityRow(payload.nodes[0]);
   if (!identity || !requestedId || identity.id !== requestedId) return null;
   const widgets = (payload.nodes[0] as Record<string, unknown>).widgets;
   if (!widgets || typeof widgets !== "object" || Array.isArray(widgets)) return null;
-  return widgets as Record<string, unknown>;
+  if (!/\bPower Lora Loader\b/i.test(identity.type)) return null;
+  return { type: identity.type, widgets: widgets as Record<string, unknown> };
 }
 
 async function readPowerLoraNodeFromTab(
@@ -4181,9 +4190,9 @@ async function settlePowerLoraWidgetAfterAckTimeout(
   if (probeOnSessionTab && ctx.tabId !== dispatchTab) {
     return powerLoraTimeoutUnknown(timedOut, widget, requested, mutationId);
   }
-  const widgets = powerLoraWidgetsFromProbe(probe, nodeId);
-  if (widgets === null || !Object.prototype.hasOwnProperty.call(widgets, widget)) {
-    if (probe.isError || widgets === null) {
+  const node = powerLoraWidgetsFromProbe(probe, nodeId);
+  if (node === null || !Object.prototype.hasOwnProperty.call(node.widgets, widget)) {
+    if (probe.isError || node === null) {
       return powerLoraTimeoutUnknown(timedOut, widget, requested, mutationId);
     }
     return {
@@ -4209,7 +4218,7 @@ async function settlePowerLoraWidgetAfterAckTimeout(
       ],
     };
   }
-  const observed = widgets[widget];
+  const observed = node.widgets[widget];
   if (!powerLoraValuesMatch(requested, observed)) {
     return {
       isError: true,

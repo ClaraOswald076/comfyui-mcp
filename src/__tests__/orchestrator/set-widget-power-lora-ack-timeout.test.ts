@@ -46,14 +46,17 @@ const ackTimeout = (cmd: string, ms: number): Error =>
 
 let sent: Array<{ cmd: string; tabId?: string; widget?: unknown }> = [];
 
-function powerLoraDetail(widgets: Record<string, unknown> | undefined) {
+function powerLoraDetail(
+  widgets: Record<string, unknown> | undefined,
+  type = "Power Lora Loader (rgthree)",
+) {
   return {
     truncated: false,
     viewing: { scope: "root" },
     nodes: [
       {
         id: NODE_ID,
-        type: "Power Lora Loader (rgthree)",
+        type,
         is_subgraph: false,
         widgets: widgets ?? {},
         inputs: [],
@@ -65,6 +68,7 @@ function powerLoraDetail(widgets: Record<string, unknown> | undefined) {
 function bridge(opts: {
   writeReply?: "timeout" | "acked-error" | "acked-error-timeout-worded" | "ok";
   probeWidgets?: Record<string, unknown> | "timeout" | "missing";
+  probeType?: string;
   loseTabAfterWrite?: boolean;
 }) {
   let tabGone = false;
@@ -102,8 +106,8 @@ function bridge(opts: {
       }
       if (cmd.cmd === "graph_query") {
         if (opts.probeWidgets === "timeout") throw ackTimeout("graph_query", 8000);
-        if (opts.probeWidgets === "missing") return powerLoraDetail({});
-        return powerLoraDetail(opts.probeWidgets ?? { lora_1: LORA_OBJECT });
+        if (opts.probeWidgets === "missing") return powerLoraDetail({}, opts.probeType);
+        return powerLoraDetail(opts.probeWidgets ?? { lora_1: LORA_OBJECT }, opts.probeType);
       }
       return { ok: true };
     },
@@ -209,6 +213,20 @@ describe("an unacknowledged Power Lora row write is settled by a read (#2495)", 
     expect(out.text).toMatch(/not a JSON object/);
     expect(out.text).not.toMatch(/CHECKED FOR YOU/);
     expect(out.text).not.toMatch(/mutation_id/);
+  });
+
+  it("does not settle a same-named row on a different node type", async () => {
+    const out = await runSetWidget({
+      writeReply: "timeout",
+      probeWidgets: { lora_1: LORA_OBJECT },
+      probeType: "Some Other Loader",
+    });
+
+    expect(sent.map((s) => s.cmd)).toEqual(["graph_set_widget", "graph_query"]);
+    expect(out.isError).toBe(true);
+    expect(out.text).toMatch(/\"applied\": \"unknown\"/);
+    expect(out.text).toMatch(/Do not guess/);
+    expect(out.text).not.toMatch(/CHECKED FOR YOU/);
   });
 
   it("does not settle an ACKED error reproducing the canonical sentence VERBATIM", async () => {
