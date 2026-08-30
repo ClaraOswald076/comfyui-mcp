@@ -6286,6 +6286,8 @@ type QueriedNodeScope = {
   node: "ordinary" | "container";
   nodeType: string;
   nodeIdentity?: string;
+  /** The object-keyed graph identity of the exact view that supplied the row. */
+  graphIdentity?: string;
 };
 
 /** Read the active viewing scope and node's explicit container bit before
@@ -6307,8 +6309,16 @@ function parseVerifiedQueriedNodeScope(
   }
   const viewing = payload.viewing;
   if (!viewing || typeof viewing !== "object" || Array.isArray(viewing)) return null;
-  const activeView = (viewing as Record<string, unknown>).scope;
+  const viewingRecord = viewing as Record<string, unknown>;
+  const activeView = viewingRecord.scope;
   if (activeView !== "root" && activeView !== "subgraph") return null;
+  const graphIdentity = viewingRecord.graph_identity;
+  if (
+    graphIdentity !== undefined &&
+    (typeof graphIdentity !== "string" || graphIdentity.length === 0 || graphIdentity.length > 256)
+  ) {
+    return null;
+  }
 
   let row: unknown;
   if (Object.prototype.hasOwnProperty.call(payload, "nodes")) {
@@ -6340,6 +6350,7 @@ function parseVerifiedQueriedNodeScope(
     node: isSubgraph ? "container" : "ordinary",
     nodeType: identity.type,
     ...(identity.nodeIdentity !== undefined ? { nodeIdentity: identity.nodeIdentity } : {}),
+    ...(graphIdentity !== undefined ? { graphIdentity } : {}),
   };
 }
 
@@ -6780,8 +6791,14 @@ type PromotedWritePlan = {
 
 type OrdinaryWritePlan = {
   kind: "ordinary-write";
+  activeView: "root" | "subgraph";
+  graphIdentity: string;
   expectedNodeType: string;
-  expectedNodeIdentity: string;
+  expectedNodeIdentity?: string;
+  binding: {
+    tabId: string;
+    identity?: { generation: number; tabSessionId: string };
+  };
 };
 
 type PromotedExpectedScope = PromotedScopeWitness & {
@@ -7423,6 +7440,106 @@ function panelBindingDriftReason(
   return undefined;
 }
 
+/** Ordinary writes do not have an `expected_scope` field that the panel can
+ * enforce. Keep their graph identity fence on the MCP side instead, and give
+ * binding drift its own diagnosis so a failed promotion read is not blamed
+ * for a reconnect. */
+function ordinaryBindingRefusal(widget: string, reason: string): ToolResult {
+  return fail(
+    `panel_set_widget refused "${widget}" because the ordinary panel graph binding ${reason}. ` +
+      `No graph_set_widget was dispatched. Rebind the live panel with ` +
+      `panel_set_workflow_target({mode:"current"}) and retry.`,
+  );
+}
+
+function ordinaryWritePlanFromScope(
+  widget: string,
+  scope: QueriedNodeScope,
+  tabBefore: string,
+  identityBefore: { generation: number; tabSessionId: string } | undefined,
+): OrdinaryWritePlan | ToolResult {
+  if (!scope.graphIdentity) {
+    return ordinaryBindingRefusal(
+      widget,
+      "did not publish the current graph identity needed to fence this ordinary write",
+    );
+  }
+  return {
+    kind: "ordinary-write",
+    activeView: scope.activeView,
+    graphIdentity: scope.graphIdentity,
+    expectedNodeType: scope.nodeType,
+    ...(scope.nodeIdentity !== undefined ? { expectedNodeIdentity: scope.nodeIdentity } : {}),
+    binding: {
+      tabId: tabBefore,
+      ...(isUsablePanelConnectionIdentity(identityBefore) ? { identity: identityBefore } : {}),
+    },
+  };
+}
+
+function currentOrdinaryWriteFenceError(
+  ctx: PanelToolCtx,
+  plan: OrdinaryWritePlan,
+): string | null {
+  if (ctx.tabId !== plan.binding.tabId) return "the panel tab was rebound";
+
+  if (typeof ctx.panelConnectionIdentity !== "function") {
+    return "the panel connection identity became unavailable";
+  }
+  let currentIdentity: { generation: number; tabSessionId: string } | undefined;
+  try {
+    currentIdentity = ctx.panelConnectionIdentity();
+  } catch {
+    return "the panel connection identity became unreadable";
+  }
+  if (plan.binding.identity) {
+    if (!isUsablePanelConnectionIdentity(currentIdentity)) {
+      return "the panel connection identity became unavailable";
+    }
+    if (!samePanelConnectionIdentity(plan.binding.identity, currentIdentity)) {
+      return "the panel session or connection changed";
+    }
+  }
+
+  const readScope = (ctx.bridge as BridgeProbe).promotedScopeFor;
+  if (typeof readScope !== "function") {
+    return "the current graph identity became unavailable";
+  }
+  let currentScope: TabPromotedScopeRead;
+  try {
+    currentScope = readScope.call(ctx.bridge, ctx.tabId);
+  } catch {
+    return "the current graph identity became unreadable";
+  }
+  if (currentScope.known !== true) {
+    return "the current graph identity became unavailable";
+  }
+  if (
+    currentScope.scope !== plan.activeView ||
+    currentScope.graphIdentity !== plan.graphIdentity
+  ) {
+    return "the current graph identity changed";
+  }
+  return null;
+}
+
+function ordinaryWriteBeforeDispatch(
+  ctx: PanelToolCtx,
+  widget: string,
+  plan: OrdinaryWritePlan,
+): () => void {
+  return () => {
+    const error = currentOrdinaryWriteFenceError(ctx, plan);
+    if (error) {
+      throw new Error(
+        `Refusing ordinary graph_set_widget for "${widget}": ${error}. ` +
+          `No graph_set_widget was dispatched. Rebind the live panel with ` +
+          `panel_set_workflow_target({mode:"current"}) and retry.`,
+      );
+    }
+  };
+}
+
 async function preparePromotedWidgetWrite(
   ctx: PanelToolCtx,
   nodeId: unknown,
@@ -7486,8 +7603,8 @@ async function preparePromotedWidgetWrite(
     // ordinary fast path; otherwise a tab/connection rebind can make this
     // probe's ordinary classification authorize a write on the new receiver.
     const drift = panelBindingDriftReason(ctx, "after the scope probe", hasIdentityApi, identityBefore, tabBefore);
-    if (drift) return promotedWriteRefusal(widget, drift);
-    return null;
+    if (drift) return ordinaryBindingRefusal(widget, drift);
+    return ordinaryWritePlanFromScope(widget, targetScope, tabBefore, identityBefore);
   }
 
   let sub = await ctx.call(
@@ -7575,7 +7692,26 @@ async function preparePromotedWidgetWrite(
             "enforces_expected_node_identity_at_write",
           );
         }
-        return { kind: "ordinary-write", expectedNodeType, expectedNodeIdentity };
+        const ordinaryScope = targetScope;
+        if (!ordinaryScope?.graphIdentity) {
+          return ordinaryBindingRefusal(
+            widget,
+            "did not publish the current graph identity needed to fence this ordinary write",
+          );
+        }
+        return {
+          kind: "ordinary-write",
+          activeView: ordinaryScope.activeView,
+          graphIdentity: ordinaryScope.graphIdentity,
+          expectedNodeType,
+          expectedNodeIdentity,
+          binding: {
+            tabId: tabBefore,
+            ...(isUsablePanelConnectionIdentity(identityBefore)
+              ? { identity: identityBefore }
+              : {}),
+          },
+        };
       }
       return promotedSubgraphReadRefusal(
         widget,
@@ -19187,7 +19323,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               nodeId,
               widget,
               promotedRetry.expectedNodeType,
-              undefined,
+              ordinaryWriteBeforeDispatch(ctx, widget, promotedRetry),
               undefined,
               promotedRetry.expectedNodeIdentity,
             );
@@ -19434,7 +19570,16 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           if (!promotedWritten.isError) markPanelSchemaReady(panelSchemaKey(ctx));
           return promotedWritten;
         }
-        let first = await write(args.node_id, args.widget as string);
+        let first = await write(
+          args.node_id,
+          args.widget as string,
+          expectedNodeType,
+          ordinaryPlan
+            ? ordinaryWriteBeforeDispatch(ctx, args.widget as string, ordinaryPlan)
+            : undefined,
+          undefined,
+          expectedNodeIdentity,
+        );
         if (!first.isError) {
           markPanelSchemaReady(panelSchemaKey(ctx));
           return persistUnpromotedControlAfterGenerate(first, ctx, args.node_id);
