@@ -206,6 +206,7 @@ function makeHarness(backend: AgentBackend) {
           ? null
           : journal.record(tab, payload, { conversation })
         : journal.record(tab, payload, { conversation });
+    if (entry?.alreadyDelivered) journal.suppressAlreadyDelivered(entry.token);
     const acked =
       completionKey !== null &&
       promptId !== null &&
@@ -339,6 +340,86 @@ describe("#1824 production keyed completion ingress", () => {
     expect(panel.entry).toBeNull();
     expect(panel.acked).toBe(true);
     expect(journal.outstanding(tab)).toHaveLength(0);
+  });
+});
+
+describe("#2591 production completion reconnect dedupe", () => {
+  it("suppresses a burst of acknowledged legacy frames after reconnect", async () => {
+    const backend = new ContinuationBackend();
+    const { journal, manager, flush, arriveProduction } = makeHarness(backend);
+    const tab = "tab-reconnect-2591";
+    const conversation = "orchestrator::claude";
+    const frame = {
+      kind: "executed",
+      prompt_id: PROMPT_A,
+      images: [{ filename: "reconnect-2591.png" }],
+    };
+
+    journal.openRun(PROMPT_A, { tabId: tab, conversation });
+    manager.send(tab, "render it");
+    await waitFor(() => backend.turns.length >= 1);
+
+    // This is the real production ordering: the panel completion is recorded
+    // and offered while the carrying user turn is still in flight.
+    arriveProduction(tab, frame, conversation);
+    backend.finishTurn();
+    await waitFor(() => backend.turns.length >= 2);
+    expect(backend.turns[1]).toContain("reconnect-2591.png");
+
+    // The completion's own turn result is the positive acknowledgement.
+    backend.finishTurn();
+    await waitFor(() => journal.outstanding(tab).length === 0);
+    const turnsAfterAck = backend.turns.length;
+
+    // A reconnect can resend the same legacy frame and trigger another journal
+    // sweep. It is already acknowledged, so none of the burst may create a turn.
+    for (let i = 0; i < 5; i += 1) {
+      const replay = arriveProduction(tab, frame, conversation);
+      expect(replay.entry?.alreadyDelivered).toBe(true);
+      flush(tab); // reconnect/agent-ready recovery sweep
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(journal.outstanding(tab)).toHaveLength(0);
+    expect(backend.turns).toHaveLength(turnsAfterAck);
+  });
+
+  it("still replays a genuinely undelivered legacy frame when an agent returns", async () => {
+    const backend = new ContinuationBackend();
+    const { journal, manager, arriveProduction } = makeHarness(backend);
+    const tab = "tab-undelivered-2591";
+    const conversation = "orchestrator::claude";
+
+    journal.openRun(PROMPT_B, { tabId: tab, conversation });
+    const arrival = arriveProduction(
+      tab,
+      { kind: "executed", prompt_id: PROMPT_B, images: [{ filename: "undelivered-2591.png" }] },
+      conversation,
+    );
+    expect(arrival.entry?.alreadyDelivered).toBeUndefined();
+    expect(journal.pending(tab)).toHaveLength(1); // no live agent took it
+
+    manager.send(tab, "welcome back");
+    await waitFor(() => backend.turns.some((turn) => turn.includes("undelivered-2591.png")));
+    expect(journal.outstanding(tab)).toHaveLength(1); // hand-off, not yet an ack
+
+    backend.finishTurn();
+    await waitFor(() => journal.outstanding(tab).length === 0);
+    expect(journal.ticketFor(PROMPT_B)?.settled).toBe(true);
+  });
+});
+
+describe("#2591 production ingress wiring", () => {
+  it("consumes the journal verdict before the reconnect flush", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const source = await readFile(new URL("../../orchestrator/index.ts", import.meta.url), "utf-8");
+    const record = source.indexOf("RunCompletions.record(event.tab_id");
+    const consume = source.indexOf("RunCompletions.suppressAlreadyDelivered(entry.token)", record);
+    const flush = source.indexOf("flushRunCompletions(event.tab_id)", record);
+
+    expect(record).toBeGreaterThan(-1);
+    expect(consume).toBeGreaterThan(record);
+    expect(source.slice(record, consume)).toContain("entry?.alreadyDelivered");
+    expect(flush).toBeGreaterThan(consume);
   });
 });
 

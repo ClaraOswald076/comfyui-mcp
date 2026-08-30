@@ -5588,6 +5588,15 @@ export async function runPanelOrchestrator(): Promise<void> {
           : RunCompletions.record(event.tab_id, evForTab as CompletionPayload, {
               conversation: agentKeyFor(event.tab_id),
             });
+        // #2591 — `completion_key` is unavailable on older/replayed panel
+        // frames, so the durable fence cannot identify an already-acked run.
+        // The journal has nevertheless proved the exact current ticket
+        // generation and ownership; consume that verdict before the flush can
+        // create another agent turn. Unprovable, foreign, and genuinely pending
+        // entries remain on the normal replay path.
+        if (entry?.alreadyDelivered) {
+          RunCompletions.suppressAlreadyDelivered(entry.token);
+        }
         const receiptAccepted =
           completionKey !== null &&
           typeof ev.prompt_id === "string" &&
@@ -5612,7 +5621,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         }
         logger.info(
           entry
-            ? `[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} run completion for ${describeCorrelation(entry.correlation)}${entry.possibleRepeat ? " (flagged as a possible repeat)" : ""}`
+            ? `[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} run completion for ${describeCorrelation(entry.correlation)}${entry.alreadyDelivered ? " (suppressed as already delivered)" : entry.possibleRepeat ? " (flagged as a possible repeat)" : ""}`
             : `[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} replayed an acknowledged run completion key`,
         );
         flushRunCompletions(event.tab_id);
