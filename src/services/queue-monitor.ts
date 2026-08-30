@@ -243,6 +243,9 @@ class QueueMonitorImpl {
   private completedReported = new Set<string>();
   // Completions not yet drained by the broadcaster. Bounded.
   private pendingCompletions: CompletionEvent[] = [];
+  /** Prompt that just left /queue this poll — record its history even if the
+   *  id was already in the tail (an in-progress row becoming interrupted). */
+  private vanishedPromptId: string | null = null;
   // ---- self-attribution for the backlog warning (#559) ----
   // Prompt ids THIS orchestrator queued via panel_run, plus the ms timestamp of
   // the most recent self-queue. A backlog made entirely of the agent's own recent
@@ -278,6 +281,7 @@ class QueueMonitorImpl {
     this.historySeen.clear();
     this.completedReported.clear();
     this.pendingCompletions.length = 0;
+    this.vanishedPromptId = null;
     this.state.lastCompleted = null;
     // Self-queued prompt ids belong to the OLD target — a fresh ComfyUI's jobs are
     // foreign to us until we queue them, so drop the attribution (#559).
@@ -798,6 +802,7 @@ class QueueMonitorImpl {
       // Empty queue → the tracked run is over. Skip the clear if a run was
       // adopted AFTER this fetch began (the response would be stale for it).
       if ((this.state.lastActivityTs ?? 0) <= fetchStart) {
+        this.vanishedPromptId = this.state.runningPromptId;
         this.clearRunning();
         this.emitEndIfIdle();
       }
@@ -821,11 +826,16 @@ class QueueMonitorImpl {
     } | null;
     const st = entry && typeof entry === "object" ? entry.status : undefined;
     const messages = Array.isArray(st?.messages) ? (st.messages as unknown[]) : [];
+    const has = (type: string) => messages.some((m) => Array.isArray(m) && m[0] === type);
     let status: CompletionStatus;
-    if (st?.completed === true || st?.status_str === "success" || st === undefined) {
-      status = "success";
-    } else if (messages.some((m) => Array.isArray(m) && m[0] === "execution_interrupted")) {
+    // Interrupt is terminal even when ComfyUI marks completed:true / status_str
+    // success-or-error — that used to classify a cancel as a successful finish.
+    if (has("execution_interrupted")) {
       status = "interrupted";
+    } else if (has("execution_error") || st?.status_str === "error") {
+      status = "error";
+    } else if (st?.completed === true || st?.status_str === "success" || st === undefined) {
+      status = "success";
     } else {
       status = "error";
     }
@@ -877,6 +887,29 @@ class QueueMonitorImpl {
     }
     for (const e of unseen) this.recordCompletion(e.id, e.status);
     this.historySeen = new Set(ids);
+    // A tracked run that left /queue this tick may already have been in the
+    // tail (in-progress). The unseen diff would miss it; record the terminal
+    // status now so an interrupt is not held until the next prompt (#2512).
+    const vanished = this.vanishedPromptId;
+    this.vanishedPromptId = null;
+    if (vanished && h[vanished] && !this.completedReported.has(vanished)) {
+      const terminal = this.terminalHistoryStatus(h[vanished]);
+      if (terminal) this.recordCompletion(vanished, terminal);
+    }
+  }
+
+  /** Fail-closed: only a proven finish (interrupt / error / completed success). */
+  private terminalHistoryStatus(raw: unknown): CompletionStatus | null {
+    if (!raw || typeof raw !== "object") return null;
+    const st = (raw as { status?: unknown }).status;
+    if (!st || typeof st !== "object") return null;
+    const status = st as { status_str?: unknown; completed?: unknown; messages?: unknown };
+    const messages = Array.isArray(status.messages) ? status.messages : [];
+    const has = (type: string) => messages.some((m) => Array.isArray(m) && m[0] === type);
+    if (has("execution_interrupted")) return "interrupted";
+    if (has("execution_error") || status.status_str === "error") return "error";
+    if (status.completed === true || status.status_str === "success") return "success";
+    return null;
   }
 
   /** Cheap snapshot for backpressure (panel_run) and the live `queue_status`

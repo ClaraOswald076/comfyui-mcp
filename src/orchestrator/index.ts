@@ -282,7 +282,7 @@ import {
 } from "./run-completion-idempotency.js";
 import {
   createRunCompletionWatchdog,
-  resolveHistoryCompletionImages,
+  resolveHistoryCompletion,
   resolveHistoryCompletionStatus,
   type RunCompletionWatchdog,
 } from "./run-completion-watchdog.js";
@@ -6765,7 +6765,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   const wd = createRunCompletionWatchdog({
     awaiting: (promptId) => RunCompletions.awaitingCompletion(promptId),
     knownTicket: (promptId) => RunCompletions.ticketFor(promptId),
-    resolveOutputs: (promptId) => resolveHistoryCompletionImages(promptId),
+    resolveOutputs: (promptId) => resolveHistoryCompletion(promptId),
     lookupStatus: (promptId) => resolveHistoryCompletionStatus(promptId),
     deliver: (payload, ticket) => {
       // The SAME arrival path the panel's frame takes: correlated once, here,
