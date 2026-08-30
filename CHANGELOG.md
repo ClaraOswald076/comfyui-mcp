@@ -10,7 +10,7 @@ All notable changes to this project are documented here. This project adheres to
 
 #### Fixed
 - persist subgraph viewing scope across panel tool calls so interior mutations do not silently fall back to root (#2553)
-
+- use the authenticated connected panel for headless `/object_info` reads when the configured ComfyUI route is unreachable (#2283)
 
 ## [0.52.151] - 2026-08-30
 
