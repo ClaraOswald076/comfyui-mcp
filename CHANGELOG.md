@@ -28,6 +28,7 @@ All notable changes to this project are documented here. This project adheres to
 #### Fixed
 - omit the unexpose reindex warning when the panel already reindexed (#2474)
 - keep the causal line above a native fault and stop blaming a pass-through node (#2508) (#2519) (#2520) (#2478) (#2509) (#2552)
+- rewrite a panel's bare `unknown <cmd>` (and a missing `panel_version`) into the same actionable version-skew error as `Unknown command "…"` (#619)
 
 
 ## [0.52.146] - 2026-08-27

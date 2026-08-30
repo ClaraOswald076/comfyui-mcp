@@ -6,6 +6,7 @@ import {
   makeUnknownCommandError,
   panelVersionProvesUnsupported,
   isPanelCmdUnsupportedError,
+  isUnknownCommandReply,
   MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS,
   minPanelVersionForCmd,
   markDispatched,
@@ -4614,6 +4615,9 @@ describe("makeUnknownCommandError (old-panel version gate)", () => {
     expect(e?.message.toLowerCase()).toContain("update");
     expect(e?.message.toLowerCase()).toContain("latest release");
     expect(e?.message.toLowerCase()).toContain("reconnect");
+    // Missing hello version is still a connected version: name it "unknown"
+    // rather than omitting the parenthetical (#619 recurrence).
+    expect(e?.message).toContain("detected panel unknown");
     // The 0.11.4 fallback baseline is a floor, not this command's minimum — quoting
     // it would fabricate a requirement (#619).
     expect(e?.message).not.toContain(MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS);
@@ -4820,6 +4824,76 @@ describe("makeUnknownCommandError (old-panel version gate)", () => {
     expect(makeUnknownCommandError('Unknown command "graph_resize_node"', "0.11.32")).toBeNull();
   });
 
+  // #619 recurrence (2026-08-29): a legacy/cached sidebar with NO panel_version
+  // replied `unknown graph_outline` (no "command" word, no quotes). The mapper
+  // only recognized `Unknown command "…"`, so the raw error leaked and skipped
+  // the upgrade remedy. Both spellings, with the version absent, must rewrite.
+  it("rewrites a bare unknown <cmd> with no panel_version into actionable skew guidance (#619 recurrence)", () => {
+    for (const raw of [
+      "unknown graph_outline",
+      "Unknown graph_outline",
+      'unknown "graph_outline"',
+      "Error: unknown graph_outline",
+    ]) {
+      const e = makeUnknownCommandError(raw);
+      expect(e, raw).not.toBeNull();
+      expect(e?.message, raw).toContain("graph_outline");
+      expect(e?.message, raw).toContain("detected panel unknown");
+      expect(e?.message, raw).toContain("0.4.6");
+      expect(e?.message.toLowerCase(), raw).toContain("does not implement");
+      expect(e?.message.toLowerCase(), raw).toContain("update");
+      expect(e?.message, raw).not.toBe(raw);
+      expect(e?.message.toLowerCase(), raw).not.toMatch(/^unknown /);
+    }
+  });
+
+  it("rewrites a bare unknown refresh_nodes with no panel_version, quoting ≥0.11.28 (#619 recurrence)", () => {
+    const e = makeUnknownCommandError("unknown refresh_nodes");
+    expect(e).not.toBeNull();
+    expect(e?.message).toContain("refresh_nodes");
+    expect(e?.message).toContain("detected panel unknown");
+    expect(e?.message).toContain("0.11.28");
+    expect(e?.message.toLowerCase()).toContain("update");
+    expect(e?.message).not.toBe("unknown refresh_nodes");
+  });
+
+  it("still names panel unknown for Unknown-command spelling when the hello omitted the version (#619 recurrence)", () => {
+    const e = makeUnknownCommandError('Unknown command "refresh_nodes"');
+    expect(e).not.toBeNull();
+    expect(e?.message).toContain("refresh_nodes");
+    expect(e?.message).toContain("detected panel unknown");
+    expect(e?.message).toContain("0.11.28");
+    expect(e?.message).toMatch(/, mcp \d+\.\d+\.\d+/);
+  });
+
+  it("does NOT rewrite a bare unknown <cmd> from a panel that advertises a new-enough version (#352)", () => {
+    expect(makeUnknownCommandError("unknown graph_outline", "0.11.21")).toBeNull();
+    expect(makeUnknownCommandError("unknown graph_outline", "0.4.6")).toBeNull();
+    expect(makeUnknownCommandError("Error: unknown graph_outline", "0.11.21")).toBeNull();
+  });
+
+  it("does NOT rewrite English 'unknown <word>' that is not a bridge command", () => {
+    expect(makeUnknownCommandError("unknown node")).toBeNull();
+    expect(makeUnknownCommandError("unknown backend")).toBeNull();
+    expect(makeUnknownCommandError("unknown prompt")).toBeNull();
+  });
+
+  it("does NOT rewrite a bare unknown <cmd> that continues with an explanation (smoke-mock shape)", () => {
+    expect(
+      makeUnknownCommandError(
+        "unknown graph_outline — this tab is the knowledge-parity SMOKE MOCK, not a real panel",
+      ),
+    ).toBeNull();
+  });
+
+  it("isUnknownCommandReply accepts both dispatcher spellings (#619 recurrence)", () => {
+    expect(isUnknownCommandReply('Unknown command "refresh_nodes"')).toBe(true);
+    expect(isUnknownCommandReply("unknown graph_outline")).toBe(true);
+    expect(isUnknownCommandReply("Error: unknown graph_outline")).toBe(true);
+    expect(isUnknownCommandReply("unknown node")).toBe(false);
+    expect(isUnknownCommandReply("node 5 not found")).toBe(false);
+  });
+
 });
 
 describe("panelVersionProvesUnsupported (#392 proactive version gate)", () => {
@@ -4906,6 +4980,19 @@ describe("isPanelCmdUnsupportedError (#413 structured unsupported-command detect
     ).toBe(false);
   });
 
+  it("matches the bare unknown <cmd> spelling (#619 recurrence)", () => {
+    expect(isPanelCmdUnsupportedError(new Error("unknown graph_outline"))).toBe(true);
+    expect(isPanelCmdUnsupportedError(new Error("unknown graph_outline"), "graph_outline")).toBe(
+      true,
+    );
+    expect(isPanelCmdUnsupportedError(new Error("unknown graph_outline"), "refresh_nodes")).toBe(
+      false,
+    );
+    expect(isPanelCmdUnsupportedError(new Error("Error: unknown refresh_nodes"), "refresh_nodes")).toBe(
+      true,
+    );
+  });
+
   it("matches the rewritten 'too old for' text even without the tag", () => {
     const raw = new Error('This ComfyUI-MCP panel is too old for "graph_serialize" — update…');
     expect(isPanelCmdUnsupportedError(raw)).toBe(true);
@@ -4949,6 +5036,49 @@ describe("UiBridge.send (graceful gate end-to-end)", () => {
     await expect(bridge.send({ cmd: "graph_query" }, { tabId: "old-tab" })).rejects.toThrow(
       /too old for "graph_query".*0\.6\.8.*update/is,
     );
+  });
+
+  // #619 recurrence: a cached sidebar hello omits panel_version and the
+  // dispatcher answers `unknown graph_outline` (not `Unknown command "…"`).
+  // The send path must still rewrite to the upgrade remedy, naming the command,
+  // connected panel "unknown", and the command's minimum.
+  it("rewrites a bare unknown <cmd> from a no-version tab into actionable skew guidance (#619 recurrence)", async () => {
+    const sock = await connectPanel("legacy-cached");
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd) {
+        sock.send(JSON.stringify({ rid: msg.rid, ok: false, error: `unknown ${msg.cmd}` }));
+      }
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    const outline = await bridge
+      .send({ cmd: "graph_outline" }, { tabId: "legacy-cached" })
+      .then(
+        () => {
+          throw new Error("graph_outline should have been rejected");
+        },
+        (e: Error) => e,
+      );
+    expect(outline.message).toMatch(/does not implement "graph_outline"/i);
+    expect(outline.message).toContain("detected panel unknown");
+    expect(outline.message).toContain("0.4.6");
+    expect(outline.message.toLowerCase()).toContain("update");
+    expect(outline.message).not.toBe("unknown graph_outline");
+
+    const refresh = await bridge
+      .send({ cmd: "refresh_nodes" }, { tabId: "legacy-cached" })
+      .then(
+        () => {
+          throw new Error("refresh_nodes should have been rejected");
+        },
+        (e: Error) => e,
+      );
+    expect(refresh.message).toMatch(/does not implement "refresh_nodes"/i);
+    expect(refresh.message).toContain("detected panel unknown");
+    expect(refresh.message).toContain("0.11.28");
+    expect(refresh.message.toLowerCase()).toContain("update");
+    expect(refresh.message).not.toBe("unknown refresh_nodes");
   });
 
   // #236 — for a command with NO changelog-verified per-command minimum (so the
