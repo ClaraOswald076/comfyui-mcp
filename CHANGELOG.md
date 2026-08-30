@@ -9,6 +9,7 @@ All notable changes to this project are documented here. This project adheres to
 ### MCP
 
 #### Fixed
+- panel_open_workflow and a verified pin align turn routing onto the switched canvas so the next origin-less turn does not inherit the previous workflow (#2531)
 - panel_set_widget settles a missing ACK on a Power Lora lora_N row with a graph read-back instead of reporting outcome-unknown for a row that already landed (#2495)
 - panel_open_workflow does not report a successful tab switch as an error when only frontend-owned ue_properties / widget representations differ, including a live serialize that omits nested subgraph definitions (#2494)
 
