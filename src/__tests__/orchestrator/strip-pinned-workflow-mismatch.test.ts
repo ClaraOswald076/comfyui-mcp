@@ -277,6 +277,28 @@ describe("panel_strip_workflow honors a verified pin over a stale advertisement 
     sock.close();
   });
 
+  it("does not repair an ambiguous basename pin against another directory", async () => {
+    // A lenient/older panel may preserve the caller's bare filename as the pin.
+    // That filename is not enough to identify workflows/other/a.json when the
+    // live canvas is a same-basename workflow in another directory.
+    advertised.set(TAB, STALE);
+    sessionStamp = LIVE;
+    livePath = "workflows/other/a.json";
+    const sock = await connectPanel();
+    await waitFor(() => expect(bridge.tabs().map((t) => t.tab_id)).toContain(TAB));
+    const store = new WorkflowTargetStore();
+    store.set(SCOPE, { mode: "pinned", path: "a.json", filename: "a.json" });
+    const ctx = ctxFor(store);
+    received.length = 0;
+
+    await expect(tool("panel_strip_workflow", {}, ctx)).rejects.toThrow(
+      /Couldn't capture the live canvas[\s\S]*workflow instance mismatch/,
+    );
+    expect(received.map((f) => f.cmd)).not.toContain("graph_serialize");
+    expect(advertised.get(TAB)).toBe(STALE);
+    sock.close();
+  });
+
   it("without a pin the mismatch still refuses — the fence is not weakened", async () => {
     advertised.set(TAB, STALE);
     sessionStamp = LIVE;

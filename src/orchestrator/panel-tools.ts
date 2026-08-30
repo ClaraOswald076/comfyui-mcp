@@ -12042,6 +12042,25 @@ function pinHonorsLiveCanvas(
 }
 
 /**
+ * Automatic fence repair needs stronger identity than legacy pin resolution.
+ * `activeMatchesTarget` intentionally accepts filename/basename aliases for
+ * compatibility, but a basename cannot prove which saved workflow is live
+ * when two directories contain the same filename. Use only a canonical path
+ * or a canonical key here; otherwise leave the dispatch fence refusing.
+ */
+function exactPinnedSavedPathMatchesLive(
+  pinPath: string,
+  liveActive: Record<string, unknown> | undefined,
+): boolean {
+  const expected = canonicalSavedWorkflowPath(pinPath);
+  if (!expected || !expected.includes("/") || !liveActive) return false;
+  const observed = liveActive as { path?: unknown; key?: unknown };
+  return [observed.path, observed.key].some(
+    (value) => canonicalSavedWorkflowPath(value) === expected,
+  );
+}
+
+/**
  * The ONE remedy that is actually reachable from every wedged state below, and
  * the one the reporters found to be the only thing that worked.
  *
@@ -16505,13 +16524,12 @@ async function repairPinnedStampForLiveCanvas(ctx: PanelToolCtx): Promise<boolea
   // pinHonorsLiveCanvas is the UUID-adoption gate: it needs routing_key ===
   // wf:<path>. Current panels advertise wf:<route>:<path> (#640), which that
   // gate reads as indeterminate. Path/filename/key equality still proves the
-  // pin names this canvas; a POSITIVE "different" still refuses.
+  // pin names this canvas. A path/key match is required when the panel's
+  // routing shape is indeterminate; a bare filename is never enough.
   const live = liveActiveFromProbe(probe);
   const namesLive =
     pinHonorsLiveCanvas(pin, live) ||
-    (live != null &&
-      readOpenActiveAgainstTarget(live, pin.path) !== "different" &&
-      activeMatchesTarget(live, pin.path));
+    exactPinnedSavedPathMatchesLive(pin.path, live);
   if (!namesLive) return false;
 
   if (probe.status === "already_current") {
