@@ -17,6 +17,7 @@ All notable changes to this project are documented here. This project adheres to
 - make `resolve_missing` suggest `models/clip_vision/` for missing `CLIPVisionLoader.clip_name` models while keeping ordinary CLIP loaders on `models/text_encoders/` (#2604)
 - classify an existing `application/octet-stream` OBJ returned by `get_image` as an unsupported attachment instead of a missing file (#2608)
 - suppress acknowledged completion replays after reconnect (#2591)
+- fall back to ComfyUI-Manager for install_custom_node action:"list" when the local comfy-cli version is unrecognized (#2603)
 
 
 ## [0.52.152] - 2026-08-30

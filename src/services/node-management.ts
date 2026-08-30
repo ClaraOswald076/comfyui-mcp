@@ -36,6 +36,7 @@ import {
 import {
   assertComfyCliOk,
   getComfyCliVersion,
+  isComfyCliUsable,
   isSupportedComfyCliVersion,
   resolveComfyCliExecutable,
   runComfyCliSync,
@@ -6102,7 +6103,12 @@ async function listInstalledNodesAt(
 ): Promise<InstalledNode[]> {
   const { mode = "default" } = opts;
 
-  if (opts.useCmCli) {
+  // `list` is read-only, so an explicitly requested CLI is a preference here,
+  // not a reason to reject an otherwise useful inventory when the installed
+  // executable is absent or its version probe is unrecognized. Keep the remote
+  // branch on runCmCli so its existing no-local-CLI refusal remains intact.
+  const useCli = opts.useCmCli === true && (isRemoteMode() || isComfyCliUsable());
+  if (useCli) {
     // cm-cli `show installed` prints a formatted table — return raw lines as
     // pseudo-nodes since structured data is HTTP-only. `enabled` is left
     // undefined: the table does not report it, so claiming a value would be

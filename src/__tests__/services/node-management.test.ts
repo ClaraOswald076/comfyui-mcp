@@ -156,7 +156,7 @@ process.env.COMFYUI_MCP_PANEL_PIN = "off";
 
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { config } from "../../config.js";
 import {
@@ -184,6 +184,7 @@ import { applyManifest } from "../../services/manifest.js";
 import { getManifestPartialLeftover } from "../../services/manifest-partial.js";
 
 const mockedExec = vi.mocked(execFileSync);
+const mockedSpawn = vi.mocked(spawnSync);
 const mockedExists = vi.mocked(existsSync);
 let priorComfyuiPathEnv: string | undefined;
 
@@ -442,6 +443,21 @@ describe("node-management service", () => {
     // below and must then provide a call-scoped or verified live root.
     process.env.COMFYUI_PATH = "/fake/comfy";
     mockedExec.mockReset();
+    mockedSpawn.mockReset();
+    mockedSpawn.mockReturnValue({
+      status: 0,
+      stdout: JSON.stringify({
+        schema: "envelope/1",
+        type: "envelope",
+        ok: true,
+        command: "version",
+        version: "1.11.1",
+        where: null,
+        data: {},
+        error: null,
+      }),
+      stderr: "",
+    } as never);
     mockedExists.mockReset();
     mockedExists.mockReturnValue(true);
     // Default: no custom_nodes fixture — the #797 disk scan delegates to the
@@ -3594,6 +3610,98 @@ describe("node-management service", () => {
   // ---- list --------------------------------------------------------------
 
   describe("listInstalledNodes", () => {
+    it("#2603 falls back to Manager HTTP when the installed comfy-cli version is unrecognized", async () => {
+      const cliPath = "/fake/comfy-cli-2603-unrecognized";
+      const priorCliPath = process.env.COMFY_CLI_PATH;
+      process.env.COMFY_CLI_PATH = cliPath;
+      mockedSpawn.mockReturnValue({
+        status: 0,
+        stdout: "comfy-cli version unavailable\n",
+        stderr: "",
+      } as never);
+      const { calls } = stubFetch({
+        installedBody: {
+          "ComfyUI-Manager": {
+            ver: "3.1",
+            cnr_id: "comfyui-manager",
+            enabled: true,
+          },
+        },
+      });
+
+      try {
+        const nodes = await listInstalledNodes({ mode: "default", useCmCli: true });
+        expect(nodes).toEqual([
+          {
+            module: "ComfyUI-Manager",
+            cnrId: "comfyui-manager",
+            version: "3.1",
+            enabled: true,
+          },
+        ]);
+        expect(mockedSpawn).toHaveBeenCalledWith(
+          cliPath,
+          ["--json", "--version"],
+          expect.objectContaining({ timeout: 10_000 }),
+        );
+        expect(mockedExec).not.toHaveBeenCalled();
+        expect(
+          calls.some((call) => call.url.includes("/v2/customnode/installed?mode=default")),
+        ).toBe(true);
+      } finally {
+        if (priorCliPath === undefined) delete process.env.COMFY_CLI_PATH;
+        else process.env.COMFY_CLI_PATH = priorCliPath;
+      }
+    });
+
+    it("does not fall back after a supported comfy-cli inventory command fails", async () => {
+      const cliPath = "/fake/comfy-cli-2603-command-error";
+      const priorCliPath = process.env.COMFY_CLI_PATH;
+      process.env.COMFY_CLI_PATH = cliPath;
+      mockedSpawn.mockReturnValue({
+        status: 0,
+        stdout: JSON.stringify({
+          schema: "envelope/1",
+          type: "envelope",
+          ok: true,
+          command: "version",
+          version: "1.11.1",
+          where: null,
+          data: {},
+          error: null,
+        }),
+        stderr: "",
+      } as never);
+      mockedExec.mockReturnValue(
+        JSON.stringify({
+          schema: "envelope/1",
+          type: "envelope",
+          ok: false,
+          command: "node show installed",
+          version: "1.11.1",
+          where: "local",
+          data: null,
+          error: {
+            code: "node_inventory_failed",
+            message: "inventory unavailable",
+          },
+        }) as never,
+      );
+      const { fetchMock } = stubFetch({
+        installedBody: { "Manager-pack": { ver: "1.0", enabled: true } },
+      });
+
+      try {
+        await expect(listInstalledNodes({ useCmCli: true })).rejects.toThrow(
+          /comfy-cli node show failed: node_inventory_failed: inventory unavailable/,
+        );
+        expect(fetchMock).not.toHaveBeenCalled();
+      } finally {
+        if (priorCliPath === undefined) delete process.env.COMFY_CLI_PATH;
+        else process.env.COMFY_CLI_PATH = priorCliPath;
+      }
+    });
+
     it("parses an object-keyed installed response", async () => {
       stubFetch({
         installedBody: {
