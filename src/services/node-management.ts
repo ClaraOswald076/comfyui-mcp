@@ -3674,6 +3674,19 @@ async function cloneCustomNodeFallback(
 // Public API — install
 // ---------------------------------------------------------------------------
 
+export interface LocalFallbackBinding {
+  /** The apply_manifest operation that owns this fallback. */
+  readonly operationId: string;
+  /** The manifest custom_node entry bound to this fallback. */
+  readonly itemId: string;
+  /** The agent scope authorized to observe the operation. */
+  readonly scope: string;
+  /** The exact Manager target captured at operation entry. */
+  readonly target: string;
+  /** The monotonic target generation captured at operation entry. */
+  readonly targetGeneration: number;
+}
+
 export interface InstallOptions {
   id: string;
   source?: InstallSource;
@@ -3697,21 +3710,47 @@ export interface InstallOptions {
   managerBase?: string;
   /** Monotonic ComfyUI target generation captured with managerBase. */
   targetGeneration?: number;
+  /** Binding required by the internal fallback phase hooks. */
+  localFallbackBinding?: LocalFallbackBinding;
   /**
    * Internal apply_manifest phase hook. Called once when this operation has
    * selected its local git fallback, before it waits for the local writer lock.
    * It is observational only and does not change the install decision.
    */
-  onLocalFallback?: () => void;
+  onLocalFallback?: (binding: LocalFallbackBinding) => void;
+  /** Internal apply_manifest hook called after a selected local fallback settles. */
+  onLocalFallbackSettled?: (
+    binding: LocalFallbackBinding,
+    state: "applied" | "failed",
+  ) => void;
 }
 
 function notifyLocalFallbackSelected(opts: InstallOptions): void {
+  const binding = opts.localFallbackBinding;
+  if (!binding) return;
   try {
-    opts.onLocalFallback?.();
+    opts.onLocalFallback?.(binding);
   } catch (err) {
     // This is an observational hook used by apply_manifest; a reporting
     // callback must never prevent the selected local fallback from running.
     logger.debug("Ignoring local fallback phase-hook failure", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+function notifyLocalFallbackSettled(
+  opts: InstallOptions,
+  state: "applied" | "failed",
+): void {
+  const binding = opts.localFallbackBinding;
+  if (!binding) return;
+  try {
+    opts.onLocalFallbackSettled?.(binding, state);
+  } catch (err) {
+    // This is an observational hook used by apply_manifest; a reporting
+    // callback must never change the install result.
+    logger.debug("Ignoring local fallback settle-hook failure", {
       error: err instanceof Error ? err.message : String(err),
     });
   }
@@ -4065,7 +4104,8 @@ async function installCustomNodeImpl(
           wrongInstallRefusal(localWriteMismatch, 'install_custom_node (action:"install", git clone)', managerBase),
         );
       }
-      if (!isRemoteMode()) notifyLocalFallbackSelected(opts);
+      const localFallback = !isRemoteMode();
+      if (localFallback) notifyLocalFallbackSelected(opts);
       const managerUnavailable =
         refusedBy === undefined &&
         isManagerQueueDetectionFailure(err) &&
@@ -4106,10 +4146,17 @@ async function installCustomNodeImpl(
       // Manager task that resolves no pack reaches cloneCustomNodeFallback only
       // to receive its authoritative remote-target refusal; do not make that
       // refusal wait behind an unrelated local writer.
-      const cloned = isRemoteMode()
-        ? await clone()
-        : await withLocalInstallMutationLock(targetGeneration, managerBase, clone);
-      assertInstallTargetStable(targetGeneration, managerBase);
+      let cloned: NodeOpResult;
+      try {
+        cloned = localFallback
+          ? await withLocalInstallMutationLock(targetGeneration, managerBase, clone)
+          : await clone();
+        assertInstallTargetStable(targetGeneration, managerBase);
+      } catch (err) {
+        if (localFallback) notifyLocalFallbackSettled(opts, "failed");
+        throw err;
+      }
+      if (localFallback) notifyLocalFallbackSettled(opts, "applied");
       return withCliNote(cloned);
     }
     assertInstallTargetStable(targetGeneration, managerBase);
@@ -4133,7 +4180,8 @@ async function installCustomNodeImpl(
         wrongInstallRefusal(localWriteMismatch, 'install_custom_node (action:"install", git clone)', managerBase),
       );
     }
-    if (!isRemoteMode()) notifyLocalFallbackSelected(opts);
+    const localFallback = !isRemoteMode();
+    if (localFallback) notifyLocalFallbackSelected(opts);
     const clone = () => cloneCustomNodeFallback(gitId, repoName, gitRef, status, cliWorkspace, {
       refFromVersion,
       allowSharedWorkspaceFallback: cliWorkspace !== undefined,
@@ -4141,10 +4189,17 @@ async function installCustomNodeImpl(
     // An accepted remote Manager task that resolves no pack still reaches this
     // helper only for its authoritative remote-target refusal; it is not a
     // local write and must not wait on the local writer lock.
-    const cloned = isRemoteMode()
-      ? await clone()
-      : await withLocalInstallMutationLock(targetGeneration, managerBase, clone);
-    assertInstallTargetStable(targetGeneration, managerBase);
+    let cloned: NodeOpResult;
+    try {
+      cloned = localFallback
+        ? await withLocalInstallMutationLock(targetGeneration, managerBase, clone)
+        : await clone();
+      assertInstallTargetStable(targetGeneration, managerBase);
+    } catch (err) {
+      if (localFallback) notifyLocalFallbackSettled(opts, "failed");
+      throw err;
+    }
+    if (localFallback) notifyLocalFallbackSettled(opts, "applied");
     return withCliNote(cloned);
   }
 

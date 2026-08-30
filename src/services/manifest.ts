@@ -54,11 +54,11 @@ import { ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import {
   buildManifestPartial,
+  createManifestPartialOperation,
   describeManifestSource,
   formatLocalFallbackMessage,
   formatNotStartedMessage,
   formatStillInstallingMessage,
-  recordManifestPartial,
   type ManifestPartialInstall,
 } from "./manifest-partial.js";
 
@@ -996,6 +996,11 @@ function looksLikeGitManifestSource(id: string): boolean {
   return /^(?:https?:\/\/|git@|git\+)/i.test(candidate) || /\.git(?:[?#]|$)/i.test(candidate);
 }
 
+function manifestOutcomeTargetGeneration(fallback: number): number {
+  const configured = Number(process.env.COMFYUI_MCP_TARGET_GENERATION);
+  return Number.isSafeInteger(configured) && configured >= 0 ? configured : fallback;
+}
+
 async function resolveLocalManifestCustomNodesBase(): Promise<string | undefined> {
   if (isRemoteMode()) return undefined;
   try {
@@ -1053,6 +1058,17 @@ async function applyManifestSections(
   const localMode = !isRemoteMode();
   const hasLocalDataFs = localMode && Boolean(dataBase);
   const hasLocalCodeFs = localMode && Boolean(codeBase);
+
+  // Register the operation before the first install promise is created. The
+  // local fallback can select synchronously, before apply_manifest reaches its
+  // final aggregate record; its immutable binding keeps that early callback
+  // attached to this operation and target until the final record is written.
+  const partialOperation = createManifestPartialOperation({
+    source,
+    scope: process.env.COMFYUI_MCP_TAB?.trim() || `stdio:${process.pid}`,
+    target: managerBase,
+    targetGeneration: manifestOutcomeTargetGeneration(targetGeneration),
+  });
 
   // The data root answers where custom_nodes and the ordinary models/ tree live,
   // but it is not the complete answer for model downloads. A connected local
@@ -1210,6 +1226,7 @@ async function applyManifestSections(
     // git-clone / ref-checkout fallback writes into the tree the runtime scans
     // (#1715/#1770). Pip uses codeBase independently above.
     let localFallbackSelected = false;
+    const fallbackBinding = partialOperation.bindItem(normalizedId);
     const installOutcome = installCustomNode({
       id: normalizedId,
       ...(customNodesBase ? { comfyuiPath: customNodesBase } : {}),
@@ -1218,8 +1235,12 @@ async function applyManifestSections(
         : {}),
       managerBase,
       targetGeneration,
-      onLocalFallback: () => {
-        localFallbackSelected = true;
+      localFallbackBinding: fallbackBinding,
+      onLocalFallback: (binding) => {
+        localFallbackSelected = partialOperation.reconcile(binding, "selected");
+      },
+      onLocalFallbackSettled: (binding, state) => {
+        partialOperation.reconcile(binding, state);
       },
     })
       .then((res) => ({ kind: "settled" as const, res }))
@@ -1664,7 +1685,7 @@ async function applyManifestSections(
     stillInstalling,
     outcomeUnknown,
   });
-  recordManifestPartial(partial);
+  const recordedPartial = partialOperation.record(partial);
 
   return {
     // `success` means the manifest is APPLIED AND VERIFIED — nothing failed AND
@@ -1680,6 +1701,6 @@ async function applyManifestSections(
     success: summary.failed === 0 && summary.pending === 0,
     summary,
     results,
-    ...(partial ? { partial } : {}),
+    ...(recordedPartial ? { partial: recordedPartial } : {}),
   };
 }
