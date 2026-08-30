@@ -11,13 +11,8 @@ All notable changes to this project are documented here. This project adheres to
 ### MCP
 
 #### Fixed
-- graph tools inherit a live bound/current tab after a multi-workflow reconnect instead of requiring a manual rebind (#1001)
-
-### MCP
-
-#### Fixed
-- inherit a live bound/current tab after multi-workflow reconnect (#2557)
-- rewrite bare unknown <cmd> when panel_version is missing (#619) (#2555)
+- graph tools inherit a live bound/current tab after a multi-workflow reconnect instead of requiring a manual rebind (#1001, #2557)
+- rewrite a panel's bare `unknown <cmd>` (and a missing `panel_version`) into the same actionable version-skew error as `Unknown command "…"` (#619, #2555)
 
 #### Changed
 - raise the filing bar, drop the beta reporting bias (#2554)
@@ -36,7 +31,6 @@ All notable changes to this project are documented here. This project adheres to
 - keep the causal line above a native fault and stop blaming a pass-through node (#2508)
 - direct-clone local git installs when Manager queue is unavailable (#2509)
 - make the Kimi Code backend usable (#2552)
-- only list history assets fetchable through /view (#2515)
 - reconcile release citations (#2519, #2520)
 
 
