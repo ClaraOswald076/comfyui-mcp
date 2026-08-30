@@ -17,6 +17,7 @@ import {
   HEADLESS_RECENCY_MS,
   BRIDGE_READ_DEFAULT_TIMEOUT_MS,
   BRIDGE_READONLY_CMDS,
+  BRIDGE_CMD_MIN_PANEL_VERSION,
   isMutatingGraphCommand,
   requiresWorkflowStampEnforcement,
   BRIDGE_CAPABILITY_MIN_PANEL_VERSION,
@@ -163,7 +164,11 @@ async function startBridgeOnFreePort(
 function connectPanel(
   tabId?: string,
   title = "workflow-a",
-  opts: { tabSessionId?: string; expectedNodeIdentityFence?: boolean } = {},
+  opts: {
+    tabSessionId?: string;
+    expectedNodeIdentityFence?: boolean;
+    panelVersion?: string;
+  } = {},
 ): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
     const sock = new WebSocket(`ws://127.0.0.1:${port}`);
@@ -184,6 +189,7 @@ function connectPanel(
             enforces_expected_scope_at_write: true,
             enforces_expected_scope_graph_identity_at_write: true,
             enforces_promoted_parent_rail_at_write: true,
+            ...(opts.panelVersion ? { panel_version: opts.panelVersion } : {}),
             // The panel's sessionStorage-backed browser-tab identity: unique per
             // browser tab, stable across a reload (#486/#709).
             ...(opts.tabSessionId ? { tab_session_id: opts.tabSessionId } : {}),
@@ -4894,6 +4900,36 @@ describe("makeUnknownCommandError (old-panel version gate)", () => {
     expect(isUnknownCommandReply("node 5 not found")).toBe(false);
   });
 
+  it("does not classify inherited object keys as bridge commands (#619 follow-up)", () => {
+    expect(Object.getPrototypeOf(BRIDGE_CMD_MIN_PANEL_VERSION)).toBeNull();
+    for (const cmd of ["toString", "constructor"]) {
+      // These names are inherited from Object.prototype, not entries in the
+      // bridge minimum table. They must remain ordinary unknown dispatcher text.
+      expect(minPanelVersionForCmd(cmd)).toBe(MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS);
+      expect(panelVersionProvesUnsupported(cmd, "0.0.1")).toBe(false);
+      for (const raw of [`unknown ${cmd}`, `Error: unknown ${cmd}`]) {
+        expect(isUnknownCommandReply(raw), raw).toBe(false);
+        expect(makeUnknownCommandError(raw), raw).toBeNull();
+        // Supplying a parseable panel version must not send an inherited
+        // function to compareSemver or fabricate a supported-command verdict.
+        expect(makeUnknownCommandError(raw, "0.11.21"), raw).toBeNull();
+      }
+    }
+  });
+
+  it("keeps the bare unknown-command rewrite version-aware for normal commands (#619)", () => {
+    const withoutVersion = makeUnknownCommandError("unknown graph_query");
+    expect(withoutVersion?.message).toMatch(/does not implement "graph_query"/i);
+    expect(withoutVersion?.message).toContain("detected panel unknown");
+    expect(withoutVersion?.message).toContain("0.7.0");
+
+    const oldPanel = makeUnknownCommandError("unknown graph_query", "0.6.8");
+    expect(oldPanel?.message).toMatch(/too old for "graph_query"/i);
+    expect(oldPanel?.message).toContain("detected panel 0.6.8");
+    expect(oldPanel?.message).toContain("0.7.0");
+    expect(makeUnknownCommandError("unknown graph_query", "0.7.0")).toBeNull();
+  });
+
 });
 
 describe("panelVersionProvesUnsupported (#392 proactive version gate)", () => {
@@ -5019,6 +5055,29 @@ describe("isPanelCmdUnsupportedError (#413 structured unsupported-command detect
 });
 
 describe("UiBridge.send (graceful gate end-to-end)", () => {
+  it("passes inherited object keys through as raw unknown-command errors (#619 follow-up)", async () => {
+    const sock = await connectPanel("prototype-command-tab", "wf", { panelVersion: "0.11.21" });
+    const dispatched: string[] = [];
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd) {
+        dispatched.push(msg.cmd);
+        sock.send(JSON.stringify({ rid: msg.rid, ok: false, error: `unknown ${msg.cmd}` }));
+      }
+    });
+    await waitFor(() =>
+      expect(bridge.tabs().some((t) => t.tab_id === "prototype-command-tab")).toBe(true),
+    );
+
+    for (const cmd of ["toString", "constructor"]) {
+      await expect(bridge.send({ cmd }, { tabId: "prototype-command-tab" })).rejects.toThrow(
+        `unknown ${cmd}`,
+      );
+    }
+    expect(dispatched).toEqual(["toString", "constructor"]);
+    sock.close();
+  });
+
   it("surfaces an actionable message (with panel version) when an old panel rejects a bridge command", async () => {
     const sock = await connectPanel(undefined);
     // Old panel: advertises its version, then rejects unknown bridge commands.
