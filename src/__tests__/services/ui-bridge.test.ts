@@ -2920,6 +2920,39 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     expect(bridge.tabConnectionGeneration("tmp:closing")).toBeUndefined();
   });
 
+  it("refuses an identity-fenced mutation after an anonymous same-socket re-hello withdraws the capability (#2475)", async () => {
+    const desktop = await connectPanel("tmp:anonymous-rehello", "fresh");
+    const frames: Array<Record<string, unknown>> = [];
+    desktop.on("message", (buf) => frames.push(JSON.parse(buf.toString()) as Record<string, unknown>));
+    await waitFor(() => expect(bridge.tabExpectedNodeIdentityFenceCapability("tmp:anonymous-rehello")).toBe(true));
+    const incarnation = bridge.tabIncarnation("tmp:anonymous-rehello");
+    expect(incarnation).toBeTruthy();
+
+    // This is the production anonymous path: no tab_session_id is sent, so a
+    // same-socket re-hello retains its synthetic incarnation while capability
+    // flags are read again from the new hello.
+    desktop.send(
+      JSON.stringify({ type: "hello", tab_id: "tmp:anonymous-rehello", title: "stale bundle" }),
+    );
+    await waitFor(() => expect(bridge.tabExpectedNodeIdentityFenceCapability("tmp:anonymous-rehello")).toBe(false));
+    expect(bridge.tabIncarnation("tmp:anonymous-rehello")).toBe(incarnation);
+
+    await expect(
+      bridge.send(
+        {
+          cmd: "graph_set_widget",
+          node_id: "312",
+          widget: "control_after_generate",
+          value: "fixed",
+          expected_node_identity: "inner-node-instance-a",
+        } as never,
+        { tabId: "tmp:anonymous-rehello" },
+      ),
+    ).rejects.toThrow(/expected[- ]node[- ]identity|node-instance/i);
+    expect(frames.some((frame) => frame.cmd === "graph_set_widget")).toBe(false);
+    desktop.close();
+  });
+
   it("keeps the browser-tab session identity per hello rather than inheriting it across a workflow-id takeover (#709)", async () => {
     const original = await connectPanel("wf:shared.json", "shared");
     original.send(

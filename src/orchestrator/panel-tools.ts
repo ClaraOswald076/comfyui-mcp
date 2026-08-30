@@ -6935,6 +6935,25 @@ function currentPromotedBindingError(
   return null;
 }
 
+/** A promoted plan that captured a receiver-issued node witness must retain the
+ * matching enforcement capability through the final synchronous dispatch. A
+ * same-socket anonymous re-hello keeps its private incarnation, but the hello
+ * may truthfully advertise a different panel capability set; the unchanged
+ * incarnation therefore cannot authorize dropping this fence. */
+function currentPromotedNodeIdentityFenceError(
+  ctx: PanelToolCtx,
+  binding: PromotedWriteBinding,
+): string | null {
+  if (!isUsableNodeInstanceWitness(binding.nodeInstanceWitness)) return null;
+  try {
+    return ctx.tabExpectedNodeIdentityFenceCapability?.() === true
+      ? null
+      : "the panel node-instance write fence was withdrawn or became unavailable";
+  } catch {
+    return "the panel node-instance write fence became unreadable";
+  }
+}
+
 function capturePromotedWriteBinding(ctx: PanelToolCtx): PromotedWriteBinding | null {
   if (typeof ctx.panelConnectionIdentity !== "function") return null;
   return {
@@ -7503,7 +7522,7 @@ async function preparePromotedWidgetWrite(
       identity: identityAfter,
       incarnation: incarnationBefore,
       nodeType: innerNodeType,
-      ...(enforcesNodeIdentity && inner.nodeInstanceWitness
+      ...(isUsableNodeInstanceWitness(inner.nodeInstanceWitness)
         ? { nodeInstanceWitness: inner.nodeInstanceWitness }
         : {}),
       scope,
@@ -18854,6 +18873,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                     `Refusing promoted inner graph_set_widget: ${error}. No graph_set_widget was dispatched.`,
                   );
                 }
+                const nodeIdentityError = currentPromotedNodeIdentityFenceError(ctx, plan.binding);
+                if (nodeIdentityError) {
+                  throw new Error(
+                    `Refusing promoted inner graph_set_widget: ${nodeIdentityError}. ` +
+                      `No graph_set_widget was dispatched.`,
+                  );
+                }
                 const scopeError = currentPromotedScopeError(
                   ctx,
                   plan.scope,
@@ -18872,9 +18898,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 parentRail: plan.inner.parentRail,
                 ...(plan.terminal ? { terminal: plan.terminal } : {}),
               },
-              ctx.tabExpectedNodeIdentityFenceCapability?.() === true
-                ? plan.inner.nodeInstanceWitness
-                : undefined,
+              plan.binding.nodeInstanceWitness,
             );
             const exited = await leave();
             if (written.isError) {

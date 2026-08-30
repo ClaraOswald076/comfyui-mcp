@@ -211,6 +211,7 @@ async function setWidget(
 function witnessedBridge(opts: {
   replacement?: "graph" | "type" | "connection" | "anonymous" | "node";
   anonymous?: boolean;
+  anonymousRehelloBeforeFinalWrite?: boolean;
   pinFails?: boolean;
   persistExitFails?: boolean;
   enterFailsAt?: number;
@@ -222,6 +223,8 @@ function witnessedBridge(opts: {
   let nodeInstanceWitness = PROMOTED_INNER_NODE_INSTANCE;
   let connectionIdentity = { generation: 1, tabSessionId: "browser-tab-a" };
   let anonymousIncarnation = "anon:1";
+  let nodeIdentityFenceCapability = true;
+  let anonymousRehelloApplied = false;
   let enters = 0;
   let exits = 0;
   let mutations = 0;
@@ -271,6 +274,19 @@ function witnessedBridge(opts: {
       calls.push({ ...cmd });
 
       if (cmd.cmd === "graph_query") {
+        if (
+          opts.anonymous &&
+          opts.anonymousRehelloBeforeFinalWrite &&
+          inSubgraph &&
+          !anonymousRehelloApplied
+        ) {
+          // Production UiBridge keeps the same per-socket anonymous incarnation
+          // across a re-hello, but re-reads capability flags from that hello.
+          // Model the capability transition before the final write's command is
+          // assembled; the live scope and anonymous incarnation remain stable.
+          anonymousRehelloApplied = true;
+          nodeIdentityFenceCapability = false;
+        }
         const id = Array.isArray(cmd.ids) && cmd.ids.length ? String(cmd.ids[0]) : "";
         if (id === "320") {
           return {
@@ -363,7 +379,7 @@ function witnessedBridge(opts: {
     promotedScopeFor: () => scope(),
     workflowUuidFor: () => ({ known: true, uuid: "workflow-a" }),
     tabExpectedNodeTypeFenceCapability: () => true,
-    tabExpectedNodeIdentityFenceCapability: () => true,
+    tabExpectedNodeIdentityFenceCapability: () => nodeIdentityFenceCapability,
     tabExpectedScopeGraphIdentityFenceCapability: () => true,
     tabPromotedTerminalWitnessCapability: () => false,
     tabPromotedParentRailFenceCapability: () => false,
@@ -622,6 +638,18 @@ describe("panel_set_widget promoted control persistence dispatch fences (#1925)"
     expect(mutations).toBe(2);
     expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(2);
     expect(text).toMatch(/control_after_generate_pinned/);
+  });
+
+  it("refuses the primary write after an anonymous same-socket re-hello withdraws the identity fence", async () => {
+    const { text, isError, calls, mutations } = await setWidgetWithWitnessedBridge(
+      { node_id: 320, widget: "value_2", value: 1920 },
+      { anonymous: true, anonymousRehelloBeforeFinalWrite: true },
+    );
+
+    expect(isError).toBe(true);
+    expect(mutations).toBe(0);
+    expect(calls.filter((call) => call.cmd === "graph_set_widget")).toHaveLength(0);
+    expect(text).toMatch(/node-instance write fence was withdrawn|No graph_set_widget was dispatched/);
   });
 
   it("refuses the secondary write when the public connection changes", async () => {
